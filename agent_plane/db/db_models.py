@@ -47,8 +47,10 @@ class SqlTask(Base):
     __tablename__ = "tasks"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    agent_id: Mapped[str] = mapped_column(String(64), ForeignKey("agents.id"))
-    conversation_id: Mapped[str] = mapped_column(String(64), ForeignKey("conversations.id"))
+    agent_id: Mapped[str] = mapped_column(String(64), ForeignKey("agents.id", ondelete="CASCADE"))
+    conversation_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("conversations.id", ondelete="CASCADE")
+    )
     previous_response_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer)
     inbox_closed: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -66,7 +68,9 @@ class SqlConversationItem(Base):
     __tablename__ = "conversation_items"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    conversation_id: Mapped[str] = mapped_column(String(64), ForeignKey("conversations.id"))
+    conversation_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("conversations.id", ondelete="CASCADE")
+    )
     response_id: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(32), default="completed")

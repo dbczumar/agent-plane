@@ -46,6 +46,10 @@ async def test_list_files(client: httpx.AsyncClient) -> None:
     assert len(body["data"]) == 2
     filenames = {f["filename"] for f in body["data"]}
     assert filenames == {"a.txt", "b.txt"}
+    # Verify PaginatedList structure
+    assert isinstance(body["first_id"], str)
+    assert isinstance(body["last_id"], str)
+    assert body["has_more"] is False
 
 
 async def test_get_file(client: httpx.AsyncClient) -> None:
@@ -65,6 +69,7 @@ async def test_get_file(client: httpx.AsyncClient) -> None:
 async def test_get_file_not_found(client: httpx.AsyncClient) -> None:
     resp = await client.get("/v1/files/nonexistent")
     assert resp.status_code == 404
+    assert isinstance(resp.json()["detail"], str)
 
 
 async def test_get_file_content(client: httpx.AsyncClient) -> None:
@@ -91,6 +96,7 @@ async def test_delete_file(client: httpx.AsyncClient) -> None:
     assert del_resp.status_code == 200
     body = del_resp.json()
     assert body["id"] == file_id
+    assert body["object"] == "file"
     assert body["deleted"] is True
 
     # Confirm it's gone
@@ -101,6 +107,7 @@ async def test_delete_file(client: httpx.AsyncClient) -> None:
 async def test_delete_file_not_found(client: httpx.AsyncClient) -> None:
     resp = await client.delete("/v1/files/nonexistent")
     assert resp.status_code == 404
+    assert isinstance(resp.json()["detail"], str)
 
 
 async def test_list_files_pagination(client: httpx.AsyncClient) -> None:

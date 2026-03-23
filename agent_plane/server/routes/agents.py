@@ -81,8 +81,11 @@ def create_agents_router(
         if agent is None:
             raise HTTPException(status_code=404, detail="Agent not found")
 
+        # Cancel active tasks (graceful shutdown), then delete all
+        # task rows so the agent FK can be removed. The CASCADE on
+        # tasks.agent_id is a safety net, not the primary mechanism.
         for task in task_store.list_tasks(agent_id=agent_id):
-            await task_store.cancel(task.id)
+            await task_store.delete(task.id)
         artifact_store.delete(agent_id)
         agent_store.delete(agent_id)
 

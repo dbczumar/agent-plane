@@ -141,8 +141,11 @@ def create_conversations_router(
         conv = conversation_store.get_conversation(conversation_id)
         if conv is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
+        # Cancel active tasks (graceful shutdown), then delete all
+        # task rows so the conversation FK can be removed. The CASCADE
+        # on tasks.conversation_id is a safety net, not the primary mechanism.
         for task in task_store.list_tasks(conversation_id=conversation_id):
-            await task_store.cancel(task.id)
+            await task_store.delete(task.id)
         deleted = await conversation_store.delete_conversation(conversation_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Conversation not found")

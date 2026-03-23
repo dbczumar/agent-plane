@@ -64,6 +64,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["conversation_id"],
             ["conversations.id"],
+            ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("id"),
     )
@@ -89,10 +90,12 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["agent_id"],
             ["agents.id"],
+            ondelete="CASCADE",
         ),
         sa.ForeignKeyConstraint(
             ["conversation_id"],
             ["conversations.id"],
+            ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("id"),
     )

@@ -67,6 +67,8 @@ class IntegrationTaskStore(TaskStore):
         self._deleted: set[str] = set()
         # Workflow inputs stored in-memory (simulates DBOS workflow_status.input)
         self._workflow_inputs: dict[str, dict[str, Any]] = {}
+        # When True, start() does NOT auto-complete tasks (for steering tests)
+        self.defer_all_completions: bool = False
 
     # ── Internal helpers ──────────────────────────────────
 
@@ -228,7 +230,8 @@ class IntegrationTaskStore(TaskStore):
             "instructions": instructions,
             "reasoning": reasoning,
         }
-        self._completed.add(task_id)
+        if not self.defer_all_completions:
+            self._completed.add(task_id)
 
     async def stream(self, task_id: str) -> AsyncIterator[dict[str, Any]]:
         yield {
@@ -288,12 +291,18 @@ class IntegrationTaskStore(TaskStore):
 
 
 @pytest.fixture()
-def app(db_uri: str, tmp_path: Path) -> FastAPI:
+def task_store(db_uri: str) -> IntegrationTaskStore:
+    """IntegrationTaskStore exposed for tests that need to control task behavior."""
+    return IntegrationTaskStore(db_uri)
+
+
+@pytest.fixture()
+def app(task_store: IntegrationTaskStore, db_uri: str, tmp_path: Path) -> FastAPI:
     """Build the FastAPI app with real stores and a stubbed task runtime."""
     return create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
-        task_store=IntegrationTaskStore(db_uri),
+        task_store=task_store,
         conversation_store=SqlAlchemyConversationStore(db_uri),
         artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
     )
