@@ -34,10 +34,17 @@ Layer 2: Agent Execution Loop
  Each workflow gets its own ToolManager — connects MCP servers at start, tears them down in finally. No cross-execution
  resource sharing. Simple, no leaked state.
 
+ Agent loading via AgentCache
+
+ AgentCache (already implemented in runtime/agent_cache.py) is a two-tier cache (memory + disk) backed by ArtifactStore.
+ On cache miss it downloads the tarball, extracts to disk, parses, and validates via spec.load(). On hit it returns a
+ LoadedAgent(spec, workdir) from memory or re-parses from the disk cache. The cache is constructed at server startup and
+ held in _globals. Workflows call agent_cache.load(agent_id) — no manual extract/parse/validate steps.
+
  Store access via module globals
 
- runtime/_globals.py holds store references set once at server startup. Workflow functions read them directly, matching the
-  pattern in RUNTIME.md.
+ runtime/_globals.py holds store references and the AgentCache, set once at server startup. Workflow functions read them
+ directly, matching the pattern in RUNTIME.md.
 
  Tool manager concurrency via contextvars
 
@@ -47,28 +54,30 @@ Layer 2: Agent Execution Loop
  New Files
 
  agent_plane/runtime/
-   _globals.py      # NEW — module-level store globals + init()
+   _globals.py      # NEW — module-level store globals + AgentCache + init()
    prompt.py        # NEW — prompt construction from spec + history
    tool_manager.py  # NEW — MCP lifecycle, tool routing, built-in tools
-   steps.py         # NEW — @step functions (call_llm, call_tool, load_spec, load_history)
+   steps.py         # NEW — @step functions (call_llm, call_tool, load_agent, load_history)
    workflow.py      # REPLACE — real agent loop
+   agent_cache.py   # EXISTS — two-tier agent cache (memory + disk)
 
  File Details
 
- 1. _globals.py — Store globals
+ 1. _globals.py — Store globals + AgentCache
 
  conversation_store: ConversationStore | None = None
  task_store: TaskStore | None = None
- artifact_store: ArtifactStore | None = None
  agent_store: AgentStore | None = None
+ agent_cache: AgentCache | None = None
 
  # Per-workflow tool manager (contextvars for thread safety)
  _tool_manager: ContextVar[ToolManager | None] = ContextVar(default=None)
 
- def init(conversation_store, task_store, artifact_store, agent_store):
+ def init(conversation_store, task_store, agent_store, agent_cache):
      """Called once at server startup."""
 
- cli.py calls _globals.init(...) after constructing stores, before uvicorn.run().
+ cli.py constructs the AgentCache (wrapping ArtifactStore) and passes it to init().
+ Workflows access agent_cache.load(agent_id) to get LoadedAgent(spec, workdir).
 
  2. prompt.py — Prompt construction
 
@@ -103,9 +112,10 @@ Layer 2: Agent Execution Loop
  4. steps.py — DBOS-checkpointed operations
 
  @step()
- def load_agent_spec(agent_id: str) -> dict:
-     # artifact_store.get(agent_id) → bytes → extract → parse → validate
-     # Returns dataclasses.asdict(spec) (must be JSON-serializable for DBOS)
+ def load_agent(agent_id: str) -> dict:
+     # agent_cache.load(agent_id) → LoadedAgent(spec, workdir)
+     # Returns {"spec": dataclasses.asdict(spec), "workdir": str(workdir)}
+     # (must be JSON-serializable for DBOS checkpointing)
 
  @step()
  def load_history(conversation_id: str) -> list[dict]:
@@ -126,10 +136,10 @@ Layer 2: Agent Execution Loop
      # Routes to MCP server, built-in, or local tool
 
  Serialization boundary: All @step inputs and outputs must be JSON-serializable. AgentSpec is passed as dict between steps;
-  reconstructed to dataclass in the workflow.
+  reconstructed to dataclass in the workflow. workdir is passed as a string path.
 
- Crash recovery: On restart, completed steps return cached output. The workflow re-extracts the bundle (fast, idempotent)
- and reconnects MCP servers, but skips re-executing completed LLM/tool calls.
+ Crash recovery: On restart, completed steps return cached output. The AgentCache's disk tier means the bundle doesn't
+ need to be re-downloaded — just re-parsed from disk. MCP servers are reconnected, but completed LLM/tool calls are skipped.
 
  5. workflow.py — The agent loop
 
@@ -138,9 +148,9 @@ Layer 2: Agent Execution Loop
      task_id = get_workflow_id()
 
      # Phase 1: Load
-     spec_dict = load_agent_spec(agent_id)           # @step (cached on recovery)
-     spec = reconstruct_spec(spec_dict)
-     work_dir = extract_bundle(agent_id)             # not a step (idempotent, re-runs on recovery)
+     agent_dict = load_agent(agent_id)               # @step (cached on recovery)
+     spec = reconstruct_spec(agent_dict["spec"])
+     work_dir = Path(agent_dict["workdir"])
      tool_mgr = ToolManager(spec, work_dir)
      _globals._tool_manager.set(tool_mgr)
 
@@ -207,12 +217,15 @@ Layer 2: Agent Execution Loop
 
  After constructing stores, before uvicorn.run():
 
+ from agent_plane.runtime.agent_cache import AgentCache
  from agent_plane.runtime._globals import init as init_runtime
+
+ agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=Path(cache_dir))
  init_runtime(
      conversation_store=conversation_store,
      task_store=task_store,
-     artifact_store=artifact_store,
      agent_store=agent_store,
+     agent_cache=agent_cache,
  )
 
  7. pyproject.toml — New dependencies
@@ -224,16 +237,16 @@ Layer 2: Agent Execution Loop
 
  Phase A: Foundation (no external deps needed)
 
- 1. _globals.py — store globals + init
+ 1. _globals.py — store globals + AgentCache + init
  2. runtime/__init__.py — re-export init
- 3. cli.py — call init at startup
+ 3. cli.py — construct AgentCache, call init at startup
  4. prompt.py — message construction from spec + history
  5. Tests for prompt.py (pure data transformation, no mocks)
 
  Phase B: LLM integration
 
  1. Add litellm dependency
- 2. steps.py — load_agent_spec, load_history, check_steering, call_llm
+ 2. steps.py — load_agent (via AgentCache), load_history, check_steering, call_llm
  3. Tests for steps (monkeypatch litellm.completion)
 
  Phase C: Tool integration
@@ -260,14 +273,13 @@ Layer 2: Agent Execution Loop
 
  Key Existing Code to Reuse
 
- - agent_plane/spec/parser.parse(root) → AgentSpec (spec/parser.py)
- - agent_plane/spec/validator.validate(spec) → ValidationResult (spec/validator.py)
- - agent_plane/spec/tar_utils.extract_safe(path, dest) → extraction (spec/tar_utils.py)
+ - agent_plane/runtime/agent_cache.py — AgentCache.load(agent_id) → LoadedAgent(spec, workdir)
+ - agent_plane/spec.load(source, dest) — extract + parse + validate in one call
  - agent_plane/entities/conversation.py — all item data types and parse_item_data()
+ - agent_plane/entities/agent.py — LoadedAgent dataclass
  - agent_plane/runtime/durability.py — workflow/step/write_stream/close_stream
  - agent_plane/stores/task_store — close_inbox, try_deliver (steering handshake)
  - agent_plane/stores/conversation_store — list_items, append
- - agent_plane/stores/artifact_store — get (load bundle bytes)
 
  Verification
 
