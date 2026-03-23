@@ -53,7 +53,7 @@ def parse(root: Path) -> AgentSpec:
     tools_config = _parse_tools_config(raw.get("tools"))
     params = raw.get("params", {})
 
-    instructions = _read_optional_file(root / "AGENTS.md")
+    instructions = _resolve_instructions(root, raw.get("instructions"))
     skills = _discover_skills(root / "skills")
     mcp_servers = _discover_mcp_servers(root / "tools" / "mcp")
     local_tools = _discover_local_tools(root / "tools")
@@ -114,9 +114,25 @@ def _parse_tools_config(raw: dict[str, object] | None) -> ToolsConfig:
     )
 
 
-def _read_optional_file(path: Path) -> str | None:
-    if path.exists():
-        return path.read_text()
+def _resolve_instructions(root: Path, raw_value: object) -> str | None:
+    """
+    Resolve the instructions for an agent image.
+
+    - If ``instructions`` is set in config.yaml and the value is a path to an
+      existing file relative to root, read that file.
+    - If ``instructions`` is set but is not a file path, treat as inline text.
+    - If ``instructions`` is not set, fall back to reading AGENTS.md.
+    """
+    if raw_value is not None:
+        text = str(raw_value)
+        candidate = root / text
+        if candidate.is_file():
+            return candidate.read_text()
+        return text
+    # Default: read AGENTS.md if present
+    agents_md = root / "AGENTS.md"
+    if agents_md.exists():
+        return agents_md.read_text()
     return None
 
 

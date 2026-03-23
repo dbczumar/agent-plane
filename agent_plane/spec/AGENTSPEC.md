@@ -45,6 +45,7 @@ spec_version: 1               # required; must be 1
 
 name: my-agent                # display name
 description: Does X and Y.   # optional free-form description
+instructions: AGENTS.md       # inline text or path to file (default: AGENTS.md)
 
 llm:
   model: openai/gpt-5.4       # required if llm block present; LiteLLM format
@@ -118,19 +119,30 @@ needed.
 
 ---
 
-## AGENTS.md
+## Instructions
 
-Free-form markdown injected into the system prompt. Defines personality,
+Free-form text injected into the system prompt. Defines personality,
 constraints, and behavioral guidelines.
+
+The `instructions` key in `config.yaml` controls where instructions come from:
+
+| `instructions` value | Behavior |
+|---|---|
+| *(omitted)* | Read `AGENTS.md` from the agent root if present |
+| `path/to/file.md` | Read the file at that path relative to the agent root |
+| `"You are a helpful assistant."` | Use the string as inline instructions |
+
+Resolution: if the value matches an existing file relative to the agent root,
+the file contents are used. Otherwise the value is treated as inline text.
 
 ```markdown
 You are a research assistant. Always cite sources. Ask one clarifying
 question before diving in. When unsure, say so.
 ```
 
-Not machine-parsed — the entire file contents are passed to the model as
-instructions. Optional; if absent, the model receives no agent-level system
-prompt (per-request `instructions` from the API still apply).
+Not machine-parsed — the entire contents (file or inline) are passed to the
+model as instructions. Optional; if absent, the model receives no agent-level
+system prompt (per-request `instructions` from the API still apply).
 
 ---
 

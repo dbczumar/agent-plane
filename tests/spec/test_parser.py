@@ -96,10 +96,47 @@ def test_parse_llm_missing_model(tmp_path: Path) -> None:
         parse(tmp_path)
 
 
-def test_parse_agents_md(agent_dir: Path) -> None:
+def test_parse_agents_md_fallback(agent_dir: Path) -> None:
+    """No instructions key in config -> falls back to AGENTS.md."""
     (agent_dir / "AGENTS.md").write_text("You are a helpful research assistant.")
     spec = parse(agent_dir)
     assert spec.instructions == "You are a helpful research assistant."
+
+
+def test_parse_instructions_inline(tmp_path: Path) -> None:
+    """instructions key with inline text (not a file path)."""
+    config = {"spec_version": 1, "instructions": "Be concise and helpful."}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.instructions == "Be concise and helpful."
+
+
+def test_parse_instructions_file_reference(agent_dir: Path) -> None:
+    """instructions key pointing to an existing file."""
+    (agent_dir / "SYSTEM.md").write_text("Custom system prompt from file.")
+    config = {"spec_version": 1, "name": "test-agent", "instructions": "SYSTEM.md"}
+    (agent_dir / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(agent_dir)
+    assert spec.instructions == "Custom system prompt from file."
+
+
+def test_parse_instructions_overrides_agents_md(agent_dir: Path) -> None:
+    """Explicit instructions key takes precedence over AGENTS.md."""
+    (agent_dir / "AGENTS.md").write_text("Fallback instructions.")
+    config = {"spec_version": 1, "name": "test-agent", "instructions": "Inline wins."}
+    (agent_dir / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(agent_dir)
+    assert spec.instructions == "Inline wins."
+
+
+def test_parse_instructions_file_overrides_agents_md(agent_dir: Path) -> None:
+    """instructions pointing to a file takes precedence over AGENTS.md."""
+    (agent_dir / "AGENTS.md").write_text("Fallback instructions.")
+    (agent_dir / "CUSTOM.md").write_text("Custom file wins.")
+    config = {"spec_version": 1, "name": "test-agent", "instructions": "CUSTOM.md"}
+    (agent_dir / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(agent_dir)
+    assert spec.instructions == "Custom file wins."
 
 
 def test_parse_skill(agent_dir: Path) -> None:
