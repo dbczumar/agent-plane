@@ -96,7 +96,9 @@ def generate_task_id() -> str:
 
 
 def generate_item_id(item_type: str) -> str:
-    prefix = _ITEM_TYPE_PREFIX.get(item_type, "item_")
+    prefix = _ITEM_TYPE_PREFIX.get(item_type)
+    if prefix is None:
+        raise ValueError(f"unknown item type: {item_type!r}")
     return f"{prefix}{uuid.uuid4().hex}"
 
 
