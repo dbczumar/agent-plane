@@ -204,83 +204,116 @@ but completed LLM/tool calls are skipped.
 
 ### 5. `workflow.py` — The agent loop
 
+Every call is annotated: **[EXISTS]** means it's implemented today,
+**[NEW]** means Layer 2 must create it.
+
 ```python
-@workflow()
+@workflow()                                          # [EXISTS] durability.py
 def agent_execution_workflow(agent_id, conversation_id,
                              previous_response_id, instructions):
-    task_id = get_workflow_id()
+    task_id = get_workflow_id()                       # [EXISTS] durability.py
 
     # Phase 1: Load
-    agent_dict = load_agent(agent_id)               # @step (cached on recovery)
-    spec = reconstruct_spec(agent_dict["spec"])
-    work_dir = Path(agent_dict["workdir"])
-    tool_mgr = ToolManager(spec, work_dir)
-    _globals._tool_manager.set(tool_mgr)
+    loaded = _globals.agent_cache.load(agent_id)     # [EXISTS] AgentCache.load() → LoadedAgent
+    spec = loaded.spec                               # [EXISTS] LoadedAgent.spec: AgentSpec
+    work_dir = loaded.workdir                        # [EXISTS] LoadedAgent.workdir: Path
+    tool_mgr = ToolManager(spec, work_dir)           # [NEW] tool_manager.py
+    _globals._tool_manager.set(tool_mgr)             # [NEW] _globals.py ContextVar
 
     try:
-        tool_mgr.start()
-        tool_schemas = tool_mgr.get_tool_schemas()
+        tool_mgr.start()                             # [NEW] tool_manager.py
+        tool_schemas = tool_mgr.get_tool_schemas()   # [NEW] tool_manager.py
 
-        history_dicts = load_history(conversation_id)   # @step
-        history = [reconstruct_item(d) for d in history_dicts]
+        items = _globals.conversation_store \
+            .list_items(conversation_id)              # [EXISTS] ConversationStore → PagedList
+        history = items.data                         # [EXISTS] PagedList.data: list[ConversationItem]
         last_seen = history[-1].id if history else None
         output_items = []
-        total_usage = {}
 
-        # Phase 2: Loop
-        max_iter = spec.params.get("max_iterations", 32)
-        for _ in range(max_iter):
+        # Phase 2: Loop (_MAX_ITERATIONS is a runtime constant)
+        for _ in range(_MAX_ITERATIONS):
             # Check steering
-            new = check_steering(conversation_id, last_seen)  # @step
-            if new:
-                new_items = [reconstruct_item(d) for d in new]
-                history.extend(new_items)
-                last_seen = new_items[-1].id
+            new_page = _globals.conversation_store \
+                .list_items(conversation_id,
+                            after=last_seen)         # [EXISTS] ConversationStore.list_items
+            if new_page.data:
+                history.extend(new_page.data)
+                last_seen = new_page.data[-1].id
 
-            # Call LLM
-            messages = build_messages(spec, history, instructions,
-                                     tool_schemas)
-            llm_resp = call_llm(
-                messages, spec.llm.model, tool_schemas,
+            # Call LLM (streams tokens to clients during execution)
+            messages = build_messages(                # [NEW] prompt.py
+                spec, history, instructions,
+                tool_schemas,
+            )
+            llm_resp = call_llm(                     # [NEW] steps.py @step
+                messages, spec.llm.model,
+                tool_schemas,
                 spec.llm.max_completion_tokens,
                 spec.llm.reasoning_effort,
-            )  # @step — streams tokens to clients during execution
+            )
 
             # If no tool calls → final response
-            if not has_tool_calls(llm_resp):
-                late = task_store.close_inbox(
-                    task_id, conversation_id, last_seen,
+            if not has_tool_calls(llm_resp):          # [NEW] utility
+                late = _globals.task_store.close_inbox(  # [EXISTS] TaskStore.close_inbox
+                    task_id, conversation_id,
+                    last_seen,
                 )
                 if late:
-                    history.append(to_history(llm_resp, task_id))
                     history.extend(late)
                     last_seen = late[-1].id
                     continue
 
                 # Persist and return
-                persist_output(conversation_id, task_id, spec,
-                               llm_resp, output_items)
-                return build_result(task_id, "completed",
-                                    output_items, total_usage)
+                persist_output(                      # [NEW] utility — appends items
+                    conversation_id, task_id,        #   to conversation_store
+                    llm_resp, output_items,
+                )
+                return build_result(                 # [NEW] utility — builds task
+                    task_id, "completed",             #   result dict
+                    output_items,
+                )
 
             # Execute tool calls
-            history.append(to_history(llm_resp, task_id))
-            for tc in get_tool_calls(llm_resp):
-                result = call_tool(tc.name, tc.arguments)  # @step
-                stream_tool_output(tc, result)
-                history.append(to_tool_output(tc, result))
-                output_items.append(to_output_item(tc, result))
+            for tc in get_tool_calls(llm_resp):      # [NEW] utility
+                result = call_tool(                  # [NEW] steps.py @step
+                    tc.name, tc.arguments,
+                )
+                history.append(
+                    to_tool_output(tc, result)        # [NEW] utility → ConversationItem
+                )
+                output_items.append(
+                    to_output_item(tc, result)        # [NEW] utility → dict for output
+                )
 
         return build_result(
             task_id, "incomplete",
             incomplete_details={"reason": "max_output_tokens"},
         )
     finally:
-        close_stream("output")
-        tool_mgr.shutdown()
-        _globals._tool_manager.set(None)
-        drain_inbox(task_id, conversation_id, last_seen)
+        close_stream("output")                       # [EXISTS] durability.py
+        tool_mgr.shutdown()                          # [NEW] tool_manager.py
+        _globals._tool_manager.set(None)             # [NEW] _globals.py
+        drain_inbox(                                 # [NEW] utility — final inbox
+            task_id, conversation_id, last_seen,     #   cleanup on exit
+        )
 ```
+
+**Functions that need to be created in Layer 2:**
+
+| Function | Module | Purpose |
+|----------|--------|---------|
+| `ToolManager` (class) | `tool_manager.py` | MCP lifecycle, tool dispatch, built-in tools |
+| `build_messages()` | `prompt.py` | Assemble system + history into litellm message list |
+| `call_llm()` | `steps.py` | `@step` — streaming litellm call, checkpointed |
+| `call_tool()` | `steps.py` | `@step` — route to ToolManager via ContextVar |
+| `has_tool_calls()` | `workflow.py` | Check if LLM response contains tool calls |
+| `get_tool_calls()` | `workflow.py` | Extract tool call list from LLM response |
+| `persist_output()` | `workflow.py` | Append output items to conversation store |
+| `build_result()` | `workflow.py` | Build task result dict |
+| `to_tool_output()` | `workflow.py` | LLM tool call + result → `ConversationItem` |
+| `to_output_item()` | `workflow.py` | LLM tool call + result → output dict |
+| `drain_inbox()` | `workflow.py` | Final inbox cleanup in `finally` block |
+| `_globals.init()` | `_globals.py` | Set store refs + AgentCache at startup |
 
 ### 6. `cli.py` — Add runtime init
 
@@ -406,3 +439,6 @@ mcp>=1.0
   connection dispatch, per-agent connection sets, lifecycle management (reconnect on failure,
   teardown on agent eviction), and careful isolation so one workflow's tool call doesn't
   interfere with another's.
+- Configurable max iterations — currently a hardcoded runtime constant. Could become a per-agent
+  setting (formal field on `AgentSpec` or `LLMConfig`) or a server-level config. Not in `params`
+  since params are explicitly "not interpreted by the runtime" per AGENTSPEC.md.
