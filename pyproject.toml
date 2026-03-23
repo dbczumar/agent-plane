@@ -1,0 +1,10 @@
+[project]
+name = "agent-plane"
+version = "0.1.0"
+description = "MLflow AgentPlane — agent specification, runtime, and server"
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
