@@ -31,7 +31,7 @@ ACTIVE_STATUSES = frozenset({TaskStatus.QUEUED, TaskStatus.IN_PROGRESS})
 class Task:
     """A task representing a single response execution."""
 
-    task_id: str
+    id: str
     conversation_id: str
     status: str
     agent_id: str

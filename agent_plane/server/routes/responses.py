@@ -40,7 +40,7 @@ def _build_response_object(
     """
     agent = agent_store.get(task.agent_id)
     return ResponseObject(
-        id=task.task_id,
+        id=task.id,
         status=task.status,
         model=agent.name if agent else task.agent_id,
         created_at=task.created_at,
@@ -198,12 +198,12 @@ def create_responses_router(
             [
                 NewConversationItem(
                     type="message",
-                    response_id=task.task_id,
+                    response_id=task.id,
                     data=MessageData(role="user", content=content),
                 )
             ],
         )
-        task_store.start(task.task_id)
+        task_store.start(task.id)
 
         # -- background=true, stream=false: return immediately --
         if req.background and not req.stream:
@@ -258,7 +258,7 @@ def create_responses_router(
                     seq += 1
 
                     # Stream events from the task store
-                    async for event in task_store.stream(task.task_id):
+                    async for event in task_store.stream(task.id):
                         event_type = event.get("type", "unknown")
                         event["sequence_number"] = seq
                         yield _format_sse(event_type, event)
@@ -267,7 +267,7 @@ def create_responses_router(
                     # Stream ended — wait for the workflow to
                     # fully exit (the finally block may still be
                     # running after close_stream).
-                    final_task = await task_store.wait(task.task_id)
+                    final_task = await task_store.wait(task.id)
                     final_resp = _build_response_object(final_task, agent_store)
                     final_dict = final_resp.model_dump()
 
@@ -288,9 +288,9 @@ def create_responses_router(
                 finally:
                     # Foreground streaming: cancel on disconnect
                     if not req.background and not completed_normally:
-                        current = task_store.get(task.task_id)
+                        current = task_store.get(task.id)
                         if current and current.status not in TERMINAL_STATUSES:
-                            await asyncio.shield(task_store.cancel(task.task_id))
+                            await asyncio.shield(task_store.cancel(task.id))
 
             return StreamingResponse(
                 event_generator(),
@@ -300,7 +300,7 @@ def create_responses_router(
         # -- background=false, stream=false: blocking wait --
         # Race task completion against client disconnect so
         # foreground requests are cancelled when the client drops.
-        wait_coro = asyncio.create_task(task_store.wait(task.task_id))
+        wait_coro = asyncio.create_task(task_store.wait(task.id))
         disconnect_coro = asyncio.create_task(_poll_disconnect(request))
         done, pending = await asyncio.wait(
             {wait_coro, disconnect_coro},
@@ -313,7 +313,7 @@ def create_responses_router(
             return _build_response_object(wait_coro.result(), agent_store)
 
         # Client disconnected — cancel the foreground task
-        cancelled = await task_store.cancel(task.task_id)
+        cancelled = await task_store.cancel(task.id)
         return _build_response_object(cancelled, agent_store)
 
     # ── GET /responses/{response_id} ─────────────────────────────

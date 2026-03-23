@@ -389,13 +389,13 @@ def test_search_finds_try_deliver_messages(
 
     msg = NewConversationItem(
         type="message",
-        response_id=task.task_id,
+        response_id=task.id,
         data=MessageData(
             role="user",
             content=[{"type": "input_text", "text": "steered banana"}],
         ),
     )
-    assert task_store.try_deliver(task.task_id, conv.id, msg) is True
+    assert task_store.try_deliver(task.id, conv.id, msg) is True
 
     results = conversation_store.search("banana")
     assert len(results) == 1

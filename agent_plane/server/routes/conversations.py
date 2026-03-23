@@ -142,7 +142,7 @@ def create_conversations_router(
         if conv is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
         for task in task_store.list_tasks(conversation_id=conversation_id):
-            await task_store.cancel(task.task_id)
+            await task_store.cancel(task.id)
         deleted = await conversation_store.delete_conversation(conversation_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Conversation not found")

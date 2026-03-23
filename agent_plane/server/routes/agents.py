@@ -82,7 +82,7 @@ def create_agents_router(
             raise HTTPException(status_code=404, detail="Agent not found")
 
         for task in task_store.list_tasks(agent_id=agent_id):
-            await task_store.cancel(task.task_id)
+            await task_store.cancel(task.id)
         artifact_store.delete(agent_id)
         agent_store.delete(agent_id)
 

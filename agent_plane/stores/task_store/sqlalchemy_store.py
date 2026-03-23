@@ -76,7 +76,7 @@ def _to_entity(row: SqlTask) -> Task:
     Call _enrich_from_dbos() afterwards to merge DBOS workflow state.
     """
     return Task(
-        task_id=row.id,
+        id=row.id,
         conversation_id=row.conversation_id,
         agent_id=row.agent_id,
         created_at=row.created_at,
@@ -114,7 +114,7 @@ def _enrich_from_dbos(task: Task) -> Task:
     Sync enrichment — merge DBOS workflow state into a Task.
     Must NOT be called from an async context (DBOS will raise).
     """
-    wf_status: WorkflowStatus | None = get_workflow_status(task.task_id)
+    wf_status: WorkflowStatus | None = get_workflow_status(task.id)
     if wf_status is None:
         return task
     return _apply_workflow_status(task, wf_status)
@@ -125,7 +125,7 @@ async def _enrich_from_dbos_async(task: Task) -> Task:
     Async enrichment — for use in async methods where an event
     loop is already running.
     """
-    wf_status: WorkflowStatus | None = await get_workflow_status_async(task.task_id)
+    wf_status: WorkflowStatus | None = await get_workflow_status_async(task.id)
     if wf_status is None:
         return task
     return _apply_workflow_status(task, wf_status)

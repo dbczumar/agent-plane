@@ -39,16 +39,16 @@ def test_create_and_get(
         instructions="Be helpful",
         background=True,
     )
-    assert task.task_id.startswith("resp_")
+    assert task.id.startswith("resp_")
     assert task.conversation_id == conv_id
     assert task.agent_id == agent_id
     assert task.status == "queued"
     assert task.instructions == "Be helpful"
     assert task.background is True
 
-    fetched = task_store.get(task.task_id)
+    fetched = task_store.get(task.id)
     assert fetched is not None
-    assert fetched.task_id == task.task_id
+    assert fetched.id == task.id
 
 
 def test_get_nonexistent(task_store: SqlAlchemyTaskStore) -> None:
@@ -99,8 +99,8 @@ async def test_delete(
     conv_id = _make_conversation(conversation_store)
     task = task_store.create(conversation_id=conv_id, agent_id=agent_id)
 
-    await task_store.delete(task.task_id)
-    assert task_store.get(task.task_id) is None
+    await task_store.delete(task.id)
+    assert task_store.get(task.id) is None
 
 
 # ── Steering handshake ───────────────────────────────
@@ -117,13 +117,13 @@ def test_try_deliver_open_inbox(
 
     msg = NewConversationItem(
         type="message",
-        response_id=task.task_id,
+        response_id=task.id,
         data=MessageData(
             role="user",
             content=[{"type": "input_text", "text": "steering msg"}],
         ),
     )
-    assert task_store.try_deliver(task.task_id, conv_id, msg) is True
+    assert task_store.try_deliver(task.id, conv_id, msg) is True
 
     items = conversation_store.list_items(conv_id)
     assert len(items.data) == 1
@@ -139,17 +139,17 @@ def test_try_deliver_closed_inbox(
     conv_id = _make_conversation(conversation_store)
     task = task_store.create(conversation_id=conv_id, agent_id=agent_id)
 
-    task_store.close_inbox(task.task_id, conv_id, None)
+    task_store.close_inbox(task.id, conv_id, None)
 
     msg = NewConversationItem(
         type="message",
-        response_id=task.task_id,
+        response_id=task.id,
         data=MessageData(
             role="user",
             content=[{"type": "input_text", "text": "too late"}],
         ),
     )
-    assert task_store.try_deliver(task.task_id, conv_id, msg) is False
+    assert task_store.try_deliver(task.id, conv_id, msg) is False
 
 
 def test_close_inbox_no_new_messages(
@@ -161,10 +161,10 @@ def test_close_inbox_no_new_messages(
     conv_id = _make_conversation(conversation_store)
     task = task_store.create(conversation_id=conv_id, agent_id=agent_id)
 
-    late = task_store.close_inbox(task.task_id, conv_id, None)
+    late = task_store.close_inbox(task.id, conv_id, None)
     assert late == []
 
-    fetched = task_store.get(task.task_id)
+    fetched = task_store.get(task.id)
     assert fetched is not None
     assert fetched.inbox_closed is True
 
@@ -183,7 +183,7 @@ def test_close_inbox_with_new_messages(
         [
             NewConversationItem(
                 type="message",
-                response_id=task.task_id,
+                response_id=task.id,
                 data=MessageData(
                     role="user",
                     content=[{"type": "input_text", "text": "late msg"}],
@@ -192,11 +192,11 @@ def test_close_inbox_with_new_messages(
         ],
     )
 
-    late = task_store.close_inbox(task.task_id, conv_id, None)
+    late = task_store.close_inbox(task.id, conv_id, None)
     assert len(late) == 1
     assert late[0].id == items[0].id
 
-    fetched = task_store.get(task.task_id)
+    fetched = task_store.get(task.id)
     assert fetched is not None
     assert fetched.inbox_closed is False
 
@@ -214,32 +214,32 @@ def test_steering_handshake_sequence(
     # Server delivers a steering message
     msg = NewConversationItem(
         type="message",
-        response_id=task.task_id,
+        response_id=task.id,
         data=MessageData(
             role="user",
             content=[{"type": "input_text", "text": "redirect"}],
         ),
     )
-    assert task_store.try_deliver(task.task_id, conv_id, msg) is True
+    assert task_store.try_deliver(task.id, conv_id, msg) is True
 
     # Agent tries to close inbox — sees the new message
-    late = task_store.close_inbox(task.task_id, conv_id, None)
+    late = task_store.close_inbox(task.id, conv_id, None)
     assert len(late) == 1
 
     # Agent processes the message, then closes inbox with updated cursor
-    late2 = task_store.close_inbox(task.task_id, conv_id, late[-1].id)
+    late2 = task_store.close_inbox(task.id, conv_id, late[-1].id)
     assert late2 == []
 
     # Inbox is now closed — further deliveries fail
     msg2 = NewConversationItem(
         type="message",
-        response_id=task.task_id,
+        response_id=task.id,
         data=MessageData(
             role="user",
             content=[{"type": "input_text", "text": "too late"}],
         ),
     )
-    assert task_store.try_deliver(task.task_id, conv_id, msg2) is False
+    assert task_store.try_deliver(task.id, conv_id, msg2) is False
 
 
 # ── DBOS workflow integration ──────────────────────────
@@ -257,9 +257,9 @@ async def test_start_and_get_completed(
     task = task_store.create(conversation_id=conv_id, agent_id=agent_id)
 
     assert task.status == "queued"
-    task_store.start(task.task_id)
+    task_store.start(task.id)
 
-    result = await task_store.wait(task.task_id)
+    result = await task_store.wait(task.id)
     assert result.status == "completed"
     assert len(result.output) == 1
     assert result.output[0]["role"] == "assistant"
@@ -275,8 +275,8 @@ async def test_wait_returns_completed_task(
     agent_id = _make_agent(agent_store)
     conv_id = _make_conversation(conversation_store)
     task = task_store.create(conversation_id=conv_id, agent_id=agent_id)
-    task_store.start(task.task_id)
+    task_store.start(task.id)
 
-    result = await task_store.wait(task.task_id)
+    result = await task_store.wait(task.id)
     assert result.status == "completed"
     assert len(result.output) == 1
