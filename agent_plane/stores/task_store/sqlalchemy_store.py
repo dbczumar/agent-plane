@@ -211,5 +211,7 @@ class SqlAlchemyTaskStore(TaskStore):
                 stmt = stmt.where(SqlTask.conversation_id == conversation_id)
             if agent_id:
                 stmt = stmt.where(SqlTask.agent_id == agent_id)
+            # Not paginated (internal use only), but ordered for determinism.
+            stmt = stmt.order_by(SqlTask.created_at.desc())
             rows = list(session.execute(stmt).scalars().all())
             return [_to_entity(r) for r in rows]
