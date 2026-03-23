@@ -36,30 +36,36 @@ __all__ = [
 ]
 
 
-def load(source: Path, *, dest: Path | None = None) -> AgentSpec:
+def load(source: Path | bytes, *, dest: Path | None = None) -> AgentSpec:
     """
-    Load an agent spec from a directory or tarball.
+    Load an agent spec from a directory, tarball path, or raw bytes.
 
     If *source* is a directory, parse and validate it directly.
-    If *source* is a file (tarball), extract it to *dest* first,
-    then parse and validate the extracted directory.
+    If *source* is a file path (tarball) or raw bytes, extract to
+    *dest* first, then parse and validate the extracted directory.
 
     Args:
-        source: Path to an agent image directory or a .tar.gz bundle.
+        source: Path to an agent image directory or .tar.gz bundle,
+            or raw tarball bytes (e.g. from an HTTP upload).
         dest: Extraction destination — required when source is a
-              tarball, ignored when source is a directory.
+              tarball or bytes, ignored when source is a directory.
 
     Returns:
         A validated AgentSpec.
 
     Raises:
         ValueError: If the spec fails validation, or if source is a
-            tarball and dest is not provided.
-        FileNotFoundError: If source does not exist, or if the
-            extracted directory is missing config.yaml.
+            tarball/bytes and dest is not provided.
+        FileNotFoundError: If source is a Path that does not exist,
+            or if the extracted directory is missing config.yaml.
         ExtractionError: If the tarball fails safety checks.
     """
-    if source.is_dir():
+    if isinstance(source, bytes):
+        if dest is None:
+            raise ValueError("dest is required when loading from bytes")
+        extract_safe(source, dest)
+        root = dest
+    elif source.is_dir():
         root = source
     elif source.is_file():
         if dest is None:

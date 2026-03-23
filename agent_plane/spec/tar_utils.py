@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import tarfile
 from pathlib import Path, PurePosixPath
 
@@ -17,7 +18,7 @@ class ExtractionError(Exception):
 
 
 def extract_safe(
-    tar_path: Path,
+    source: Path | bytes,
     dest: Path,
     *,
     max_bytes: int = DEFAULT_MAX_BYTES,
@@ -33,7 +34,7 @@ def extract_safe(
     - Entry count bombs (more than max_entries files)
 
     Args:
-        tar_path: Path to the .tar.gz / .tar file.
+        source: Path to a .tar.gz / .tar file, or raw tarball bytes.
         dest: Directory to extract into (created if needed).
         max_bytes: Maximum total extracted size in bytes.
         max_entries: Maximum number of tar entries.
@@ -43,10 +44,11 @@ def extract_safe(
 
     Raises:
         ExtractionError: If any safety check fails.
-        FileNotFoundError: If tar_path does not exist.
+        FileNotFoundError: If source is a Path and does not exist.
     """
-    if not tar_path.exists():
-        raise FileNotFoundError(f"tarball not found: {tar_path}")
+    if isinstance(source, Path):
+        if not source.exists():
+            raise FileNotFoundError(f"tarball not found: {source}")
 
     dest.mkdir(parents=True, exist_ok=True)
     resolved_dest = dest.resolve()
@@ -54,7 +56,7 @@ def extract_safe(
     total_bytes = 0
     entry_count = 0
 
-    with tarfile.open(tar_path, "r:*") as tf:
+    with _open_tar(source) as tf:
         for member in tf:
             entry_count += 1
             if entry_count > max_entries:
@@ -72,6 +74,15 @@ def extract_safe(
             tf.extract(member, dest, set_attrs=False)
 
     return dest
+
+
+def _open_tar(source: Path | bytes) -> tarfile.TarFile:
+    """
+    Open a tarball from a file path or raw bytes.
+    """
+    if isinstance(source, bytes):
+        return tarfile.open(fileobj=io.BytesIO(source), mode="r:*")
+    return tarfile.open(source, "r:*")
 
 
 def _check_member_safety(member: tarfile.TarInfo, resolved_dest: Path) -> None:

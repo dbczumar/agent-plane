@@ -69,3 +69,19 @@ def test_load_invalid_spec_raises(tmp_path: Path) -> None:
 def test_load_missing_source(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="source not found"):
         load(tmp_path / "nonexistent")
+
+
+def test_load_from_bytes(tmp_path: Path) -> None:
+    config = yaml.dump({"spec_version": 1, "name": "bytes-agent"})
+    tar_path = _make_tarball(tmp_path, {"config.yaml": config})
+    bundle_bytes = tar_path.read_bytes()
+    dest = tmp_path / "extracted"
+
+    spec = load(bundle_bytes, dest=dest)
+    assert spec.name == "bytes-agent"
+    assert dest.is_dir()
+
+
+def test_load_bytes_without_dest_raises() -> None:
+    with pytest.raises(ValueError, match="dest is required"):
+        load(b"fake-tarball-bytes")

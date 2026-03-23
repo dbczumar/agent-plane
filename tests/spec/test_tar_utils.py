@@ -117,3 +117,26 @@ def test_extract_creates_dest_directory(tmp_path: Path) -> None:
     extract_safe(tar_path, dest)
     assert dest.is_dir()
     assert (dest / "config.yaml").exists()
+
+
+def test_extract_from_bytes(tmp_path: Path, dest: Path) -> None:
+    config = yaml.dump({"spec_version": 1, "name": "bytes-agent"})
+    tar_path = _create_tar(tmp_path, {"config.yaml": config})
+    bundle_bytes = tar_path.read_bytes()
+
+    result = extract_safe(bundle_bytes, dest)
+    assert result == dest
+    assert (dest / "config.yaml").exists()
+    assert yaml.safe_load((dest / "config.yaml").read_text())["name"] == "bytes-agent"
+
+
+def test_extract_from_bytes_rejects_traversal(dest: Path) -> None:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        data = b"evil"
+        info = tarfile.TarInfo(name="../escape.txt")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+
+    with pytest.raises(ExtractionError, match="path traversal"):
+        extract_safe(buf.getvalue(), dest)
