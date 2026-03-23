@@ -137,7 +137,6 @@ gunicorn.conf.py
 # ignore everything in .claude
 .claude/*
 !.claude/commands/
-!.claude/skills/
 !.claude/hooks/
 !.claude/rules/
 !.claude/scripts/
