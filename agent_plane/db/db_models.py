@@ -53,6 +53,9 @@ class SqlTask(Base):
     created_at: Mapped[int] = mapped_column(Integer)
     inbox_closed: Mapped[bool] = mapped_column(Boolean, default=False)
     instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # JSON-encoded reasoning config, e.g. '{"effort": "high"}'
+    reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
+    agent_name: Mapped[str] = mapped_column(String(256))
     background: Mapped[bool] = mapped_column(Boolean, default=False)
 
     __table_args__ = (

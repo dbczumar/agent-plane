@@ -79,10 +79,12 @@ def _to_entity(row: SqlTask) -> Task:
         id=row.id,
         conversation_id=row.conversation_id,
         agent_id=row.agent_id,
+        agent_name=row.agent_name,
         created_at=row.created_at,
         inbox_closed=row.inbox_closed,
         previous_response_id=row.previous_response_id,
         instructions=row.instructions,
+        reasoning=json.loads(row.reasoning) if row.reasoning else None,
         background=row.background or False,
         status=TaskStatus.QUEUED,
     )
@@ -157,6 +159,7 @@ class SqlAlchemyTaskStore(TaskStore):
         self,
         conversation_id: str,
         agent_id: str,
+        agent_name: str,
         instructions: str | None = None,
         reasoning: dict[str, str] | None = None,
         previous_response_id: str | None = None,
@@ -165,11 +168,13 @@ class SqlAlchemyTaskStore(TaskStore):
         row = SqlTask(
             id=generate_task_id(),
             agent_id=agent_id,
+            agent_name=agent_name,
             conversation_id=conversation_id,
             previous_response_id=previous_response_id,
             created_at=now_epoch(),
             inbox_closed=False,
             instructions=instructions,
+            reasoning=json.dumps(reasoning) if reasoning else None,
             background=background,
         )
         with self._session() as session:

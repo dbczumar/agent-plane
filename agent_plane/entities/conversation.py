@@ -15,7 +15,7 @@ class Conversation:
     """A conversation grouping related turns."""
 
     id: str
-    created_at: int = 0
+    created_at: int
     title: str | None = None
 
 

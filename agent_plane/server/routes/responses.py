@@ -30,19 +30,16 @@ from agent_plane.server.schemas import (
 from agent_plane.stores import AgentStore, ConversationStore, TaskStore
 
 
-def _build_response_object(
-    task: Task,
-    agent_store: AgentStore,
-) -> ResponseObject:
+def _build_response_object(task: Task) -> ResponseObject:
     """
     Convert a runtime Task into an API-layer ResponseObject.
-    Looks up the agent name from agent_id for the model field.
+    Uses task.agent_name (persisted at creation) for the model field
+    so the value is stable even if the agent is renamed or deleted.
     """
-    agent = agent_store.get(task.agent_id)
     return ResponseObject(
         id=task.id,
         status=task.status,
-        model=agent.name if agent else task.agent_id,
+        model=task.agent_name,
         created_at=task.created_at,
         completed_at=task.completed_at,
         output=task.output if task.status == TaskStatus.COMPLETED else [],
@@ -174,7 +171,7 @@ def create_responses_router(
                 if delivered:
                     # Message accepted by running agent — return the
                     # existing in-progress response.
-                    return _build_response_object(prev_task, agent_store)
+                    return _build_response_object(prev_task)
                 # Inbox closed — agent is finishing. Wait for
                 # completion so assistant output is in the conversation
                 # before the new response loads history.
@@ -188,6 +185,7 @@ def create_responses_router(
         task = task_store.create(
             conversation_id=conversation_id,
             agent_id=agent.id,
+            agent_name=agent.name,
             instructions=req.instructions,
             reasoning=req.reasoning,
             previous_response_id=req.previous_response_id,
@@ -207,7 +205,7 @@ def create_responses_router(
 
         # -- background=true, stream=false: return immediately --
         if req.background and not req.stream:
-            return _build_response_object(task, agent_store)
+            return _build_response_object(task)
 
         # -- streaming (both background and foreground) --
         if req.stream:
@@ -216,7 +214,7 @@ def create_responses_router(
                 completed_normally = False
                 try:
                     seq = 0
-                    initial = _build_response_object(task, agent_store)
+                    initial = _build_response_object(task)
                     initial_dict = initial.model_dump()
 
                     # response.created
@@ -268,7 +266,7 @@ def create_responses_router(
                     # fully exit (the finally block may still be
                     # running after close_stream).
                     final_task = await task_store.wait(task.id)
-                    final_resp = _build_response_object(final_task, agent_store)
+                    final_resp = _build_response_object(final_task)
                     final_dict = final_resp.model_dump()
 
                     # Terminal status event
@@ -310,11 +308,11 @@ def create_responses_router(
             t.cancel()
 
         if wait_coro in done:
-            return _build_response_object(wait_coro.result(), agent_store)
+            return _build_response_object(wait_coro.result())
 
         # Client disconnected — cancel the foreground task
         cancelled = await task_store.cancel(task.id)
-        return _build_response_object(cancelled, agent_store)
+        return _build_response_object(cancelled)
 
     # ── GET /responses/{response_id} ─────────────────────────────
 
@@ -323,7 +321,7 @@ def create_responses_router(
         task = task_store.get(response_id)
         if not task:
             raise HTTPException(status_code=404, detail="Response not found")
-        return _build_response_object(task, agent_store)
+        return _build_response_object(task)
 
     # ── POST /responses/{response_id}/cancel ─────────────────────
 
@@ -333,9 +331,9 @@ def create_responses_router(
         if not task:
             raise HTTPException(status_code=404, detail="Response not found")
         if task.status in TERMINAL_STATUSES:
-            return _build_response_object(task, agent_store)
+            return _build_response_object(task)
         cancelled_task = await task_store.cancel(response_id)
-        return _build_response_object(cancelled_task, agent_store)
+        return _build_response_object(cancelled_task)
 
     # ── DELETE /responses/{response_id} ──────────────────────────
 

@@ -385,7 +385,7 @@ def test_search_finds_try_deliver_messages(
     """Messages inserted via try_deliver are indexed for FTS."""
     agent = agent_store.create(name="search-agent")
     conv = conversation_store.create_conversation()
-    task = task_store.create(conversation_id=conv.id, agent_id=agent.id)
+    task = task_store.create(conversation_id=conv.id, agent_id=agent.id, agent_name=agent.name)
 
     msg = NewConversationItem(
         type="message",
@@ -434,8 +434,8 @@ async def test_delete_conversation_with_tasks(
 ) -> None:
     agent = agent_store.create(name="a")
     conv = conversation_store.create_conversation()
-    task_store.create(conversation_id=conv.id, agent_id=agent.id)
-    task_store.create(conversation_id=conv.id, agent_id=agent.id)
+    task_store.create(conversation_id=conv.id, agent_id=agent.id, agent_name=agent.name)
+    task_store.create(conversation_id=conv.id, agent_id=agent.id, agent_name=agent.name)
     conversation_store.append(
         conv.id,
         [

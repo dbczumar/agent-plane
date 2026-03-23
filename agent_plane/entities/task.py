@@ -35,6 +35,9 @@ class Task:
     conversation_id: str
     status: str
     agent_id: str
+    # Denormalized: persisted at creation so the API can return
+    # a stable model name even if the agent is renamed or deleted.
+    agent_name: str
     created_at: int
     completed_at: int | None = None
     # Heterogeneous output items (messages, reasoning, function_calls)

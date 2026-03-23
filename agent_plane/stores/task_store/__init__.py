@@ -27,6 +27,7 @@ class TaskStore(ABC):
         self,
         conversation_id: str,
         agent_id: str,
+        agent_name: str,
         instructions: str | None = None,
         reasoning: dict[str, str] | None = None,
         previous_response_id: str | None = None,
@@ -37,6 +38,9 @@ class TaskStore(ABC):
         Generates a unique task_id (which doubles as the response_id),
         stores the task record with status="queued", and returns the Task.
         Does not start execution -- call start() to begin.
+
+        agent_name is persisted so the API can return the original model
+        name even if the agent is later renamed or deleted.
         """
         ...
 

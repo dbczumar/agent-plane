@@ -13,9 +13,11 @@ from agent_plane.stores.task_store.sqlalchemy_store import SqlAlchemyTaskStore
 
 # ── Helpers ──────────────────────────────────────────
 
+_AGENT_NAME = "test-agent"
+
 
 def _make_agent(agent_store: SqlAlchemyAgentStore) -> str:
-    return agent_store.create(name="test-agent").id
+    return agent_store.create(name=_AGENT_NAME).id
 
 
 def _make_conversation(conversation_store: SqlAlchemyConversationStore) -> str:
@@ -36,6 +38,7 @@ def test_create_and_get(
     task = task_store.create(
         conversation_id=conv_id,
         agent_id=agent_id,
+        agent_name=_AGENT_NAME,
         instructions="Be helpful",
         background=True,
     )
@@ -64,9 +67,9 @@ def test_list_tasks_by_conversation(
     conv1 = _make_conversation(conversation_store)
     conv2 = _make_conversation(conversation_store)
 
-    task_store.create(conversation_id=conv1, agent_id=agent_id)
-    task_store.create(conversation_id=conv1, agent_id=agent_id)
-    task_store.create(conversation_id=conv2, agent_id=agent_id)
+    task_store.create(conversation_id=conv1, agent_id=agent_id, agent_name=_AGENT_NAME)
+    task_store.create(conversation_id=conv1, agent_id=agent_id, agent_name=_AGENT_NAME)
+    task_store.create(conversation_id=conv2, agent_id=agent_id, agent_name=_AGENT_NAME)
 
     assert len(task_store.list_tasks(conversation_id=conv1)) == 2
     assert len(task_store.list_tasks(conversation_id=conv2)) == 1
@@ -82,8 +85,8 @@ def test_list_tasks_by_agent(
     a2 = agent_store.create(name="agent-b").id
     conv = _make_conversation(conversation_store)
 
-    task_store.create(conversation_id=conv, agent_id=a1)
-    task_store.create(conversation_id=conv, agent_id=a2)
+    task_store.create(conversation_id=conv, agent_id=a1, agent_name="agent-a")
+    task_store.create(conversation_id=conv, agent_id=a2, agent_name="agent-b")
 
     assert len(task_store.list_tasks(agent_id=a1)) == 1
     assert len(task_store.list_tasks(agent_id=a2)) == 1
@@ -97,7 +100,7 @@ async def test_delete(
 ) -> None:
     agent_id = _make_agent(agent_store)
     conv_id = _make_conversation(conversation_store)
-    task = task_store.create(conversation_id=conv_id, agent_id=agent_id)
+    task = task_store.create(conversation_id=conv_id, agent_id=agent_id, agent_name=_AGENT_NAME)
 
     await task_store.delete(task.id)
     assert task_store.get(task.id) is None
@@ -113,7 +116,7 @@ def test_try_deliver_open_inbox(
 ) -> None:
     agent_id = _make_agent(agent_store)
     conv_id = _make_conversation(conversation_store)
-    task = task_store.create(conversation_id=conv_id, agent_id=agent_id)
+    task = task_store.create(conversation_id=conv_id, agent_id=agent_id, agent_name=_AGENT_NAME)
 
     msg = NewConversationItem(
         type="message",
@@ -137,7 +140,7 @@ def test_try_deliver_closed_inbox(
 ) -> None:
     agent_id = _make_agent(agent_store)
     conv_id = _make_conversation(conversation_store)
-    task = task_store.create(conversation_id=conv_id, agent_id=agent_id)
+    task = task_store.create(conversation_id=conv_id, agent_id=agent_id, agent_name=_AGENT_NAME)
 
     task_store.close_inbox(task.id, conv_id, None)
 
@@ -159,7 +162,7 @@ def test_close_inbox_no_new_messages(
 ) -> None:
     agent_id = _make_agent(agent_store)
     conv_id = _make_conversation(conversation_store)
-    task = task_store.create(conversation_id=conv_id, agent_id=agent_id)
+    task = task_store.create(conversation_id=conv_id, agent_id=agent_id, agent_name=_AGENT_NAME)
 
     late = task_store.close_inbox(task.id, conv_id, None)
     assert late == []
@@ -176,7 +179,7 @@ def test_close_inbox_with_new_messages(
 ) -> None:
     agent_id = _make_agent(agent_store)
     conv_id = _make_conversation(conversation_store)
-    task = task_store.create(conversation_id=conv_id, agent_id=agent_id)
+    task = task_store.create(conversation_id=conv_id, agent_id=agent_id, agent_name=_AGENT_NAME)
 
     items = conversation_store.append(
         conv_id,
@@ -209,7 +212,7 @@ def test_steering_handshake_sequence(
     """Full steering handshake: deliver -> agent sees it -> close inbox."""
     agent_id = _make_agent(agent_store)
     conv_id = _make_conversation(conversation_store)
-    task = task_store.create(conversation_id=conv_id, agent_id=agent_id)
+    task = task_store.create(conversation_id=conv_id, agent_id=agent_id, agent_name=_AGENT_NAME)
 
     # Server delivers a steering message
     msg = NewConversationItem(
@@ -254,7 +257,7 @@ async def test_start_and_get_completed(
     """start() launches a DBOS workflow; get() reflects completion."""
     agent_id = _make_agent(agent_store)
     conv_id = _make_conversation(conversation_store)
-    task = task_store.create(conversation_id=conv_id, agent_id=agent_id)
+    task = task_store.create(conversation_id=conv_id, agent_id=agent_id, agent_name=_AGENT_NAME)
 
     assert task.status == "queued"
     task_store.start(task.id)
@@ -274,7 +277,7 @@ async def test_wait_returns_completed_task(
     """wait() blocks until the workflow completes and returns the task."""
     agent_id = _make_agent(agent_store)
     conv_id = _make_conversation(conversation_store)
-    task = task_store.create(conversation_id=conv_id, agent_id=agent_id)
+    task = task_store.create(conversation_id=conv_id, agent_id=agent_id, agent_name=_AGENT_NAME)
     task_store.start(task.id)
 
     result = await task_store.wait(task.id)
