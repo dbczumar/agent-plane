@@ -84,6 +84,8 @@ def upgrade() -> None:
         sa.Column("previous_response_id", sa.String(length=64), nullable=True),
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.Column("inbox_closed", sa.Boolean(), nullable=False),
+        sa.Column("agent_name", sa.String(length=256), nullable=False),
+        sa.Column("background", sa.Boolean(), nullable=False),
         sa.ForeignKeyConstraint(
             ["agent_id"],
             ["agents.id"],

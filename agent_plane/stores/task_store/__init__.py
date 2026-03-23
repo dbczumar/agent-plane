@@ -28,8 +28,6 @@ class TaskStore(ABC):
         conversation_id: str,
         agent_id: str,
         agent_name: str,
-        instructions: str | None = None,
-        reasoning: dict[str, str] | None = None,
         previous_response_id: str | None = None,
         background: bool = False,
     ) -> Task:
@@ -41,17 +39,32 @@ class TaskStore(ABC):
 
         agent_name is persisted so the API can return the original model
         name even if the agent is later renamed or deleted.
+
+        instructions and reasoning are NOT stored in the task row --
+        they are pure workflow inputs passed to start().
         """
         ...
 
     @abstractmethod
-    def start(self, task_id: str) -> None:
+    def start(
+        self,
+        task_id: str,
+        instructions: str | None = None,
+        reasoning: dict[str, str] | None = None,
+    ) -> None:
         """
         Begin execution of a previously created task. Launches the DBOS
         workflow asynchronously and returns immediately -- the task
         remains "queued" until the workflow actually begins running,
         at which point it transitions to "in_progress". The task must
         exist and be in "queued" status.
+
+        instructions and reasoning are passed directly to the DBOS
+        workflow as inputs (stored by DBOS, not in the tasks table).
+
+        Enforces the task/workflow invariant via a compensating
+        transaction: if the DBOS workflow fails to start, the task
+        row is deleted so neither artifact exists.
         """
         ...
 

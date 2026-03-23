@@ -3,11 +3,18 @@
 DB-only methods (create, try_deliver, close_inbox, list_tasks) use
 SQLAlchemy directly. Execution-related methods (start, get, stream,
 wait, cancel, delete) delegate to the DBOS runtime.
+
+instructions and reasoning are pure workflow inputs — stored by DBOS
+(in workflow_status.input), not in the tasks table. The task row holds
+only relationship/identity columns (agent_id, conversation_id, etc.)
+and the steering handshake flag (inbox_closed). TaskStore.get()
+assembles the full Task entity from both the DB row and DBOS state.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -47,6 +54,8 @@ from agent_plane.runtime.durability import (
 )
 from agent_plane.stores.task_store import TaskStore
 
+_logger = logging.getLogger(__name__)
+
 # ── DBOS → Task status mapping ───────────────────────────
 
 _DBOS_TO_TASK_STATUS: dict[str, str] = {
@@ -76,7 +85,8 @@ def _map_dbos_status(dbos_status_value: str) -> str:
 def _to_entity(row: SqlTask) -> Task:
     """
     Build a Task from a DB row with status="queued" as default.
-    Call _enrich_from_dbos() afterwards to merge DBOS workflow state.
+    Call _enrich_from_dbos() afterwards to merge DBOS workflow state
+    (including instructions and reasoning from workflow inputs).
     """
     return Task(
         id=row.id,
@@ -86,17 +96,27 @@ def _to_entity(row: SqlTask) -> Task:
         created_at=row.created_at,
         inbox_closed=row.inbox_closed,
         previous_response_id=row.previous_response_id,
-        instructions=row.instructions,
-        reasoning=json.loads(row.reasoning) if row.reasoning else None,
         background=row.background,
         status=TaskStatus.QUEUED,
+        # instructions and reasoning are populated by _apply_workflow_status
+        # from DBOS workflow inputs, not from the DB row.
     )
 
 
 def _apply_workflow_status(task: Task, wf_status: WorkflowStatus) -> Task:
-    """Apply a DBOS WorkflowStatus to a Task, populating status/output/error."""
+    """
+    Apply a DBOS WorkflowStatus to a Task, populating status/output/error
+    and restoring instructions/reasoning from the workflow inputs.
+    """
     # wf_status.status is a plain string (e.g. "SUCCESS", "PENDING")
     task.status = _map_dbos_status(str(wf_status.status))
+
+    # Restore instructions and reasoning from DBOS workflow inputs.
+    # These are passed as kwargs to start_workflow() and stored by DBOS.
+    if wf_status.input is not None:
+        kwargs: dict[str, Any] = wf_status.input.get("kwargs", {})
+        task.instructions = kwargs.get("instructions")
+        task.reasoning = kwargs.get("reasoning")
 
     if task.status == TaskStatus.COMPLETED and wf_status.output is not None:
         # The workflow returns {"task_id": ..., "output": [...], ...}
@@ -163,8 +183,6 @@ class SqlAlchemyTaskStore(TaskStore):
         conversation_id: str,
         agent_id: str,
         agent_name: str,
-        instructions: str | None = None,
-        reasoning: dict[str, str] | None = None,
         previous_response_id: str | None = None,
         background: bool = False,
     ) -> Task:
@@ -176,8 +194,6 @@ class SqlAlchemyTaskStore(TaskStore):
             previous_response_id=previous_response_id,
             created_at=now_epoch(),
             inbox_closed=False,
-            instructions=instructions,
-            reasoning=json.dumps(reasoning) if reasoning else None,
             background=background,
         )
         with self._session() as session:
@@ -186,7 +202,12 @@ class SqlAlchemyTaskStore(TaskStore):
 
     # ── DBOS-backed execution methods ─────────────────────
 
-    def start(self, task_id: str) -> None:
+    def start(
+        self,
+        task_id: str,
+        instructions: str | None = None,
+        reasoning: dict[str, str] | None = None,
+    ) -> None:
         with self._session() as session:
             row = session.get(SqlTask, task_id)
             if row is None:
@@ -194,22 +215,38 @@ class SqlAlchemyTaskStore(TaskStore):
             agent_id = row.agent_id
             conversation_id = row.conversation_id
             previous_response_id = row.previous_response_id
-            instructions = row.instructions
 
         # Lazy import: workflow module uses DBOS decorators that
         # require DBOS to be initialized (which happens in __init__).
         from agent_plane.runtime.workflow import agent_execution_workflow
 
-        # Pin the DBOS workflow_uuid to our task_id so we can
-        # retrieve workflow state by task_id later.
-        with SetWorkflowID(task_id):
-            start_workflow(
-                agent_execution_workflow,
-                agent_id,
-                conversation_id,
-                previous_response_id,
-                instructions,
+        try:
+            # Pin the DBOS workflow_uuid to our task_id so we can
+            # retrieve workflow state by task_id later.
+            # Pass optional params as kwargs so DBOS stores them
+            # with named keys in workflow_status.input.kwargs.
+            with SetWorkflowID(task_id):
+                start_workflow(
+                    agent_execution_workflow,
+                    agent_id,
+                    conversation_id,
+                    previous_response_id=previous_response_id,
+                    instructions=instructions,
+                    reasoning=reasoning,
+                )
+        except Exception:
+            # Compensating transaction: delete the orphaned task row
+            # so the invariant holds (task row exists ↔ DBOS workflow
+            # exists).
+            _logger.warning(
+                "DBOS workflow failed to start for task %s; deleting orphaned row",
+                task_id,
             )
+            with self._session() as session:
+                orphan = session.get(SqlTask, task_id)
+                if orphan is not None:
+                    session.delete(orphan)
+            raise
 
     async def stream(self, task_id: str) -> AsyncIterator[dict[str, Any]]:
         # read_stream_async yields events as they arrive from the

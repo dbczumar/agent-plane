@@ -65,6 +65,8 @@ class IntegrationTaskStore(TaskStore):
         self._completed: set[str] = set()
         self._cancelled: set[str] = set()
         self._deleted: set[str] = set()
+        # Workflow inputs stored in-memory (simulates DBOS workflow_status.input)
+        self._workflow_inputs: dict[str, dict[str, Any]] = {}
 
     # ── Internal helpers ──────────────────────────────────
 
@@ -78,11 +80,14 @@ class IntegrationTaskStore(TaskStore):
             created_at=row.created_at,
             inbox_closed=row.inbox_closed,
             previous_response_id=row.previous_response_id,
-            instructions=row.instructions,
-            reasoning=json.loads(row.reasoning) if row.reasoning else None,
             background=row.background,
             status=TaskStatus.QUEUED,
         )
+        # Restore instructions/reasoning from in-memory workflow inputs
+        inputs = self._workflow_inputs.get(row.id, {})
+        task.instructions = inputs.get("instructions")
+        task.reasoning = inputs.get("reasoning")
+
         if row.id in self._cancelled:
             task.status = TaskStatus.CANCELLED
         elif row.id in self._completed:
@@ -98,8 +103,6 @@ class IntegrationTaskStore(TaskStore):
         conversation_id: str,
         agent_id: str,
         agent_name: str,
-        instructions: str | None = None,
-        reasoning: dict[str, str] | None = None,
         previous_response_id: str | None = None,
         background: bool = False,
     ) -> Task:
@@ -113,8 +116,6 @@ class IntegrationTaskStore(TaskStore):
             previous_response_id=previous_response_id,
             created_at=now_epoch(),
             inbox_closed=False,
-            instructions=instructions,
-            reasoning=json.dumps(reasoning) if reasoning else None,
             background=background,
         )
         with self._session() as session:
@@ -212,11 +213,21 @@ class IntegrationTaskStore(TaskStore):
 
     # ── Runtime-replacement methods (in-memory, no DBOS) ──
 
-    def start(self, task_id: str) -> None:
+    def start(
+        self,
+        task_id: str,
+        instructions: str | None = None,
+        reasoning: dict[str, str] | None = None,
+    ) -> None:
         with self._session() as session:
             row = session.get(SqlTask, task_id)
             if row is None:
                 raise LookupError(f"task {task_id!r} not found")
+        # Store workflow inputs in-memory (simulates DBOS)
+        self._workflow_inputs[task_id] = {
+            "instructions": instructions,
+            "reasoning": reasoning,
+        }
         self._completed.add(task_id)
 
     async def stream(self, task_id: str) -> AsyncIterator[dict[str, Any]]:

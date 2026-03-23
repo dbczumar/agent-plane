@@ -54,12 +54,12 @@ in `agent_plane/db/db_models.py`.
 
 Responses. `task_id` = `response_id` = DBOS `workflow_uuid`.
 
-This table stores only relationship/identity columns and the steering handshake flag.
-All execution state — status, output, error, usage, instructions, background, etc. —
-lives in DBOS (workflow inputs for request params, workflow result for outcomes).
-`TaskStore.get()` assembles the full `Task` entity from both sources. If we later
-need to query by any DBOS-managed field (e.g. filter tasks by status), we can
-promote it to a column here.
+This table stores relationship/identity columns, display dimensions, and the steering
+handshake flag. All execution state — status, output, error, usage, etc. — lives in
+DBOS (workflow inputs for request params, workflow result for outcomes).
+`TaskStore.get()` assembles the full `Task` entity from both the DB row and DBOS state.
+If we later need to query by any DBOS-managed field (e.g. filter tasks by status), we
+can promote it to a column here.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -69,14 +69,27 @@ promote it to a column here.
 | previous_response_id | String(64) | No FK — allows dangling after mid-chain delete |
 | created_at | Integer NOT NULL | |
 | inbox_closed | Integer NOT NULL | Default 0 (0=open, 1=closed) |
+| agent_name | String(256) NOT NULL | Denormalized — stable model name even if agent is renamed/deleted |
+| background | Boolean NOT NULL | Default 0 — display dimension for API responses |
 
-**Stored in DBOS** (workflow inputs): `instructions`, `background`
+**Stored in DBOS** (workflow inputs): `instructions`, `reasoning`
 
 **Stored in DBOS** (workflow result): `status`, `output`, `completed_at`, `error`,
 `incomplete_details`, `usage`
 
 **Indexes:** `ix_tasks_conversation_id`, `ix_tasks_agent_id` (for agent deletion cascade),
 `ix_tasks_created_at`
+
+### Task/workflow invariant
+
+For any task, both a `tasks` table row AND a DBOS `workflow_status` entry must exist,
+OR NEITHER. This is enforced by a compensating transaction in `TaskStore.start()`:
+
+1. `create()` writes the task row and commits.
+2. `start()` launches the DBOS workflow. On failure, it deletes the orphaned row.
+3. If the process crashes between `create()` committing and `start()` succeeding,
+   a reaper on startup can detect orphaned rows (rows with no matching DBOS workflow)
+   and clean them up.
 
 ---
 
@@ -249,8 +262,8 @@ an `after_create` DDL event listener.
 
 | Method | DB Operation |
 |---|---|
-| `create(spec, conversation_id, prev_id)` | INSERT INTO tasks |
-| `start(task_id)` | Launch DBOS workflow (no DB write) |
+| `create(conversation_id, agent_id, agent_name, ...)` | INSERT INTO tasks (no instructions/reasoning — those are workflow inputs) |
+| `start(task_id, instructions, reasoning)` | Launch DBOS workflow; compensating delete of task row on failure |
 | `get(task_id)` | SELECT FROM tasks WHERE id = ?, then DBOS.retrieve_workflow() for status/output/etc. |
 | `wait(task_id)` | DBOS.retrieve_workflow().get_result(), then assemble Task from DB row + workflow result |
 | `stream(task_id)` | DBOS.read_stream(task_id, "output") |

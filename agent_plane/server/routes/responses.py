@@ -188,8 +188,6 @@ def create_responses_router(
             conversation_id=conversation_id,
             agent_id=agent.id,
             agent_name=agent.name,
-            instructions=req.instructions,
-            reasoning=req.reasoning,
             previous_response_id=req.previous_response_id,
             background=req.background,
         )
@@ -203,7 +201,17 @@ def create_responses_router(
                 )
             ],
         )
-        task_store.start(task.id)
+        # instructions and reasoning are pure workflow inputs — passed
+        # directly to the DBOS workflow, not stored in the task row.
+        task_store.start(
+            task.id,
+            instructions=req.instructions,
+            reasoning=req.reasoning,
+        )
+        # Set workflow inputs on the task entity for the initial response.
+        # Subsequent get() calls restore them from DBOS workflow inputs.
+        task.instructions = req.instructions
+        task.reasoning = req.reasoning
 
         # -- background=true, stream=false: return immediately --
         if req.background and not req.stream:

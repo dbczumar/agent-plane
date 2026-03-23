@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
+from pathlib import Path
 
-from sqlalchemy import Engine, create_engine, text
+from sqlalchemy import Engine, create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from agent_plane.entities import NewConversationItem
+
+_logger = logging.getLogger(__name__)
 
 # A callable that returns a context manager yielding a Session.
 ManagedSessionMaker = Callable[[], AbstractContextManager[Session]]
@@ -23,12 +27,47 @@ _engine_lock = threading.Lock()
 
 
 def get_or_create_engine(db_uri: str) -> Engine:
-    """Return a cached engine for the given URI, creating one if needed."""
+    """
+    Return a cached engine for the given URI, creating one if needed.
+
+    On first creation, runs Alembic migrations to ensure the schema is
+    up to date. Subsequent calls with the same URI return the cached
+    engine without re-running migrations.
+    """
     if db_uri not in _engine_cache:
         with _engine_lock:
             if db_uri not in _engine_cache:
-                _engine_cache[db_uri] = create_engine(db_uri)
+                engine = create_engine(db_uri)
+                _run_migrations(engine, db_uri)
+                _engine_cache[db_uri] = engine
     return _engine_cache[db_uri]
+
+
+def _run_migrations(engine: Engine, db_uri: str) -> None:
+    """
+    Run Alembic migrations against the database if the schema is not
+    current. Checks whether our application tables exist first to avoid
+    unnecessary work on already-initialized databases.
+    """
+    from agent_plane.db.db_models import Base
+    from alembic import command
+    from alembic.config import Config
+
+    expected_tables = {table.name for table in Base.metadata.sorted_tables}
+    actual_tables = set(inspect(engine).get_table_names())
+    if expected_tables.issubset(actual_tables):
+        return
+
+    _logger.info("Initializing application database tables...")
+    alembic_ini = Path(__file__).parent / "alembic.ini"
+    config = Config(str(alembic_ini))
+    config.set_main_option("sqlalchemy.url", db_uri)
+    # Pass a shared connection so Alembic operates within the same
+    # engine (required for SQLite in-memory databases, and avoids
+    # creating a second connection pool).
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "head")
 
 
 def clear_engine_cache() -> None:

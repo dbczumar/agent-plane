@@ -48,9 +48,12 @@ The server then calls stores directly — no executor indirection:
 
 ```python
 # server handles a request (see Request Lifecycles for full flows)
-task = task_store.create(conversation_id=conversation_id, agent_id="agent_123", previous_response_id="resp_abc123")
-conversation_store.append(conversation_id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "user", ...})])
-task_store.start(task.task_id)
+task = task_store.create(conversation_id=conversation_id, agent_id="agent_123",
+    agent_name="my-agent", previous_response_id="resp_abc123")
+conversation_store.append(conversation_id, [NewConversationItem(type="message",
+    response_id=task.task_id, data={"role": "user", ...})])
+# instructions and reasoning are passed directly to DBOS, not stored in the task row.
+task_store.start(task.task_id, instructions="Be concise", reasoning={"effort": "high"})
 
 # server resolves conversation for a follow-up request
 conversation_id = conversation_store.get_conversation_id("resp_abc123")
@@ -73,7 +76,7 @@ class TaskStore(ABC):
         self,
         conversation_id: str,
         agent_id: str,
-        instructions: str | None = None,
+        agent_name: str,
         previous_response_id: str | None = None,
         background: bool = False,
     ) -> Task:
@@ -82,17 +85,30 @@ class TaskStore(ABC):
         Generates a unique task_id (which doubles as the response_id),
         stores the task record with status="queued", and returns the Task.
         Does not start execution — call start() to begin.
+
+        instructions and reasoning are NOT stored in the task row —
+        they are pure workflow inputs passed to start().
         """
         ...
 
     @abstractmethod
-    def start(self, task_id: str) -> None:
+    def start(
+        self,
+        task_id: str,
+        instructions: str | None = None,
+        reasoning: dict | None = None,
+    ) -> None:
         """
         Begin execution of a previously created task. Launches the DBOS
         workflow asynchronously and returns immediately — the task
         remains "queued" until the workflow actually begins running,
-        at which point it transitions to "in_progress". The task must
-        exist and be in "queued" status.
+        at which point it transitions to "in_progress".
+
+        instructions and reasoning are passed directly to the DBOS
+        workflow as inputs (stored by DBOS, not in the tasks table).
+
+        Enforces the task/workflow invariant: if the DBOS workflow fails
+        to start, the task row is deleted via compensating transaction.
         """
         ...
 
@@ -218,11 +234,13 @@ class Task:
     conversation_id: str                            # the conversation this task belongs to
     status: str                                     # "queued", "in_progress", "completed", "failed", "incomplete", "cancelled"
     agent_id: str                                   # ID of the agent executing this task
+    agent_name: str                                 # denormalized — stable model name even if agent is renamed
     created_at: int                                 # epoch timestamp
     completed_at: int | None = None                 # epoch timestamp, set on terminal status
     output: list = field(default_factory=list)      # empty until status is "completed"
     inbox_closed: bool = False                      # True once the agent's final inbox check found no messages
-    instructions: str | None = None                 # per-request steering instructions
+    instructions: str | None = None                 # from DBOS workflow inputs (not DB row)
+    reasoning: dict | None = None                   # from DBOS workflow inputs (not DB row)
     background: bool = False                        # whether this task runs in background mode
     previous_response_id: str | None = None         # response this task continues from
     usage: dict | None = None                       # token usage stats
@@ -583,10 +601,11 @@ def handle_post(previous_response_id, input, conversation, ...):
 
     # Normal: create a new response
     task = task_store.create(conversation_id=conversation_id, agent_id=agent_id,
-        previous_response_id=previous_response_id)
+        agent_name=agent.name, previous_response_id=previous_response_id)
     conversation_store.append(conversation_id, [
         NewConversationItem(type="message", response_id=task.task_id, data={"role": "user", "content": input})])
-    task_store.start(task.task_id)
+    # instructions and reasoning are pure workflow inputs — passed to DBOS, not stored in task row.
+    task_store.start(task.task_id, instructions=instructions, reasoning=reasoning)
     return task
 ```
 
@@ -620,9 +639,9 @@ Simplest case. Server holds the connection until done.
 
 1. Server receives `POST /v1/responses` with `background: false, stream: false`
 2. If `previous_response_id` is set: `conversation_id = conversation_store.get_conversation_id(previous_response_id)`, then `prev_task = task_store.get(previous_response_id)` — if None (deleted), return 400. Otherwise: `conversation = conversation_store.create_conversation()` → `conversation_id = conversation.id`
-3. `task = task_store.create(conversation_id=conversation_id, agent_id=agent_id, previous_response_id=previous_response_id)`
+3. `task = task_store.create(conversation_id=conversation_id, agent_id=agent_id, agent_name=agent.name, previous_response_id=previous_response_id)`
 4. `conversation_store.append(conversation_id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "user", "content": [...]})])` — persist user input (durable before execution begins)
-5. `task_store.start(task.task_id)` — starts the DBOS workflow asynchronously
+5. `task_store.start(task.task_id, instructions=instructions, reasoning=reasoning)` — starts the DBOS workflow asynchronously; compensating delete on failure
 6. `task = task_store.wait(task.task_id)` — server blocks here
 7. Runtime loads history via `conversation_store.search_items(conversation_id)` — includes the user message from step 4
 8. Runtime runs the agent loop (LLM calls, tool calls, steering inbox checks between iterations, `write_stream()` for deltas)
@@ -641,9 +660,9 @@ Server reads deltas in real time and forwards as SSE.
 
 1. Server receives `POST /v1/responses` with `background: false, stream: true`
 2. If `previous_response_id` is set: `conversation_id = conversation_store.get_conversation_id(previous_response_id)`, then `prev_task = task_store.get(previous_response_id)` — if None (deleted), return 400. Otherwise: `conversation = conversation_store.create_conversation()` → `conversation_id = conversation.id`
-3. `task = task_store.create(conversation_id=conversation_id, agent_id=agent_id, previous_response_id=previous_response_id)`
+3. `task = task_store.create(conversation_id=conversation_id, agent_id=agent_id, agent_name=agent.name, previous_response_id=previous_response_id)`
 4. `conversation_store.append(conversation_id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "user", "content": [...]})])` — persist user input
-5. `task_store.start(task.task_id)` — starts the DBOS workflow asynchronously
+5. `task_store.start(task.task_id, instructions=instructions, reasoning=reasoning)` — starts the DBOS workflow asynchronously; compensating delete on failure
 6. Server opens SSE connection and iterates `task_store.stream(task.task_id)`
 7. Runtime loads history via `conversation_store.search_items(conversation_id)` — includes the user message from step 4
 8. Runtime runs the agent loop — each `write_stream()` delta is yielded by `stream()`
@@ -664,9 +683,9 @@ Fire and forget. Client polls GET for result.
 
 1. Server receives `POST /v1/responses` with `background: true, stream: false`
 2. If `previous_response_id` is set: `conversation_id = conversation_store.get_conversation_id(previous_response_id)`, then `prev_task = task_store.get(previous_response_id)` — if None (deleted), return 400. Otherwise: `conversation = conversation_store.create_conversation()` → `conversation_id = conversation.id`
-3. `task = task_store.create(conversation_id=conversation_id, agent_id=agent_id, previous_response_id=previous_response_id)`
+3. `task = task_store.create(conversation_id=conversation_id, agent_id=agent_id, agent_name=agent.name, previous_response_id=previous_response_id)`
 4. `conversation_store.append(conversation_id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "user", "content": [...]})])` — persist user input
-5. `task_store.start(task.task_id)` — starts the DBOS workflow asynchronously
+5. `task_store.start(task.task_id, instructions=instructions, reasoning=reasoning)` — starts the DBOS workflow asynchronously; compensating delete on failure
 6. Server returns 200 immediately with `{id: task.task_id, status: "queued", output: []}`
 7. Runtime loads history via `conversation_store.search_items(conversation_id)` — includes the user message from step 4
 8. Runtime runs the agent loop in the background
@@ -685,9 +704,9 @@ The laptop-closing scenario. Durable execution + live streaming while connected.
 
 1. Server receives `POST /v1/responses` with `background: true, stream: true`
 2. If `previous_response_id` is set: `conversation_id = conversation_store.get_conversation_id(previous_response_id)`, then `prev_task = task_store.get(previous_response_id)` — if None (deleted), return 400. Otherwise: `conversation = conversation_store.create_conversation()` → `conversation_id = conversation.id`
-3. `task = task_store.create(conversation_id=conversation_id, agent_id=agent_id, previous_response_id=previous_response_id)`
+3. `task = task_store.create(conversation_id=conversation_id, agent_id=agent_id, agent_name=agent.name, previous_response_id=previous_response_id)`
 4. `conversation_store.append(conversation_id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "user", "content": [...]})])` — persist user input
-5. `task_store.start(task.task_id)` — starts the DBOS workflow asynchronously
+5. `task_store.start(task.task_id, instructions=instructions, reasoning=reasoning)` — starts the DBOS workflow asynchronously; compensating delete on failure
 6. Server opens SSE connection and iterates `task_store.stream(task.task_id)`
 7. Runtime loads history via `conversation_store.search_items(conversation_id)` — includes the user message from step 4
 8. Runtime runs the agent loop — deltas streamed to client via SSE (same as flow 2)

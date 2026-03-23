@@ -36,6 +36,7 @@ def agent_execution_workflow(
     conversation_id: str,
     previous_response_id: str | None = None,
     instructions: str | None = None,
+    reasoning: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     Placeholder agent execution workflow.

@@ -42,9 +42,7 @@ def cache_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
-def agent_cache(
-    artifact_store: LocalArtifactStore, cache_dir: Path
-) -> AgentCache:
+def agent_cache(artifact_store: LocalArtifactStore, cache_dir: Path) -> AgentCache:
     return AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
 
 

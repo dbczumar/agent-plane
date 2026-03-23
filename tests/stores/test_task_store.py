@@ -39,15 +39,17 @@ def test_create_and_get(
         conversation_id=conv_id,
         agent_id=agent_id,
         agent_name=_AGENT_NAME,
-        instructions="Be helpful",
         background=True,
     )
     assert task.id.startswith("resp_")
     assert task.conversation_id == conv_id
     assert task.agent_id == agent_id
     assert task.status == "queued"
-    assert task.instructions == "Be helpful"
     assert task.background is True
+    # instructions/reasoning are not set by create() — they are
+    # workflow inputs passed to start() and stored by DBOS.
+    assert task.instructions is None
+    assert task.reasoning is None
 
     fetched = task_store.get(task.id)
     assert fetched is not None
@@ -260,12 +262,14 @@ async def test_start_and_get_completed(
     task = task_store.create(conversation_id=conv_id, agent_id=agent_id, agent_name=_AGENT_NAME)
 
     assert task.status == "queued"
-    task_store.start(task.id)
+    task_store.start(task.id, instructions="Be helpful")
 
     result = await task_store.wait(task.id)
     assert result.status == "completed"
     assert len(result.output) == 1
     assert result.output[0]["role"] == "assistant"
+    # instructions are stored in DBOS and restored by get()/wait()
+    assert result.instructions == "Be helpful"
 
 
 @pytest.mark.asyncio
@@ -278,8 +282,9 @@ async def test_wait_returns_completed_task(
     agent_id = _make_agent(agent_store)
     conv_id = _make_conversation(conversation_store)
     task = task_store.create(conversation_id=conv_id, agent_id=agent_id, agent_name=_AGENT_NAME)
-    task_store.start(task.id)
+    task_store.start(task.id, reasoning={"effort": "high"})
 
     result = await task_store.wait(task.id)
     assert result.status == "completed"
     assert len(result.output) == 1
+    assert result.reasoning == {"effort": "high"}
