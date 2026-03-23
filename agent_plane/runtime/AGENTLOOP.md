@@ -63,12 +63,13 @@ at the expense of per-request latency for MCP server initialization.
 ### Agent loading via AgentCache
 
 `AgentCache` (already implemented in `runtime/agent_cache.py`) is a
-two-tier cache (memory + disk) backed by `ArtifactStore`. On cache miss
-it downloads the tarball, extracts to disk, parses, and validates via
-`spec.load()`. On hit it returns a `LoadedAgent(spec, workdir)` from
-memory or re-parses from the disk cache. The cache is constructed at
-server startup and held in `_globals`. Workflows call
-`agent_cache.load(agent_id)` — no manual extract/parse/validate steps.
+two-tier cache (memory + disk) backed by `ArtifactStore`. The empty
+cache is instantiated at server startup and held in `_globals` — no
+agents are loaded until a workflow requests one. When a workflow calls
+`agent_cache.load(agent_id)`, the cache checks memory, then disk, then
+downloads from `ArtifactStore` on a full miss (extracting, parsing, and
+validating via `spec.load()`). Subsequent requests for the same agent
+hit the cache.
 
 ### Store access via module globals
 
