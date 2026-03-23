@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 from pathlib import Path
 
-from agent_plane.entities.agent import LoadedAgent
-from agent_plane.spec.parser import parse
-from agent_plane.spec.tar_utils import extract_safe
-from agent_plane.spec.types import AgentSpec
-from agent_plane.spec.validator import validate
+from agent_plane.entities import LoadedAgent
+from agent_plane.spec import AgentSpec
+from agent_plane.spec import load as load_spec
 from agent_plane.stores.artifact_store import ArtifactStore
 
 
@@ -26,9 +25,7 @@ class AgentCache:
     extracted to disk, parsed, validated, and stored in both tiers.
     """
 
-    def __init__(
-        self, artifact_store: ArtifactStore, cache_dir: Path
-    ) -> None:
+    def __init__(self, artifact_store: ArtifactStore, cache_dir: Path) -> None:
         self._artifact_store = artifact_store
         self._cache_dir = cache_dir
         self._specs: dict[str, AgentSpec] = {}
@@ -48,15 +45,21 @@ class AgentCache:
 
         # Tier 2: disk cache (directory already extracted)
         if workdir.is_dir():
-            spec = _parse_and_validate(workdir)
+            spec = load_spec(workdir)
             self._specs[agent_id] = spec
             return LoadedAgent(spec=spec, workdir=workdir)
 
-        # Cache miss — download from artifact store
+        # Cache miss — download bundle, write to temp file, extract
         bundle_bytes = self._artifact_store.get(agent_id)
-        _extract_bundle(bundle_bytes, workdir)
+        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".tar.gz")
+        os.close(tmp_fd)  # close immediately; we re-open via Path.write_bytes
+        tmp_path = Path(tmp_name)
+        try:
+            tmp_path.write_bytes(bundle_bytes)
+            spec = load_spec(tmp_path, dest=workdir)
+        finally:
+            tmp_path.unlink()
 
-        spec = _parse_and_validate(workdir)
         self._specs[agent_id] = spec
         return LoadedAgent(spec=spec, workdir=workdir)
 
@@ -69,35 +72,3 @@ class AgentCache:
         workdir = self._cache_dir / agent_id
         if workdir.is_dir():
             shutil.rmtree(workdir)
-
-
-def _parse_and_validate(workdir: Path) -> AgentSpec:
-    """
-    Parse and validate the agent spec from an extracted directory.
-
-    Raises ValueError if validation fails.
-    """
-    spec = parse(workdir)
-    result = validate(spec)
-    if not result.valid:
-        errors = "; ".join(
-            f"{e.path}: {e.message}" for e in result.errors
-        )
-        raise ValueError(f"invalid agent spec: {errors}")
-    return spec
-
-
-def _extract_bundle(bundle_bytes: bytes, dest: Path) -> None:
-    """
-    Write bundle bytes to a temp file and extract safely to dest.
-
-    extract_safe() requires a file path (not bytes), so we write to
-    a temporary file first.
-    """
-    tmp_fd, tmp_name = tempfile.mkstemp(suffix=".tar.gz")
-    tmp_path = Path(tmp_name)
-    try:
-        tmp_path.write_bytes(bundle_bytes)
-        extract_safe(tmp_path, dest)
-    finally:
-        tmp_path.unlink()

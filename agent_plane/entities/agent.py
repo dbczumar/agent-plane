@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent_plane.spec.types import AgentSpec
+from agent_plane.spec import AgentSpec
 
 
 @dataclass

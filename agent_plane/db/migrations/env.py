@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import Connection, engine_from_config, pool
 
 from agent_plane.db import Base
 from alembic import context
@@ -43,19 +43,33 @@ def run_migrations_online() -> None:
     """
     Run migrations in 'online' mode — connect to the database
     and apply migrations directly.
+
+    If a shared connection was passed via config.attributes (e.g.
+    from _run_migrations in db/utils.py), reuse it instead of
+    creating a new connection pool. This is required for SQLite
+    in-memory databases and avoids redundant connections.
     """
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
-    with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
+    connection = config.attributes.get("connection")
+    if connection is not None:
+        _run_with_connection(connection)
+    else:
+        connectable = engine_from_config(
+            config.get_section(config.config_ini_section, {}),
+            prefix="sqlalchemy.",
+            poolclass=pool.NullPool,
         )
-        with context.begin_transaction():
-            context.run_migrations()
+        with connectable.connect() as conn:
+            _run_with_connection(conn)
+
+
+def _run_with_connection(connection: Connection) -> None:
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        render_as_batch=True,  # required for SQLite ALTER TABLE support
+    )
+    with context.begin_transaction():
+        context.run_migrations()
 
 
 if context.is_offline_mode():

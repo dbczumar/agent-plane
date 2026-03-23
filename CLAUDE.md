@@ -86,6 +86,22 @@ Check each file against this checklist:
     pass tuples as arguments. Use lightweight dataclasses with named
     fields. Tuples are positionally fragile and not extensible.
 
+19. ABSTRACTION VIOLATIONS: Code must respect abstraction boundaries.
+    This includes but is not limited to:
+    - Importing from a package's internal submodules when it exposes a
+      public API (e.g. import from `agent_plane.spec` not
+      `agent_plane.spec.parser`). Exception: same-package siblings
+      and unit tests for a specific submodule.
+    - Manually orchestrating a multi-step pipeline that a higher-level
+      function should encapsulate (e.g. calling parse() then validate()
+      separately instead of a single load()).
+    - Duplicating logic that belongs in another layer (e.g. route-level
+      code reimplementing store-level validation).
+    - Exposing internal state or implementation details through a
+      public interface.
+    If a needed abstraction doesn't exist, create it rather than
+    working around the gap.
+
 Report each finding as:
   [FILE:LINE] ISSUE — description of the problem and suggested fix
 
