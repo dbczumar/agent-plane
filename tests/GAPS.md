@@ -102,9 +102,9 @@ Route-level enforcement in `_build_response_object()`: returns
 
 ### ~~7. Agent delete: cancel in-flight responses~~ — FIXED
 
-`task_store` is now passed to `create_agents_router()`. Added
-`cancel_by_agent(agent)` to `TaskStore`. `delete_agent` calls
-`task_store.cancel_by_agent(agent.name)` before removing the agent.
+`task_store` is now passed to `create_agents_router()`. `delete_agent`
+uses `task_store.list_tasks(agent_id=agent_id)` to find in-flight tasks
+and cancels each via `task_store.cancel()` before removing the agent.
 
 ### ~~8a. Agent bundle storage~~ — FIXED
 
@@ -122,10 +122,10 @@ and enforce tarball structure requirements (e.g. required files like
 
 ### ~~9. Conversation delete: cancel in-flight responses~~ — FIXED
 
-Handled in the route layer: `delete_conversation` now calls
-`task_store.cancel_by_session(conversation_id)` before
-`session_store.delete_session()`. Added `cancel_by_session(session_id)`
-to `TaskStore`. `task_store` is now injected into
+Handled in the route layer: `delete_conversation` uses
+`task_store.list_tasks(session_id=conversation_id)` to find in-flight
+tasks and cancels each via `task_store.cancel()` before calling
+`session_store.delete_session()`. `task_store` is now injected into
 `create_conversations_router()`.
 
 ---
