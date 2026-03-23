@@ -11,7 +11,6 @@ from agent_plane.stores.conversation_store.sqlalchemy_store import (
 )
 from agent_plane.stores.task_store.sqlalchemy_store import SqlAlchemyTaskStore
 
-
 # ── Helpers ──────────────────────────────────────────
 
 
@@ -246,14 +245,13 @@ def test_steering_handshake_sequence(
 # ── DBOS workflow integration ──────────────────────────
 
 
-def test_start_and_get_completed(
+@pytest.mark.asyncio
+async def test_start_and_get_completed(
     task_store: SqlAlchemyTaskStore,
     agent_store: SqlAlchemyAgentStore,
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """start() launches a DBOS workflow; get() reflects completion."""
-    import time
-
     agent_id = _make_agent(agent_store)
     conv_id = _make_conversation(conversation_store)
     task = task_store.create(conversation_id=conv_id, agent_id=agent_id)
@@ -261,19 +259,10 @@ def test_start_and_get_completed(
     assert task.status == "queued"
     task_store.start(task.task_id)
 
-    # Placeholder workflow completes near-instantly. Poll briefly.
-    fetched = None
-    for _ in range(20):
-        fetched = task_store.get(task.task_id)
-        assert fetched is not None
-        if fetched.status == "completed":
-            break
-        time.sleep(0.1)
-
-    assert fetched is not None
-    assert fetched.status == "completed"
-    assert len(fetched.output) == 1
-    assert fetched.output[0]["role"] == "assistant"
+    result = await task_store.wait(task.task_id)
+    assert result.status == "completed"
+    assert len(result.output) == 1
+    assert result.output[0]["role"] == "assistant"
 
 
 @pytest.mark.asyncio
