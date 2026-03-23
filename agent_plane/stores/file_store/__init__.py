@@ -14,7 +14,6 @@ class FileStore(ABC):
         self,
         filename: str,
         bytes: int,
-        content_location: str,
         content_type: str | None = None,
     ) -> StoredFile:
         """

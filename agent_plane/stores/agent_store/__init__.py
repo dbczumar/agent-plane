@@ -13,7 +13,6 @@ class AgentStore(ABC):
     def create(
         self,
         name: str,
-        bundle_location: str,
         description: str | None = None,
     ) -> Agent:
         """

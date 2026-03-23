@@ -114,9 +114,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
+            items = [_to_item(r) for r in rows]
             return PagedList(
-                data=[_to_item(r) for r in rows],
-                next_page_token=rows[-1].id if has_more else None,
+                data=items,
+                first_id=items[0].id if items else None,
+                last_id=items[-1].id if items else None,
+                has_more=has_more,
             )
 
     def append(
@@ -209,9 +212,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
+            convs = [_to_conversation(r) for r in rows]
             return PagedList(
-                data=[_to_conversation(r) for r in rows],
-                next_page_token=rows[-1].id if has_more else None,
+                data=convs,
+                first_id=convs[0].id if convs else None,
+                last_id=convs[-1].id if convs else None,
+                has_more=has_more,
             )
 
     def update_conversation(

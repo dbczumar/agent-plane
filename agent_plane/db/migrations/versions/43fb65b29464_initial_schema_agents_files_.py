@@ -28,7 +28,6 @@ def upgrade() -> None:
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.Column("name", sa.String(length=256), nullable=False),
         sa.Column("description", sa.Text(), nullable=True),
-        sa.Column("bundle_location", sa.Text(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("name"),
     )
@@ -47,7 +46,6 @@ def upgrade() -> None:
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.Column("filename", sa.String(length=512), nullable=False),
         sa.Column("bytes", sa.Integer(), nullable=False),
-        sa.Column("content_location", sa.Text(), nullable=False),
         sa.Column("content_type", sa.String(length=256), nullable=True),
         sa.PrimaryKeyConstraint("id"),
     )

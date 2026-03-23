@@ -19,7 +19,6 @@ in `agent_plane/db/db_models.py`.
 | created_at | Integer NOT NULL | Unix epoch seconds |
 | name | String(256) UNIQUE NOT NULL | Used as `model` in inference requests |
 | description | Text | nullable |
-| bundle_location | Text NOT NULL | Path to stored tarball; spec read from bundle at runtime |
 
 **Indexes:** `uq_agents_name` (unique on name), `ix_agents_created_at`
 
@@ -33,7 +32,6 @@ in `agent_plane/db/db_models.py`.
 | created_at | Integer NOT NULL | |
 | filename | String(512) NOT NULL | Original filename |
 | bytes | Integer NOT NULL | File size |
-| content_location | Text NOT NULL | Path to binary on disk / artifact store |
 | content_type | String(256) | MIME type, nullable |
 
 **Indexes:** `ix_files_created_at`

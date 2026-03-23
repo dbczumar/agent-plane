@@ -11,4 +11,3 @@ class Agent:
     created_at: int
     name: str
     description: str | None = None
-    bundle_location: str = ""

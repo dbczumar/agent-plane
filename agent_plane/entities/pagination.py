@@ -8,7 +8,9 @@ T = TypeVar("T")
 
 @dataclass
 class PagedList(Generic[T]):
-    """A page of results with an optional cursor for the next page."""
+    """A page of results matching the OpenAI list pagination shape."""
 
     data: list[T] = field(default_factory=list)
-    next_page_token: str | None = None
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False

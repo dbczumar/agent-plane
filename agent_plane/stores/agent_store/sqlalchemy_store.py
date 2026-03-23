@@ -21,7 +21,6 @@ def _to_entity(row: SqlAgent) -> Agent:
         created_at=row.created_at,
         name=row.name,
         description=row.description,
-        bundle_location=row.bundle_location,
     )
 
 
@@ -34,7 +33,6 @@ class SqlAlchemyAgentStore(AgentStore):
     def create(
         self,
         name: str,
-        bundle_location: str,
         description: str | None = None,
     ) -> Agent:
         row = SqlAgent(
@@ -42,7 +40,6 @@ class SqlAlchemyAgentStore(AgentStore):
             created_at=now_epoch(),
             name=name,
             description=description,
-            bundle_location=bundle_location,
         )
         with self._session() as session:
             session.add(row)
@@ -89,9 +86,12 @@ class SqlAlchemyAgentStore(AgentStore):
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
+            entities = [_to_entity(r) for r in rows]
             return PagedList(
-                data=[_to_entity(r) for r in rows],
-                next_page_token=rows[-1].id if has_more else None,
+                data=entities,
+                first_id=entities[0].id if entities else None,
+                last_id=entities[-1].id if entities else None,
+                has_more=has_more,
             )
 
     def delete(self, agent_id: str) -> bool:

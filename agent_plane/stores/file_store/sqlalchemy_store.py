@@ -21,7 +21,6 @@ def _to_entity(row: SqlFile) -> StoredFile:
         created_at=row.created_at,
         filename=row.filename,
         bytes=row.bytes,
-        content_location=row.content_location,
         content_type=row.content_type,
     )
 
@@ -36,7 +35,6 @@ class SqlAlchemyFileStore(FileStore):
         self,
         filename: str,
         bytes: int,
-        content_location: str,
         content_type: str | None = None,
     ) -> StoredFile:
         row = SqlFile(
@@ -44,7 +42,6 @@ class SqlAlchemyFileStore(FileStore):
             created_at=now_epoch(),
             filename=filename,
             bytes=bytes,
-            content_location=content_location,
             content_type=content_type,
         )
         with self._session() as session:
@@ -85,9 +82,12 @@ class SqlAlchemyFileStore(FileStore):
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
+            entities = [_to_entity(r) for r in rows]
             return PagedList(
-                data=[_to_entity(r) for r in rows],
-                next_page_token=rows[-1].id if has_more else None,
+                data=entities,
+                first_id=entities[0].id if entities else None,
+                last_id=entities[-1].id if entities else None,
+                has_more=has_more,
             )
 
     def delete(self, file_id: str) -> bool:

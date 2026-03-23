@@ -17,7 +17,6 @@ class SqlAgent(Base):
     created_at: Mapped[int] = mapped_column(Integer)
     name: Mapped[str] = mapped_column(String(256), unique=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
-    bundle_location: Mapped[str] = mapped_column(Text)
 
     __table_args__ = (Index("ix_agents_created_at", "created_at"),)
 
@@ -29,7 +28,6 @@ class SqlFile(Base):
     created_at: Mapped[int] = mapped_column(Integer)
     filename: Mapped[str] = mapped_column(String(512))
     bytes: Mapped[int] = mapped_column(Integer)
-    content_location: Mapped[str] = mapped_column(Text)
     content_type: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     __table_args__ = (Index("ix_files_created_at", "created_at"),)

@@ -48,10 +48,9 @@ def task_store(db_uri: str) -> SqlAlchemyTaskStore:
 
 class TestAgentStore:
     def test_create_and_get(self, agent_store: SqlAlchemyAgentStore) -> None:
-        agent = agent_store.create(name="gpt-4", bundle_location="/bundles/gpt4.tar")
+        agent = agent_store.create(name="gpt-4")
         assert agent.id.startswith("ag_")
         assert agent.name == "gpt-4"
-        assert agent.bundle_location == "/bundles/gpt4.tar"
 
         fetched = agent_store.get(agent.id)
         assert fetched is not None
@@ -62,43 +61,41 @@ class TestAgentStore:
         assert agent_store.get("ag_nonexistent") is None
 
     def test_get_by_name(self, agent_store: SqlAlchemyAgentStore) -> None:
-        agent_store.create(name="claude", bundle_location="/b/claude.tar")
+        agent_store.create(name="claude")
         found = agent_store.get_by_name("claude")
         assert found is not None
         assert found.name == "claude"
         assert agent_store.get_by_name("missing") is None
 
     def test_create_with_description(self, agent_store: SqlAlchemyAgentStore) -> None:
-        agent = agent_store.create(
-            name="helper", bundle_location="/b/h.tar", description="A helper agent"
-        )
+        agent = agent_store.create(name="helper", description="A helper agent")
         assert agent.description == "A helper agent"
 
     def test_delete(self, agent_store: SqlAlchemyAgentStore) -> None:
-        agent = agent_store.create(name="temp", bundle_location="/b/t.tar")
+        agent = agent_store.create(name="temp")
         assert agent_store.delete(agent.id) is True
         assert agent_store.get(agent.id) is None
         assert agent_store.delete(agent.id) is False
 
     def test_list_pagination(self, agent_store: SqlAlchemyAgentStore) -> None:
         for i in range(5):
-            agent_store.create(name=f"agent-{i}", bundle_location=f"/b/{i}.tar")
+            agent_store.create(name=f"agent-{i}")
 
         page1 = agent_store.list(limit=2)
         assert len(page1.data) == 2
-        assert page1.next_page_token is not None
+        assert page1.has_more is True
 
-        page2 = agent_store.list(limit=2, after=page1.next_page_token)
+        page2 = agent_store.list(limit=2, after=page1.last_id)
         assert len(page2.data) == 2
-        assert page2.next_page_token is not None
+        assert page2.has_more is True
 
-        page3 = agent_store.list(limit=2, after=page2.next_page_token)
+        page3 = agent_store.list(limit=2, after=page2.last_id)
         assert len(page3.data) == 1
-        assert page3.next_page_token is None
+        assert page3.has_more is False
 
     def test_list_returns_newest_first(self, agent_store: SqlAlchemyAgentStore) -> None:
-        a1 = agent_store.create(name="first", bundle_location="/b/1.tar")
-        a2 = agent_store.create(name="second", bundle_location="/b/2.tar")
+        a1 = agent_store.create(name="first")
+        a2 = agent_store.create(name="second")
         page = agent_store.list()
         ids = {a.id for a in page.data}
         # Both returned; ordering is (created_at DESC, id DESC) —
@@ -113,7 +110,7 @@ class TestAgentStore:
 
 class TestFileStore:
     def test_create_and_get(self, file_store: SqlAlchemyFileStore) -> None:
-        f = file_store.create(filename="data.csv", bytes=1024, content_location="/files/data.csv")
+        f = file_store.create(filename="data.csv", bytes=1024)
         assert f.id.startswith("file_")
         assert f.filename == "data.csv"
         assert f.bytes == 1024
@@ -129,28 +126,27 @@ class TestFileStore:
         f = file_store.create(
             filename="img.png",
             bytes=2048,
-            content_location="/files/img.png",
             content_type="image/png",
         )
         assert f.content_type == "image/png"
 
     def test_delete(self, file_store: SqlAlchemyFileStore) -> None:
-        f = file_store.create(filename="temp.txt", bytes=10, content_location="/f/t.txt")
+        f = file_store.create(filename="temp.txt", bytes=10)
         assert file_store.delete(f.id) is True
         assert file_store.get(f.id) is None
         assert file_store.delete(f.id) is False
 
     def test_list_pagination(self, file_store: SqlAlchemyFileStore) -> None:
         for i in range(4):
-            file_store.create(filename=f"f{i}.txt", bytes=i, content_location=f"/f/{i}")
+            file_store.create(filename=f"f{i}.txt", bytes=i)
 
         page1 = file_store.list(limit=2)
         assert len(page1.data) == 2
-        assert page1.next_page_token is not None
+        assert page1.has_more is True
 
-        page2 = file_store.list(limit=2, after=page1.next_page_token)
+        page2 = file_store.list(limit=2, after=page1.last_id)
         assert len(page2.data) == 2
-        assert page2.next_page_token is None
+        assert page2.has_more is False
 
 
 # ═══════════════════════════════════════════════════════
@@ -388,7 +384,7 @@ class TestConversationStore:
         task_store: SqlAlchemyTaskStore,
         agent_store: SqlAlchemyAgentStore,
     ) -> None:
-        agent = agent_store.create(name="a", bundle_location="/b/a.tar")
+        agent = agent_store.create(name="a")
         conv = conversation_store.create_conversation()
         task_store.create(conversation_id=conv.id, agent_id=agent.id)
         task_store.create(conversation_id=conv.id, agent_id=agent.id)
@@ -417,11 +413,11 @@ class TestConversationStore:
 
         page1 = conversation_store.list_conversations(limit=2)
         assert len(page1.data) == 2
-        assert page1.next_page_token is not None
+        assert page1.has_more is True
 
-        page2 = conversation_store.list_conversations(limit=2, after=page1.next_page_token)
+        page2 = conversation_store.list_conversations(limit=2, after=page1.last_id)
         assert len(page2.data) == 2
-        assert page2.next_page_token is None
+        assert page2.has_more is False
 
 
 # ═══════════════════════════════════════════════════════
@@ -431,7 +427,7 @@ class TestConversationStore:
 
 class TestTaskStore:
     def _make_agent(self, agent_store: SqlAlchemyAgentStore) -> str:
-        return agent_store.create(name="test-agent", bundle_location="/b/t.tar").id
+        return agent_store.create(name="test-agent").id
 
     def _make_conversation(self, conversation_store: SqlAlchemyConversationStore) -> str:
         return conversation_store.create_conversation().id
@@ -489,8 +485,8 @@ class TestTaskStore:
         conversation_store: SqlAlchemyConversationStore,
     ) -> None:
         agent_store = SqlAlchemyAgentStore(db_uri)
-        a1 = agent_store.create(name="agent-a", bundle_location="/b/a.tar").id
-        a2 = agent_store.create(name="agent-b", bundle_location="/b/b.tar").id
+        a1 = agent_store.create(name="agent-a").id
+        a2 = agent_store.create(name="agent-b").id
         conv = self._make_conversation(conversation_store)
 
         task_store.create(conversation_id=conv, agent_id=a1)

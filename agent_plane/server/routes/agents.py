@@ -38,11 +38,8 @@ def create_agents_router(
             )
 
         bundle_bytes = await bundle.read()
-        # bundle_location is unused — binary content is stored
-        # separately via artifact_store, keyed by agent.id.
         agent = agent_store.create(
             name=name,
-            bundle_location="",
             description=description,
         )
         artifact_store.put(agent.id, bundle_bytes)
@@ -61,9 +58,9 @@ def create_agents_router(
         page = agent_store.list(limit=limit, after=after, before=before)
         return PaginatedList(
             data=[_to_agent_object(a) for a in page.data],
-            first_id=page.data[0].id if page.data else None,
-            last_id=page.data[-1].id if page.data else None,
-            has_more=page.next_page_token is not None,
+            first_id=page.first_id,
+            last_id=page.last_id,
+            has_more=page.has_more,
         )
 
     # ── GET /agents/{agent_id} ─────────────────────────────────────

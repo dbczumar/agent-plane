@@ -78,7 +78,7 @@ def create_conversations_router(
             data=data,
             first_id=data[0].id if data else None,
             last_id=data[-1].id if data else None,
-            has_more=page.next_page_token is not None,
+            has_more=page.has_more,
         )
 
     # ── GET /conversations/{conversation_id} ──────────────────────
@@ -119,7 +119,7 @@ def create_conversations_router(
             data=data,
             first_id=data[0]["id"] if data else None,
             last_id=data[-1]["id"] if data else None,
-            has_more=page.next_page_token is not None,
+            has_more=page.has_more,
         )
 
     # ── PATCH /conversations/{conversation_id} ────────────────────

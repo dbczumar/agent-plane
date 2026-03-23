@@ -11,5 +11,4 @@ class StoredFile:
     created_at: int
     filename: str
     bytes: int
-    content_location: str
     content_type: str | None = None

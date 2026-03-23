@@ -33,12 +33,9 @@ def create_files_router(
     ) -> FileObject:
         content = await file.read()
         content_type = mimetypes.guess_type(file.filename or "")[0] if file.filename else None
-        # content_location is unused — binary content is stored
-        # separately via artifact_store, keyed by stored.id.
         stored = file_store.create(
             filename=file.filename or "unknown",
             bytes=len(content),
-            content_location="",
             content_type=content_type,
         )
         artifact_store.put(stored.id, content)
@@ -57,9 +54,9 @@ def create_files_router(
         page = file_store.list(limit=limit, after=after, before=before)
         return PaginatedList(
             data=[_to_file_object(f) for f in page.data],
-            first_id=page.data[0].id if page.data else None,
-            last_id=page.data[-1].id if page.data else None,
-            has_more=page.next_page_token is not None,
+            first_id=page.first_id,
+            last_id=page.last_id,
+            has_more=page.has_more,
         )
 
     # ── GET /files/{file_id} ─────────────────────────────────────
