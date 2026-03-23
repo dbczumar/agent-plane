@@ -106,15 +106,19 @@ Route-level enforcement in `_build_response_object()`: returns
 `cancel_by_agent(agent)` to `TaskStore`. `delete_agent` calls
 `task_store.cancel_by_agent(agent.name)` before removing the agent.
 
-### 8. Agent bundle storage and validation
+### ~~8a. Agent bundle storage~~ — FIXED
 
-**Spec**: API.md lines 38-40 — `bundle` is a required tarball. Line 57:
-"400 Bad Request — invalid bundle."
+Bundle bytes are now read from the `UploadFile` and stored via
+`artifact_store.put(agent_id, bundle_bytes)` in `create_agent`.
+Deleted via `artifact_store.delete(agent_id)` in `delete_agent`.
 
-**Gap**: The bundle `UploadFile` is accepted but its content is never read,
-validated, or stored. This is intentionally a placeholder — the real
-implementation needs a bundle storage backend and validation logic (tarball
-structure, required files like `AGENTS.md`).
+### 8b. Agent bundle validation
+
+**Spec**: API.md line 57: "400 Bad Request — invalid bundle."
+
+**Gap**: Bundle bytes are stored but never validated. Need to define
+and enforce tarball structure requirements (e.g. required files like
+`AGENTS.md`, safe extraction, size limits).
 
 ### 9. Conversation delete: cancel in-flight responses
 
