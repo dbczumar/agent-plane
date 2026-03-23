@@ -357,6 +357,14 @@ The validator (`validator.py`) enforces:
 - **`file` output modality** — agents generating downloadable files as output.
   Output modalities are limited to `text`, `image`, and `audio` in v1.
 
+- **Flexible skill content sources** — similar to how `instructions` can be
+  inline text or a file reference, skills could support an `instructions` key
+  pointing to an arbitrary file instead of requiring `skills/<name>/SKILL.md`.
+  Whether inlining skill text directly in `config.yaml` should also be
+  supported is an open question — it trades discoverability and
+  separation-of-concerns for convenience in simple single-skill agents. In v1,
+  skills must live in `skills/<name>/SKILL.md`.
+
 - **Tool environment declarations** — specifying dependencies for local tools,
   e.g. a `requirements.txt` for Python tools or `package.json` for TypeScript.
   The runtime currently assumes dependencies are pre-installed in the execution
