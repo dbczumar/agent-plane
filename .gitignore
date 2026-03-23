@@ -1,3 +1,6 @@
+# Agent-plane SQLite databases
+*.db
+
 # MLflow
 mlruns/
 mlartifacts/

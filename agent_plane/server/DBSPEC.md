@@ -6,8 +6,8 @@ operation_outputs, streams, etc.) in a separate `dbos` schema within the same da
 Tasks and conversation_items MUST share the same database — the steering handshake
 (try_deliver + close_inbox) requires single-transaction atomicity.
 
-Initial setup uses `Base.metadata.create_all(engine)`. No Alembic until the
-schema stabilizes.
+Schema is managed by Alembic migrations in `alembic/`. SQLAlchemy models live
+in `agent_plane/server/db.py`.
 
 ---
 
