@@ -42,6 +42,8 @@ def _build_response_object(task: Task) -> ResponseObject:
         model=task.agent_name,
         created_at=task.created_at,
         completed_at=task.completed_at,
+        # Only completed tasks surface output; failed/incomplete/cancelled
+        # return [] per the OpenResponses spec.
         output=task.output if task.status == TaskStatus.COMPLETED else [],
         background=task.background,
         previous_response_id=task.previous_response_id,
@@ -257,9 +259,10 @@ def create_responses_router(
 
                     # Stream events from the task store
                     async for event in task_store.stream(task.id):
-                        event_type = event.get("type", "unknown")
+                        if "type" not in event:
+                            raise ValueError("stream event missing 'type' field")
                         event["sequence_number"] = seq
-                        yield _format_sse(event_type, event)
+                        yield _format_sse(event["type"], event)
                         seq += 1
 
                     # Stream ended — wait for the workflow to

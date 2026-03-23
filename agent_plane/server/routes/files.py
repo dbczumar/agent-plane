@@ -31,10 +31,12 @@ def create_files_router(
     async def upload_file(
         file: UploadFile = File(...),
     ) -> FileObject:
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="filename is required")
         content = await file.read()
-        content_type = mimetypes.guess_type(file.filename or "")[0] if file.filename else None
+        content_type = mimetypes.guess_type(file.filename)[0]
         stored = file_store.create(
-            filename=file.filename or "unknown",
+            filename=file.filename,
             bytes=len(content),
             content_type=content_type,
         )
