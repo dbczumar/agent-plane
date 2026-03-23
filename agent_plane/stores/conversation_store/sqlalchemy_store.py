@@ -6,7 +6,7 @@ import json
 
 from sqlalchemy import and_, delete, func, or_, select
 
-from agent_plane.db.db_models import SqlConversation, SqlConversationItem
+from agent_plane.db.db_models import SqlConversation, SqlConversationItem, SqlTask
 from agent_plane.db.utils import (
     extract_search_text,
     generate_conversation_id,
@@ -128,6 +128,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         persisted: list[ConversationItem] = []
 
         with self._session() as session:
+            # coalesce to -1 so the first appended item gets position 0.
             max_pos = session.execute(
                 select(func.coalesce(func.max(SqlConversationItem.position), -1)).where(
                     SqlConversationItem.conversation_id == conversation_id
@@ -142,7 +143,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     conversation_id=conversation_id,
                     response_id=item.response_id,
                     created_at=now,
-                    status="completed",
+                    status="completed",  # items are final on append
                     position=max_pos,
                     type=item.type,
                     data=json.dumps(data_dict),
@@ -229,6 +230,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             row = session.get(SqlConversation, conversation_id)
             if not row:
                 return False
+            # Order matters for FK constraints:
+            # tasks and items reference the conversation.
+            session.execute(delete(SqlTask).where(SqlTask.conversation_id == conversation_id))
             session.execute(
                 delete(SqlConversationItem).where(
                     SqlConversationItem.conversation_id == conversation_id

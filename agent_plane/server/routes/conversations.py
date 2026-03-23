@@ -70,6 +70,7 @@ def create_conversations_router(
             after=after,
             before=before,
         )
+        # Store always returns newest-first; reverse for ascending.
         data = [_to_conversation_object(s) for s in page.data]
         if order == "asc":
             data = list(reversed(data))
@@ -110,6 +111,7 @@ def create_conversations_router(
             after=after,
             before=before,
         )
+        # Store returns items in position order (ascending); reverse for desc.
         data = [_to_api_item(m) for m in page.data]
         if order == "desc":
             data = list(reversed(data))

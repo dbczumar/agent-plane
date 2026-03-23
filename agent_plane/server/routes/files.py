@@ -33,6 +33,8 @@ def create_files_router(
     ) -> FileObject:
         content = await file.read()
         content_type = mimetypes.guess_type(file.filename or "")[0] if file.filename else None
+        # content_location is unused — binary content is stored
+        # separately via artifact_store, keyed by stored.id.
         stored = file_store.create(
             filename=file.filename or "unknown",
             bytes=len(content),

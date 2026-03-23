@@ -38,6 +38,8 @@ def create_agents_router(
             )
 
         bundle_bytes = await bundle.read()
+        # bundle_location is unused — binary content is stored
+        # separately via artifact_store, keyed by agent.id.
         agent = agent_store.create(
             name=name,
             bundle_location="",

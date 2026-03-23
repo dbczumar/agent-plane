@@ -381,6 +381,34 @@ class TestConversationStore:
         assert conversation_store.search_items(conv.id).data == []
         assert await conversation_store.delete_conversation(conv.id) is False
 
+    @pytest.mark.asyncio
+    async def test_delete_conversation_with_tasks(
+        self,
+        conversation_store: SqlAlchemyConversationStore,
+        task_store: SqlAlchemyTaskStore,
+        agent_store: SqlAlchemyAgentStore,
+    ) -> None:
+        agent = agent_store.create(name="a", bundle_location="/b/a.tar")
+        conv = conversation_store.create_conversation()
+        task_store.create(conversation_id=conv.id, agent_id=agent.id)
+        task_store.create(conversation_id=conv.id, agent_id=agent.id)
+        conversation_store.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="resp_x",
+                    data=MessageData(
+                        role="user",
+                        content=[{"type": "input_text", "text": "hi"}],
+                    ),
+                ),
+            ],
+        )
+        assert await conversation_store.delete_conversation(conv.id) is True
+        assert conversation_store.get_conversation(conv.id) is None
+        assert task_store.list_tasks(conversation_id=conv.id) == []
+
     def test_list_conversations_pagination(
         self, conversation_store: SqlAlchemyConversationStore
     ) -> None:

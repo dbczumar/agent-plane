@@ -59,7 +59,7 @@ def make_managed_session_maker(
             try:
                 if is_sqlite:
                     session.execute(text("PRAGMA foreign_keys = ON"))
-                    session.execute(text("PRAGMA busy_timeout = 20000"))
+                    session.execute(text("PRAGMA busy_timeout = 20000"))  # 20s
                 yield session
                 session.commit()
             except Exception:

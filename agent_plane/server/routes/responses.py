@@ -92,6 +92,9 @@ def create_responses_router(
 
     # ── POST /responses ──────────────────────────────────────────
 
+    # response_model=None: this endpoint returns either a Pydantic model
+    # or a StreamingResponse; FastAPI can't auto-generate a schema for
+    # that union, so we disable automatic response model inference.
     @router.post("/responses", response_model=None)
     async def create_response(
         req: CreateResponseRequest, request: Request
