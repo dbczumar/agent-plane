@@ -20,9 +20,7 @@ async def test_create_agent(client: httpx.AsyncClient) -> None:
 
 
 async def test_create_agent_with_description(client: httpx.AsyncClient) -> None:
-    body = await create_test_agent(
-        client, name="described-agent", description="A helpful agent"
-    )
+    body = await create_test_agent(client, name="described-agent", description="A helpful agent")
     assert body["description"] == "A helpful agent"
 
 
@@ -101,9 +99,7 @@ async def test_list_agents_pagination(client: httpx.AsyncClient) -> None:
     assert len(body["data"]) == 2
     assert body["has_more"] is True
 
-    resp2 = await client.get(
-        "/api/agents", params={"limit": 2, "after": body["last_id"]}
-    )
+    resp2 = await client.get("/api/agents", params={"limit": 2, "after": body["last_id"]})
     body2 = resp2.json()
     assert len(body2["data"]) == 1
     assert body2["has_more"] is False

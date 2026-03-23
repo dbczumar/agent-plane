@@ -20,7 +20,7 @@ from agent_plane.db.utils import (
     make_managed_session_maker,
     now_epoch,
 )
-from agent_plane.entities import Task, TaskStatus
+from agent_plane.entities import ConversationItem, NewConversationItem, Task, TaskStatus
 from agent_plane.server.app import create_app
 from agent_plane.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from agent_plane.stores.artifact_store.local import LocalArtifactStore
@@ -125,15 +125,16 @@ class IntegrationTaskStore(TaskStore):
         self,
         task_id: str,
         conversation_id: str,
-        item: Any,
+        item: NewConversationItem,
     ) -> bool:
+        from sqlalchemy import func
+
         from agent_plane.db.db_models import SqlConversationItem
         from agent_plane.db.utils import (
             extract_search_text,
             generate_item_id,
             insert_fts,
         )
-        from sqlalchemy import func
 
         with self._session() as session:
             stmt = select(SqlTask).where(SqlTask.id == task_id)
@@ -142,9 +143,7 @@ class IntegrationTaskStore(TaskStore):
                 return False
 
             max_pos: int = session.execute(
-                select(
-                    func.coalesce(func.max(SqlConversationItem.position), -1)
-                ).where(
+                select(func.coalesce(func.max(SqlConversationItem.position), -1)).where(
                     SqlConversationItem.conversation_id == conversation_id
                 )
             ).scalar_one()
@@ -173,9 +172,9 @@ class IntegrationTaskStore(TaskStore):
         task_id: str,
         conversation_id: str,
         last_seen_item_id: str | None,
-    ) -> list[Any]:
+    ) -> list[ConversationItem]:
         from agent_plane.db.db_models import SqlConversationItem
-        from agent_plane.entities import ConversationItem, parse_item_data
+        from agent_plane.entities import parse_item_data
 
         with self._session() as session:
             stmt = select(SqlConversationItem).where(
@@ -270,11 +269,7 @@ class IntegrationTaskStore(TaskStore):
             stmt = stmt.order_by(SqlTask.created_at.desc())
             rows = list(session.execute(stmt).scalars().all())
             # Build tasks inside the session so row attributes are accessible
-            tasks = [
-                self._row_to_task(r)
-                for r in rows
-                if r.id not in self._deleted
-            ]
+            tasks = [self._row_to_task(r) for r in rows if r.id not in self._deleted]
         return tasks
 
 
@@ -297,7 +292,5 @@ def app(db_uri: str, tmp_path: Path) -> FastAPI:
 async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
     """Async HTTP client wired to the FastAPI app (no real server)."""
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(
-        transport=transport, base_url="http://test"
-    ) as c:
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c

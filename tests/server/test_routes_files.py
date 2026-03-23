@@ -117,9 +117,7 @@ async def test_list_files_pagination(client: httpx.AsyncClient) -> None:
     assert body["has_more"] is True
 
     # Fetch next page using last_id as cursor
-    resp2 = await client.get(
-        "/v1/files", params={"limit": 2, "after": body["last_id"]}
-    )
+    resp2 = await client.get("/v1/files", params={"limit": 2, "after": body["last_id"]})
     body2 = resp2.json()
     assert len(body2["data"]) == 1
     assert body2["has_more"] is False

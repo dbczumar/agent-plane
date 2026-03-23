@@ -22,8 +22,8 @@ async def test_list_conversations_empty(client: httpx.AsyncClient) -> None:
 async def test_get_conversation(client: httpx.AsyncClient) -> None:
     """Conversations are created implicitly via POST /responses."""
     await create_test_agent(client)
-    _, response_body = await create_test_response(client)
-    conv_id = response_body["conversation"]["id"]
+    result = await create_test_response(client)
+    conv_id = result.body["conversation"]["id"]
 
     resp = await client.get(f"/v1/conversations/{conv_id}")
     assert resp.status_code == 200
@@ -42,8 +42,8 @@ async def test_list_conversations_after_response(
     client: httpx.AsyncClient,
 ) -> None:
     await create_test_agent(client)
-    _, resp1 = await create_test_response(client, input_text="First")
-    conv_id = resp1["conversation"]["id"]
+    result = await create_test_response(client, input_text="First")
+    conv_id = result.body["conversation"]["id"]
 
     resp = await client.get("/v1/conversations")
     body = resp.json()
@@ -53,8 +53,8 @@ async def test_list_conversations_after_response(
 
 async def test_update_conversation_title(client: httpx.AsyncClient) -> None:
     await create_test_agent(client)
-    _, resp_body = await create_test_response(client)
-    conv_id = resp_body["conversation"]["id"]
+    result = await create_test_response(client)
+    conv_id = result.body["conversation"]["id"]
 
     patch_resp = await client.patch(
         f"/v1/conversations/{conv_id}",
@@ -81,8 +81,8 @@ async def test_update_conversation_not_found(
 
 async def test_delete_conversation(client: httpx.AsyncClient) -> None:
     await create_test_agent(client)
-    _, resp_body = await create_test_response(client)
-    conv_id = resp_body["conversation"]["id"]
+    result = await create_test_response(client)
+    conv_id = result.body["conversation"]["id"]
 
     del_resp = await client.delete(f"/v1/conversations/{conv_id}")
     assert del_resp.status_code == 200
@@ -105,8 +105,8 @@ async def test_delete_conversation_not_found(
 async def test_list_conversation_items(client: httpx.AsyncClient) -> None:
     """After creating a response, the user message should appear as an item."""
     await create_test_agent(client)
-    _, resp_body = await create_test_response(client, input_text="Hello agent")
-    conv_id = resp_body["conversation"]["id"]
+    result = await create_test_response(client, input_text="Hello agent")
+    conv_id = result.body["conversation"]["id"]
 
     resp = await client.get(f"/v1/conversations/{conv_id}/items")
     assert resp.status_code == 200

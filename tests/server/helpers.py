@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
+
+
+@dataclass
+class ApiResponse:
+    """Result of an API call — avoids returning positional tuples."""
+
+    status_code: int
+    # Any: JSON response bodies are inherently heterogeneous dicts.
+    body: dict[str, Any]
 
 
 async def create_test_agent(
@@ -31,10 +41,14 @@ async def create_test_response(
     input_text: str = "Hello",
     background: bool = True,
     stream: bool = False,
-    **kwargs: Any,
-) -> tuple[int, dict[str, Any]]:
+    instructions: str | None = None,
+    previous_response_id: str | None = None,
+    store: bool | None = None,
+    conversation: dict[str, str] | None = None,
+    reasoning: dict[str, str] | None = None,
+) -> ApiResponse:
     """
-    Create a response via the API and return (status_code, response JSON).
+    Create a response via the API and return an ApiResponse.
 
     Defaults to background=True so the endpoint returns immediately
     without blocking on task completion.
@@ -44,7 +58,16 @@ async def create_test_response(
         "input": input_text,
         "background": background,
         "stream": stream,
-        **kwargs,
     }
+    if instructions is not None:
+        payload["instructions"] = instructions
+    if previous_response_id is not None:
+        payload["previous_response_id"] = previous_response_id
+    if store is not None:
+        payload["store"] = store
+    if conversation is not None:
+        payload["conversation"] = conversation
+    if reasoning is not None:
+        payload["reasoning"] = reasoning
     resp = await client.post("/v1/responses", json=payload)
-    return resp.status_code, resp.json()
+    return ApiResponse(status_code=resp.status_code, body=resp.json())

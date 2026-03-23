@@ -17,28 +17,24 @@ pytestmark = pytest.mark.asyncio
 async def test_create_response_background(client: httpx.AsyncClient) -> None:
     """background=True, stream=False returns immediately with queued status."""
     await create_test_agent(client)
-    status, body = await create_test_response(
-        client, background=True, stream=False
-    )
-    assert status == 200
-    assert body["object"] == "response"
-    assert body["status"] == "queued"
-    assert body["model"] == "test-agent"
-    assert isinstance(body["id"], str)
-    assert isinstance(body["created_at"], int)
-    assert body["conversation"] is not None
-    assert body["output"] == []
+    result = await create_test_response(client, background=True, stream=False)
+    assert result.status_code == 200
+    assert result.body["object"] == "response"
+    assert result.body["status"] == "queued"
+    assert result.body["model"] == "test-agent"
+    assert isinstance(result.body["id"], str)
+    assert isinstance(result.body["created_at"], int)
+    assert result.body["conversation"] is not None
+    assert result.body["output"] == []
 
 
 async def test_create_response_foreground(client: httpx.AsyncClient) -> None:
     """background=False, stream=False blocks until completion."""
     await create_test_agent(client)
-    status, body = await create_test_response(
-        client, background=False, stream=False
-    )
-    assert status == 200
-    assert body["status"] == "completed"
-    assert len(body["output"]) > 0
+    result = await create_test_response(client, background=False, stream=False)
+    assert result.status_code == 200
+    assert result.body["status"] == "completed"
+    assert len(result.body["output"]) > 0
 
 
 async def test_create_response_streaming(client: httpx.AsyncClient) -> None:
@@ -89,8 +85,8 @@ async def test_create_response_streaming(client: httpx.AsyncClient) -> None:
 
 async def test_get_response(client: httpx.AsyncClient) -> None:
     await create_test_agent(client)
-    _, created = await create_test_response(client)
-    response_id = created["id"]
+    created = await create_test_response(client)
+    response_id = created.body["id"]
 
     resp = await client.get(f"/v1/responses/{response_id}")
     assert resp.status_code == 200
@@ -107,8 +103,8 @@ async def test_get_response_not_found(client: httpx.AsyncClient) -> None:
 
 async def test_delete_response(client: httpx.AsyncClient) -> None:
     await create_test_agent(client)
-    _, created = await create_test_response(client)
-    response_id = created["id"]
+    created = await create_test_response(client)
+    response_id = created.body["id"]
 
     del_resp = await client.delete(f"/v1/responses/{response_id}")
     assert del_resp.status_code == 200
@@ -129,8 +125,8 @@ async def test_delete_response_not_found(client: httpx.AsyncClient) -> None:
 async def test_cancel_completed_response(client: httpx.AsyncClient) -> None:
     """Cancelling an already-completed response is a no-op."""
     await create_test_agent(client)
-    _, created = await create_test_response(client)
-    response_id = created["id"]
+    created = await create_test_response(client)
+    response_id = created.body["id"]
 
     resp = await client.post(f"/v1/responses/{response_id}/cancel")
     assert resp.status_code == 200
@@ -165,10 +161,8 @@ async def test_create_response_with_instructions(
     client: httpx.AsyncClient,
 ) -> None:
     await create_test_agent(client)
-    _, body = await create_test_response(
-        client, instructions="Be concise"
-    )
-    assert body["instructions"] == "Be concise"
+    result = await create_test_response(client, instructions="Be concise")
+    assert result.body["instructions"] == "Be concise"
 
 
 async def test_create_response_with_previous_response_id(
@@ -178,20 +172,20 @@ async def test_create_response_with_previous_response_id(
     await create_test_agent(client)
 
     # First turn
-    _, first = await create_test_response(client, input_text="Turn 1")
-    first_id = first["id"]
-    conv_id = first["conversation"]["id"]
+    first = await create_test_response(client, input_text="Turn 1")
+    first_id = first.body["id"]
+    conv_id = first.body["conversation"]["id"]
 
     # Second turn referencing the first
-    status, second = await create_test_response(
+    second = await create_test_response(
         client,
         input_text="Turn 2",
         previous_response_id=first_id,
     )
-    assert status == 200
-    assert second["previous_response_id"] == first_id
+    assert second.status_code == 200
+    assert second.body["previous_response_id"] == first_id
     # Should be in the same conversation
-    assert second["conversation"]["id"] == conv_id
+    assert second.body["conversation"]["id"] == conv_id
 
 
 async def test_create_response_invalid_previous_response_id(
