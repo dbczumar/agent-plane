@@ -28,15 +28,28 @@ The `mcp` PyPI package provides stdio and HTTP transport clients. It's
 async-only, but DBOS step threads have no running event loop, so
 `asyncio.run()` works inside steps. Add `mcp>=1.0` to dependencies.
 
-### Non-streaming LLM calls for MVP
+### Streaming LLM calls inside DBOS steps
 
-DBOS checkpoints `@step` output on completion. Streaming deltas from the
-LLM mid-step would bypass checkpointing. MVP uses
-`litellm.completion(stream=False)` — the complete response is the step
-output. After the step returns, the workflow writes the result to the
-DBOS stream for SSE. This means clients see the full response arrive at
-once (no token-by-token streaming), but durability is correct. Streaming
-LLM calls are a follow-up optimization.
+`call_llm` uses `litellm.completion(stream=True)`. As token chunks
+arrive, they are written to the DBOS stream (for SSE delivery to
+clients) **and** accumulated in memory. When the stream finishes, the
+full assembled response is returned as the step's output — this is what
+DBOS checkpoints.
+
+- **Normal operation**: Clients see tokens arrive incrementally via SSE.
+- **Crash recovery**: DBOS returns the cached full response from the
+  completed step. The workflow re-emits it as a single output event.
+  The client has reconnected anyway, so token-by-token replay isn't
+  needed — they get the complete response immediately.
+- **Crash mid-stream**: If the step hadn't finished (LLM call was still
+  in progress), DBOS re-runs the step from scratch on recovery. The LLM
+  call re-executes and streams fresh tokens. This is acceptable — the
+  client reconnected and the LLM call is idempotent.
+
+**Open question**: Verify that `write_stream()` works inside a DBOS
+`@step` function during implementation. If not, the LLM call moves out
+of the step and becomes a plain function call within the workflow body,
+with a separate `@step` to checkpoint the assembled response afterward.
 
 ### Per-execution tool manager
 
@@ -165,7 +178,9 @@ def check_steering(conversation_id: str, after: str | None) -> list[dict]:
 @step()
 def call_llm(messages: list[dict], model: str, tools: list[dict],
              max_tokens: int | None, reasoning_effort: str | None) -> dict:
-    # litellm.completion(...) → response dict
+    # litellm.completion(stream=True, ...) → iterate chunks
+    # For each chunk: write_stream("output", token_event) + accumulate
+    # Return full assembled response dict (checkpointed by DBOS)
 
 @step()
 def call_tool(tool_name: str, arguments: str) -> str:
@@ -225,12 +240,7 @@ def agent_execution_workflow(agent_id, conversation_id,
                 messages, spec.llm.model, tool_schemas,
                 spec.llm.max_completion_tokens,
                 spec.llm.reasoning_effort,
-            )  # @step
-
-            # Stream the response
-            for event in response_to_stream_events(llm_resp,
-                                                   len(output_items)):
-                write_stream("output", event)
+            )  # @step — streams tokens to clients during execution
 
             # If no tool calls → final response
             if not has_tool_calls(llm_resp):
