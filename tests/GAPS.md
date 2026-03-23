@@ -130,18 +130,7 @@ tasks and cancels each via `task_store.cancel()` before calling
 
 ---
 
-## Low priority / cosmetic
-
-### 10. Background streaming: durable execution correctness
-
-**Spec**: API.md line 705 — background execution continues on disconnect.
-
-**Status**: This works accidentally because the streaming path has no
-disconnect-cancel logic for background requests (the `finally` block
-checks `req.background` and skips cancellation). Now that foreground
-disconnect cancellation is implemented, this is explicitly correct — the
-`not req.background` guard ensures background tasks are never cancelled
-on disconnect.
+## Low priority
 
 ### 11. `context_management` not passed to runtime
 
