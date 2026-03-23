@@ -429,9 +429,12 @@ mcp>=1.0
 2. **Integration tests**: Full workflow with monkeypatched `call_llm`
    returning canned responses. Verify: events stream correctly, output
    persisted to conversation, steering works, inbox drained on exit
-3. **Manual smoke test**: Start server, register an agent bundle with a
-   real LLM config, `POST /v1/responses`, verify response comes back
-   with real LLM output
+3. **Manual smoke test**: A checked-in script (e.g. `scripts/smoke_test.sh`)
+   that accepts an LLM API key as input (e.g.
+   `./scripts/smoke_test.sh $(cat /tmp/mykey)`). The script starts the
+   server, registers an agent bundle with a real LLM config using the
+   provided key, `POST /v1/responses`, and verifies the response comes
+   back with real LLM output.
 4. **Tool test**: Agent with an MCP server (e.g. a trivial stdio tool),
    verify `function_call` → `function_call_output` round-trip
 
