@@ -14,7 +14,7 @@ from agent_plane.entities.conversation import (
 )
 from agent_plane.entities.file import StoredFile
 from agent_plane.entities.pagination import PagedList
-from agent_plane.entities.task import Task
+from agent_plane.entities.task import ACTIVE_STATUSES, TERMINAL_STATUSES, Task, TaskStatus
 
 __all__ = [
     "Agent",
@@ -28,6 +28,9 @@ __all__ = [
     "PagedList",
     "ReasoningData",
     "StoredFile",
+    "ACTIVE_STATUSES",
+    "TERMINAL_STATUSES",
     "Task",
+    "TaskStatus",
     "parse_item_data",
 ]

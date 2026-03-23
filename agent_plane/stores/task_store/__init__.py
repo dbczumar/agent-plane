@@ -28,6 +28,7 @@ class TaskStore(ABC):
         conversation_id: str,
         agent_id: str,
         instructions: str | None = None,
+        reasoning: dict[str, str] | None = None,
         previous_response_id: str | None = None,
         background: bool = False,
     ) -> Task:

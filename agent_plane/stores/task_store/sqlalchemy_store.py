@@ -1,8 +1,8 @@
-"""SQLAlchemy-backed task store.
+"""SQLAlchemy-backed task store with DBOS durable execution.
 
-Implements the DB-only methods of TaskStore. DBOS-dependent methods
-(start, stream, wait, cancel) raise NotImplementedError until the
-DBOS integration is wired in.
+DB-only methods (create, try_deliver, close_inbox, list_tasks) use
+SQLAlchemy directly. Execution-related methods (start, get, stream,
+wait, cancel, delete) delegate to the DBOS runtime.
 """
 
 from __future__ import annotations
@@ -29,15 +29,51 @@ from agent_plane.entities import (
     ConversationItem,
     NewConversationItem,
     Task,
+    TaskStatus,
     parse_item_data,
 )
+from agent_plane.runtime.durability import (
+    SetWorkflowID,
+    WorkflowHandleAsync,
+    WorkflowStatus,
+    WorkflowStatusString,
+    cancel_workflow_async,
+    ensure_dbos,
+    get_workflow_status,
+    get_workflow_status_async,
+    read_stream_async,
+    retrieve_workflow_async,
+    start_workflow,
+)
 from agent_plane.stores.task_store import TaskStore
+
+# ── DBOS → Task status mapping ───────────────────────────
+
+_DBOS_TO_TASK_STATUS: dict[str, str] = {
+    WorkflowStatusString.ENQUEUED.value: TaskStatus.QUEUED,
+    WorkflowStatusString.PENDING.value: TaskStatus.IN_PROGRESS,
+    WorkflowStatusString.SUCCESS.value: TaskStatus.COMPLETED,
+    WorkflowStatusString.ERROR.value: TaskStatus.FAILED,
+    WorkflowStatusString.CANCELLED.value: TaskStatus.CANCELLED,
+    WorkflowStatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED.value: TaskStatus.FAILED,
+}
+
+# DBOS statuses that mean the workflow is still running.
+_DBOS_ACTIVE = frozenset({WorkflowStatusString.PENDING.value, WorkflowStatusString.ENQUEUED.value})
+
+
+def _map_dbos_status(dbos_status_value: str) -> str:
+    """Map a DBOS WorkflowStatusString value to our TaskStatus."""
+    return _DBOS_TO_TASK_STATUS.get(dbos_status_value, TaskStatus.FAILED)
+
+
+# ── Row → entity helpers ─────────────────────────────────
 
 
 def _to_entity(row: SqlTask) -> Task:
     """
-    Build a Task from a DB row. DBOS-managed fields (status, output,
-    error, usage, etc.) use defaults until DBOS integration populates them.
+    Build a Task from a DB row with status="queued" as default.
+    Call _enrich_from_dbos() afterwards to merge DBOS workflow state.
     """
     return Task(
         task_id=row.id,
@@ -46,8 +82,53 @@ def _to_entity(row: SqlTask) -> Task:
         created_at=row.created_at,
         inbox_closed=row.inbox_closed,
         previous_response_id=row.previous_response_id,
-        status="queued",
+        instructions=row.instructions,
+        background=row.background or False,
+        status=TaskStatus.QUEUED,
     )
+
+
+def _apply_workflow_status(task: Task, wf_status: WorkflowStatus) -> Task:
+    """Apply a DBOS WorkflowStatus to a Task, populating status/output/error."""
+    # wf_status.status is a plain string (e.g. "SUCCESS", "PENDING")
+    task.status = _map_dbos_status(str(wf_status.status))
+
+    if task.status == TaskStatus.COMPLETED and wf_status.output is not None:
+        # The workflow returns {"task_id": ..., "output": [...], ...}
+        result: dict[str, Any] = wf_status.output
+        task.output = result.get("output", [])
+        task.usage = result.get("usage")
+        task.completed_at = result.get("completed_at")
+
+    if task.status == TaskStatus.FAILED and wf_status.error is not None:
+        task.error = {
+            "code": "runtime_error",
+            "message": str(wf_status.error),
+        }
+
+    return task
+
+
+def _enrich_from_dbos(task: Task) -> Task:
+    """
+    Sync enrichment — merge DBOS workflow state into a Task.
+    Must NOT be called from an async context (DBOS will raise).
+    """
+    wf_status: WorkflowStatus | None = get_workflow_status(task.task_id)
+    if wf_status is None:
+        return task
+    return _apply_workflow_status(task, wf_status)
+
+
+async def _enrich_from_dbos_async(task: Task) -> Task:
+    """
+    Async enrichment — for use in async methods where an event
+    loop is already running.
+    """
+    wf_status: WorkflowStatus | None = await get_workflow_status_async(task.task_id)
+    if wf_status is None:
+        return task
+    return _apply_workflow_status(task, wf_status)
 
 
 def _row_to_item(row: SqlConversationItem) -> ConversationItem:
@@ -68,12 +149,16 @@ class SqlAlchemyTaskStore(TaskStore):
         self._session = make_managed_session_maker(self._engine)
         self._supports_for_update = self._engine.dialect.name != "sqlite"
         ensure_fts_table(self._engine)
+        ensure_dbos(storage_location)
+
+    # ── Create ────────────────────────────────────────────
 
     def create(
         self,
         conversation_id: str,
         agent_id: str,
         instructions: str | None = None,
+        reasoning: dict[str, str] | None = None,
         previous_response_id: str | None = None,
         background: bool = False,
     ) -> Task:
@@ -84,33 +169,72 @@ class SqlAlchemyTaskStore(TaskStore):
             previous_response_id=previous_response_id,
             created_at=now_epoch(),
             inbox_closed=False,
+            instructions=instructions,
+            background=background,
         )
         with self._session() as session:
             session.add(row)
-            return Task(
-                task_id=row.id,
-                conversation_id=row.conversation_id,
-                agent_id=row.agent_id,
-                created_at=row.created_at,
-                status="queued",
-                instructions=instructions,
-                background=background,
-                previous_response_id=previous_response_id,
-            )
+            return _to_entity(row)
+
+    # ── DBOS-backed execution methods ─────────────────────
 
     def start(self, task_id: str) -> None:
-        raise NotImplementedError("start() requires DBOS integration")
+        with self._session() as session:
+            row = session.get(SqlTask, task_id)
+            if row is None:
+                raise LookupError(f"task {task_id!r} not found")
+            agent_id = row.agent_id
+            conversation_id = row.conversation_id
+            previous_response_id = row.previous_response_id
+            instructions = row.instructions
 
-    def stream(self, task_id: str) -> AsyncIterator[dict[str, Any]]:
-        raise NotImplementedError("stream() requires DBOS integration")
+        # Lazy import: workflow module uses DBOS decorators that
+        # require DBOS to be initialized (which happens in __init__).
+        from agent_plane.runtime.workflow import agent_execution_workflow
+
+        # Pin the DBOS workflow_uuid to our task_id so we can
+        # retrieve workflow state by task_id later.
+        with SetWorkflowID(task_id):
+            start_workflow(
+                agent_execution_workflow,
+                agent_id,
+                conversation_id,
+                previous_response_id,
+                instructions,
+            )
+
+    async def stream(self, task_id: str) -> AsyncIterator[dict[str, Any]]:
+        # read_stream_async yields events as they arrive from the
+        # DBOS stream. Layer 2 will add richer event types.
+        async for event in read_stream_async(task_id, "output"):
+            yield event
 
     def get(self, task_id: str) -> Task | None:
         with self._session() as session:
             row = session.get(SqlTask, task_id)
-            return _to_entity(row) if row else None
+            if row is None:
+                return None
+            task = _to_entity(row)
+        return _enrich_from_dbos(task)
+
+    async def _get_async(self, task_id: str) -> Task | None:
+        """Async variant of get() for use in async methods."""
+        with self._session() as session:
+            row = session.get(SqlTask, task_id)
+            if row is None:
+                return None
+            task = _to_entity(row)
+        return await _enrich_from_dbos_async(task)
 
     async def wait(self, task_id: str) -> Task:
-        raise NotImplementedError("wait() requires DBOS integration")
+        handle: WorkflowHandleAsync[dict[str, Any]] = await retrieve_workflow_async(task_id)
+        await handle.get_result()
+        task = await self._get_async(task_id)
+        if task is None:
+            raise LookupError(f"task {task_id!r} not found")
+        return task
+
+    # ── Steering handshake (DB-only, unchanged) ──────────
 
     def _get_task_for_update(self, session: Session, task_id: str) -> SqlTask | None:
         """
@@ -204,14 +328,27 @@ class SqlAlchemyTaskStore(TaskStore):
                 row.inbox_closed = True
             return []
 
+    # ── Cancel / Delete ───────────────────────────────────
+
     async def cancel(self, task_id: str) -> Task:
-        raise NotImplementedError("cancel() requires DBOS integration")
+        await cancel_workflow_async(task_id)
+        task = await self._get_async(task_id)
+        if task is None:
+            raise LookupError(f"task {task_id!r} not found")
+        return task
 
     async def delete(self, task_id: str) -> None:
+        # Cancel the DBOS workflow if it's still running
+        wf_status = await get_workflow_status_async(task_id)
+        if wf_status is not None and str(wf_status.status) in _DBOS_ACTIVE:
+            await cancel_workflow_async(task_id)
+
         with self._session() as session:
             row = session.get(SqlTask, task_id)
             if row:
                 session.delete(row)
+
+    # ── List ──────────────────────────────────────────────
 
     def list_tasks(
         self,
@@ -227,4 +364,6 @@ class SqlAlchemyTaskStore(TaskStore):
             # Not paginated (internal use only), but ordered for determinism.
             stmt = stmt.order_by(SqlTask.created_at.desc())
             rows = list(session.execute(stmt).scalars().all())
-            return [_to_entity(r) for r in rows]
+            tasks = [_to_entity(r) for r in rows]
+
+        return [_enrich_from_dbos(t) for t in tasks]

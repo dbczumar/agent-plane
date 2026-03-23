@@ -11,9 +11,12 @@ from fastapi import APIRouter, HTTPException, Request
 from starlette.responses import StreamingResponse
 
 from agent_plane.entities import (
+    ACTIVE_STATUSES,
+    TERMINAL_STATUSES,
     MessageData,
     NewConversationItem,
     Task,
+    TaskStatus,
 )
 from agent_plane.server.schemas import (
     ConversationRef,
@@ -25,8 +28,6 @@ from agent_plane.server.schemas import (
     Usage,
 )
 from agent_plane.stores import AgentStore, ConversationStore, TaskStore
-
-_TERMINAL_STATUSES = {"completed", "failed", "incomplete", "cancelled"}
 
 
 def _build_response_object(
@@ -44,11 +45,12 @@ def _build_response_object(
         model=agent.name if agent else task.agent_id,
         created_at=task.created_at,
         completed_at=task.completed_at,
-        output=task.output if task.status == "completed" else [],
+        output=task.output if task.status == TaskStatus.COMPLETED else [],
         background=task.background,
         previous_response_id=task.previous_response_id,
         conversation=ConversationRef(id=task.conversation_id),
         instructions=task.instructions,
+        reasoning=task.reasoning,
         usage=Usage(**task.usage) if task.usage else None,
         error=(ErrorDetail(**task.error) if task.error else None),
         incomplete_details=(
@@ -57,7 +59,7 @@ def _build_response_object(
     )
 
 
-def _normalize_input(raw_input: str | list[Any]) -> list[Any]:
+def _normalize_input(raw_input: str | list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     Normalize the request input into a list of content parts. A plain
     string is converted into a single input_text content block.
@@ -158,7 +160,7 @@ def create_responses_router(
 
             # Steering: if the previous response is still running, try
             # to deliver the message to the running agent's inbox.
-            if prev_task.status in ("in_progress", "queued"):
+            if prev_task.status in ACTIVE_STATUSES:
                 message = NewConversationItem(
                     type="message",
                     response_id=req.previous_response_id,
@@ -187,6 +189,7 @@ def create_responses_router(
             conversation_id=conversation_id,
             agent_id=agent.id,
             instructions=req.instructions,
+            reasoning=req.reasoning,
             previous_response_id=req.previous_response_id,
             background=req.background,
         )
@@ -242,7 +245,7 @@ def create_responses_router(
                     # response.in_progress
                     in_progress_dict = {
                         **initial_dict,
-                        "status": "in_progress",
+                        "status": TaskStatus.IN_PROGRESS,
                     }
                     yield _format_sse(
                         "response.in_progress",
@@ -286,7 +289,7 @@ def create_responses_router(
                     # Foreground streaming: cancel on disconnect
                     if not req.background and not completed_normally:
                         current = task_store.get(task.task_id)
-                        if current and current.status not in _TERMINAL_STATUSES:
+                        if current and current.status not in TERMINAL_STATUSES:
                             await asyncio.shield(task_store.cancel(task.task_id))
 
             return StreamingResponse(
@@ -329,7 +332,7 @@ def create_responses_router(
         task = task_store.get(response_id)
         if not task:
             raise HTTPException(status_code=404, detail="Response not found")
-        if task.status in _TERMINAL_STATUSES:
+        if task.status in TERMINAL_STATUSES:
             return _build_response_object(task, agent_store)
         cancelled_task = await task_store.cancel(response_id)
         return _build_response_object(cancelled_task, agent_store)

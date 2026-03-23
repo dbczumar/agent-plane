@@ -52,6 +52,8 @@ class SqlTask(Base):
     previous_response_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer)
     inbox_closed: Mapped[bool] = mapped_column(Boolean, default=False)
+    instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    background: Mapped[bool] = mapped_column(Boolean, default=False)
 
     __table_args__ = (
         Index("ix_tasks_conversation_id", "conversation_id"),
