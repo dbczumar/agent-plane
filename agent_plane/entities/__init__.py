@@ -1,6 +1,6 @@
 """Core domain entities shared across runtime, server, and store layers."""
 
-from agent_plane.entities.agent import Agent
+from agent_plane.entities.agent import Agent, LoadedAgent
 from agent_plane.entities.conversation import (
     Conversation,
     ConversationItem,
@@ -18,6 +18,7 @@ from agent_plane.entities.task import ACTIVE_STATUSES, TERMINAL_STATUSES, Task, 
 
 __all__ = [
     "Agent",
+    "LoadedAgent",
     "Conversation",
     "ConversationItem",
     "FunctionCallData",
