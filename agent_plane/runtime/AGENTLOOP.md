@@ -453,11 +453,11 @@ mcp>=1.0
 - `completed_at` timestamp — populate on terminal task status.
 - Cancellation propagation — when a client cancels a response, interrupt the in-flight LLM call
   or tool execution rather than waiting for the current step to finish.
-- `Runtime` object — replace `_globals.py` module state with a proper `Runtime` class that holds
+- `Runtime` object — replace `_globals.py` entirely with a proper `Runtime` class that holds
   stores, AgentCache, and configuration. The getter functions in `__init__.py` would delegate to
-  the active `Runtime` instance instead of raw module globals. Would make the runtime usable
-  outside the server (CLI-driven execution, testing, embedded use) without relying on module-level
-  state set during server startup.
+  the active `Runtime` instance, and `_globals.py` would be deleted — all state lives on the
+  `Runtime`. Would make the runtime usable outside the server (CLI-driven execution, testing,
+  embedded use) without relying on module-level state set during server startup.
 - Shared `ToolManager` — replace per-workflow tool managers with a centralized `ToolManager` that
   holds long-lived MCP connections and is shared across concurrent workflow executions. Would
   eliminate per-request MCP startup cost and the `ContextVar` plumbing. Requires thread-safe
