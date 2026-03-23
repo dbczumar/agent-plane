@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Union
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
-
 
 # ── Conversation ──────────────────────────────────────
 
@@ -16,7 +15,7 @@ class Conversation:
     """A conversation grouping related turns."""
 
     id: str
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, str] = field(default_factory=dict)
     created_at: int = 0
     title: str | None = None
 
@@ -29,17 +28,13 @@ class MessageData(BaseModel):
 
     role: Literal["user", "assistant"]
     content: list[Any]
-    agent: str | None = Field(
-        default=None, serialization_alias="model"
-    )
+    agent: str | None = Field(default=None, serialization_alias="model")
 
     @model_validator(mode="after")
     def check_agent_for_assistant(self) -> MessageData:
         """Assistant messages require agent; user messages must not."""
         if self.role == "assistant" and self.agent is None:
-            raise ValueError(
-                "assistant messages require 'agent'"
-            )
+            raise ValueError("assistant messages require 'agent'")
         return self
 
 
@@ -68,12 +63,7 @@ class ReasoningData(BaseModel):
     encrypted_content: str | None = None
 
 
-ItemData = Union[
-    MessageData,
-    FunctionCallData,
-    FunctionCallOutputData,
-    ReasoningData,
-]
+ItemData = MessageData | FunctionCallData | FunctionCallOutputData | ReasoningData
 
 ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
     "message": MessageData,
@@ -94,17 +84,13 @@ def parse_item_data(item_type: str, raw: dict[str, Any]) -> ItemData:
     return cls(**raw)  # type: ignore[return-value]
 
 
-def _validate_type_matches_data(
-    item_type: str, data: ItemData
-) -> None:
+def _validate_type_matches_data(item_type: str, data: ItemData) -> None:
     expected = ITEM_TYPE_TO_DATA_CLS.get(item_type)
     if expected is None:
         raise ValueError(f"unknown item type: {item_type!r}")
     if not isinstance(data, expected):
         raise ValueError(
-            f"item type {item_type!r} requires "
-            f"{expected.__name__}, got "
-            f"{type(data).__name__}"
+            f"item type {item_type!r} requires {expected.__name__}, got {type(data).__name__}"
         )
 
 

@@ -21,6 +21,6 @@ class Task:
     instructions: str | None = None
     background: bool = False
     previous_response_id: str | None = None
-    usage: dict[str, Any] | None = None
+    usage: dict[str, Any] | None = None  # serialized Usage model
     error: dict[str, str] | None = None
     incomplete_details: dict[str, str] | None = None
