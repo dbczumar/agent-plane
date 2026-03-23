@@ -48,7 +48,7 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def search_items(
+    def list_items(
         self,
         conversation_id: str,
         limit: int = 100,

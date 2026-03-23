@@ -71,7 +71,7 @@ class SqlConversationItem(Base):
     position: Mapped[int] = mapped_column(Integer)
     type: Mapped[str] = mapped_column(String(32))
     data: Mapped[str] = mapped_column(Text)
-    search_text: Mapped[str] = mapped_column(Text, default="")
+    search_text: Mapped[str] = mapped_column(Text)
 
     __table_args__ = (
         Index(

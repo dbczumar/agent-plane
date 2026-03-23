@@ -124,7 +124,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             order = {iid: i for i, iid in enumerate(item_ids)}
             return [_to_item(r) for r in sorted(rows, key=lambda r: order[r.id])]
 
-    def search_items(
+    def list_items(
         self,
         conversation_id: str,
         limit: int = 100,

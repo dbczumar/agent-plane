@@ -174,9 +174,7 @@ class TestConversationStore:
 
         assert conversation_store.update_conversation("conv_none", title="x") is None
 
-    def test_append_and_search_items(
-        self, conversation_store: SqlAlchemyConversationStore
-    ) -> None:
+    def test_append_and_list_items(self, conversation_store: SqlAlchemyConversationStore) -> None:
         conv = conversation_store.create_conversation()
         items = conversation_store.append(
             conv.id,
@@ -203,7 +201,7 @@ class TestConversationStore:
         assert items[0].id.startswith("msg_")
         assert items[1].id.startswith("msg_")
 
-        page = conversation_store.search_items(conv.id)
+        page = conversation_store.list_items(conv.id)
         assert len(page.data) == 2
         assert page.data[0].data.role == "user"
         assert page.data[1].data.role == "assistant"
@@ -281,12 +279,12 @@ class TestConversationStore:
                 ),
             ],
         )
-        page = conversation_store.search_items(conv.id)
+        page = conversation_store.list_items(conv.id)
         assert len(page.data) == 2
         texts = [page.data[i].data.content[0]["text"] for i in range(2)]
         assert texts == ["First", "Second"]
 
-    def test_search_items_after_cursor(
+    def test_list_items_after_cursor(
         self, conversation_store: SqlAlchemyConversationStore
     ) -> None:
         conv = conversation_store.create_conversation()
@@ -305,7 +303,7 @@ class TestConversationStore:
             ],
         )
 
-        page = conversation_store.search_items(conv.id, after=items[1].id, limit=2)
+        page = conversation_store.list_items(conv.id, after=items[1].id, limit=2)
         assert len(page.data) == 2
         assert page.data[0].id == items[2].id
 
@@ -445,7 +443,7 @@ class TestConversationStore:
         )
         assert await conversation_store.delete_conversation(conv.id) is True
         assert conversation_store.get_conversation(conv.id) is None
-        assert conversation_store.search_items(conv.id).data == []
+        assert conversation_store.list_items(conv.id).data == []
         assert await conversation_store.delete_conversation(conv.id) is False
 
     @pytest.mark.asyncio
@@ -600,7 +598,7 @@ class TestTaskStore:
         )
         assert task_store.try_deliver(task.task_id, conv_id, msg) is True
 
-        items = conversation_store.search_items(conv_id)
+        items = conversation_store.list_items(conv_id)
         assert len(items.data) == 1
         assert items.data[0].data.content[0]["text"] == "steering msg"
 

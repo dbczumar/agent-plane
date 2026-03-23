@@ -103,7 +103,7 @@ def create_conversations_router(
         conv = conversation_store.get_conversation(conversation_id)
         if conv is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
-        page = conversation_store.search_items(
+        page = conversation_store.list_items(
             conversation_id=conversation_id,
             limit=limit,
             after=after,
