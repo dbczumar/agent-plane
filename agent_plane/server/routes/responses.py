@@ -12,7 +12,7 @@ from agent_plane.runtime.models import (
     NewConversationItem,
     Task,
 )
-from agent_plane.stores import SessionStore, TaskStore
+from agent_plane.stores import ConversationStore, TaskStore
 from agent_plane.server.models import (
     AgentObject,
     ConversationRef,
@@ -42,7 +42,7 @@ def _build_response_object(task: Task) -> ResponseObject:
         output=task.output if task.status == "completed" else [],
         background=task.background,
         previous_response_id=task.previous_response_id,
-        conversation=ConversationRef(id=task.session_id),
+        conversation=ConversationRef(id=task.conversation_id),
         instructions=task.instructions,
         metadata=task.metadata,
         usage=Usage(**task.usage) if task.usage else None,
@@ -81,7 +81,7 @@ async def _poll_disconnect(request: Request) -> None:
 
 def create_responses_router(
     task_store: TaskStore,
-    session_store: SessionStore,
+    conversation_store: ConversationStore,
     get_agent_by_name: Callable[[str], AgentObject | None],
 ) -> APIRouter:
     """
@@ -125,11 +125,13 @@ def create_responses_router(
         content = _normalize_input(req.input)
 
         if req.previous_response_id:
-            # Resolve session via durable path (queries messages by
+            # Resolve conversation via durable path (queries items by
             # response_id). Raises internally if not found.
             try:
-                session_id = session_store.get_session_id(
-                    req.previous_response_id
+                conversation_id = (
+                    conversation_store.get_conversation_id(
+                        req.previous_response_id
+                    )
                 )
             except Exception:
                 raise HTTPException(
@@ -139,7 +141,7 @@ def create_responses_router(
 
             # Validate conversation / response relationship
             if req.conversation:
-                if session_id != req.conversation.id:
+                if conversation_id != req.conversation.id:
                     raise HTTPException(
                         status_code=400,
                         detail=(
@@ -147,7 +149,9 @@ def create_responses_router(
                             "the specified conversation"
                         ),
                     )
-                latest = session_store.get_latest_response_id(session_id)
+                latest = conversation_store.get_latest_response_id(
+                    conversation_id
+                )
                 if latest != req.previous_response_id:
                     raise HTTPException(
                         status_code=400,
@@ -177,24 +181,26 @@ def create_responses_router(
                     ),
                 )
                 delivered = task_store.try_deliver(
-                    req.previous_response_id, session_id, message
+                    req.previous_response_id,
+                    conversation_id,
+                    message,
                 )
                 if delivered:
                     # Message accepted by running agent — return the
                     # existing in-progress response.
                     return _build_response_object(prev_task)
                 # Inbox closed — agent is finishing. Wait for
-                # completion so assistant output is in the session
+                # completion so assistant output is in the conversation
                 # before the new response loads history.
                 await task_store.wait(req.previous_response_id)
         else:
-            # No previous response — create a fresh session
-            session = session_store.create_session()
-            session_id = session.id
+            # No previous response — create a fresh conversation
+            conversation = conversation_store.create_conversation()
+            conversation_id = conversation.id
 
         # -- Normal flow: create a new response --
         task = task_store.create(
-            session_id=session_id,
+            conversation_id=conversation_id,
             agent_id=agent.id,
             agent_name=agent.name,
             instructions=req.instructions,
@@ -202,8 +208,8 @@ def create_responses_router(
             previous_response_id=req.previous_response_id,
             background=req.background,
         )
-        session_store.append(
-            session_id,
+        conversation_store.append(
+            conversation_id,
             [
                 NewConversationItem(
                     type="message",

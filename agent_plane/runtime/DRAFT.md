@@ -34,7 +34,7 @@ Progressive skill disclosure:
 - On `load_script(skill, script)`: return script file content
 - All reads are from the extracted working directory
 
-### session.py
+### conversation.py
 Conversation state for a single execution:
 - Message history (user, assistant, tool messages)
 - Active skill context

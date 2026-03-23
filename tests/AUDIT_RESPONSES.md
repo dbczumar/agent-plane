@@ -16,13 +16,13 @@ Background x Stream Behavior Matrix) and the runtime design in `/agent_plane/run
    ✅ Lines 98-102: `get_agent_by_name(req.model)` returns None -> 404.
 
 3. **Invalid previous_response_id -> 400**
-   ✅ Lines 116-124: `session_store.get_session_id()` raises -> caught -> 400 "invalid previous_response_id". Lines 148-153: `task_store.get()` returns None -> 400 "previous_response_id not found".
+   ✅ Lines 116-124: `conversation_store.get_conversation_id()` raises -> caught -> 400 "invalid previous_response_id". Lines 148-153: `task_store.get()` returns None -> 400 "previous_response_id not found".
 
 4. **Conversation without previous_response_id -> 400**
    ✅ Lines 104-109: checks `req.conversation and not req.previous_response_id` -> 400.
 
 5. **Conversation / response mismatch -> 400**
-   ✅ Lines 127-135: `session_id != req.conversation.id` -> 400.
+   ✅ Lines 127-135: `conversation_id != req.conversation.id` -> 400.
 
 6. **Fork + explicit conversation -> 400**
    ✅ Lines 136-145: `latest != req.previous_response_id` -> 400.
@@ -36,8 +36,8 @@ Background x Stream Behavior Matrix) and the runtime design in `/agent_plane/run
 
 ## 2. POST /responses — Handler Flow (RUNTIME.md pseudocode compliance)
 
-8. **Session resolution: `session_store.get_session_id(previous_response_id)`**
-   ✅ Lines 117-119: uses `session_store.get_session_id(req.previous_response_id)`.
+8. **Conversation resolution: `conversation_store.get_conversation_id(previous_response_id)`**
+   ✅ Lines 117-119: uses `conversation_store.get_conversation_id(req.previous_response_id)`.
 
 9. **Steering check: prev_task status in ("in_progress", "queued") -> try_deliver**
    ✅ Lines 157-173: checks status, builds `NewMessage`, calls `task_store.try_deliver`.
@@ -48,11 +48,11 @@ Background x Stream Behavior Matrix) and the runtime design in `/agent_plane/run
 11. **Steering inbox closed -> wait for previous response before creating new**
     ✅ Lines 172-173: calls `await task_store.wait(req.previous_response_id)`.
 
-12. **No previous_response_id -> create fresh session**
-    ✅ Lines 176-177: `session_store.create_session()`.
+12. **No previous_response_id -> create fresh conversation**
+    ✅ Lines 176-177: `conversation_store.create_conversation()`.
 
 13. **Normal flow: create task, append user message, start**
-    ✅ Lines 180-198: `task_store.create(...)`, `session_store.append(...)`, `task_store.start(...)`.
+    ✅ Lines 180-198: `task_store.create(...)`, `conversation_store.append(...)`, `task_store.start(...)`.
 
 14. **`context_management` field accepted on request**
     ❌ **FAIL**: API.md (lines 451-459) specifies a `context_management` field on the request
@@ -249,8 +249,8 @@ All 16 fields from the spec are present in `ResponseObject`.
     `previous_response_id` points to a non-latest response (a fork), the server creates a
     new conversation. The implementation does not implement fork detection at all — when no
     explicit `conversation` is provided and the previous_response_id is not the latest
-    response in the conversation, the implementation simply reuses the existing session_id
-    (line 117-119 resolves session_id from the previous response and uses it directly).
+    response in the conversation, the implementation simply reuses the existing conversation_id
+    (line 117-119 resolves conversation_id from the previous response and uses it directly).
     Fork detection and conversation splitting only trigger as a 400 error when the caller
     explicitly passes a `conversation` field (lines 136-145). Without an explicit
     `conversation`, forks silently append to the existing conversation, violating the spec's

@@ -2,7 +2,7 @@
 
 from fastapi import FastAPI
 
-from agent_plane.stores import ArtifactStore, SessionStore, TaskStore
+from agent_plane.stores import ArtifactStore, ConversationStore, TaskStore
 from agent_plane.server.routes.agents import create_agents_router
 from agent_plane.server.routes.conversations import create_conversations_router
 from agent_plane.server.routes.files import create_files_router
@@ -11,7 +11,7 @@ from agent_plane.server.routes.responses import create_responses_router
 
 def create_app(
     task_store: TaskStore,
-    session_store: SessionStore,
+    conversation_store: ConversationStore,
     artifact_store: ArtifactStore,
 ) -> FastAPI:
     """
@@ -30,14 +30,14 @@ def create_app(
     app.include_router(
         create_responses_router(
             task_store,
-            session_store,
+            conversation_store,
             get_agent_by_name=agents_router.get_agent_by_name,
         ),
         prefix="/v1",
         tags=["responses"],
     )
     app.include_router(
-        create_conversations_router(session_store, task_store),
+        create_conversations_router(conversation_store, task_store),
         prefix="/v1",
         tags=["conversations"],
     )

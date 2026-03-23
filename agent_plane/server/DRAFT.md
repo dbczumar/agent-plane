@@ -93,6 +93,6 @@ Abstract interface + local filesystem implementation:
 ## Not yet (future)
 - `POST /api/agents/{agent_id}/invoke` — execute agent
 - `POST /api/agents/{agent_id}/stream` — streaming execution
-- Session management APIs
+- Conversation management APIs
 - Agent listing with filtering
 - Health / readiness endpoints

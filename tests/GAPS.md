@@ -63,8 +63,8 @@ append to the existing conversation. Fork detection only triggers as a 400
 error when the caller explicitly passes `conversation`.
 
 **Status**: Already listed in RUNTIME.md "Not Yet" section. Requires:
-- `session_store.fork_session(source_session_id, fork_at_response_id)`
-  method to copy items and create a new session.
+- `conversation_store.fork_conversation(source_conversation_id, fork_at_response_id)`
+  method to copy items and create a new conversation.
 - Route logic in `responses.py` to detect implicit forks (when
   `previous_response_id` is not the latest response and no `conversation`
   is provided) and call the fork method.
@@ -123,9 +123,9 @@ and enforce tarball structure requirements (e.g. required files like
 ### ~~9. Conversation delete: cancel in-flight responses~~ — FIXED
 
 Handled in the route layer: `delete_conversation` uses
-`task_store.list_tasks(session_id=conversation_id)` to find in-flight
+`task_store.list_tasks(conversation_id=conversation_id)` to find in-flight
 tasks and cancels each via `task_store.cancel()` before calling
-`session_store.delete_session()`. `task_store` is now injected into
+`conversation_store.delete_conversation()`. `task_store` is now injected into
 `create_conversations_router()`.
 
 ---

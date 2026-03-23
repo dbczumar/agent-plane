@@ -762,14 +762,14 @@ assert status == "in_progress"
 **What happened server-side:**
 
 ```
-1. Server resolved session_id from resp_1
+1. Server resolved conversation_id from resp_1
 2. Server called task_store.get(resp_1) → status "in_progress"
-3. Server called task_store.try_deliver(resp_1, session_id,
+3. Server called task_store.try_deliver(resp_1, conversation_id,
      NewMessage(role="user", content="Focus only on San Francisco",
                 response_id=resp_1))
-4. try_deliver checked inbox_closed=False → appended message to session → returned True
+4. try_deliver checked inbox_closed=False → appended message to conversation → returned True
 5. Server returned the existing in-progress response (no new task created)
-6. Runtime's next search_messages(session_id, after=last_seen) found the steering message
+6. Runtime's next search_messages(conversation_id, after=last_seen) found the steering message
 7. Runtime added it to history — LLM sees "Focus only on San Francisco" on next iteration
 ```
 
@@ -888,10 +888,10 @@ assert resp_2.previous_response_id == resp_1
 **What happened server-side:**
 
 ```
-1. Server resolved session_id from resp_1
+1. Server resolved conversation_id from resp_1
 2. Server called task_store.get(resp_1) → status "completed"
 3. Status is NOT in ("in_progress", "queued") → skip steering
-4. Server created a new task (resp_2) in the same session
+4. Server created a new task (resp_2) in the same conversation
 5. Server appended user message with response_id=resp_2
 6. Server started resp_2 → runtime loaded full history (resp_1's user + assistant + resp_2's user)
 ```
@@ -930,7 +930,7 @@ agent that pauses between close_inbox and workflow completion. In this case:
 4. Server: get(resp_1) → status "in_progress" (workflow still running)
 5. Server: try_deliver → inbox_closed=True → returns False
 6. Server: wait(resp_1) → blocks until resp_1 completes
-7. Server: creates resp_2 in the same session
+7. Server: creates resp_2 in the same conversation
 8. Result: same as above — resp_2 is a new response in conv_1
 ```
 
@@ -1054,9 +1054,9 @@ assert status == "completed"
 **What happened server-side:**
 
 ```
-1. Server resolved session_id from resp_1 (user message exists with response_id=resp_1)
+1. Server resolved conversation_id from resp_1 (user message exists with response_id=resp_1)
 2. task_store.get(resp_1) → status "cancelled" (not in_progress → skip steering)
-3. Server created resp_2 in the same session
+3. Server created resp_2 in the same conversation
 4. Runtime loaded history: [user("Write a long essay..."), user("Actually, write a short summary")]
    Note: no assistant message from resp_1 — it was cancelled before persisting output
 5. Runtime completed resp_2 with a short summary
@@ -1168,14 +1168,14 @@ POST /v1/responses
 assert conversation continues normally
 ```
 
-**Step 7: Can still resolve session from the deleted response's messages**
+**Step 7: Can still resolve conversation from the deleted response's messages**
 
 ```
 POST /v1/responses
   {"model": "echo-agent", "input": "Continue from turn 1", "previous_response_id": "resp_1"}
 ```
 
-This should still work because `get_session_id(resp_1)` resolves via persisted
+This should still work because `get_conversation_id(resp_1)` resolves via persisted
 messages (which still exist), not via the task record (which is deleted). However,
 `task_store.get(resp_1)` returns None, so the handler returns 400.
 
@@ -1183,7 +1183,7 @@ messages (which still exist), not via the task record (which is deleted). Howeve
 → 400 Bad Request ("previous_response_id not found")
 ```
 
-Wait — there's a subtlety here. `get_session_id` succeeds (messages exist), but
+Wait — there's a subtlety here. `get_conversation_id` succeeds (messages exist), but
 `task_store.get` returns None (task deleted). The handler raises 400. This is correct:
 the response is deleted, so it shouldn't be referenceable as previous_response_id.
 

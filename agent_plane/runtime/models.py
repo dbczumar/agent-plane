@@ -16,7 +16,7 @@ class Task:
     """A task representing a single response execution."""
 
     task_id: str
-    session_id: str
+    conversation_id: str
     status: str  # "queued", "in_progress", "completed", "failed", "incomplete", "cancelled"
     agent_id: str
     agent_name: str
@@ -154,12 +154,12 @@ class ConversationItem(BaseModel):
         return self
 
 
-# ── Session ────────────────────────────────────────────
+# ── Conversation ──────────────────────────────────────
 
 
 @dataclass
-class Session:
-    """A conversation session grouping related turns."""
+class Conversation:
+    """A conversation grouping related turns."""
 
     id: str
     metadata: dict = field(default_factory=dict)

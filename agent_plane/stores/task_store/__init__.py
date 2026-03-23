@@ -21,7 +21,7 @@ class TaskStore(ABC):
     @abstractmethod
     def create(
         self,
-        session_id: str,
+        conversation_id: str,
         agent_id: str,
         agent_name: str,
         instructions: str | None = None,
@@ -30,7 +30,7 @@ class TaskStore(ABC):
         background: bool = False,
     ) -> Task:
         """
-        Create a new task for executing an agent in the given session.
+        Create a new task for executing an agent in the given conversation.
         Generates a unique task_id (which doubles as the response_id),
         stores the task record with status="queued", and returns the Task.
         Does not start execution -- call start() to begin.
@@ -86,7 +86,7 @@ class TaskStore(ABC):
     def try_deliver(
         self,
         task_id: str,
-        session_id: str,
+        conversation_id: str,
         item: NewConversationItem,
     ) -> bool:
         """
@@ -94,7 +94,7 @@ class TaskStore(ABC):
         report that the inbox is already closed.
 
         Single transaction: if the agent's inbox is still open, appends
-        the item to the session and returns True. If the agent has
+        the item to the conversation and returns True. If the agent has
         already closed its inbox (finishing up), returns False -- the
         caller should create a new response instead.
 
@@ -106,12 +106,12 @@ class TaskStore(ABC):
     def close_inbox(
         self,
         task_id: str,
-        session_id: str,
+        conversation_id: str,
         last_seen_item_id: str | None,
     ) -> list[ConversationItem]:
         """
         Atomically attempt to close the inbox for a finishing task.
-        Within a single transaction: queries for items in the session
+        Within a single transaction: queries for items in the conversation
         newer than last_seen_item_id (or all items if None). If found,
         returns them (inbox stays open -- agent must continue). If none
         found, sets inbox_closed=True and returns empty list (agent may
@@ -146,7 +146,7 @@ class TaskStore(ABC):
     @abstractmethod
     def list_tasks(
         self,
-        session_id: str | None = None,
+        conversation_id: str | None = None,
         agent_id: str | None = None,
         status: str | None = None,
     ) -> list[Task]:

@@ -2,8 +2,8 @@
 
 from fastapi import APIRouter, HTTPException, Query
 
-from agent_plane.runtime.models import ConversationItem, Session
-from agent_plane.stores import SessionStore, TaskStore
+from agent_plane.runtime.models import ConversationItem
+from agent_plane.stores import ConversationStore, TaskStore
 from agent_plane.server.models import (
     ConversationDeleted,
     ConversationObject,
@@ -11,11 +11,11 @@ from agent_plane.server.models import (
 )
 
 
-def _session_to_conversation(session: Session) -> ConversationObject:
-    """Convert a runtime Session to an API-layer ConversationObject."""
+def _to_conversation_object(conv):
+    """Convert a runtime Conversation to an API-layer ConversationObject."""
     return ConversationObject(
-        id=session.id,
-        created_at=session.created_at,
+        id=conv.id,
+        created_at=conv.created_at,
     )
 
 
@@ -37,7 +37,7 @@ def _to_api_item(item: ConversationItem) -> dict:
 
 
 def create_conversations_router(
-    session_store: SessionStore,
+    conversation_store: ConversationStore,
     task_store: TaskStore,
 ) -> APIRouter:
     """
@@ -55,12 +55,12 @@ def create_conversations_router(
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
     ):
-        page = session_store.list_sessions(
+        page = conversation_store.list_conversations(
             limit=limit,
             after=after,
             before=before,
         )
-        data = [_session_to_conversation(s) for s in page.data]
+        data = [_to_conversation_object(s) for s in page.data]
         if order == "asc":
             data = list(reversed(data))
         return PaginatedList(
@@ -74,12 +74,12 @@ def create_conversations_router(
 
     @router.get("/conversations/{conversation_id}")
     async def get_conversation(conversation_id: str):
-        session = session_store.get_session(conversation_id)
-        if session is None:
+        conv = conversation_store.get_conversation(conversation_id)
+        if conv is None:
             raise HTTPException(
                 status_code=404, detail="Conversation not found"
             )
-        return _session_to_conversation(session)
+        return _to_conversation_object(conv)
 
     # ── GET /conversations/{conversation_id}/items ────────────────
 
@@ -91,13 +91,13 @@ def create_conversations_router(
         before: str | None = Query(default=None),
         order: str = Query(default="asc", pattern="^(asc|desc)$"),
     ):
-        session = session_store.get_session(conversation_id)
-        if session is None:
+        conv = conversation_store.get_conversation(conversation_id)
+        if conv is None:
             raise HTTPException(
                 status_code=404, detail="Conversation not found"
             )
-        page = session_store.search_items(
-            session_id=conversation_id,
+        page = conversation_store.search_items(
+            conversation_id=conversation_id,
             limit=limit,
             after=after,
             before=before,
@@ -116,14 +116,18 @@ def create_conversations_router(
 
     @router.delete("/conversations/{conversation_id}")
     async def delete_conversation(conversation_id: str):
-        session = session_store.get_session(conversation_id)
-        if session is None:
+        conv = conversation_store.get_conversation(conversation_id)
+        if conv is None:
             raise HTTPException(
                 status_code=404, detail="Conversation not found"
             )
-        for task in task_store.list_tasks(session_id=conversation_id):
+        for task in task_store.list_tasks(
+            conversation_id=conversation_id
+        ):
             await task_store.cancel(task.task_id)
-        deleted = await session_store.delete_session(conversation_id)
+        deleted = await conversation_store.delete_conversation(
+            conversation_id
+        )
         if not deleted:
             raise HTTPException(
                 status_code=404, detail="Conversation not found"
