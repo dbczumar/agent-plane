@@ -11,6 +11,9 @@ from agent_plane.entities import (
 
 
 class ConversationStore(ABC):
+    def __init__(self, storage_location: str) -> None:
+        self.storage_location = storage_location
+
     @abstractmethod
     def create_conversation(self) -> Conversation:
         """

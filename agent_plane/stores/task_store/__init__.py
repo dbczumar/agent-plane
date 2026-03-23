@@ -14,12 +14,13 @@ from agent_plane.entities import (
 
 
 class TaskStore(ABC):
-    def __init__(self, uri: str) -> None:
+    def __init__(self, storage_location: str) -> None:
         """
-        Initialize the task store and the underlying DBOS durable execution
-        engine. Calls ensure_dbos(uri) to initialize the DBOS singleton if
-        it hasn't been already.
+        Initialize the task store. The storage_location is a database URI.
+        Concrete implementations also initialize the DBOS durable execution
+        engine via ensure_dbos(storage_location).
         """
+        self.storage_location = storage_location
 
     @abstractmethod
     def create(

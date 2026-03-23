@@ -92,7 +92,7 @@ def create_responses_router(
 
     # ── POST /responses ──────────────────────────────────────────
 
-    @router.post("/responses")
+    @router.post("/responses", response_model=None)
     async def create_response(
         req: CreateResponseRequest, request: Request
     ) -> ResponseObject | StreamingResponse:

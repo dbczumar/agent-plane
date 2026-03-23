@@ -50,9 +50,7 @@ class LocalArtifactStore(ArtifactStore):
         # Join validated parts with OS-native separator
         resolved = (self._root / Path(*parts)).resolve()
         if not resolved.is_relative_to(self._root.resolve()):
-            raise ValueError(
-                f"artifact key escapes root directory: {key!r}"
-            )
+            raise ValueError(f"artifact key escapes root directory: {key!r}")
         return resolved
 
     # ── ArtifactStore interface ──────────────────────────────

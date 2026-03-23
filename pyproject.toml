@@ -4,11 +4,20 @@ version = "0.1.0"
 description = "MLflow AgentPlane — agent specification, runtime, server"
 requires-python = ">=3.10"
 dependencies = [
+    "click>=8.0",
     "fastapi",
     "pydantic>=2.0",
+    "pyyaml>=6.0",
     "sqlalchemy>=2.0",
     "alembic",
+    "uvicorn[standard]",
 ]
+
+[project.scripts]
+ap = "agent_plane.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["agent_plane*"]
 
 [build-system]
 requires = ["setuptools>=68.0"]

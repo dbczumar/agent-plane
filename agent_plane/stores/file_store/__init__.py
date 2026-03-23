@@ -6,6 +6,9 @@ from agent_plane.entities import PagedList, StoredFile
 
 
 class FileStore(ABC):
+    def __init__(self, storage_location: str) -> None:
+        self.storage_location = storage_location
+
     @abstractmethod
     def create(
         self,
