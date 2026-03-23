@@ -20,15 +20,12 @@ from agent_plane.runtime.durability import (
 
 
 @step()
-def _placeholder_step(
-    agent_id: str, conversation_id: str
-) -> dict[str, str]:
+def _placeholder_step(agent_id: str, conversation_id: str) -> dict[str, str]:
     """Simulates a single LLM call. Will be replaced by real inference."""
     return {
         "role": "assistant",
         "content": (
-            f"Placeholder response from agent {agent_id}"
-            f" in conversation {conversation_id}"
+            f"Placeholder response from agent {agent_id} in conversation {conversation_id}"
         ),
     }
 

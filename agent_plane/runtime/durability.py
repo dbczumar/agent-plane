@@ -8,7 +8,6 @@ DBOS dependency contained and makes it easy to swap or mock.
 from __future__ import annotations
 
 import threading
-from typing import Any
 
 from dbos import (
     DBOS,

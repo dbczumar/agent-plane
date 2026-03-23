@@ -53,6 +53,14 @@ Check each file against this checklist:
     fixtures, not class-based (no `class TestFoo`). Test file structure
     must mirror the source directory (e.g. tests/stores/test_agent_store.py).
 
+12. NO SLEEP IN TESTS: No `time.sleep()` in test code. Use `await wait()`,
+    event-driven checks, or restructure the test. If truly unavoidable,
+    flag to reviewer with a comment explaining why.
+
+13. NO INTERNAL METHOD CALLS IN TESTS: Tests must not call `_`-prefixed
+    (private/internal) methods of production code. If a test needs a
+    private method, the public API is likely incomplete — flag to reviewer.
+
 Report each finding as:
   [FILE:LINE] ISSUE — description of the problem and suggested fix
 
