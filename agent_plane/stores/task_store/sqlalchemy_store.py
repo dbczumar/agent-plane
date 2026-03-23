@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 from agent_plane.db.db_models import SqlConversationItem, SqlTask
 from agent_plane.db.utils import (
@@ -63,6 +64,7 @@ class SqlAlchemyTaskStore(TaskStore):
         super().__init__(storage_location)
         self._engine = get_or_create_engine(storage_location)
         self._session = make_managed_session_maker(self._engine)
+        self._supports_for_update = self._engine.dialect.name != "sqlite"
 
     def create(
         self,
@@ -107,6 +109,16 @@ class SqlAlchemyTaskStore(TaskStore):
     async def wait(self, task_id: str) -> Task:
         raise NotImplementedError("wait() requires DBOS integration")
 
+    def _get_task_for_update(self, session: Session, task_id: str) -> SqlTask | None:
+        """
+        Fetch a task row with FOR UPDATE locking on PostgreSQL.
+        SQLite relies on database-level locking instead.
+        """
+        stmt = select(SqlTask).where(SqlTask.id == task_id)
+        if self._supports_for_update:
+            stmt = stmt.with_for_update()
+        return session.execute(stmt).scalar_one_or_none()
+
     def try_deliver(
         self,
         task_id: str,
@@ -119,14 +131,12 @@ class SqlAlchemyTaskStore(TaskStore):
         if closed, return False.
         """
         with self._session() as session:
-            row = session.get(SqlTask, task_id)
+            row = self._get_task_for_update(session, task_id)
             if row is None or row.inbox_closed:
                 return False
 
             max_pos: int = session.execute(
-                select(
-                    func.coalesce(func.max(SqlConversationItem.position), -1)
-                ).where(
+                select(func.coalesce(func.max(SqlConversationItem.position), -1)).where(
                     SqlConversationItem.conversation_id == conversation_id
                 )
             ).scalar_one()
@@ -176,7 +186,7 @@ class SqlAlchemyTaskStore(TaskStore):
             if new_rows:
                 return [_row_to_item(r) for r in new_rows]
 
-            row = session.get(SqlTask, task_id)
+            row = self._get_task_for_update(session, task_id)
             if row is not None:
                 row.inbox_closed = 1
             return []

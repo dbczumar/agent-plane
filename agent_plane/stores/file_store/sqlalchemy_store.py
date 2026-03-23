@@ -65,11 +65,7 @@ class SqlAlchemyFileStore(FileStore):
         with self._session() as session:
             stmt = select(SqlFile)
             if after:
-                sub = (
-                    select(SqlFile.created_at)
-                    .where(SqlFile.id == after)
-                    .scalar_subquery()
-                )
+                sub = select(SqlFile.created_at).where(SqlFile.id == after).scalar_subquery()
                 stmt = stmt.where(
                     or_(
                         SqlFile.created_at < sub,
@@ -77,20 +73,14 @@ class SqlAlchemyFileStore(FileStore):
                     )
                 )
             if before:
-                sub = (
-                    select(SqlFile.created_at)
-                    .where(SqlFile.id == before)
-                    .scalar_subquery()
-                )
+                sub = select(SqlFile.created_at).where(SqlFile.id == before).scalar_subquery()
                 stmt = stmt.where(
                     or_(
                         SqlFile.created_at > sub,
                         and_(SqlFile.created_at == sub, SqlFile.id > before),
                     )
                 )
-            stmt = stmt.order_by(
-                SqlFile.created_at.desc(), SqlFile.id.desc()
-            ).limit(limit + 1)
+            stmt = stmt.order_by(SqlFile.created_at.desc(), SqlFile.id.desc()).limit(limit + 1)
             rows = list(session.execute(stmt).scalars().all())
             has_more = len(rows) > limit
             if has_more:

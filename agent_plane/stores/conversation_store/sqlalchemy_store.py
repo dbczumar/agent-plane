@@ -72,9 +72,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .limit(1)
             ).scalar_one_or_none()
             if conv_id is None:
-                raise LookupError(
-                    f"no items found for response_id={response_id!r}"
-                )
+                raise LookupError(f"no items found for response_id={response_id!r}")
             return conv_id
 
     def get_latest_response_id(self, conversation_id: str) -> str | None:

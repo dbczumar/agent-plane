@@ -69,11 +69,7 @@ class SqlAlchemyAgentStore(AgentStore):
         with self._session() as session:
             stmt = select(SqlAgent)
             if after:
-                sub = (
-                    select(SqlAgent.created_at)
-                    .where(SqlAgent.id == after)
-                    .scalar_subquery()
-                )
+                sub = select(SqlAgent.created_at).where(SqlAgent.id == after).scalar_subquery()
                 stmt = stmt.where(
                     or_(
                         SqlAgent.created_at < sub,
@@ -81,20 +77,14 @@ class SqlAlchemyAgentStore(AgentStore):
                     )
                 )
             if before:
-                sub = (
-                    select(SqlAgent.created_at)
-                    .where(SqlAgent.id == before)
-                    .scalar_subquery()
-                )
+                sub = select(SqlAgent.created_at).where(SqlAgent.id == before).scalar_subquery()
                 stmt = stmt.where(
                     or_(
                         SqlAgent.created_at > sub,
                         and_(SqlAgent.created_at == sub, SqlAgent.id > before),
                     )
                 )
-            stmt = stmt.order_by(
-                SqlAgent.created_at.desc(), SqlAgent.id.desc()
-            ).limit(limit + 1)
+            stmt = stmt.order_by(SqlAgent.created_at.desc(), SqlAgent.id.desc()).limit(limit + 1)
             rows = list(session.execute(stmt).scalars().all())
             has_more = len(rows) > limit
             if has_more:

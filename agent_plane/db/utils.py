@@ -41,6 +41,7 @@ def clear_engine_cache() -> None:
 
 # ── Managed session ────────────────────────────────────
 
+
 def make_managed_session_maker(
     engine: Engine,
 ) -> ManagedSessionMaker:
@@ -117,7 +118,7 @@ def extract_search_text(item: NewConversationItem) -> str:
     if item.type == "function_call":
         return f"{data.get('name', '')} {data.get('arguments', '')}"
     if item.type == "function_call_output":
-        return data.get("output", "")
+        return str(data.get("output", ""))
     if item.type == "reasoning":
         summary: list[dict[str, str]] = data.get("summary", [])
         return " ".join(

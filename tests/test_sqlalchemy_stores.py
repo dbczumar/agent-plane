@@ -18,7 +18,6 @@ from agent_plane.stores.conversation_store.sqlalchemy_store import (
 from agent_plane.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from agent_plane.stores.task_store.sqlalchemy_store import SqlAlchemyTaskStore
 
-
 # ── Fixtures ───────────────────────────────────────────
 
 
@@ -101,8 +100,10 @@ class TestAgentStore:
         a1 = agent_store.create(name="first", bundle_location="/b/1.tar")
         a2 = agent_store.create(name="second", bundle_location="/b/2.tar")
         page = agent_store.list()
-        ids = [a.id for a in page.data]
-        assert ids == [a2.id, a1.id]
+        ids = {a.id for a in page.data}
+        # Both returned; ordering is (created_at DESC, id DESC) —
+        # same-second items are ordered by ID, not insertion order.
+        assert ids == {a1.id, a2.id}
 
 
 # ═══════════════════════════════════════════════════════
@@ -112,9 +113,7 @@ class TestAgentStore:
 
 class TestFileStore:
     def test_create_and_get(self, file_store: SqlAlchemyFileStore) -> None:
-        f = file_store.create(
-            filename="data.csv", bytes=1024, content_location="/files/data.csv"
-        )
+        f = file_store.create(filename="data.csv", bytes=1024, content_location="/files/data.csv")
         assert f.id.startswith("file_")
         assert f.filename == "data.csv"
         assert f.bytes == 1024
@@ -243,9 +242,7 @@ class TestConversationStore:
         assert items[0].id.startswith("fc_")
         assert items[1].id.startswith("fco_")
 
-    def test_append_reasoning_item(
-        self, conversation_store: SqlAlchemyConversationStore
-    ) -> None:
+    def test_append_reasoning_item(self, conversation_store: SqlAlchemyConversationStore) -> None:
         conv = conversation_store.create_conversation()
         items = conversation_store.append(
             conv.id,
@@ -262,9 +259,7 @@ class TestConversationStore:
         )
         assert items[0].id.startswith("rs_")
 
-    def test_position_ordering(
-        self, conversation_store: SqlAlchemyConversationStore
-    ) -> None:
+    def test_position_ordering(self, conversation_store: SqlAlchemyConversationStore) -> None:
         conv = conversation_store.create_conversation()
         conversation_store.append(
             conv.id,
@@ -318,9 +313,7 @@ class TestConversationStore:
         assert len(page.data) == 2
         assert page.data[0].id == items[2].id
 
-    def test_get_conversation_id(
-        self, conversation_store: SqlAlchemyConversationStore
-    ) -> None:
+    def test_get_conversation_id(self, conversation_store: SqlAlchemyConversationStore) -> None:
         conv = conversation_store.create_conversation()
         conversation_store.append(
             conv.id,
@@ -342,9 +335,7 @@ class TestConversationStore:
         with pytest.raises(LookupError):
             conversation_store.get_conversation_id("resp_nonexistent")
 
-    def test_get_latest_response_id(
-        self, conversation_store: SqlAlchemyConversationStore
-    ) -> None:
+    def test_get_latest_response_id(self, conversation_store: SqlAlchemyConversationStore) -> None:
         conv = conversation_store.create_conversation()
         assert conversation_store.get_latest_response_id(conv.id) is None
 
@@ -354,9 +345,7 @@ class TestConversationStore:
                 NewConversationItem(
                     type="message",
                     response_id="resp_first",
-                    data=MessageData(
-                        role="user", content=[{"type": "input_text", "text": "a"}]
-                    ),
+                    data=MessageData(role="user", content=[{"type": "input_text", "text": "a"}]),
                 ),
             ],
         )
@@ -366,9 +355,7 @@ class TestConversationStore:
                 NewConversationItem(
                     type="message",
                     response_id="resp_second",
-                    data=MessageData(
-                        role="user", content=[{"type": "input_text", "text": "b"}]
-                    ),
+                    data=MessageData(role="user", content=[{"type": "input_text", "text": "b"}]),
                 ),
             ],
         )
@@ -385,9 +372,7 @@ class TestConversationStore:
                 NewConversationItem(
                     type="message",
                     response_id="resp_del",
-                    data=MessageData(
-                        role="user", content=[{"type": "input_text", "text": "bye"}]
-                    ),
+                    data=MessageData(role="user", content=[{"type": "input_text", "text": "bye"}]),
                 ),
             ],
         )
