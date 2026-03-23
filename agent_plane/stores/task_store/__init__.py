@@ -22,7 +22,8 @@ class TaskStore(ABC):
     def create(
         self,
         session_id: str,
-        agent: str,
+        agent_id: str,
+        agent_name: str,
         instructions: str | None = None,
         metadata: dict | None = None,
         previous_response_id: str | None = None,
@@ -143,22 +144,16 @@ class TaskStore(ABC):
         ...
 
     @abstractmethod
-    async def cancel_by_agent(self, agent: str) -> list[Task]:
+    def list_tasks(
+        self,
+        session_id: str | None = None,
+        agent_id: str | None = None,
+        status: str | None = None,
+    ) -> list[Task]:
         """
-        Cancel all in-flight tasks (queued or in_progress) for the given
-        agent. Returns the list of cancelled tasks. Used when an agent
-        is deleted to stop all its running responses. Async because
-        each cancellation may block while finally blocks run.
-        """
-        ...
-
-    @abstractmethod
-    async def cancel_by_session(self, session_id: str) -> list[Task]:
-        """
-        Cancel all in-flight tasks (queued or in_progress) in the given
-        session. Returns the list of cancelled tasks. Used when a
-        conversation is deleted to stop running responses before
-        removing session data. Async because each cancellation may
-        block while finally blocks run.
+        Return tasks matching the given filters. All filters are
+        optional and combined with AND. Used by the route layer to
+        find in-flight tasks for cancellation (e.g. before deleting
+        an agent or conversation).
         """
         ...

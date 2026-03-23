@@ -191,11 +191,13 @@ class TestConversationItem:
         item = ConversationItem(
             id="item_1",
             type="message",
+            status="completed",
             response_id="resp_1",
             created_at=1700000000,
             data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
         )
         assert item.id == "item_1"
+        assert item.status == "completed"
         assert item.created_at == 1700000000
 
     def test_type_data_mismatch_rejected(self):
@@ -203,6 +205,7 @@ class TestConversationItem:
             ConversationItem(
                 id="item_1",
                 type="reasoning",
+                status="completed",
                 response_id="resp_1",
                 created_at=1700000000,
                 data=MessageData(role="user", content=[]),

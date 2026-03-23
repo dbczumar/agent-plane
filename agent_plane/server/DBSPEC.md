@@ -92,7 +92,6 @@ Single table with a `type` discriminator and a JSON `data` blob for type-specifi
 | id | String(64) PK | Prefixed by type: msg_, fc_, fco_, rs_ |
 | session_id | String(64) NOT NULL | No FK |
 | response_id | String(64) NOT NULL | No FK — must survive task deletion |
-| model | String(256) NOT NULL | Denormalized from task |
 | type | String(32) NOT NULL | message, function_call, function_call_output, reasoning |
 | status | String(32) NOT NULL | Default "completed" |
 | position | Integer NOT NULL | Ordering within session |
@@ -144,9 +143,11 @@ Portable across SQLite and PostgreSQL. Application-level json.loads/json.dumps.
 SQLite stores Boolean as INTEGER internally, so Integer(0/1) avoids ORM coercion
 differences.
 
-### model denormalized on conversation_items
+### model lives in the data blob, not as a column
 
-Tasks can be deleted but items must retain model for the conversation items API.
+The `agent`/`model` field is already type-specific inside the JSON `data` blob for
+item types that need it (assistant messages, function calls, reasoning). No queries
+filter conversation_items by model, so a top-level column would be redundant.
 
 ---
 

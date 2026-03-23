@@ -36,7 +36,7 @@ def _build_response_object(task: Task) -> ResponseObject:
     return ResponseObject(
         id=task.task_id,
         status=task.status,
-        model=task.agent,
+        model=task.agent_name,
         created_at=task.created_at,
         completed_at=task.completed_at,
         output=task.output if task.status == "completed" else [],
@@ -195,7 +195,8 @@ def create_responses_router(
         # -- Normal flow: create a new response --
         task = task_store.create(
             session_id=session_id,
-            agent=req.model,
+            agent_id=agent.id,
+            agent_name=agent.name,
             instructions=req.instructions,
             metadata=req.metadata,
             previous_response_id=req.previous_response_id,

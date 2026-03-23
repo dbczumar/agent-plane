@@ -144,7 +144,8 @@ def create_agents_router(
             )
 
         agents_by_name.pop(agent.name, None)
-        await task_store.cancel_by_agent(agent.name)
+        for task in task_store.list_tasks(agent_id=agent_id):
+            await task_store.cancel(task.task_id)
         artifact_store.delete(agent_id)
 
         return AgentDeleted(id=agent_id)

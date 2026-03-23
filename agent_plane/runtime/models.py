@@ -18,7 +18,8 @@ class Task:
     task_id: str
     session_id: str
     status: str  # "queued", "in_progress", "completed", "failed", "incomplete", "cancelled"
-    agent: str = ""
+    agent_id: str = ""
+    agent_name: str = ""
     created_at: int = 0
     completed_at: int | None = None
     output: list = field(default_factory=list)
@@ -141,6 +142,7 @@ class ConversationItem(BaseModel):
 
     id: str
     type: str
+    status: str
     response_id: str
     created_at: int
     data: ItemData
