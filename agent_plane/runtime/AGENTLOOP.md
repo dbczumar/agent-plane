@@ -71,11 +71,16 @@ downloads from `ArtifactStore` on a full miss (extracting, parsing, and
 validating via `spec.load()`). Subsequent requests for the same agent
 hit the cache.
 
-### Store access via module globals
+### Store access via getter functions
 
-`runtime/_globals.py` holds store references and the `AgentCache`, set
-once at server startup. Workflow functions read them directly, matching
-the pattern in RUNTIME.md.
+`runtime/_globals.py` is a private module that holds store references
+and the `AgentCache`, set once at server startup via `init()`.
+Workflow code **never imports `_globals` directly**. Instead,
+`runtime/__init__.py` exports typed getter functions —
+`get_conversation_store()`, `get_task_store()`, `get_agent_cache()`,
+etc. — that read from the private module and raise `RuntimeError` if
+the runtime hasn't been initialized yet. This keeps the global state
+encapsulated and gives callers a clean, discoverable API.
 
 ### Tool manager concurrency via contextvars
 
@@ -90,7 +95,8 @@ per-task/per-thread safe.
 
 ```
 agent_plane/runtime/
-  _globals.py      # NEW — module-level store globals + AgentCache + init()
+  __init__.py      # MODIFY — public getters (get_agent_cache, get_task_store, etc.) + init()
+  _globals.py      # NEW — private store globals + init()
   prompt.py        # NEW — prompt construction from spec + history
   tool_manager.py  # NEW — MCP lifecycle, tool routing, built-in tools
   steps.py         # NEW — @step functions (call_llm, call_tool, load_agent, load_history)
@@ -102,24 +108,37 @@ agent_plane/runtime/
 
 ## File Details
 
-### 1. `_globals.py` — Store globals + AgentCache
+### 1. `_globals.py` + `__init__.py` — Runtime state + public getters
+
+`_globals.py` is private — never imported outside the `runtime` package.
 
 ```python
-conversation_store: ConversationStore | None = None
-task_store: TaskStore | None = None
-agent_store: AgentStore | None = None
-agent_cache: AgentCache | None = None
-
-# Per-workflow tool manager (contextvars for thread safety)
-_tool_manager: ContextVar[ToolManager | None] = ContextVar(default=None)
+# _globals.py  (private)
+_conversation_store: ConversationStore | None = None
+_task_store: TaskStore | None = None
+_agent_store: AgentStore | None = None
+_agent_cache: AgentCache | None = None
+_tool_manager: ContextVar[ToolManager | None] = ContextVar(
+    "_tool_manager", default=None,
+)
 
 def init(conversation_store, task_store, agent_store, agent_cache):
     """Called once at server startup."""
 ```
 
-`cli.py` constructs the `AgentCache` (wrapping `ArtifactStore`) and
-passes it to `init()`. Workflows access `agent_cache.load(agent_id)` to
-get `LoadedAgent(spec, workdir)`.
+`runtime/__init__.py` exports typed getter functions:
+
+```python
+# __init__.py  (public API)
+def get_conversation_store() -> ConversationStore: ...
+def get_task_store() -> TaskStore: ...
+def get_agent_store() -> AgentStore: ...
+def get_agent_cache() -> AgentCache: ...
+def get_tool_manager() -> ToolManager: ...   # reads from ContextVar
+```
+
+Each getter raises `RuntimeError` if the value is `None` (runtime not
+initialized). `cli.py` calls `init()`; workflow code calls getters.
 
 ### 2. `prompt.py` — Prompt construction
 
@@ -188,7 +207,7 @@ def call_llm(messages: list[dict], model: str, tools: list[dict],
 
 @step()
 def call_tool(tool_name: str, arguments: str) -> str:
-    # Reads ToolManager from _globals._tool_manager contextvar
+    # get_tool_manager() → ToolManager (from ContextVar via getter)
     # Routes to MCP server, built-in, or local tool
 ```
 
@@ -214,17 +233,17 @@ def agent_execution_workflow(agent_id, conversation_id,
     task_id = get_workflow_id()                       # [EXISTS] durability.py
 
     # Phase 1: Load
-    loaded = _globals.agent_cache.load(agent_id)     # [EXISTS] AgentCache.load() → LoadedAgent
+    loaded = get_agent_cache().load(agent_id)        # [EXISTS] AgentCache.load() → LoadedAgent
     spec = loaded.spec                               # [EXISTS] LoadedAgent.spec: AgentSpec
     work_dir = loaded.workdir                        # [EXISTS] LoadedAgent.workdir: Path
     tool_mgr = ToolManager(spec, work_dir)           # [NEW] tool_manager.py
-    _globals._tool_manager.set(tool_mgr)             # [NEW] _globals.py ContextVar
+    set_tool_manager(tool_mgr)                       # [NEW] __init__.py (writes ContextVar)
 
     try:
         tool_mgr.start()                             # [NEW] tool_manager.py
         tool_schemas = tool_mgr.get_tool_schemas()   # [NEW] tool_manager.py
 
-        items = _globals.conversation_store \
+        items = get_conversation_store() \
             .list_items(conversation_id)              # [EXISTS] ConversationStore → PagedList
         history = items.data                         # [EXISTS] PagedList.data: list[ConversationItem]
         last_seen = history[-1].id if history else None
@@ -233,7 +252,7 @@ def agent_execution_workflow(agent_id, conversation_id,
         # Phase 2: Loop (_MAX_ITERATIONS is a runtime constant)
         for _ in range(_MAX_ITERATIONS):
             # Check steering
-            new_page = _globals.conversation_store \
+            new_page = get_conversation_store() \
                 .list_items(conversation_id,
                             after=last_seen)         # [EXISTS] ConversationStore.list_items
             if new_page.data:
@@ -254,7 +273,7 @@ def agent_execution_workflow(agent_id, conversation_id,
 
             # If no tool calls → final response
             if not has_tool_calls(llm_resp):          # [NEW] utility
-                late = _globals.task_store.close_inbox(  # [EXISTS] TaskStore.close_inbox
+                late = get_task_store().close_inbox(      # [EXISTS] TaskStore.close_inbox
                     task_id, conversation_id,
                     last_seen,
                 )
@@ -292,7 +311,7 @@ def agent_execution_workflow(agent_id, conversation_id,
     finally:
         close_stream("output")                       # [EXISTS] durability.py
         tool_mgr.shutdown()                          # [NEW] tool_manager.py
-        _globals._tool_manager.set(None)             # [NEW] _globals.py
+        set_tool_manager(None)                       # [NEW] __init__.py
         drain_inbox(                                 # [NEW] utility — final inbox
             task_id, conversation_id, last_seen,     #   cleanup on exit
         )
@@ -313,15 +332,20 @@ def agent_execution_workflow(agent_id, conversation_id,
 | `to_tool_output()` | `workflow.py` | LLM tool call + result → `ConversationItem` |
 | `to_output_item()` | `workflow.py` | LLM tool call + result → output dict |
 | `drain_inbox()` | `workflow.py` | Final inbox cleanup in `finally` block |
-| `_globals.init()` | `_globals.py` | Set store refs + AgentCache at startup |
+| `init()` | `__init__.py` | Set store refs + AgentCache at startup (delegates to `_globals`) |
+| `get_agent_cache()` | `__init__.py` | Return canonical `AgentCache` instance |
+| `get_conversation_store()` | `__init__.py` | Return canonical `ConversationStore` instance |
+| `get_task_store()` | `__init__.py` | Return canonical `TaskStore` instance |
+| `get_tool_manager()` | `__init__.py` | Return current workflow's `ToolManager` from `ContextVar` |
+| `set_tool_manager()` | `__init__.py` | Set/clear the per-workflow `ToolManager` `ContextVar` |
 
 ### 6. `cli.py` — Add runtime init
 
 After constructing stores, before `uvicorn.run()`:
 
 ```python
+from agent_plane.runtime import init as init_runtime
 from agent_plane.runtime.agent_cache import AgentCache
-from agent_plane.runtime._globals import init as init_runtime
 
 agent_cache = AgentCache(
     artifact_store=artifact_store,
@@ -348,9 +372,9 @@ mcp>=1.0
 
 ### Phase A: Foundation (no external deps needed)
 
-1. `_globals.py` — store globals + AgentCache + init
-2. `runtime/__init__.py` — re-export init
-3. `cli.py` — construct AgentCache, call init at startup
+1. `_globals.py` — private store globals + `init()`
+2. `runtime/__init__.py` — public getter functions + re-export `init`
+3. `cli.py` — construct AgentCache, call `init()` at startup
 4. `prompt.py` — message construction from spec + history
 5. Tests for prompt.py (pure data transformation, no mocks)
 
@@ -429,10 +453,11 @@ mcp>=1.0
 - `completed_at` timestamp — populate on terminal task status.
 - Cancellation propagation — when a client cancels a response, interrupt the in-flight LLM call
   or tool execution rather than waiting for the current step to finish.
-- `Runtime` object — replace module-level globals in `_globals.py` with a proper `Runtime` class
-  that holds stores, AgentCache, and configuration. Would make the runtime usable outside the
-  server (e.g. CLI-driven execution, testing, embedded use in other Python programs) without
-  relying on module-level state set during server startup.
+- `Runtime` object — replace `_globals.py` module state with a proper `Runtime` class that holds
+  stores, AgentCache, and configuration. The getter functions in `__init__.py` would delegate to
+  the active `Runtime` instance instead of raw module globals. Would make the runtime usable
+  outside the server (CLI-driven execution, testing, embedded use) without relying on module-level
+  state set during server startup.
 - Shared `ToolManager` — replace per-workflow tool managers with a centralized `ToolManager` that
   holds long-lived MCP connections and is shared across concurrent workflow executions. Would
   eliminate per-request MCP startup cost and the `ContextVar` plumbing. Requires thread-safe
