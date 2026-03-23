@@ -396,3 +396,7 @@ mcp>=1.0
 - `completed_at` timestamp — populate on terminal task status.
 - Cancellation propagation — when a client cancels a response, interrupt the in-flight LLM call
   or tool execution rather than waiting for the current step to finish.
+- `Runtime` object — replace module-level globals in `_globals.py` with a proper `Runtime` class
+  that holds stores, AgentCache, and configuration. Would make the runtime usable outside the
+  server (e.g. CLI-driven execution, testing, embedded use in other Python programs) without
+  relying on module-level state set during server startup.
