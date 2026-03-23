@@ -5,10 +5,10 @@ from __future__ import annotations
 import os
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from agent_plane.server.db import Base
+from agent_plane.db import Base
+from alembic import context
 
 config = context.config
 

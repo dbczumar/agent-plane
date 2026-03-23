@@ -1,4 +1,4 @@
-"""SQLAlchemy table definitions for the agent-plane server."""
+"""SQLAlchemy table definitions for the agent-plane database."""
 
 from __future__ import annotations
 

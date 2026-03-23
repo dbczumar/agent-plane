@@ -7,7 +7,7 @@ Tasks and conversation_items MUST share the same database — the steering hands
 (try_deliver + close_inbox) requires single-transaction atomicity.
 
 Schema is managed by Alembic migrations in `alembic/`. SQLAlchemy models live
-in `agent_plane/server/db.py`.
+in `agent_plane/db/db_models.py`.
 
 ---
 
