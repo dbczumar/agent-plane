@@ -64,6 +64,9 @@ _DBOS_ACTIVE = frozenset({WorkflowStatusString.PENDING.value, WorkflowStatusStri
 
 def _map_dbos_status(dbos_status_value: str) -> str:
     """Map a DBOS WorkflowStatusString value to our TaskStatus."""
+    # Fallback to FAILED: if DBOS introduces a status we haven't mapped,
+    # treating it as failed is the safest option — it surfaces the gap
+    # via the API rather than silently misclassifying the task.
     return _DBOS_TO_TASK_STATUS.get(dbos_status_value, TaskStatus.FAILED)
 
 
@@ -85,7 +88,7 @@ def _to_entity(row: SqlTask) -> Task:
         previous_response_id=row.previous_response_id,
         instructions=row.instructions,
         reasoning=json.loads(row.reasoning) if row.reasoning else None,
-        background=row.background or False,
+        background=row.background,
         status=TaskStatus.QUEUED,
     )
 
@@ -98,7 +101,7 @@ def _apply_workflow_status(task: Task, wf_status: WorkflowStatus) -> Task:
     if task.status == TaskStatus.COMPLETED and wf_status.output is not None:
         # The workflow returns {"task_id": ..., "output": [...], ...}
         result: dict[str, Any] = wf_status.output
-        task.output = result.get("output", [])
+        task.output = result["output"]
         task.usage = result.get("usage")
         task.completed_at = result.get("completed_at")
 

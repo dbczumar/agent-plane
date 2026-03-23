@@ -65,6 +65,27 @@ Check each file against this checklist:
     (private/internal) methods of production code. If a test needs a
     private method, the public API is likely incomplete — flag to reviewer.
 
+15. NO INVENTED DEFAULTS: No `.get("key", "fallback")` or `value or "unknown"`
+    where the default was not explicitly designed. Required values must fail
+    loud (KeyError, ValueError) rather than silently substituting a made-up
+    value. If a default is genuinely needed, it must have a comment explaining
+    why that specific value is correct.
+
+16. NO OVERLY DEFENSIVE ERROR HANDLING: Don't wrap code in try/except
+    "just in case". Catch only specific exceptions at system boundaries
+    (user input, external APIs). Internal code should fail loud. Bare
+    `except Exception` is almost always wrong. Never swallow errors.
+
+17. DB COLUMN DEFAULT CORRELATION: When mapping DB rows to entities,
+    correlate Python-side defaults with the column schema. Nullable
+    columns must not have hardcoded fallbacks (masks NULL data).
+    Non-nullable columns with server defaults must not have redundant
+    Python-side fallbacks. Flag both cases to a human for review.
+
+18. NO TUPLE RETURNS OR ARGUMENTS: Never return tuples from functions or
+    pass tuples as arguments. Use lightweight dataclasses with named
+    fields. Tuples are positionally fragile and not extensible.
+
 Report each finding as:
   [FILE:LINE] ISSUE — description of the problem and suggested fix
 

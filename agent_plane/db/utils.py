@@ -148,24 +148,27 @@ def delete_fts_by_conversation(session: Session, conversation_id: str) -> None:
 def extract_search_text(item: NewConversationItem) -> str:
     """
     Extract plain text for FTS from an item's data, per DBSPEC.
+
+    The item has already been Pydantic-validated, so required fields
+    (content, name, arguments, output, summary) are guaranteed present.
+    We use direct dict access to fail loud if that assumption is ever
+    violated.
     """
     data = item.data.model_dump()
     if item.type == "message":
-        content: list[dict[str, str]] = data.get("content", [])
         return " ".join(
-            block.get("text", "")
-            for block in content
+            block["text"]
+            for block in data["content"]
             if isinstance(block, dict) and block.get("text")
         )
     if item.type == "function_call":
-        return f"{data.get('name', '')} {data.get('arguments', '')}"
+        return f"{data['name']} {data['arguments']}"
     if item.type == "function_call_output":
-        return str(data.get("output", ""))
+        return str(data["output"])
     if item.type == "reasoning":
-        summary: list[dict[str, str]] = data.get("summary", [])
         return " ".join(
-            block.get("text", "")
-            for block in summary
+            block["text"]
+            for block in data["summary"]
             if isinstance(block, dict) and block.get("text")
         )
     return ""

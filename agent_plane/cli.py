@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import click
 import yaml
 
 
-def _load_config(path: str | None) -> dict:
+# Any: YAML configs have heterogeneous value types (str, int, list, etc.)
+def _load_config(path: str | None) -> dict[str, Any]:
     """
     Load and return config from a YAML file.
     Returns an empty dict if no path is provided.
@@ -85,17 +87,11 @@ def server(
     # CLI args take precedence over config file, which takes precedence
     # over defaults.
     db_uri = database_uri or cfg.get("database_uri", _DEFAULT_DB_URI)
-    art_loc = artifact_location or cfg.get(
-        "artifact_location", _DEFAULT_ARTIFACT_LOCATION
-    )
+    art_loc = artifact_location or cfg.get("artifact_location", _DEFAULT_ARTIFACT_LOCATION)
 
     # Resolve relative artifact location against config file's directory
     # (only when the value came from the config file, not CLI).
-    if (
-        config_path
-        and artifact_location is None
-        and not Path(art_loc).is_absolute()
-    ):
+    if config_path and artifact_location is None and not Path(art_loc).is_absolute():
         art_loc = str(Path(config_path).parent / art_loc)
 
     app = create_app(
