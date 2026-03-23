@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from agent_plane.entities import Conversation, ConversationItem
-from agent_plane.server.models import (
+from agent_plane.server.schemas import (
     ConversationDeleted,
     ConversationObject,
     PaginatedList,

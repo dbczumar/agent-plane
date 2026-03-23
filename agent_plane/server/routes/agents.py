@@ -3,7 +3,7 @@
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 
 from agent_plane.entities import Agent
-from agent_plane.server.models import AgentDeleted, AgentObject, PaginatedList
+from agent_plane.server.schemas import AgentDeleted, AgentObject, PaginatedList
 from agent_plane.stores import AgentStore, ArtifactStore, TaskStore
 
 

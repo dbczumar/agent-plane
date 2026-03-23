@@ -15,7 +15,7 @@ from agent_plane.entities import (
     NewConversationItem,
     Task,
 )
-from agent_plane.server.models import (
+from agent_plane.server.schemas import (
     ConversationRef,
     CreateResponseRequest,
     ErrorDetail,

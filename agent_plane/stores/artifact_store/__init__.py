@@ -10,6 +10,21 @@ class ArtifactStore(ABC):
     size, etc.) is managed separately by the route layer.
     """
 
+    def __init__(self, storage_location: str) -> None:
+        """
+        Initialize the store with a backend-specific storage location.
+
+        The interpretation of *storage_location* depends on the
+        concrete implementation — e.g. a filesystem path for local
+        storage, an S3 URI for cloud storage, etc.
+        """
+        self._storage_location = storage_location
+
+    @property
+    def storage_location(self) -> str:
+        """The backend-specific storage location (path, URI, bucket, etc.)."""
+        return self._storage_location
+
     @abstractmethod
     def put(self, key: str, data: bytes) -> None:
         """Store a blob under the given key. Overwrites if exists."""

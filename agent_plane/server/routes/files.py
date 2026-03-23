@@ -6,7 +6,7 @@ from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from starlette.responses import Response
 
 from agent_plane.entities import StoredFile
-from agent_plane.server.models import FileDeleted, FileObject, PaginatedList
+from agent_plane.server.schemas import FileDeleted, FileObject, PaginatedList
 from agent_plane.stores import ArtifactStore, FileStore
 
 
