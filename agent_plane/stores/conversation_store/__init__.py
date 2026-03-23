@@ -54,11 +54,13 @@ class ConversationStore(ABC):
         limit: int = 100,
         after: str | None = None,
         before: str | None = None,
+        order: str = "asc",
     ) -> PagedList[ConversationItem]:
         """
-        Return items in a conversation with cursor-based pagination,
-        ordered chronologically. Used by the runtime to load
-        conversation history and by the UI to display conversations.
+        Return items in a conversation with cursor-based pagination.
+
+        ``order`` controls the sort direction on ``position``
+        (``"asc"`` = chronological, ``"desc"`` = reverse-chronological).
 
         `after`: only return items after this item ID.
         `before`: only return items before this item ID.
@@ -86,18 +88,37 @@ class ConversationStore(ABC):
         limit: int = 20,
         after: str | None = None,
         before: str | None = None,
+        order: str = "desc",
     ) -> PagedList[Conversation]:
-        """List conversations with cursor-based pagination, newest first."""
+        """
+        List conversations with cursor-based pagination.
+
+        ``order`` controls the sort direction on ``created_at``
+        (``"desc"`` = newest-first, ``"asc"`` = oldest-first).
+        """
+        ...
+
+    @abstractmethod
+    def search(
+        self,
+        query: str,
+        conversation_id: str | None = None,
+        limit: int = 20,
+    ) -> list[ConversationItem]:
+        """
+        Full-text search over conversation items. Returns items whose
+        search_text matches the query, optionally scoped to a single
+        conversation. Results are ranked by relevance.
+        """
         ...
 
     @abstractmethod
     def update_conversation(
-        self, conversation_id: str, **kwargs: str | None
+        self, conversation_id: str, title: str | None = None
     ) -> Conversation | None:
         """
-        Update mutable fields on a conversation. Currently only
-        `title` is updatable. Returns the updated Conversation, or
-        None if the conversation does not exist.
+        Update mutable fields on a conversation. Returns the updated
+        Conversation, or None if the conversation does not exist.
         """
         ...
 

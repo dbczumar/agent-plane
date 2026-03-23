@@ -55,9 +55,10 @@ def create_agents_router(
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
     ) -> PaginatedList:
-        page = agent_store.list(limit=limit, after=after, before=before)
+        page = agent_store.list(limit=limit, after=after, before=before, order=order)
+        data = [_to_agent_object(a) for a in page.data]
         return PaginatedList(
-            data=[_to_agent_object(a) for a in page.data],
+            data=data,
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,

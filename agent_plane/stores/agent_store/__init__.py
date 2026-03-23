@@ -37,8 +37,14 @@ class AgentStore(ABC):
         limit: int = 20,
         after: str | None = None,
         before: str | None = None,
+        order: str = "desc",
     ) -> PagedList[Agent]:
-        """List agents with cursor-based pagination."""
+        """
+        List agents with cursor-based pagination.
+
+        ``order`` controls the sort direction on ``created_at``
+        (``"desc"`` = newest-first, ``"asc"`` = oldest-first).
+        """
         ...
 
     @abstractmethod

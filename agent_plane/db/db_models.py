@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -51,7 +51,7 @@ class SqlTask(Base):
     conversation_id: Mapped[str] = mapped_column(String(64), ForeignKey("conversations.id"))
     previous_response_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer)
-    inbox_closed: Mapped[int] = mapped_column(Integer, default=0)
+    inbox_closed: Mapped[bool] = mapped_column(Boolean, default=False)
 
     __table_args__ = (
         Index("ix_tasks_conversation_id", "conversation_id"),

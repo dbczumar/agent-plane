@@ -357,6 +357,77 @@ class TestConversationStore:
         )
         assert conversation_store.get_latest_response_id(conv.id) == "resp_second"
 
+    def test_search(self, conversation_store: SqlAlchemyConversationStore) -> None:
+        conv = conversation_store.create_conversation()
+        conversation_store.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="resp_s1",
+                    data=MessageData(
+                        role="user",
+                        content=[{"type": "input_text", "text": "weather in Paris"}],
+                    ),
+                ),
+                NewConversationItem(
+                    type="message",
+                    response_id="resp_s1",
+                    data=MessageData(
+                        role="assistant",
+                        content=[{"type": "output_text", "text": "sunny and warm"}],
+                        agent="test-agent",
+                    ),
+                ),
+            ],
+        )
+        results = conversation_store.search("Paris")
+        assert len(results) == 1
+        assert results[0].type == "message"
+
+        results = conversation_store.search("sunny")
+        assert len(results) == 1
+
+        assert conversation_store.search("nonexistent") == []
+
+    def test_search_scoped_to_conversation(
+        self, conversation_store: SqlAlchemyConversationStore
+    ) -> None:
+        conv1 = conversation_store.create_conversation()
+        conv2 = conversation_store.create_conversation()
+        conversation_store.append(
+            conv1.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="r1",
+                    data=MessageData(
+                        role="user",
+                        content=[{"type": "input_text", "text": "hello world"}],
+                    ),
+                ),
+            ],
+        )
+        conversation_store.append(
+            conv2.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="r2",
+                    data=MessageData(
+                        role="user",
+                        content=[{"type": "input_text", "text": "hello universe"}],
+                    ),
+                ),
+            ],
+        )
+        # Unscoped: both match "hello"
+        assert len(conversation_store.search("hello")) == 2
+
+        # Scoped: only one per conversation
+        assert len(conversation_store.search("hello", conversation_id=conv1.id)) == 1
+        assert len(conversation_store.search("hello", conversation_id=conv2.id)) == 1
+
     @pytest.mark.asyncio
     async def test_delete_conversation(
         self, conversation_store: SqlAlchemyConversationStore

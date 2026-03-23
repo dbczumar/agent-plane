@@ -51,9 +51,10 @@ def create_files_router(
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
     ) -> PaginatedList:
-        page = file_store.list(limit=limit, after=after, before=before)
+        page = file_store.list(limit=limit, after=after, before=before, order=order)
+        data = [_to_file_object(f) for f in page.data]
         return PaginatedList(
-            data=[_to_file_object(f) for f in page.data],
+            data=data,
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,

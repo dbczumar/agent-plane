@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import json
 
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, asc, delete, desc, func, or_, select, text
 
 from agent_plane.db.db_models import SqlConversation, SqlConversationItem, SqlTask
 from agent_plane.db.utils import (
+    delete_fts_by_conversation,
+    ensure_fts_table,
     extract_search_text,
     generate_conversation_id,
     generate_item_id,
     get_or_create_engine,
+    insert_fts,
     make_managed_session_maker,
     now_epoch,
 )
@@ -49,6 +52,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         super().__init__(storage_location)
         self._engine = get_or_create_engine(storage_location)
         self._session = make_managed_session_maker(self._engine)
+        ensure_fts_table(self._engine)
 
     def create_conversation(self) -> Conversation:
         row = SqlConversation(
@@ -84,14 +88,54 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .limit(1)
             ).scalar_one_or_none()
 
+    def search(
+        self,
+        query: str,
+        conversation_id: str | None = None,
+        limit: int = 20,
+    ) -> list[ConversationItem]:
+        with self._session() as session:
+            stmt = text(
+                "SELECT item_id FROM conversation_items_fts "
+                "WHERE search_text MATCH :query "
+                "ORDER BY rank "
+                "LIMIT :limit"
+            )
+            params: dict[str, str | int] = {"query": query, "limit": limit}
+            if conversation_id is not None:
+                stmt = text(
+                    "SELECT item_id FROM conversation_items_fts "
+                    "WHERE conversation_id = :cid AND search_text MATCH :query "
+                    "ORDER BY rank "
+                    "LIMIT :limit"
+                )
+                params["cid"] = conversation_id
+            item_ids = [row[0] for row in session.execute(stmt, params).fetchall()]
+            if not item_ids:
+                return []
+            rows = (
+                session.execute(
+                    select(SqlConversationItem).where(SqlConversationItem.id.in_(item_ids))
+                )
+                .scalars()
+                .all()
+            )
+            # Preserve FTS rank order
+            order = {iid: i for i, iid in enumerate(item_ids)}
+            return [_to_item(r) for r in sorted(rows, key=lambda r: order[r.id])]
+
     def search_items(
         self,
         conversation_id: str,
         limit: int = 100,
         after: str | None = None,
         before: str | None = None,
+        order: str = "asc",
     ) -> PagedList[ConversationItem]:
         with self._session() as session:
+            sort_fn = asc if order == "asc" else desc
+            # Always query in asc (position) order for consistent cursor
+            # semantics, then reverse if the caller requested desc.
             stmt = select(SqlConversationItem).where(
                 SqlConversationItem.conversation_id == conversation_id
             )
@@ -115,6 +159,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             if has_more:
                 rows = rows[:limit]
             items = [_to_item(r) for r in rows]
+            if sort_fn is desc:
+                items.reverse()
             return PagedList(
                 data=items,
                 first_id=items[0].id if items else None,
@@ -141,8 +187,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             for item in items:
                 max_pos += 1
                 data_dict = item.data.model_dump(exclude_none=True)
+                search = extract_search_text(item)
+                item_id = generate_item_id(item.type)
                 row = SqlConversationItem(
-                    id=generate_item_id(item.type),
+                    id=item_id,
                     conversation_id=conversation_id,
                     response_id=item.response_id,
                     created_at=now,
@@ -150,9 +198,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     position=max_pos,
                     type=item.type,
                     data=json.dumps(data_dict),
-                    search_text=extract_search_text(item),
+                    search_text=search,
                 )
                 session.add(row)
+                insert_fts(session, item_id, conversation_id, search)
                 persisted.append(
                     ConversationItem(
                         id=row.id,
@@ -171,8 +220,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         limit: int = 20,
         after: str | None = None,
         before: str | None = None,
+        order: str = "desc",
     ) -> PagedList[Conversation]:
         with self._session() as session:
+            sort_fn = desc if order == "desc" else asc
+            # Always query in desc order for consistent cursor semantics,
+            # then reverse the results if the caller requested asc.
             stmt = select(SqlConversation)
             if after:
                 sub = (
@@ -213,6 +266,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             if has_more:
                 rows = rows[:limit]
             convs = [_to_conversation(r) for r in rows]
+            if sort_fn is asc:
+                convs.reverse()
             return PagedList(
                 data=convs,
                 first_id=convs[0].id if convs else None,
@@ -221,14 +276,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
     def update_conversation(
-        self, conversation_id: str, **kwargs: str | None
+        self, conversation_id: str, title: str | None = None
     ) -> Conversation | None:
         with self._session() as session:
             row = session.get(SqlConversation, conversation_id)
             if not row:
                 return None
-            if "title" in kwargs:
-                row.title = kwargs["title"]
+            if title is not None:
+                row.title = title
             return _to_conversation(row)
 
     async def delete_conversation(self, conversation_id: str) -> bool:
@@ -239,6 +294,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Order matters for FK constraints:
             # tasks and items reference the conversation.
             session.execute(delete(SqlTask).where(SqlTask.conversation_id == conversation_id))
+            delete_fts_by_conversation(session, conversation_id)
             session.execute(
                 delete(SqlConversationItem).where(
                     SqlConversationItem.conversation_id == conversation_id

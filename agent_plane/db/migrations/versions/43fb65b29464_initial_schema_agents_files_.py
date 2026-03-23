@@ -83,7 +83,7 @@ def upgrade() -> None:
         sa.Column("conversation_id", sa.String(length=64), nullable=False),
         sa.Column("previous_response_id", sa.String(length=64), nullable=True),
         sa.Column("created_at", sa.Integer(), nullable=False),
-        sa.Column("inbox_closed", sa.Integer(), nullable=False),
+        sa.Column("inbox_closed", sa.Boolean(), nullable=False),
         sa.ForeignKeyConstraint(
             ["agent_id"],
             ["agents.id"],

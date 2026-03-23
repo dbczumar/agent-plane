@@ -16,10 +16,12 @@ from sqlalchemy.orm import Session
 
 from agent_plane.db.db_models import SqlConversationItem, SqlTask
 from agent_plane.db.utils import (
+    ensure_fts_table,
     extract_search_text,
     generate_item_id,
     generate_task_id,
     get_or_create_engine,
+    insert_fts,
     make_managed_session_maker,
     now_epoch,
 )
@@ -42,7 +44,7 @@ def _to_entity(row: SqlTask) -> Task:
         conversation_id=row.conversation_id,
         agent_id=row.agent_id,
         created_at=row.created_at,
-        inbox_closed=bool(row.inbox_closed),
+        inbox_closed=row.inbox_closed,
         previous_response_id=row.previous_response_id,
         status="queued",
     )
@@ -65,6 +67,7 @@ class SqlAlchemyTaskStore(TaskStore):
         self._engine = get_or_create_engine(storage_location)
         self._session = make_managed_session_maker(self._engine)
         self._supports_for_update = self._engine.dialect.name != "sqlite"
+        ensure_fts_table(self._engine)
 
     def create(
         self,
@@ -80,7 +83,7 @@ class SqlAlchemyTaskStore(TaskStore):
             conversation_id=conversation_id,
             previous_response_id=previous_response_id,
             created_at=now_epoch(),
-            inbox_closed=0,
+            inbox_closed=False,
         )
         with self._session() as session:
             session.add(row)
@@ -129,6 +132,12 @@ class SqlAlchemyTaskStore(TaskStore):
         Server-side steering handshake. Within a single transaction:
         check inbox_closed; if open, append the item and return True;
         if closed, return False.
+
+        This inserts into conversation_items directly (rather than
+        delegating to ConversationStore.append) because the inbox check
+        and the item insert MUST be atomic — if they were separate
+        operations, close_inbox could run between them, and the
+        delivered message would never be seen by the agent.
         """
         with self._session() as session:
             row = self._get_task_for_update(session, task_id)
@@ -142,9 +151,11 @@ class SqlAlchemyTaskStore(TaskStore):
             ).scalar_one()
 
             data_dict = item.data.model_dump(exclude_none=True)
+            search = extract_search_text(item)
+            item_id = generate_item_id(item.type)
             session.add(
                 SqlConversationItem(
-                    id=generate_item_id(item.type),
+                    id=item_id,
                     conversation_id=conversation_id,
                     response_id=item.response_id,
                     created_at=now_epoch(),
@@ -152,9 +163,11 @@ class SqlAlchemyTaskStore(TaskStore):
                     position=max_pos + 1,
                     type=item.type,
                     data=json.dumps(data_dict),
-                    search_text=extract_search_text(item),
+                    search_text=search,
                 )
             )
+            # Dual-write to FTS so steered messages are searchable.
+            insert_fts(session, item_id, conversation_id, search)
             return True
 
     def close_inbox(
@@ -188,7 +201,7 @@ class SqlAlchemyTaskStore(TaskStore):
 
             row = self._get_task_for_update(session, task_id)
             if row is not None:
-                row.inbox_closed = 1
+                row.inbox_closed = True
             return []
 
     async def cancel(self, task_id: str) -> Task:

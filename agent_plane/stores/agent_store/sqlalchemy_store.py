@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, asc, desc, or_, select
 
 from agent_plane.db.db_models import SqlAgent
 from agent_plane.db.utils import (
@@ -62,8 +62,12 @@ class SqlAlchemyAgentStore(AgentStore):
         limit: int = 20,
         after: str | None = None,
         before: str | None = None,
+        order: str = "desc",
     ) -> PagedList[Agent]:
         with self._session() as session:
+            sort_fn = desc if order == "desc" else asc
+            # Always query in desc order for consistent cursor semantics,
+            # then reverse the results if the caller requested asc.
             stmt = select(SqlAgent)
             if after:
                 sub = select(SqlAgent.created_at).where(SqlAgent.id == after).scalar_subquery()
@@ -87,6 +91,8 @@ class SqlAlchemyAgentStore(AgentStore):
             if has_more:
                 rows = rows[:limit]
             entities = [_to_entity(r) for r in rows]
+            if sort_fn is asc:
+                entities.reverse()
             return PagedList(
                 data=entities,
                 first_id=entities[0].id if entities else None,

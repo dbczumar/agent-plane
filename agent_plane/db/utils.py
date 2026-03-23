@@ -102,6 +102,46 @@ def generate_item_id(item_type: str) -> str:
     return f"{prefix}{uuid.uuid4().hex}"
 
 
+# ── FTS (SQLite FTS5) ─────────────────────────────────
+
+_FTS_TABLE = "conversation_items_fts"
+
+_CREATE_FTS = text(
+    f"CREATE VIRTUAL TABLE IF NOT EXISTS {_FTS_TABLE} USING fts5("
+    "item_id UNINDEXED, conversation_id UNINDEXED, search_text)"
+)
+
+
+def ensure_fts_table(engine: Engine) -> None:
+    """Create the FTS5 virtual table if on SQLite. Idempotent."""
+    if engine.dialect.name == "sqlite":
+        with engine.connect() as conn:
+            conn.execute(_CREATE_FTS)
+            conn.commit()
+
+
+def insert_fts(session: Session, item_id: str, conversation_id: str, search_text: str) -> None:
+    """Dual-write a row into the FTS5 table (SQLite only)."""
+    if session.bind and session.bind.dialect.name == "sqlite":
+        session.execute(
+            text(
+                f"INSERT INTO {_FTS_TABLE}"
+                "(item_id, conversation_id, search_text) "
+                "VALUES (:item_id, :cid, :st)"
+            ),
+            {"item_id": item_id, "cid": conversation_id, "st": search_text},
+        )
+
+
+def delete_fts_by_conversation(session: Session, conversation_id: str) -> None:
+    """Remove all FTS rows for a conversation (SQLite only)."""
+    if session.bind and session.bind.dialect.name == "sqlite":
+        session.execute(
+            text(f"DELETE FROM {_FTS_TABLE} WHERE conversation_id = :cid"),
+            {"cid": conversation_id},
+        )
+
+
 # ── Search text extraction ─────────────────────────────
 
 

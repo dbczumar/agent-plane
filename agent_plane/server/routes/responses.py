@@ -122,7 +122,7 @@ def create_responses_router(
             # response_id). Raises internally if not found.
             try:
                 conversation_id = conversation_store.get_conversation_id(req.previous_response_id)
-            except Exception:
+            except LookupError:
                 raise HTTPException(
                     status_code=400,
                     detail="invalid previous_response_id",

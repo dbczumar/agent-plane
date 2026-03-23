@@ -69,15 +69,13 @@ def create_conversations_router(
             limit=limit,
             after=after,
             before=before,
+            order=order,
         )
-        # Store always returns newest-first; reverse for ascending.
         data = [_to_conversation_object(s) for s in page.data]
-        if order == "asc":
-            data = list(reversed(data))
         return PaginatedList(
             data=data,
-            first_id=data[0].id if data else None,
-            last_id=data[-1].id if data else None,
+            first_id=page.first_id,
+            last_id=page.last_id,
             has_more=page.has_more,
         )
 
@@ -110,15 +108,13 @@ def create_conversations_router(
             limit=limit,
             after=after,
             before=before,
+            order=order,
         )
-        # Store returns items in position order (ascending); reverse for desc.
         data = [_to_api_item(m) for m in page.data]
-        if order == "desc":
-            data = list(reversed(data))
         return PaginatedList(
             data=data,
-            first_id=data[0]["id"] if data else None,
-            last_id=data[-1]["id"] if data else None,
+            first_id=page.first_id,
+            last_id=page.last_id,
             has_more=page.has_more,
         )
 
