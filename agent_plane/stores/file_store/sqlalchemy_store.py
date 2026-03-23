@@ -61,34 +61,27 @@ class SqlAlchemyFileStore(FileStore):
         order: str = "desc",
     ) -> PagedList[StoredFile]:
         with self._session() as session:
-            sort_fn = desc if order == "desc" else asc
-            # Always query in desc order for consistent cursor semantics,
-            # then reverse the results if the caller requested asc.
+            is_desc = order == "desc"
+            sort_fn = desc if is_desc else asc
             stmt = select(SqlFile)
             if after:
                 sub = select(SqlFile.created_at).where(SqlFile.id == after).scalar_subquery()
-                stmt = stmt.where(
-                    or_(
-                        SqlFile.created_at < sub,
-                        and_(SqlFile.created_at == sub, SqlFile.id < after),
-                    )
-                )
+                # "after" = further in sort direction
+                ts_cmp = SqlFile.created_at < sub if is_desc else SqlFile.created_at > sub
+                id_cmp = SqlFile.id < after if is_desc else SqlFile.id > after
+                stmt = stmt.where(or_(ts_cmp, and_(SqlFile.created_at == sub, id_cmp)))
             if before:
                 sub = select(SqlFile.created_at).where(SqlFile.id == before).scalar_subquery()
-                stmt = stmt.where(
-                    or_(
-                        SqlFile.created_at > sub,
-                        and_(SqlFile.created_at == sub, SqlFile.id > before),
-                    )
-                )
-            stmt = stmt.order_by(SqlFile.created_at.desc(), SqlFile.id.desc()).limit(limit + 1)
+                # "before" = opposite of sort direction
+                ts_cmp = SqlFile.created_at > sub if is_desc else SqlFile.created_at < sub
+                id_cmp = SqlFile.id > before if is_desc else SqlFile.id < before
+                stmt = stmt.where(or_(ts_cmp, and_(SqlFile.created_at == sub, id_cmp)))
+            stmt = stmt.order_by(sort_fn(SqlFile.created_at), sort_fn(SqlFile.id)).limit(limit + 1)
             rows = list(session.execute(stmt).scalars().all())
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
             entities = [_to_entity(r) for r in rows]
-            if sort_fn is asc:
-                entities.reverse()
             return PagedList(
                 data=entities,
                 first_id=entities[0].id if entities else None,

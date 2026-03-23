@@ -11,6 +11,9 @@ from pydantic import BaseModel, Field
 
 class PaginatedList(BaseModel):
     object: str = "list"
+    # Any: items are heterogeneous (ResponseObject, ConversationObject,
+    # FileObject, or dicts) and list is invariant, so no single concrete
+    # type satisfies all callers.
     data: list[Any] = Field(default_factory=list)
     first_id: str | None = None
     last_id: str | None = None
@@ -96,20 +99,25 @@ class IncompleteDetails(BaseModel):
 
 class CreateResponseRequest(BaseModel):
     model: str
-    input: str | list[Any]
+    # Heterogeneous content blocks (input_text, input_image, input_file)
+    # or a plain string shorthand; shape varies by block type.
+    input: str | list[dict[str, Any]]
     stream: bool = False
     background: bool = False
     store: bool = True
     instructions: str | None = None
     previous_response_id: str | None = None
     conversation: ConversationRef | None = None
-    context_management: list[Any] | None = None
-    # Ignored fields — agent controls these (silently dropped)
+    # Reasoning config, e.g. {"effort": "low"|"medium"|"high"}
+    reasoning: dict[str, str] | None = None
+    # Compaction strategy objects, e.g. [{"type": "compaction", ...}]
+    context_management: list[dict[str, Any]] | None = None
+    # Ignored fields — agent controls these; silently dropped.
+    # Typed loosely because we only need to accept and discard them.
     temperature: float | None = None
     top_p: float | None = None
-    tools: list[Any] | None = None
-    tool_choice: Any | None = None
-    reasoning: Any | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: dict[str, Any] | str | None = None
     max_output_tokens: int | None = None
     frequency_penalty: float | None = None
     presence_penalty: float | None = None
@@ -125,13 +133,16 @@ class ResponseObject(BaseModel):
     model: str
     created_at: int
     completed_at: int | None = None
-    output: list[Any] = Field(default_factory=list)
+    # Heterogeneous output items (messages, reasoning, function_calls);
+    # shape varies by item type.
+    output: list[dict[str, Any]] = Field(default_factory=list)
     background: bool = False
     store: bool = True
     usage: Usage | None = None
     previous_response_id: str | None = None
     conversation: ConversationRef | None = None
     instructions: str | None = None
+    reasoning: dict[str, str] | None = None
     error: ErrorDetail | None = None
     incomplete_details: IncompleteDetails | None = None
 

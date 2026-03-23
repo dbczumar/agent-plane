@@ -36,6 +36,9 @@ def _to_api_item(item: ConversationItem) -> dict[str, Any]:
     fields (role, content, model, name, arguments, etc.) come
     from item.data. `exclude_none` ensures absent optional fields
     (e.g. `model` on user messages) don't appear in the output.
+
+    Returns dict[str, Any] because value types vary across item
+    types (str, int, list, etc.) due to the model_dump spread.
     """
     return {
         "id": item.id,

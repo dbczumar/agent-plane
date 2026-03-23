@@ -133,9 +133,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         order: str = "asc",
     ) -> PagedList[ConversationItem]:
         with self._session() as session:
-            sort_fn = asc if order == "asc" else desc
-            # Always query in asc (position) order for consistent cursor
-            # semantics, then reverse if the caller requested desc.
+            is_asc = order == "asc"
+            sort_fn = asc if is_asc else desc
             stmt = select(SqlConversationItem).where(
                 SqlConversationItem.conversation_id == conversation_id
             )
@@ -145,22 +144,30 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .where(SqlConversationItem.id == after)
                     .scalar_subquery()
                 )
-                stmt = stmt.where(SqlConversationItem.position > sub)
+                # "after" = further in sort direction
+                stmt = stmt.where(
+                    SqlConversationItem.position > sub
+                    if is_asc
+                    else SqlConversationItem.position < sub
+                )
             if before:
                 sub = (
                     select(SqlConversationItem.position)
                     .where(SqlConversationItem.id == before)
                     .scalar_subquery()
                 )
-                stmt = stmt.where(SqlConversationItem.position < sub)
-            stmt = stmt.order_by(SqlConversationItem.position.asc()).limit(limit + 1)
+                # "before" = opposite of sort direction
+                stmt = stmt.where(
+                    SqlConversationItem.position < sub
+                    if is_asc
+                    else SqlConversationItem.position > sub
+                )
+            stmt = stmt.order_by(sort_fn(SqlConversationItem.position)).limit(limit + 1)
             rows = list(session.execute(stmt).scalars().all())
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
             items = [_to_item(r) for r in rows]
-            if sort_fn is desc:
-                items.reverse()
             return PagedList(
                 data=items,
                 first_id=items[0].id if items else None,
@@ -223,9 +230,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         order: str = "desc",
     ) -> PagedList[Conversation]:
         with self._session() as session:
-            sort_fn = desc if order == "desc" else asc
-            # Always query in desc order for consistent cursor semantics,
-            # then reverse the results if the caller requested asc.
+            is_desc = order == "desc"
+            sort_fn = desc if is_desc else asc
             stmt = select(SqlConversation)
             if after:
                 sub = (
@@ -233,41 +239,38 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .where(SqlConversation.id == after)
                     .scalar_subquery()
                 )
-                stmt = stmt.where(
-                    or_(
-                        SqlConversation.created_at < sub,
-                        and_(
-                            SqlConversation.created_at == sub,
-                            SqlConversation.id < after,
-                        ),
-                    )
+                # "after" = further in the sort direction:
+                # desc → smaller created_at, asc → larger created_at
+                ts_cmp = (
+                    SqlConversation.created_at < sub
+                    if is_desc
+                    else SqlConversation.created_at > sub
                 )
+                id_cmp = SqlConversation.id < after if is_desc else SqlConversation.id > after
+                stmt = stmt.where(or_(ts_cmp, and_(SqlConversation.created_at == sub, id_cmp)))
             if before:
                 sub = (
                     select(SqlConversation.created_at)
                     .where(SqlConversation.id == before)
                     .scalar_subquery()
                 )
-                stmt = stmt.where(
-                    or_(
-                        SqlConversation.created_at > sub,
-                        and_(
-                            SqlConversation.created_at == sub,
-                            SqlConversation.id > before,
-                        ),
-                    )
+                # "before" = opposite of sort direction
+                ts_cmp = (
+                    SqlConversation.created_at > sub
+                    if is_desc
+                    else SqlConversation.created_at < sub
                 )
+                id_cmp = SqlConversation.id > before if is_desc else SqlConversation.id < before
+                stmt = stmt.where(or_(ts_cmp, and_(SqlConversation.created_at == sub, id_cmp)))
             stmt = stmt.order_by(
-                SqlConversation.created_at.desc(),
-                SqlConversation.id.desc(),
+                sort_fn(SqlConversation.created_at),
+                sort_fn(SqlConversation.id),
             ).limit(limit + 1)
             rows = list(session.execute(stmt).scalars().all())
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
             convs = [_to_conversation(r) for r in rows]
-            if sort_fn is asc:
-                convs.reverse()
             return PagedList(
                 data=convs,
                 first_id=convs[0].id if convs else None,

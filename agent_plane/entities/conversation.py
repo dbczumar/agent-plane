@@ -26,7 +26,8 @@ class MessageData(BaseModel):
     """Data for a message item (user or assistant)."""
 
     role: Literal["user", "assistant"]
-    content: list[Any]
+    # Heterogeneous content blocks (input_text, output_text, input_image, etc.)
+    content: list[dict[str, Any]]
     agent: str | None = Field(default=None, serialization_alias="model")
 
     @model_validator(mode="after")
@@ -57,8 +58,10 @@ class ReasoningData(BaseModel):
     """Data for a reasoning item."""
 
     agent: str = Field(serialization_alias="model")
-    summary: list[Any]
-    content: list[Any] | None = None
+    # Summary text blocks, e.g. [{"type": "summary_text", "text": "..."}]
+    summary: list[dict[str, str]]
+    # Raw reasoning content blocks; nullable (may be redacted).
+    content: list[dict[str, str]] | None = None
     encrypted_content: str | None = None
 
 

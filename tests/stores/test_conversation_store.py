@@ -17,7 +17,6 @@ from agent_plane.stores.conversation_store.sqlalchemy_store import (
 )
 from agent_plane.stores.task_store.sqlalchemy_store import SqlAlchemyTaskStore
 
-
 # ── CRUD ──────────────────────────────────────────────
 
 
@@ -54,9 +53,7 @@ def test_append_and_list_items(conversation_store: SqlAlchemyConversationStore) 
             NewConversationItem(
                 type="message",
                 response_id="resp_001",
-                data=MessageData(
-                    role="user", content=[{"type": "input_text", "text": "Hello"}]
-                ),
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "Hello"}]),
             ),
             NewConversationItem(
                 type="message",
@@ -139,9 +136,7 @@ def test_position_ordering(conversation_store: SqlAlchemyConversationStore) -> N
             NewConversationItem(
                 type="message",
                 response_id="resp_a",
-                data=MessageData(
-                    role="user", content=[{"type": "input_text", "text": "First"}]
-                ),
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "First"}]),
             ),
         ],
     )
@@ -151,9 +146,7 @@ def test_position_ordering(conversation_store: SqlAlchemyConversationStore) -> N
             NewConversationItem(
                 type="message",
                 response_id="resp_b",
-                data=MessageData(
-                    role="user", content=[{"type": "input_text", "text": "Second"}]
-                ),
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "Second"}]),
             ),
         ],
     )
@@ -199,9 +192,7 @@ def test_list_items_desc_order(
     _make_5_items(conversation_store, conv.id)
     page_asc = conversation_store.list_items(conv.id, order="asc")
     page_desc = conversation_store.list_items(conv.id, order="desc")
-    assert [it.id for it in page_asc.data] == list(
-        reversed([it.id for it in page_desc.data])
-    )
+    assert [it.id for it in page_asc.data] == list(reversed([it.id for it in page_desc.data]))
 
 
 def test_list_items_desc_with_after_cursor(
@@ -216,9 +207,7 @@ def test_list_items_desc_with_after_cursor(
     assert page1.data[1].id == items[3].id
     assert page1.has_more is True
 
-    page2 = conversation_store.list_items(
-        conv.id, limit=2, order="desc", after=page1.last_id
-    )
+    page2 = conversation_store.list_items(conv.id, limit=2, order="desc", after=page1.last_id)
     assert page2.data[0].id == items[2].id
     assert page2.data[1].id == items[1].id
 
@@ -244,9 +233,7 @@ def test_get_conversation_id(conversation_store: SqlAlchemyConversationStore) ->
             NewConversationItem(
                 type="message",
                 response_id="resp_lookup",
-                data=MessageData(
-                    role="user", content=[{"type": "input_text", "text": "test"}]
-                ),
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "test"}]),
             ),
         ],
     )
@@ -492,9 +479,7 @@ def test_list_conversations_order_asc(
         conversation_store.create_conversation()
     page_desc = conversation_store.list_conversations(order="desc")
     page_asc = conversation_store.list_conversations(order="asc")
-    assert [c.id for c in page_asc.data] == list(
-        reversed([c.id for c in page_desc.data])
-    )
+    assert [c.id for c in page_asc.data] == list(reversed([c.id for c in page_desc.data]))
 
 
 def test_list_conversations_asc_with_after_cursor(
