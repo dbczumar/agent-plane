@@ -44,9 +44,6 @@ class FileObject(BaseModel):
     filename: str
     bytes: int
     created_at: int
-    status: str = "processed"
-    status_details: str | None = None
-    expires_at: int | None = None
 
 
 class FileDeleted(BaseModel):
@@ -61,6 +58,7 @@ class FileDeleted(BaseModel):
 class ConversationObject(BaseModel):
     id: str
     object: str = "conversation"
+    title: str | None = None
     created_at: int
 
 

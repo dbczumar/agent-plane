@@ -3,7 +3,7 @@
 Five tables in the default schema. DBOS manages its own tables (workflow_status,
 operation_outputs, streams, etc.) in a separate `dbos` schema within the same database.
 
-Tasks and items MUST share the same database — the steering handshake
+Tasks and conversation_items MUST share the same database — the steering handshake
 (try_deliver + close_inbox) requires single-transaction atomicity.
 
 Initial setup uses `Base.metadata.create_all(engine)`. No Alembic until the
@@ -82,7 +82,7 @@ Responses. `task_id` = `response_id` = DBOS `workflow_uuid`.
 
 ---
 
-## items
+## conversation_items
 
 Conversation items — messages, function calls, function call outputs, reasoning, etc.
 Single table with a `type` discriminator and a JSON `data` blob for type-specific fields.
@@ -99,7 +99,7 @@ Single table with a `type` discriminator and a JSON `data` blob for type-specifi
 | data | Text NOT NULL | JSON blob — type-specific fields (see below) |
 | created_at | Integer NOT NULL | |
 
-**Indexes:** `ix_items_session_id_position` (composite), `ix_items_response_id`
+**Indexes:** `ix_conversation_items_session_id_position` (composite), `ix_conversation_items_response_id`
 
 ### data column by type
 
@@ -115,17 +115,17 @@ Single table with a `type` discriminator and a JSON `data` blob for type-specifi
 
 ## Design Decisions
 
-### No foreign key constraints between tasks/sessions/items
+### No foreign key constraints between tasks/sessions/conversation_items
 
 Deletion semantics are too nuanced for FKs:
-- Items must survive task deletion (rules out ON DELETE CASCADE from items to tasks)
+- Items must survive task deletion (rules out ON DELETE CASCADE from conversation_items to tasks)
 - Mid-chain response deletion leaves dangling `previous_response_id` (explicitly allowed)
 - Conversation deletion cascades in application-controlled order (cancel tasks first,
-  then delete tasks, items, session)
+  then delete tasks, conversation_items, session)
 
 Referential integrity is maintained at the application level.
 
-### Single items table with JSON data column
+### Single conversation_items table with JSON data column
 
 We never filter by item-internal fields — all queries are by session_id, response_id,
 or position. A discriminated union via `type` + JSON is simpler than separate tables per
@@ -144,7 +144,7 @@ Portable across SQLite and PostgreSQL. Application-level json.loads/json.dumps.
 SQLite stores Boolean as INTEGER internally, so Integer(0/1) avoids ORM coercion
 differences.
 
-### model denormalized on items
+### model denormalized on conversation_items
 
 Tasks can be deleted but items must retain model for the conversation items API.
 
@@ -161,8 +161,8 @@ Tasks can be deleted but items must retain model for the conversation items API.
 | `get(task_id)` | SELECT FROM tasks WHERE id = ? |
 | `wait(task_id)` | DBOS.retrieve_workflow().get_result(), then SELECT task |
 | `stream(task_id)` | DBOS.read_stream(task_id, "output") |
-| `try_deliver(task_id, session_id, msg)` | **Txn:** SELECT tasks.inbox_closed FOR UPDATE; if open → INSERT INTO items, return True; if closed → return False |
-| `close_inbox(task_id, session_id, last_seen)` | **Txn:** SELECT items WHERE session_id = ? AND position > ?; if found → return them; if not → UPDATE tasks SET inbox_closed = 1, return [] |
+| `try_deliver(task_id, session_id, msg)` | **Txn:** SELECT tasks.inbox_closed FOR UPDATE; if open → INSERT INTO conversation_items, return True; if closed → return False |
+| `close_inbox(task_id, session_id, last_seen)` | **Txn:** SELECT conversation_items WHERE session_id = ? AND position > ?; if found → return them; if not → UPDATE tasks SET inbox_closed = 1, return [] |
 | `cancel(task_id)` | DBOS.cancel_workflow(), then UPDATE tasks SET status = 'cancelled' |
 | `delete(task_id)` | Cancel if in-progress, then DELETE FROM tasks WHERE id = ? (items untouched) |
 
@@ -171,17 +171,17 @@ Tasks can be deleted but items must retain model for the conversation items API.
 | Method | DB Operation |
 |---|---|
 | `create_session(metadata)` | INSERT INTO sessions |
-| `get_session_id(response_id)` | SELECT session_id FROM items WHERE response_id = ? LIMIT 1 |
-| `get_latest_response_id(session_id)` | SELECT response_id FROM items WHERE session_id = ? ORDER BY position DESC LIMIT 1 |
-| `search_messages(session_id, after, ...)` | SELECT FROM items WHERE session_id = ? [AND position > ?] ORDER BY position LIMIT ? |
-| `append(session_id, messages)` | **Txn:** SELECT MAX(position); INSERT items with incrementing position |
+| `get_session_id(response_id)` | SELECT session_id FROM conversation_items WHERE response_id = ? LIMIT 1 |
+| `get_latest_response_id(session_id)` | SELECT response_id FROM conversation_items WHERE session_id = ? ORDER BY position DESC LIMIT 1 |
+| `search_messages(session_id, after, ...)` | SELECT FROM conversation_items WHERE session_id = ? [AND position > ?] ORDER BY position LIMIT ? |
+| `append(session_id, messages)` | **Txn:** SELECT MAX(position); INSERT conversation_items with incrementing position |
 
 ### API-Level (not in runtime stores)
 
 | Operation | DB Operation |
 |---|---|
 | List conversations | SELECT FROM sessions ORDER BY created_at with cursor pagination |
-| Delete conversation | Cancel in-flight tasks, DELETE tasks, DELETE items, DELETE session |
+| Delete conversation | Cancel in-flight tasks, DELETE tasks, DELETE conversation_items, DELETE session |
 | List agents | SELECT FROM agents ORDER BY created_at with cursor pagination |
 | Delete agent | Cancel in-flight tasks (by model), DELETE FROM agents |
 | CRUD files | TBD — may be backed by artifact store instead of DB |
@@ -191,7 +191,7 @@ Tasks can be deleted but items must retain model for the conversation items API.
 ## Cursor-Based Pagination
 
 All list endpoints use the same pattern. For a sort column (created_at for
-agents/files/sessions, position for items):
+agents/files/sessions, position for conversation_items):
 
 ```
 after cursor:  WHERE sort_col > (SELECT sort_col FROM table WHERE id = :after_id)

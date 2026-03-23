@@ -120,17 +120,13 @@ Deleted via `artifact_store.delete(agent_id)` in `delete_agent`.
 and enforce tarball structure requirements (e.g. required files like
 `AGENTS.md`, safe extraction, size limits).
 
-### 9. Conversation delete: cancel in-flight responses
+### ~~9. Conversation delete: cancel in-flight responses~~ — FIXED
 
-**Spec**: API.md line 334 — "Cancels any in-flight responses in the
-conversation before deleting."
-
-**Status**: The `session_store.delete_session()` docstring says it "may
-need to cancel in-flight responses." This is delegated to the store
-implementation. The route layer is correct — it awaits the async
-`delete_session()` call. The store implementation must handle cancellation
-internally (likely by querying task_store for in-flight tasks in the
-session and cancelling them before deleting).
+Handled in the route layer: `delete_conversation` now calls
+`task_store.cancel_by_session(conversation_id)` before
+`session_store.delete_session()`. Added `cancel_by_session(session_id)`
+to `TaskStore`. `task_store` is now injected into
+`create_conversations_router()`.
 
 ---
 

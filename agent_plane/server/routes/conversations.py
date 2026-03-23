@@ -3,7 +3,7 @@
 from fastapi import APIRouter, HTTPException, Query
 
 from agent_plane.runtime.models import ConversationItem, Session
-from agent_plane.stores import SessionStore
+from agent_plane.stores import SessionStore, TaskStore
 from agent_plane.server.models import (
     ConversationDeleted,
     ConversationObject,
@@ -38,10 +38,11 @@ def _to_api_item(item: ConversationItem) -> dict:
 
 def create_conversations_router(
     session_store: SessionStore,
+    task_store: TaskStore,
 ) -> APIRouter:
     """
-    Factory that builds the conversations router. The session store
-    is closed over -- no dependency injection.
+    Factory that builds the conversations router. Stores are closed
+    over -- no dependency injection.
     """
     router = APIRouter()
 
@@ -115,6 +116,12 @@ def create_conversations_router(
 
     @router.delete("/conversations/{conversation_id}")
     async def delete_conversation(conversation_id: str):
+        session = session_store.get_session(conversation_id)
+        if session is None:
+            raise HTTPException(
+                status_code=404, detail="Conversation not found"
+            )
+        await task_store.cancel_by_session(conversation_id)
         deleted = await session_store.delete_session(conversation_id)
         if not deleted:
             raise HTTPException(

@@ -151,3 +151,14 @@ class TaskStore(ABC):
         each cancellation may block while finally blocks run.
         """
         ...
+
+    @abstractmethod
+    async def cancel_by_session(self, session_id: str) -> list[Task]:
+        """
+        Cancel all in-flight tasks (queued or in_progress) in the given
+        session. Returns the list of cancelled tasks. Used when a
+        conversation is deleted to stop running responses before
+        removing session data. Async because each cancellation may
+        block while finally blocks run.
+        """
+        ...

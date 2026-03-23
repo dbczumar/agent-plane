@@ -37,7 +37,7 @@ def create_app(
         tags=["responses"],
     )
     app.include_router(
-        create_conversations_router(session_store),
+        create_conversations_router(session_store, task_store),
         prefix="/v1",
         tags=["conversations"],
     )
