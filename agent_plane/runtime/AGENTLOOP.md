@@ -400,3 +400,9 @@ mcp>=1.0
   that holds stores, AgentCache, and configuration. Would make the runtime usable outside the
   server (e.g. CLI-driven execution, testing, embedded use in other Python programs) without
   relying on module-level state set during server startup.
+- Shared `ToolManager` — replace per-workflow tool managers with a centralized `ToolManager` that
+  holds long-lived MCP connections and is shared across concurrent workflow executions. Would
+  eliminate per-request MCP startup cost and the `ContextVar` plumbing. Requires thread-safe
+  connection dispatch, per-agent connection sets, lifecycle management (reconnect on failure,
+  teardown on agent eviction), and careful isolation so one workflow's tool call doesn't
+  interfere with another's.
