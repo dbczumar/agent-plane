@@ -1,6 +1,6 @@
 # Database Schema Design
 
-Four tables in the default schema. DBOS manages its own tables (workflow_status,
+Five tables in the default schema. DBOS manages its own tables (workflow_status,
 operation_outputs, streams, etc.) in a separate `dbos` schema within the same database.
 
 Tasks and items MUST share the same database — the steering handshake
@@ -22,6 +22,21 @@ schema stabilizes.
 | created_at | Integer NOT NULL | Unix epoch seconds |
 
 **Indexes:** `uq_agents_name` (unique on name), `ix_agents_created_at`
+
+---
+
+## files
+
+| Column | Type | Notes |
+|---|---|---|
+| id | String(64) PK | "file_" + uuid4().hex |
+| filename | String(512) NOT NULL | Original filename |
+| bytes | Integer NOT NULL | File size |
+| content_location | Text NOT NULL | Path to binary on disk / artifact store |
+| content_type | String(256) | MIME type, nullable |
+| created_at | Integer NOT NULL | |
+
+**Indexes:** `ix_files_created_at`
 
 ---
 

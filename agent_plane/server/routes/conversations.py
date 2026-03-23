@@ -3,7 +3,7 @@
 from fastapi import APIRouter, HTTPException, Query
 
 from agent_plane.runtime.models import ConversationItem, Session
-from agent_plane.runtime.stores import SessionStore
+from agent_plane.stores import SessionStore
 from agent_plane.server.models import (
     ConversationDeleted,
     ConversationObject,

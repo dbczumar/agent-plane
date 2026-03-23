@@ -135,10 +135,7 @@ Parts:
   "object": "file",
   "filename": "report.pdf",
   "bytes": 214961,
-  "created_at": 1774118382,
-  "status": "processed",
-  "status_details": null,
-  "expires_at": null
+  "created_at": 1774118382
 }
 
 400 Bad Request — missing file

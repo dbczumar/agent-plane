@@ -5,7 +5,7 @@ import uuid
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 
-from agent_plane.runtime.stores import ArtifactStore, TaskStore
+from agent_plane.stores import ArtifactStore, TaskStore
 from agent_plane.server.models import AgentDeleted, AgentObject, PaginatedList
 
 

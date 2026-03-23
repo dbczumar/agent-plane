@@ -7,7 +7,7 @@ import uuid
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from starlette.responses import Response
 
-from agent_plane.runtime.stores import ArtifactStore
+from agent_plane.stores import ArtifactStore
 from agent_plane.server.models import FileDeleted, FileObject, PaginatedList
 
 

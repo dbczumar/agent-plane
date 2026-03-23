@@ -12,7 +12,7 @@ from agent_plane.runtime.models import (
     NewConversationItem,
     Task,
 )
-from agent_plane.runtime.stores import SessionStore, TaskStore
+from agent_plane.stores import SessionStore, TaskStore
 from agent_plane.server.models import (
     AgentObject,
     ConversationRef,

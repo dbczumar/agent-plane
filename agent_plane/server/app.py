@@ -2,7 +2,7 @@
 
 from fastapi import FastAPI
 
-from agent_plane.runtime.stores import ArtifactStore, SessionStore, TaskStore
+from agent_plane.stores import ArtifactStore, SessionStore, TaskStore
 from agent_plane.server.routes.agents import create_agents_router
 from agent_plane.server.routes.conversations import create_conversations_router
 from agent_plane.server.routes.files import create_files_router
