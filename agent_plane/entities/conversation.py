@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -15,7 +15,6 @@ class Conversation:
     """A conversation grouping related turns."""
 
     id: str
-    metadata: dict[str, str] = field(default_factory=dict)
     created_at: int = 0
     title: str | None = None
 
