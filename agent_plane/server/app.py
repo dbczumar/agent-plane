@@ -2,14 +2,22 @@
 
 from fastapi import FastAPI
 
-from agent_plane.stores import ArtifactStore, ConversationStore, TaskStore
 from agent_plane.server.routes.agents import create_agents_router
 from agent_plane.server.routes.conversations import create_conversations_router
 from agent_plane.server.routes.files import create_files_router
 from agent_plane.server.routes.responses import create_responses_router
+from agent_plane.stores import (
+    AgentStore,
+    ArtifactStore,
+    ConversationStore,
+    FileStore,
+    TaskStore,
+)
 
 
 def create_app(
+    agent_store: AgentStore,
+    file_store: FileStore,
     task_store: TaskStore,
     conversation_store: ConversationStore,
     artifact_store: ArtifactStore,
@@ -20,19 +28,13 @@ def create_app(
     """
     app = FastAPI(title="Agent Plane Server")
 
-    agents_router = create_agents_router(task_store, artifact_store)
     app.include_router(
-        agents_router,
+        create_agents_router(agent_store, task_store, artifact_store),
         prefix="/api",
         tags=["agents"],
     )
-
     app.include_router(
-        create_responses_router(
-            task_store,
-            conversation_store,
-            get_agent_by_name=agents_router.get_agent_by_name,
-        ),
+        create_responses_router(task_store, conversation_store, agent_store),
         prefix="/v1",
         tags=["responses"],
     )
@@ -42,7 +44,7 @@ def create_app(
         tags=["conversations"],
     )
     app.include_router(
-        create_files_router(artifact_store),
+        create_files_router(file_store, artifact_store),
         prefix="/v1",
         tags=["files"],
     )

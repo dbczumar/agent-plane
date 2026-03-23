@@ -195,7 +195,7 @@ All 16 fields from the spec are present in `ResponseObject`.
 49. **Usage populated on completed responses**
     ❌ **FAIL**: The API.md spec (lines 512-517) shows that completed responses include a
     `usage` object with `input_tokens`, `output_tokens`, `output_tokens_details`, and
-    `total_tokens`. The Task dataclass (`runtime/models.py`) has no `usage` field at all.
+    `total_tokens`. The Task dataclass (`agent_plane/entities/task.py`) has no `usage` field at all.
     `_build_response_object()` never sets `usage`, so it always defaults to `None`. The
     spec shows `"usage": null` only for the background/queued response (line 545) but
     shows a populated usage object for completed responses (line 512). Usage is always

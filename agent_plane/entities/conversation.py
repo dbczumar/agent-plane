@@ -1,36 +1,24 @@
-"""Data models for the runtime layer."""
+"""Conversation entities — conversation, items, and item data types."""
+
+from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Generic, Literal, TypeVar, Union
+from typing import Any, Literal, Union
 
 from pydantic import BaseModel, Field, model_validator
 
-T = TypeVar("T")
 
-
-# ── Task ───────────────────────────────────────────────
+# ── Conversation ──────────────────────────────────────
 
 
 @dataclass
-class Task:
-    """A task representing a single response execution."""
+class Conversation:
+    """A conversation grouping related turns."""
 
-    task_id: str
-    conversation_id: str
-    status: str  # "queued", "in_progress", "completed", "failed", "incomplete", "cancelled"
-    agent_id: str
-    agent_name: str
-    created_at: int
-    completed_at: int | None = None
-    output: list = field(default_factory=list)
-    inbox_closed: bool = False
-    instructions: str | None = None
-    metadata: dict = field(default_factory=dict)
-    background: bool = False
-    previous_response_id: str | None = None
-    usage: dict | None = None
-    error: dict | None = None
-    incomplete_details: dict | None = None
+    id: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: int = 0
+    title: str | None = None
 
 
 # ── Conversation item data types ───────────────────────
@@ -40,13 +28,13 @@ class MessageData(BaseModel):
     """Data for a message item (user or assistant)."""
 
     role: Literal["user", "assistant"]
-    content: list
+    content: list[Any]
     agent: str | None = Field(
         default=None, serialization_alias="model"
     )
 
     @model_validator(mode="after")
-    def check_agent_for_assistant(self):
+    def check_agent_for_assistant(self) -> MessageData:
         """Assistant messages require agent; user messages must not."""
         if self.role == "assistant" and self.agent is None:
             raise ValueError(
@@ -75,8 +63,8 @@ class ReasoningData(BaseModel):
     """Data for a reasoning item."""
 
     agent: str = Field(serialization_alias="model")
-    summary: list
-    content: list | None = None
+    summary: list[Any]
+    content: list[Any] | None = None
     encrypted_content: str | None = None
 
 
@@ -95,7 +83,7 @@ ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
 }
 
 
-def parse_item_data(item_type: str, raw: dict) -> ItemData:
+def parse_item_data(item_type: str, raw: dict[str, Any]) -> ItemData:
     """
     Parse a raw dict into the appropriate ItemData model.
     Used by store implementations when deserializing from DB.
@@ -103,7 +91,7 @@ def parse_item_data(item_type: str, raw: dict) -> ItemData:
     cls = ITEM_TYPE_TO_DATA_CLS.get(item_type)
     if cls is None:
         raise ValueError(f"unknown item type: {item_type!r}")
-    return cls(**raw)
+    return cls(**raw)  # type: ignore[return-value]
 
 
 def _validate_type_matches_data(
@@ -131,7 +119,7 @@ class NewConversationItem(BaseModel):
     data: ItemData
 
     @model_validator(mode="after")
-    def check_type_matches_data(self):
+    def check_type_matches_data(self) -> NewConversationItem:
         """Ensure `type` field is consistent with `data` model."""
         _validate_type_matches_data(self.type, self.data)
         return self
@@ -148,30 +136,7 @@ class ConversationItem(BaseModel):
     data: ItemData
 
     @model_validator(mode="after")
-    def check_type_matches_data(self):
+    def check_type_matches_data(self) -> ConversationItem:
         """Ensure `type` field is consistent with `data` model."""
         _validate_type_matches_data(self.type, self.data)
         return self
-
-
-# ── Conversation ──────────────────────────────────────
-
-
-@dataclass
-class Conversation:
-    """A conversation grouping related turns."""
-
-    id: str
-    metadata: dict = field(default_factory=dict)
-    created_at: int = 0
-
-
-# ── Pagination ─────────────────────────────────────────
-
-
-@dataclass
-class PagedList(Generic[T]):
-    """A page of results with an optional cursor for the next page."""
-
-    data: list[T] = field(default_factory=list)
-    next_page_token: str | None = None

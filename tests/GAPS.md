@@ -45,7 +45,7 @@ comply with the spec.
 
 ### ~~1. Usage always null (audit item 49)~~ — FIXED
 
-Added `usage: dict | None = None` to `Task` (`runtime/models.py`).
+Added `usage: dict | None = None` to `Task` (`agent_plane/entities/task.py`).
 `_build_response_object()` now maps `task.usage` to a `Usage` model
 via `Usage(**task.usage)`. Runtime must populate `task.usage` on
 completion with `{input_tokens, output_tokens, output_tokens_details,
@@ -74,7 +74,7 @@ error when the caller explicitly passes `conversation`.
 ### ~~4. Non-message item types in conversation items~~ — FIXED
 
 Both resolved by replacing `NewMessage`/`Message` with a generic
-`NewConversationItem`/`ConversationItem` model (`runtime/models.py`).
+`NewConversationItem`/`ConversationItem` model (`agent_plane/entities/conversation.py`).
 Items have `type` ("message", "function_call", etc.) and a `data` dict
 for type-specific fields. The `model` field lives in `data` only for
 model-produced items (assistant messages, function calls, reasoning).
@@ -127,6 +127,42 @@ Handled in the route layer: `delete_conversation` uses
 tasks and cancels each via `task_store.cancel()` before calling
 `conversation_store.delete_conversation()`. `task_store` is now injected into
 `create_conversations_router()`.
+
+### ~~12. PATCH /v1/conversations/{id} missing~~ — FIXED
+
+Added `title: str | None = None` to `Conversation` dataclass. Added
+`update_conversation(conversation_id, **kwargs)` to `ConversationStore`.
+Implemented `PATCH /conversations/{conversation_id}` route.
+`_to_conversation_object()` now populates `title` from the conversation.
+
+### ~~13. Metadata on responses~~ — DEFERRED
+
+Moved to "Not Yet" in API.md. Removed `metadata` from
+`CreateResponseRequest`, `ResponseObject`, `Task`, and
+`TaskStore.create()`. OpenAI supports this but it's not required.
+
+### ~~14. Cancel already-terminal response returns 400~~ — FIXED
+
+Cancel endpoint now returns 200 with the current response state for
+already-terminal responses (idempotent). Matches API.md which only
+documents 200 and 404 for the cancel endpoint.
+
+### ~~15. Hard-coded "completed" status on conversation items~~ — FIXED
+
+`_to_api_item()` now uses `item.status` instead of hard-coded
+`"completed"`, reflecting the actual persisted status.
+
+### ~~16. RUNTIME.md is stale~~ — FIXED
+
+Updated RUNTIME.md to match current code: TaskStore.create() signature,
+full Task dataclass fields, ConversationItem.status, Conversation.title,
+ConversationStore methods, list_tasks, removed AgentSpec references.
+
+### 17. `store` field on ResponseObject always True
+
+`ResponseObject.store` defaults to `True` and is never read from the
+Task. Minor gap since we reject `store: false` on requests anyway.
+Could be addressed if we ever support ephemeral responses.
 
 ---
 

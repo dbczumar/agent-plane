@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 
-from agent_plane.runtime.models import (
+from agent_plane.entities import (
     Conversation,
     ConversationItem,
     NewConversationItem,
@@ -12,20 +12,15 @@ from agent_plane.runtime.models import (
 
 class ConversationStore(ABC):
     @abstractmethod
-    def create_conversation(
-        self, metadata: dict | None = None
-    ) -> Conversation:
+    def create_conversation(self) -> Conversation:
         """
         Create a new conversation. Generates a unique conversation_id.
-        Metadata is optional caller-attached key-value pairs (e.g. user_id,
-        title). Returns the Conversation.
+        Returns the Conversation.
         """
         ...
 
     @abstractmethod
-    def get_conversation(
-        self, conversation_id: str
-    ) -> Conversation | None:
+    def get_conversation(self, conversation_id: str) -> Conversation | None:
         """Return the conversation, or None if it does not exist."""
         ...
 
@@ -41,9 +36,7 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def get_latest_response_id(
-        self, conversation_id: str
-    ) -> str | None:
+    def get_latest_response_id(self, conversation_id: str) -> str | None:
         """
         Return the response_id of the most recent item in the
         conversation, or None if the conversation has no items.
@@ -95,9 +88,18 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    async def delete_conversation(
-        self, conversation_id: str
-    ) -> bool:
+    def update_conversation(
+        self, conversation_id: str, **kwargs: str | None
+    ) -> Conversation | None:
+        """
+        Update mutable fields on a conversation. Currently only
+        `title` is updatable. Returns the updated Conversation, or
+        None if the conversation does not exist.
+        """
+        ...
+
+    @abstractmethod
+    async def delete_conversation(self, conversation_id: str) -> bool:
         """
         Delete a conversation and all its items. Returns True if the
         conversation existed, False otherwise. Async because it may

@@ -56,26 +56,28 @@ schema stabilizes.
 
 Responses. `task_id` = `response_id` = DBOS `workflow_uuid`.
 
+This table stores only relationship/identity columns and the steering handshake flag.
+All execution state — status, output, error, usage, instructions, background, etc. —
+lives in DBOS (workflow inputs for request params, workflow result for outcomes).
+`TaskStore.get()` assembles the full `Task` entity from both sources. If we later
+need to query by any DBOS-managed field (e.g. filter tasks by status), we can
+promote it to a column here.
+
 | Column | Type | Notes |
 |---|---|---|
-| id | String(64) PK | "resp_" + uuid4().hex |
-| conversation_id | String(64) NOT NULL | No FK — app-managed integrity |
+| id | String(64) PK | "resp_" + uuid4().hex (= DBOS workflow_uuid) |
+| agent_id | String(64) NOT NULL | FK → agents.id |
+| conversation_id | String(64) NOT NULL | FK → conversations.id |
 | previous_response_id | String(64) | No FK — allows dangling after mid-chain delete |
 | created_at | Integer NOT NULL | |
-| completed_at | Integer | nullable |
-| status | String(32) NOT NULL | Default "queued" |
-| output | Text NOT NULL | Default "[]" (JSON array) |
 | inbox_closed | Integer NOT NULL | Default 0 (0=open, 1=closed) |
-| error | Text | JSON {code, message}, nullable |
-| incomplete_details | Text | JSON {reason}, nullable |
-| usage | Text | JSON {input_tokens, output_tokens, ...}, nullable |
-| model | String(256) NOT NULL | Agent name |
-| instructions | Text | nullable |
-| metadata | Text NOT NULL | Default "{}" (JSON object, max 16 keys) |
-| background | Integer NOT NULL | Default 0 (0=false, 1=true) |
-| context_management | Text | JSON array, nullable |
 
-**Indexes:** `ix_tasks_conversation_id`, `ix_tasks_model` (for agent deletion cascade),
+**Stored in DBOS** (workflow inputs): `instructions`, `background`
+
+**Stored in DBOS** (workflow result): `status`, `output`, `completed_at`, `error`,
+`incomplete_details`, `usage`
+
+**Indexes:** `ix_tasks_conversation_id`, `ix_tasks_agent_id` (for agent deletion cascade),
 `ix_tasks_created_at`
 
 ---
@@ -88,13 +90,14 @@ Single table with a `type` discriminator and a JSON `data` blob for type-specifi
 | Column | Type | Notes |
 |---|---|---|
 | id | String(64) PK | Prefixed by type: msg_, fc_, fco_, rs_ |
-| conversation_id | String(64) NOT NULL | No FK |
+| conversation_id | String(64) NOT NULL | FK → conversations.id |
 | response_id | String(64) NOT NULL | References tasks.id; no FK — must survive task deletion |
 | created_at | Integer NOT NULL | |
 | status | String(32) NOT NULL | Default "completed" |
 | position | Integer NOT NULL | Ordering within conversation |
 | type | String(32) NOT NULL | message, function_call, function_call_output, reasoning |
 | data | Text NOT NULL | JSON blob — type-specific fields (see below) |
+| search_text | Text NOT NULL | Extracted plain text for full-text search (see below) |
 
 **Indexes:** `ix_conversation_items_conversation_id_position` (composite), `ix_conversation_items_response_id`
 
@@ -112,15 +115,19 @@ Single table with a `type` discriminator and a JSON `data` blob for type-specifi
 
 ## Design Decisions
 
-### No foreign key constraints between tasks/conversations/conversation_items
+### Foreign key strategy
 
-Deletion semantics are too nuanced for FKs:
-- Items must survive task deletion (rules out ON DELETE CASCADE from conversation_items to tasks)
-- Mid-chain response deletion leaves dangling `previous_response_id` (explicitly allowed)
-- Conversation deletion cascades in application-controlled order (cancel tasks first,
-  then delete tasks, conversation_items, conversation)
+`conversation_id` on both tasks and conversation_items has a FK to `conversations.id`.
+This is safe because the deletion order (tasks → conversation_items → conversation)
+always removes children before the parent. The FK acts as a safety net against
+orphaned rows.
 
-Referential integrity is maintained at the application level.
+`tasks.agent_id → agents.id` — FK. Agent deletion handler cancels tasks,
+deletes task records, then deletes the agent row.
+
+No FK for these relationships:
+- `conversation_items.response_id → tasks.id` — items must survive task deletion
+- `tasks.previous_response_id → tasks.id` — dangling pointers are allowed after mid-chain delete
 
 ### Single conversation_items table with JSON data column
 
@@ -149,11 +156,92 @@ Portable across SQLite and PostgreSQL. Application-level json.loads/json.dumps.
 SQLite stores Boolean as INTEGER internally, so Integer(0/1) avoids ORM coercion
 differences.
 
-### model lives in the data blob, not as a column
+### agent (model) lives in the data blob, not as a column
 
 The `agent`/`model` field is already type-specific inside the JSON `data` blob for
 item types that need it (assistant messages, function calls, reasoning). No queries
 filter conversation_items by model, so a top-level column would be redundant.
+
+### Full-text search on conversation items
+
+Search needs to work within a single conversation and across all conversations.
+The searchable content lives inside the JSON `data` blob, so we extract it into
+a dedicated `search_text` column at write time and index that column for FTS.
+
+#### search_text extraction
+
+Populated by `ConversationStore.append()` before inserting. Extraction by item type:
+
+- **message**: concatenate all `text` values from the `content` array
+  (input_text, output_text entries)
+- **function_call**: `"{name} {arguments}"` — the function name and its arguments
+- **function_call_output**: the `output` value
+- **reasoning**: concatenate all `text` values from the `summary` array
+
+This is a shared code path — both backends populate the same `search_text` column.
+
+#### Backend-specific indexing
+
+**PostgreSQL — tsvector + GIN index:**
+
+```sql
+ALTER TABLE conversation_items
+  ADD COLUMN search_vector tsvector
+  GENERATED ALWAYS AS (to_tsvector('english', search_text)) STORED;
+
+CREATE INDEX ix_conversation_items_search
+  ON conversation_items USING GIN (search_vector);
+```
+
+Queries use `tsquery`:
+```sql
+SELECT * FROM conversation_items
+WHERE conversation_id = :conv_id
+  AND search_vector @@ plainto_tsquery('english', :query)
+ORDER BY ts_rank(search_vector, plainto_tsquery('english', :query)) DESC;
+```
+
+**SQLite — FTS5 virtual table:**
+
+```sql
+CREATE VIRTUAL TABLE conversation_items_fts USING fts5(
+  search_text,
+  content='conversation_items',
+  content_rowid='rowid'
+);
+```
+
+Kept in sync via triggers on INSERT/DELETE against conversation_items.
+Queries use `MATCH`:
+```sql
+SELECT ci.* FROM conversation_items ci
+JOIN conversation_items_fts fts ON ci.rowid = fts.rowid
+WHERE ci.conversation_id = :conv_id
+  AND fts.search_text MATCH :query
+ORDER BY fts.rank;
+```
+
+#### Store layer abstraction
+
+`ConversationStore` exposes a single `search()` method:
+
+```python
+def search(
+    self,
+    query: str,
+    conversation_id: str | None = None,
+    limit: int = 20,
+) -> list[ConversationItem]:
+```
+
+The SQLAlchemy store implementation detects the backend at init time
+(`engine.dialect.name`) and dispatches to the appropriate query. The caller
+never knows which FTS engine is running underneath.
+
+On Postgres, the `search_vector` generated column is automatic — no extra
+write-time work beyond populating `search_text`. On SQLite, the FTS5 virtual
+table and its sync triggers are created during `Base.metadata.create_all()` via
+an `after_create` DDL event listener.
 
 ---
 
@@ -165,23 +253,25 @@ filter conversation_items by model, so a top-level column would be redundant.
 |---|---|
 | `create(spec, conversation_id, prev_id)` | INSERT INTO tasks |
 | `start(task_id)` | Launch DBOS workflow (no DB write) |
-| `get(task_id)` | SELECT FROM tasks WHERE id = ? |
-| `wait(task_id)` | DBOS.retrieve_workflow().get_result(), then SELECT task |
+| `get(task_id)` | SELECT FROM tasks WHERE id = ?, then DBOS.retrieve_workflow() for status/output/etc. |
+| `wait(task_id)` | DBOS.retrieve_workflow().get_result(), then assemble Task from DB row + workflow result |
 | `stream(task_id)` | DBOS.read_stream(task_id, "output") |
 | `try_deliver(task_id, conversation_id, msg)` | **Txn:** SELECT tasks.inbox_closed FOR UPDATE; if open → INSERT INTO conversation_items, return True; if closed → return False |
 | `close_inbox(task_id, conversation_id, last_seen)` | **Txn:** SELECT conversation_items WHERE conversation_id = ? AND position > ?; if found → return them; if not → UPDATE tasks SET inbox_closed = 1, return [] |
-| `cancel(task_id)` | DBOS.cancel_workflow(), then UPDATE tasks SET status = 'cancelled' |
+| `cancel(task_id)` | DBOS.cancel_workflow() (status lives in DBOS) |
 | `delete(task_id)` | Cancel if in-progress, then DELETE FROM tasks WHERE id = ? (items untouched) |
+| `list_tasks(conversation_id, agent_id)` | SELECT FROM tasks WHERE conversation_id = ? AND/OR agent_id = ? |
 
 ### ConversationStore
 
 | Method | DB Operation |
 |---|---|
-| `create_conversation(metadata)` | INSERT INTO conversations |
+| `create_conversation()` | INSERT INTO conversations |
 | `get_conversation_id(response_id)` | SELECT conversation_id FROM conversation_items WHERE response_id = ? LIMIT 1 |
 | `get_latest_response_id(conversation_id)` | SELECT response_id FROM conversation_items WHERE conversation_id = ? ORDER BY position DESC LIMIT 1 |
 | `search_messages(conversation_id, after, ...)` | SELECT FROM conversation_items WHERE conversation_id = ? [AND position > ?] ORDER BY position LIMIT ? |
-| `append(conversation_id, messages)` | **Txn:** SELECT MAX(position); INSERT conversation_items with incrementing position |
+| `append(conversation_id, messages)` | **Txn:** SELECT MAX(position); INSERT conversation_items (with search_text extracted from data) with incrementing position |
+| `search(query, conversation_id?, limit)` | FTS query against search_vector (Postgres) or conversation_items_fts (SQLite), optionally scoped to a conversation |
 
 ### API-Level (not in runtime stores)
 

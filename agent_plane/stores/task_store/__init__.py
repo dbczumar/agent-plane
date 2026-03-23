@@ -1,9 +1,12 @@
 """Task store — manages task lifecycle and durable execution."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
+from typing import Any
 
-from agent_plane.runtime.models import (
+from agent_plane.entities import (
     ConversationItem,
     NewConversationItem,
     Task,
@@ -23,9 +26,7 @@ class TaskStore(ABC):
         self,
         conversation_id: str,
         agent_id: str,
-        agent_name: str,
         instructions: str | None = None,
-        metadata: dict | None = None,
         previous_response_id: str | None = None,
         background: bool = False,
     ) -> Task:
@@ -49,7 +50,7 @@ class TaskStore(ABC):
         ...
 
     @abstractmethod
-    async def stream(self, task_id: str) -> AsyncIterator[dict]:
+    def stream(self, task_id: str) -> AsyncIterator[dict[str, Any]]:
         """
         Yield streaming events as they are produced by the runtime. Awaits
         until the next event is available. The iterator ends when the task
@@ -148,7 +149,6 @@ class TaskStore(ABC):
         self,
         conversation_id: str | None = None,
         agent_id: str | None = None,
-        status: str | None = None,
     ) -> list[Task]:
         """
         Return tasks matching the given filters. All filters are

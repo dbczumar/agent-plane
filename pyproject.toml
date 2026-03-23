@@ -1,10 +1,24 @@
 [project]
 name = "agent-plane"
 version = "0.1.0"
-description = "MLflow AgentPlane — agent specification, runtime, and server"
+description = "MLflow AgentPlane — agent specification, runtime, server"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "fastapi",
+    "pydantic>=2.0",
+]
 
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+
+[tool.ruff]
+line-length = 99
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

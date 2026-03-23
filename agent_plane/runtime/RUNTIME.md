@@ -2,7 +2,7 @@
 
 ## Overview
 
-The runtime executes agents. Given an `AgentSpec` and user input, it runs the agent loop (prompt → LLM → tool calls → repeat) and produces output. It is DBOS-aware for durable execution — all LLM calls and tool calls are checkpointed, so execution survives crashes without re-running completed steps.
+The runtime executes agents. Given an `agent_id` and user input, it runs the agent loop (prompt → LLM → tool calls → repeat) and produces output. It is DBOS-aware for durable execution — all LLM calls and tool calls are checkpointed, so execution survives crashes without re-running completed steps.
 
 ## Public API (WIP)
 
@@ -26,13 +26,13 @@ Stores are module-level globals, set once at process startup. Workflow functions
 # runtime/_globals.py
 conversation_store: ConversationStore | None = None
 task_store: TaskStore | None = None
-memory_store: MemoryStore | None = None
+memory_store: MemoryStore | None = None  # Not yet implemented — TBD
 
 # runtime/__init__.py
 def init(
     conversation_store: ConversationStore,
     task_store: TaskStore,
-    memory_store: MemoryStore,
+    memory_store: MemoryStore,  # Not yet implemented — TBD
 ) -> None:
     """
     Initialize the runtime. Must be called once before any task execution.
@@ -48,7 +48,7 @@ The server then calls stores directly — no executor indirection:
 
 ```python
 # server handles a request (see Request Lifecycles for full flows)
-task = task_store.create(spec, conversation_id, previous_response_id="resp_abc123")
+task = task_store.create(conversation_id=conversation_id, agent_id="agent_123", previous_response_id="resp_abc123")
 conversation_store.append(conversation_id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "user", ...})])
 task_store.start(task.task_id)
 
@@ -71,9 +71,11 @@ class TaskStore(ABC):
     @abstractmethod
     def create(
         self,
-        spec: AgentSpec,
         conversation_id: str,
+        agent_id: str,
+        instructions: str | None = None,
         previous_response_id: str | None = None,
+        background: bool = False,
     ) -> Task:
         """
         Create a new task for executing an agent in the given conversation.
@@ -195,37 +197,60 @@ class TaskStore(ABC):
         """
         ...
 
+    @abstractmethod
+    def list_tasks(
+        self,
+        conversation_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> list[Task]:
+        """
+        Return tasks matching the given filters. All filters are
+        optional and combined with AND. Used by the route layer to
+        find in-flight tasks for cancellation (e.g. before deleting
+        an agent or conversation).
+        """
+        ...
+
 @dataclass
 class Task:
     """A task representing a single response execution."""
-    task_id: str       # doubles as response_id
-    conversation_id: str    # the conversation this task belongs to
-    status: str        # "queued", "in_progress", "completed", "failed", "incomplete", "cancelled"
-    output: list       # empty until status is "completed"
-    inbox_closed: bool # True once the agent's final inbox check found no messages
+    task_id: str                                    # doubles as response_id
+    conversation_id: str                            # the conversation this task belongs to
+    status: str                                     # "queued", "in_progress", "completed", "failed", "incomplete", "cancelled"
+    agent_id: str                                   # ID of the agent executing this task
+    created_at: int                                 # epoch timestamp
+    completed_at: int | None = None                 # epoch timestamp, set on terminal status
+    output: list = field(default_factory=list)      # empty until status is "completed"
+    inbox_closed: bool = False                      # True once the agent's final inbox check found no messages
+    instructions: str | None = None                 # per-request steering instructions
+    background: bool = False                        # whether this task runs in background mode
+    previous_response_id: str | None = None         # response this task continues from
+    usage: dict | None = None                       # token usage stats
+    error: dict | None = None                       # error details for status="failed"
+    incomplete_details: dict | None = None          # details for status="incomplete"
 
-@dataclass
-class NewConversationItem:
-    """An item that has not yet been persisted. No ID or timestamp."""
+class NewConversationItem(BaseModel):
+    """An item that has not yet been persisted. No ID or timestamp. (Pydantic model)"""
     type: str          # "message", "function_call", "function_call_output", "reasoning"
     response_id: str   # the response (task) this item belongs to
-    data: dict         # type-specific fields (role, content, model, name, arguments, etc.)
+    data: ItemData     # type-specific Pydantic model (MessageData, FunctionCallData, etc.)
 
-@dataclass
-class ConversationItem:
-    """A persisted item with a store-assigned ID."""
+class ConversationItem(BaseModel):
+    """A persisted item with a store-assigned ID. (Pydantic model)"""
     id: str
     type: str          # "message", "function_call", "function_call_output", "reasoning"
+    status: str        # item status
     response_id: str   # the response (task) this item belongs to
     created_at: int
-    data: dict         # type-specific fields
+    data: ItemData     # type-specific Pydantic model (MessageData, FunctionCallData, etc.)
 
 @dataclass
 class Conversation:
     """A conversation grouping related turns."""
-    id: str             # unique conversation identifier
-    metadata: dict      # caller-attached key-value pairs (e.g. user_id, title)
-    created_at: int     # epoch timestamp
+    id: str                                         # unique conversation identifier
+    metadata: dict = field(default_factory=dict)    # caller-attached key-value pairs
+    created_at: int = 0                             # epoch timestamp
+    title: str | None = None                        # optional conversation title
 
 @dataclass
 class PagedList(Generic[T]):
@@ -295,7 +320,45 @@ class ConversationStore(ABC):
         """
         ...
 
-# MemoryStore: methods below are illustrative — structure is TBD
+    @abstractmethod
+    def get_conversation(self, conversation_id: str) -> Conversation | None:
+        """Return the conversation, or None if it does not exist."""
+        ...
+
+    @abstractmethod
+    def list_conversations(
+        self,
+        limit: int = 20,
+        after: str | None = None,
+        before: str | None = None,
+    ) -> PagedList[Conversation]:
+        """List conversations with cursor-based pagination, newest first."""
+        ...
+
+    @abstractmethod
+    def update_conversation(
+        self, conversation_id: str, **kwargs
+    ) -> Conversation | None:
+        """
+        Update mutable fields on a conversation. Currently only
+        `title` is updatable. Returns the updated Conversation, or
+        None if the conversation does not exist.
+        """
+        ...
+
+    @abstractmethod
+    async def delete_conversation(
+        self, conversation_id: str
+    ) -> bool:
+        """
+        Delete a conversation and all its items. Returns True if the
+        conversation existed, False otherwise. Async because it may
+        need to cancel in-flight responses in the conversation first.
+        """
+        ...
+
+# MemoryStore: Not yet implemented — structure TBD.
+# The interface below is illustrative and subject to change.
 class MemoryStore(ABC):
     @abstractmethod
     def search(self, query: str, limit: int) -> list[Memory]:
@@ -352,11 +415,10 @@ The agent loop (pseudocode):
 ```python
 @workflow()
 def agent_execution_workflow(
-    model: str,                        # agent name
-    conversation_id: str,                   # conversation
+    agent_id: str,                     # agent identifier
+    conversation_id: str,              # conversation
     previous_response_id: str | None,  # conversation chain
     instructions: str | None,          # per-request steering
-    metadata: dict | None,             # caller-attached kv pairs
 ) -> dict:                             # full response object
     task_id = DBOS.workflow_id
     history = load_history(conversation_id)         # @step — checkpointed
@@ -393,7 +455,7 @@ def agent_execution_workflow(
                 # Inbox closed, no late messages — safe to persist and complete
                 conversation_store.append(conversation_id, [
                     NewConversationItem(type="message", response_id=task_id,
-                        data={"role": "assistant", "model": model, "content": response.content})])
+                        data={"role": "assistant", "agent": agent.name  # agent = agent_store.get(agent_id), "content": response.content})])
                 return build_response(...)
 
             result = call_tool(response.tool_name, ...)  # @step — checkpointed
@@ -520,7 +582,8 @@ def handle_post(previous_response_id, input, conversation, ...):
         conversation_id = conversation.id
 
     # Normal: create a new response
-    task = task_store.create(spec, conversation_id, previous_response_id)
+    task = task_store.create(conversation_id=conversation_id, agent_id=agent_id,
+        previous_response_id=previous_response_id)
     conversation_store.append(conversation_id, [
         NewConversationItem(type="message", response_id=task.task_id, data={"role": "user", "content": input})])
     task_store.start(task.task_id)
@@ -557,14 +620,14 @@ Simplest case. Server holds the connection until done.
 
 1. Server receives `POST /v1/responses` with `background: false, stream: false`
 2. If `previous_response_id` is set: `conversation_id = conversation_store.get_conversation_id(previous_response_id)`, then `prev_task = task_store.get(previous_response_id)` — if None (deleted), return 400. Otherwise: `conversation = conversation_store.create_conversation()` → `conversation_id = conversation.id`
-3. `task = task_store.create(spec, conversation_id, previous_response_id)`
+3. `task = task_store.create(conversation_id=conversation_id, agent_id=agent_id, previous_response_id=previous_response_id)`
 4. `conversation_store.append(conversation_id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "user", "content": [...]})])` — persist user input (durable before execution begins)
 5. `task_store.start(task.task_id)` — starts the DBOS workflow asynchronously
 6. `task = task_store.wait(task.task_id)` — server blocks here
 7. Runtime loads history via `conversation_store.search_items(conversation_id)` — includes the user message from step 4
 8. Runtime runs the agent loop (LLM calls, tool calls, steering inbox checks between iterations, `write_stream()` for deltas)
 9. Runtime calls `task_store.close_inbox(task.task_id, ...)` — if late messages, agent continues loop; if none, sets `inbox_closed=True`
-10. Runtime appends assistant output via `conversation_store.append(conversation_id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "assistant", "model": model, "content": [...]})])` — only after inbox is confirmed closed
+10. Runtime appends assistant output via `conversation_store.append(conversation_id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "assistant", "agent": agent.name, "content": [...]})])` — only after inbox is confirmed closed
 11. `wait()` returns the finished Task with output
 12. Server returns 200 JSON response
 
@@ -578,7 +641,7 @@ Server reads deltas in real time and forwards as SSE.
 
 1. Server receives `POST /v1/responses` with `background: false, stream: true`
 2. If `previous_response_id` is set: `conversation_id = conversation_store.get_conversation_id(previous_response_id)`, then `prev_task = task_store.get(previous_response_id)` — if None (deleted), return 400. Otherwise: `conversation = conversation_store.create_conversation()` → `conversation_id = conversation.id`
-3. `task = task_store.create(spec, conversation_id, previous_response_id)`
+3. `task = task_store.create(conversation_id=conversation_id, agent_id=agent_id, previous_response_id=previous_response_id)`
 4. `conversation_store.append(conversation_id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "user", "content": [...]})])` — persist user input
 5. `task_store.start(task.task_id)` — starts the DBOS workflow asynchronously
 6. Server opens SSE connection and iterates `task_store.stream(task.task_id)`
@@ -586,7 +649,7 @@ Server reads deltas in real time and forwards as SSE.
 8. Runtime runs the agent loop — each `write_stream()` delta is yielded by `stream()`
 9. Server converts each delta to an SSE event and writes it to the client
 10. Runtime calls `task_store.close_inbox(...)` — confirms no late messages, sets `inbox_closed=True`
-11. Runtime appends assistant output via `conversation_store.append(conversation_id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "assistant", "model": model, "content": [...]})])` — only after inbox is confirmed closed
+11. Runtime appends assistant output via `conversation_store.append(conversation_id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "assistant", "agent": agent.name, "content": [...]})])` — only after inbox is confirmed closed
 12. Workflow exits — `finally` block runs `close_stream()`, ending the `stream()` iterator
 13. Server calls `task_store.wait(task.task_id)` — the stream ending does not guarantee the workflow has fully exited (the `finally` block may still be running), so `wait()` is needed instead of `get()` to avoid a race where `get()` sees "in_progress" with empty output
 14. Server builds and sends `response.completed` SSE event (with full response object from step 13), then `[DONE]`
@@ -601,14 +664,14 @@ Fire and forget. Client polls GET for result.
 
 1. Server receives `POST /v1/responses` with `background: true, stream: false`
 2. If `previous_response_id` is set: `conversation_id = conversation_store.get_conversation_id(previous_response_id)`, then `prev_task = task_store.get(previous_response_id)` — if None (deleted), return 400. Otherwise: `conversation = conversation_store.create_conversation()` → `conversation_id = conversation.id`
-3. `task = task_store.create(spec, conversation_id, previous_response_id)`
+3. `task = task_store.create(conversation_id=conversation_id, agent_id=agent_id, previous_response_id=previous_response_id)`
 4. `conversation_store.append(conversation_id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "user", "content": [...]})])` — persist user input
 5. `task_store.start(task.task_id)` — starts the DBOS workflow asynchronously
 6. Server returns 200 immediately with `{id: task.task_id, status: "queued", output: []}`
 7. Runtime loads history via `conversation_store.search_items(conversation_id)` — includes the user message from step 4
 8. Runtime runs the agent loop in the background
 9. Runtime calls `task_store.close_inbox(...)` — confirms no late messages, sets `inbox_closed=True`
-10. Runtime appends assistant output via `conversation_store.append(conversation_id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "assistant", "model": model, "content": [...]})])` — only after inbox is confirmed closed
+10. Runtime appends assistant output via `conversation_store.append(conversation_id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "assistant", "agent": agent.name, "content": [...]})])` — only after inbox is confirmed closed
 11. Workflow completes — task status becomes "completed" with output
 12. Client polls `GET /v1/responses/{task.task_id}` → `task_store.get()` → returns Task with output
 
@@ -622,7 +685,7 @@ The laptop-closing scenario. Durable execution + live streaming while connected.
 
 1. Server receives `POST /v1/responses` with `background: true, stream: true`
 2. If `previous_response_id` is set: `conversation_id = conversation_store.get_conversation_id(previous_response_id)`, then `prev_task = task_store.get(previous_response_id)` — if None (deleted), return 400. Otherwise: `conversation = conversation_store.create_conversation()` → `conversation_id = conversation.id`
-3. `task = task_store.create(spec, conversation_id, previous_response_id)`
+3. `task = task_store.create(conversation_id=conversation_id, agent_id=agent_id, previous_response_id=previous_response_id)`
 4. `conversation_store.append(conversation_id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "user", "content": [...]})])` — persist user input
 5. `task_store.start(task.task_id)` — starts the DBOS workflow asynchronously
 6. Server opens SSE connection and iterates `task_store.stream(task.task_id)`
@@ -645,20 +708,20 @@ Shows how `previous_response_id` chains turns into a conversation.
 
 1. Server receives `POST /v1/responses` with `input: "hi"`, no `previous_response_id`
 2. `conversation = conversation_store.create_conversation()` — new conversation
-3. `task = task_store.create(spec, conversation.id)` — no previous_response_id
+3. `task = task_store.create(conversation_id=conversation.id, agent_id=agent_id, )` — no previous_response_id
 4. `conversation_store.append(conversation.id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "user", "content": [{"type": "input_text", "text": "hi"}]})])` — persist user input
 5. `task_store.start(task.task_id)`
 6. Runtime calls `conversation_store.search_items(conversation.id)` → returns `[ConversationItem(type="message", response_id=task.task_id, data={"role": "user", "content": [...]})]`
 7. Runtime runs agent, produces "Hello! How can I help?"
 8. Runtime calls `task_store.close_inbox(...)` — confirms no late messages, sets `inbox_closed=True`
-9. Runtime appends assistant output: `conversation_store.append(conversation.id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "assistant", "model": model, "content": [{"type": "output_text", "text": "Hello!..."}]})])`
+9. Runtime appends assistant output: `conversation_store.append(conversation.id, [NewConversationItem(type="message", response_id=task.task_id, data={"role": "assistant", "agent": agent.name, "content": [{"type": "output_text", "text": "Hello!..."}]})])`
 10. Server returns `{id: task.task_id, output: "Hello!..."}`
 
 **Turn 2** — continuing the conversation:
 
 1. Server receives `POST /v1/responses` with `input: "weather?"`, `previous_response_id: task.task_id` (from turn 1)
 2. `conversation_id = conversation_store.get_conversation_id(previous_response_id)` — resolves via message response_id. `prev_task = task_store.get(previous_response_id)` — if None (deleted), return 400
-3. `task2 = task_store.create(spec, conversation_id, previous_response_id)`
+3. `task2 = task_store.create(conversation_id=conversation_id, agent_id=agent_id, previous_response_id=previous_response_id)`
 4. `conversation_store.append(conversation_id, [NewConversationItem(type="message", response_id=task2.task_id, data={"role": "user", "content": [...]})])` — persist user input
 5. `task_store.start(task2.task_id)`
 6. Runtime calls `conversation_store.search_items(conversation_id)` → returns turn 1's user + assistant messages, plus turn 2's user message
@@ -693,7 +756,7 @@ User sends a new message while the agent is still running.
 3. Status is "in_progress"
 4. Server calls `task_store.try_deliver(...)` — `inbox_closed=True`, returns `False`
 5. Server calls `task_store.wait("resp_001")` — waits for resp_001 to finish so its assistant output is persisted to the conversation before resp_002 loads history
-6. Server creates `resp_002 = task_store.create(spec, conversation_id, "resp_001")`
+6. Server creates `resp_002 = task_store.create(conversation_id=conversation_id, agent_id=agent_id, previous_response_id="resp_001")`
 7. Server appends user message with `response_id=resp_002`
 8. Server starts resp_002 — runtime loads full history (including resp_001's output from step 5) and processes the message as a new turn
 
@@ -760,11 +823,14 @@ Returns the current state of a response. Always a JSON snapshot, never a stream.
 ```
 runtime/
 ├── __init__.py         # init() function, public entry point
+├── models.py           # Data models: Task, ConversationItem, Conversation, etc.
 ├── durability.py       # ALL DBOS imports isolated here
 ├── steps.py            # @step functions: call_llm, call_tool, load_history
 ├── tool_manager.py     # MCP connections, local tool loading, routing
 ├── skill_manager.py    # Progressive skill disclosure
-├── conversation.py          # ConversationStore and MemoryStore protocols
+stores/
+├── task_store/         # TaskStore interface
+├── conversation_store/ # ConversationStore interface
 ```
 
 ## Not yet
@@ -795,7 +861,7 @@ The agent loop's `history` list grows with every iteration — each LLM call and
 **What needs design:**
 
 - A context management strategy for the agent loop (summarize, truncate, or window)
-- Whether `max_iterations` should be configurable per-agent or per-request (via `AgentSpec` or request params)
+- Whether `max_iterations` should be configurable per-agent or per-request (via agent config or request params)
 - Whether to add a time-based limit alongside the iteration-based one
 - How summarization interacts with steering (summarized-away messages that contained steering input)
 
@@ -823,14 +889,12 @@ Deleting a conversation (DELETE /v1/conversations/{id}) must:
 2. Delete all response records (task records) in the conversation — subsequent GET /v1/responses/{id} returns 404 for every response that belonged to this conversation
 3. Delete the conversation itself and all conversation messages
 
-This requires a way to find all tasks belonging to a conversation (e.g., `task_store.get_tasks_by_conversation(conversation_id) -> list[Task]`), which doesn't exist on TaskStore today. The cascade must cancel before deleting to ensure the runtime's finally block runs (close_stream, inbox drain).
-
-Out of scope for now — the behavior is specified in API.md and tested in END_TO_END_TESTS.md (scenario 10), but the runtime flow and store methods aren't yet designed.
+**Resolved.** `task_store.list_tasks(conversation_id=...)` provides the ability to find all tasks belonging to a conversation. The route layer uses this to cancel in-flight tasks before deleting. `conversation_store.delete_conversation()` handles the cascade (it is async because it may need to cancel in-flight responses first).
 
 ---
 
 ## Dependencies
 
-- `spec/` — for `AgentSpec` and related types
+- `spec/` — defines the agent contract (e.g. what's in a bundle), but is not directly referenced by the runtime stores. Agent identity is passed as an `agent_id` string; the runtime looks up the agent name via `agent_store.get(agent_id)` when needed for conversation item data.
 - `dbos` — for durable execution (isolated in `durability.py`)
 - `litellm` — LLM provider

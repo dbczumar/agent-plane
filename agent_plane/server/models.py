@@ -6,7 +6,6 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-
 # ── Shared ──────────────────────────────────────────────────────
 
 
@@ -82,9 +81,7 @@ class UsageDetails(BaseModel):
 class Usage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
-    output_tokens_details: UsageDetails = Field(
-        default_factory=UsageDetails
-    )
+    output_tokens_details: UsageDetails = Field(default_factory=UsageDetails)
     total_tokens: int = 0
 
 
@@ -106,7 +103,6 @@ class CreateResponseRequest(BaseModel):
     instructions: str | None = None
     previous_response_id: str | None = None
     conversation: ConversationRef | None = None
-    metadata: dict[str, str] | None = None
     context_management: list[Any] | None = None
     # Ignored fields — agent controls these (silently dropped)
     temperature: float | None = None
@@ -136,7 +132,6 @@ class ResponseObject(BaseModel):
     previous_response_id: str | None = None
     conversation: ConversationRef | None = None
     instructions: str | None = None
-    metadata: dict[str, str] = Field(default_factory=dict)
     error: ErrorDetail | None = None
     incomplete_details: IncompleteDetails | None = None
 

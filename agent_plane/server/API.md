@@ -405,8 +405,7 @@ Content-Type: application/json
   "stream": true,
   "instructions": "Respond in French",
   "previous_response_id": "resp_xyz",
-  "conversation": {"id": "conv_abc123"},
-  "metadata": {"user_id": "u_123"}
+  "conversation": {"id": "conv_abc123"}
 }
 
 Accepted request fields:
@@ -479,10 +478,6 @@ Accepted request fields:
     `previous_response_id` automatically use the compressed context. The
     conversation stays intact — no fork, no new conversation.
 
-  metadata (object | null, optional, default: null)
-    Caller-attached key-value pairs. Max 16 keys, keys up to 64 chars,
-    values up to 512 chars. Stored with the response, returned on retrieval.
-
 Ignored fields (agent controls these — silently dropped if provided):
   temperature, top_p, tools, tool_choice, reasoning,
   max_output_tokens, frequency_penalty, presence_penalty,
@@ -539,7 +534,6 @@ Content-Type: application/json
   "previous_response_id": null,
   "conversation": {"id": "conv_abc123"},
   "instructions": "Respond in French",
-  "metadata": {"user_id": "u_123"},
   "error": null,
   "incomplete_details": null
 }
@@ -567,7 +561,6 @@ Content-Type: application/json
   "previous_response_id": null,
   "conversation": {"id": "conv_def456"},
   "instructions": null,
-  "metadata": {},
   "error": null,
   "incomplete_details": null
 }
@@ -783,6 +776,9 @@ The response is fully removed — subsequent GET returns 404.
 - Request params from OpenResponses spec: `user` (end-user identifier for abuse monitoring),
   `include` (controls extra fields in response), `stream_options` (streaming behavior),
   `service_tier` (request tier), `prompt_cache_key` / `prompt_cache_retention` (prompt caching)
+- `metadata` on responses — caller-attached key-value pairs (max 16 keys, keys ≤64 chars, values
+  ≤512 chars). Stored with the response, returned on retrieval. OpenAI supports this on their
+  Responses API. Would need: field on request/response models, Task dataclass, TaskStore.create().
 - `purpose` field on file uploads (e.g. `"input"`, `"fine-tune"`) — tag indicating how the file
   will be used. OpenAI requires this; we may add it later if needed.
 - Audio input (`input_audio` content type)

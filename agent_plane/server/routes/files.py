@@ -1,27 +1,29 @@
 """Routes for the /v1/files endpoints."""
 
 import mimetypes
-import time
-import uuid
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from starlette.responses import Response
 
-from agent_plane.stores import ArtifactStore
+from agent_plane.entities import StoredFile
 from agent_plane.server.models import FileDeleted, FileObject, PaginatedList
+from agent_plane.stores import ArtifactStore, FileStore
 
 
-def create_files_router(artifact_store: ArtifactStore) -> APIRouter:
-    """
-    Factory that builds the files router. File metadata is in-memory
-    (a simple dict inside this closure) as a placeholder until real
-    metadata storage is implemented. Binary content is stored via
-    the injected ArtifactStore.
-    """
+def _to_file_object(f: StoredFile) -> FileObject:
+    return FileObject(
+        id=f.id,
+        filename=f.filename,
+        bytes=f.bytes,
+        created_at=f.created_at,
+    )
+
+
+def create_files_router(
+    file_store: FileStore,
+    artifact_store: ArtifactStore,
+) -> APIRouter:
     router = APIRouter()
-
-    # In-memory storage: metadata keyed by file id.
-    files_by_id: dict[str, FileObject] = {}
 
     # ── POST /files ──────────────────────────────────────────────
 
@@ -30,19 +32,16 @@ def create_files_router(artifact_store: ArtifactStore) -> APIRouter:
         file: UploadFile = File(...),
     ) -> FileObject:
         content = await file.read()
-        file_id = f"file_{uuid.uuid4().hex[:12]}"
-
-        file_obj = FileObject(
-            id=file_id,
+        content_type = mimetypes.guess_type(file.filename or "")[0] if file.filename else None
+        stored = file_store.create(
             filename=file.filename or "unknown",
             bytes=len(content),
-            created_at=int(time.time()),
+            content_location="",
+            content_type=content_type,
         )
+        artifact_store.put(stored.id, content)
 
-        files_by_id[file_id] = file_obj
-        artifact_store.put(file_id, content)
-
-        return file_obj
+        return _to_file_object(stored)
 
     # ── GET /files ───────────────────────────────────────────────
 
@@ -53,67 +52,29 @@ def create_files_router(artifact_store: ArtifactStore) -> APIRouter:
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
     ) -> PaginatedList:
-        sorted_files = sorted(
-            files_by_id.values(),
-            key=lambda f: f.created_at,
-            reverse=(order == "desc"),
-        )
-
-        # Apply cursor-based pagination.
-        if after is not None:
-            idx = next(
-                (
-                    i
-                    for i, f in enumerate(sorted_files)
-                    if f.id == after
-                ),
-                None,
-            )
-            if idx is not None:
-                sorted_files = sorted_files[idx + 1 :]
-
-        if before is not None:
-            idx = next(
-                (
-                    i
-                    for i, f in enumerate(sorted_files)
-                    if f.id == before
-                ),
-                None,
-            )
-            if idx is not None:
-                sorted_files = sorted_files[:idx]
-
-        has_more = len(sorted_files) > limit
-        page = sorted_files[:limit]
-
+        page = file_store.list(limit=limit, after=after, before=before)
         return PaginatedList(
-            data=page,
-            first_id=page[0].id if page else None,
-            last_id=page[-1].id if page else None,
-            has_more=has_more,
+            data=[_to_file_object(f) for f in page.data],
+            first_id=page.data[0].id if page.data else None,
+            last_id=page.data[-1].id if page.data else None,
+            has_more=page.next_page_token is not None,
         )
 
     # ── GET /files/{file_id} ─────────────────────────────────────
 
     @router.get("/files/{file_id}")
     async def get_file(file_id: str) -> FileObject:
-        file_obj = files_by_id.get(file_id)
-        if file_obj is None:
-            raise HTTPException(
-                status_code=404, detail="File not found"
-            )
-        return file_obj
+        stored = file_store.get(file_id)
+        if stored is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        return _to_file_object(stored)
 
     # ── DELETE /files/{file_id} ──────────────────────────────────
 
     @router.delete("/files/{file_id}")
     async def delete_file(file_id: str) -> FileDeleted:
-        file_obj = files_by_id.pop(file_id, None)
-        if file_obj is None:
-            raise HTTPException(
-                status_code=404, detail="File not found"
-            )
+        if not file_store.delete(file_id):
+            raise HTTPException(status_code=404, detail="File not found")
         artifact_store.delete(file_id)
         return FileDeleted(id=file_id)
 
@@ -121,17 +82,12 @@ def create_files_router(artifact_store: ArtifactStore) -> APIRouter:
 
     @router.get("/files/{file_id}/content")
     async def get_file_content(file_id: str) -> Response:
-        file_obj = files_by_id.get(file_id)
-        if file_obj is None:
-            raise HTTPException(
-                status_code=404, detail="File not found"
-            )
+        stored = file_store.get(file_id)
+        if stored is None:
+            raise HTTPException(status_code=404, detail="File not found")
 
-        content = artifact_store.get(file_id)
-        media_type = (
-            mimetypes.guess_type(file_obj.filename)[0]
-            or "application/octet-stream"
-        )
+        content = artifact_store.get(stored.id)
+        media_type = mimetypes.guess_type(stored.filename)[0] or "application/octet-stream"
 
         return Response(content=content, media_type=media_type)
 

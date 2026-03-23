@@ -1,0 +1,22 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-format
+        name: ruff format
+        language: system
+        entry: python -m ruff format
+        types: [python]
+
+      - id: ruff-check
+        name: ruff check
+        language: system
+        entry: python -m ruff check --fix
+        types: [python]
+
+      - id: mypy
+        name: mypy
+        language: system
+        entry: python -m mypy
+        types: [python]
+        files: ^agent_plane/
+        require_serial: true

@@ -1,9 +1,10 @@
-"""Tests for runtime data models — ConversationItem validation."""
+"""Tests for runtime data models and API-layer models."""
 
 import pytest
 from pydantic import ValidationError
 
-from agent_plane.runtime.models import (
+from agent_plane.entities import (
+    Conversation,
     ConversationItem,
     FunctionCallData,
     FunctionCallOutputData,
@@ -12,7 +13,6 @@ from agent_plane.runtime.models import (
     ReasoningData,
     parse_item_data,
 )
-
 
 # ── MessageData ────────────────────────────────────────
 
@@ -142,9 +142,7 @@ class TestNewConversationItem:
         item = NewConversationItem(
             type="function_call",
             response_id="resp_1",
-            data=FunctionCallData(
-                agent="my-agent", name="fn", arguments="{}", call_id="c1"
-            ),
+            data=FunctionCallData(agent="my-agent", name="fn", arguments="{}", call_id="c1"),
         )
         assert item.data.name == "fn"
 
@@ -165,9 +163,7 @@ class TestNewConversationItem:
         assert item.type == "reasoning"
 
     def test_type_data_mismatch_rejected(self):
-        with pytest.raises(
-            ValidationError, match="requires FunctionCallData, got MessageData"
-        ):
+        with pytest.raises(ValidationError, match="requires FunctionCallData, got MessageData"):
             NewConversationItem(
                 type="function_call",
                 response_id="resp_1",
@@ -229,9 +225,7 @@ class TestParseItemData:
         assert isinstance(data, FunctionCallData)
 
     def test_parse_function_call_output(self):
-        data = parse_item_data(
-            "function_call_output", {"call_id": "c1", "output": "{}"}
-        )
+        data = parse_item_data("function_call_output", {"call_id": "c1", "output": "{}"})
         assert isinstance(data, FunctionCallOutputData)
 
     def test_parse_reasoning(self):
@@ -245,3 +239,16 @@ class TestParseItemData:
     def test_parse_invalid_data(self):
         with pytest.raises(ValidationError):
             parse_item_data("function_call", {"agent": "a"})
+
+
+# ── Conversation ──────────────────────────────────────
+
+
+class TestConversation:
+    def test_title_defaults_to_none(self):
+        conv = Conversation(id="conv_1")
+        assert conv.title is None
+
+    def test_title_set(self):
+        conv = Conversation(id="conv_1", title="Weather chat")
+        assert conv.title == "Weather chat"

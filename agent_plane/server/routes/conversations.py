@@ -1,25 +1,35 @@
 """Routes for the /v1/conversations endpoints."""
 
-from fastapi import APIRouter, HTTPException, Query
+from __future__ import annotations
 
-from agent_plane.runtime.models import ConversationItem
-from agent_plane.stores import ConversationStore, TaskStore
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
+
+from agent_plane.entities import Conversation, ConversationItem
 from agent_plane.server.models import (
     ConversationDeleted,
     ConversationObject,
     PaginatedList,
 )
+from agent_plane.stores import ConversationStore, TaskStore
 
 
-def _to_conversation_object(conv):
+class UpdateConversationRequest(BaseModel):
+    title: str | None = None
+
+
+def _to_conversation_object(conv: Conversation) -> ConversationObject:
     """Convert a runtime Conversation to an API-layer ConversationObject."""
     return ConversationObject(
         id=conv.id,
+        title=conv.title,
         created_at=conv.created_at,
     )
 
 
-def _to_api_item(item: ConversationItem) -> dict:
+def _to_api_item(item: ConversationItem) -> dict[str, Any]:
     """
     Convert a runtime ConversationItem to the API shape defined
     in API.md. Common fields come from the item; type-specific
@@ -31,7 +41,7 @@ def _to_api_item(item: ConversationItem) -> dict:
         "id": item.id,
         "response_id": item.response_id,
         "type": item.type,
-        "status": "completed",
+        "status": item.status,
         **item.data.model_dump(exclude_none=True, by_alias=True),
     }
 
@@ -54,7 +64,7 @@ def create_conversations_router(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
-    ):
+    ) -> PaginatedList:
         page = conversation_store.list_conversations(
             limit=limit,
             after=after,
@@ -73,12 +83,12 @@ def create_conversations_router(
     # ── GET /conversations/{conversation_id} ──────────────────────
 
     @router.get("/conversations/{conversation_id}")
-    async def get_conversation(conversation_id: str):
+    async def get_conversation(
+        conversation_id: str,
+    ) -> ConversationObject:
         conv = conversation_store.get_conversation(conversation_id)
         if conv is None:
-            raise HTTPException(
-                status_code=404, detail="Conversation not found"
-            )
+            raise HTTPException(status_code=404, detail="Conversation not found")
         return _to_conversation_object(conv)
 
     # ── GET /conversations/{conversation_id}/items ────────────────
@@ -90,12 +100,10 @@ def create_conversations_router(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="asc", pattern="^(asc|desc)$"),
-    ):
+    ) -> PaginatedList:
         conv = conversation_store.get_conversation(conversation_id)
         if conv is None:
-            raise HTTPException(
-                status_code=404, detail="Conversation not found"
-            )
+            raise HTTPException(status_code=404, detail="Conversation not found")
         page = conversation_store.search_items(
             conversation_id=conversation_id,
             limit=limit,
@@ -112,26 +120,31 @@ def create_conversations_router(
             has_more=page.next_page_token is not None,
         )
 
+    # ── PATCH /conversations/{conversation_id} ────────────────────
+
+    @router.patch("/conversations/{conversation_id}")
+    async def update_conversation(
+        conversation_id: str, body: UpdateConversationRequest
+    ) -> ConversationObject:
+        conv = conversation_store.update_conversation(conversation_id, title=body.title)
+        if conv is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        return _to_conversation_object(conv)
+
     # ── DELETE /conversations/{conversation_id} ───────────────────
 
     @router.delete("/conversations/{conversation_id}")
-    async def delete_conversation(conversation_id: str):
+    async def delete_conversation(
+        conversation_id: str,
+    ) -> ConversationDeleted:
         conv = conversation_store.get_conversation(conversation_id)
         if conv is None:
-            raise HTTPException(
-                status_code=404, detail="Conversation not found"
-            )
-        for task in task_store.list_tasks(
-            conversation_id=conversation_id
-        ):
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        for task in task_store.list_tasks(conversation_id=conversation_id):
             await task_store.cancel(task.task_id)
-        deleted = await conversation_store.delete_conversation(
-            conversation_id
-        )
+        deleted = await conversation_store.delete_conversation(conversation_id)
         if not deleted:
-            raise HTTPException(
-                status_code=404, detail="Conversation not found"
-            )
+            raise HTTPException(status_code=404, detail="Conversation not found")
         return ConversationDeleted(id=conversation_id)
 
     return router
