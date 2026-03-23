@@ -36,8 +36,11 @@ Check each file against this checklist:
    to store interfaces must match runtime/RUNTIME.md. Check field names,
    types, required/optional, and behavior.
 
-7. TYPE HINTS: Use specific types, not Any. If Any is unavoidable, add a
-   comment explaining why.
+7. TYPE HINTS: Use specific types, not Any, object, dict, list, Callable,
+   or other overly generic types. Prefer concrete types (e.g.
+   `dict[str, AgentSpec]` not `dict`, `Connection` not `object`,
+   `Callable[[str], bool]` not `Callable`). If a generic type is truly
+   unavoidable, add a comment explaining why.
 
 8. PYDANTIC AT BOUNDARIES: Pydantic models for API/external data, dataclasses
    for internal entities. Don't mix these up.
