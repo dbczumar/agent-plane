@@ -153,6 +153,9 @@ def extract_search_text(item: NewConversationItem) -> str:
     (content, name, arguments, output, summary) are guaranteed present.
     We use direct dict access to fail loud if that assumption is ever
     violated.
+
+    Content/summary blocks are heterogeneous (text, image, etc.) so
+    we filter to only text-bearing blocks via .get("text").
     """
     data = item.data.model_dump()
     if item.type == "message":
@@ -171,7 +174,7 @@ def extract_search_text(item: NewConversationItem) -> str:
             for block in data["summary"]
             if isinstance(block, dict) and block.get("text")
         )
-    return ""
+    raise ValueError(f"unknown item type: {item.type!r}")
 
 
 # ── Timestamp ──────────────────────────────────────────
