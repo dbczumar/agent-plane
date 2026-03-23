@@ -51,11 +51,14 @@ DBOS checkpoints.
 of the step and becomes a plain function call within the workflow body,
 with a separate `@step` to checkpoint the assembled response afterward.
 
-### Per-execution tool manager
+### Fresh MCP connections per request
 
-Each workflow gets its own `ToolManager` — connects MCP servers at start,
-tears them down in `finally`. No cross-execution resource sharing. Simple,
-no leaked state.
+Each workflow execution (i.e. each `POST /v1/responses`) creates its own
+`ToolManager`, which connects to the agent's MCP servers at the start of
+the workflow and tears them down in `finally`. Connections are not shared
+or reused across requests — every execution pays the full MCP startup
+cost. This is simple and avoids leaked state or stale-connection bugs,
+at the expense of per-request latency for MCP server initialization.
 
 ### Agent loading via AgentCache
 
@@ -342,10 +345,8 @@ mcp>=1.0
 
 ### Phase E: Polish
 
-1. Usage tracking (extract token counts from litellm response)
-2. Verify SSE event shapes match OpenAI Responses API format
-3. Cancellation handling (verify `finally` block runs correctly)
-4. `completed_at` timestamp population
+1. Verify SSE event shapes match OpenAI Responses API format
+2. Verify `finally` block runs correctly on normal and error paths
 
 ---
 
@@ -375,3 +376,22 @@ mcp>=1.0
    with real LLM output
 4. **Tool test**: Agent with an MCP server (e.g. a trivial stdio tool),
    verify `function_call` → `function_call_output` round-trip
+
+---
+
+## Not Yet
+
+- MCP connection pooling — keep long-lived MCP server connections across requests instead of
+  reconnecting on every workflow execution. Would reduce per-request latency for agents with
+  slow-to-start MCP servers (e.g. database tools, heavy stdio processes). Requires health checks,
+  reconnection logic, and cleanup on agent eviction.
+- Local tool execution — Python/TypeScript tool files bundled with the agent image. Currently
+  returns an error if called. Needs sandboxing design (subprocess? container? WASM?).
+- Parallel tool calls — execute multiple tool calls from a single LLM response concurrently
+  instead of sequentially. Would speed up agents that request several independent tool calls
+  in one turn.
+- Token usage tracking — extract token counts from litellm response and populate the `usage`
+  field on the response object.
+- `completed_at` timestamp — populate on terminal task status.
+- Cancellation propagation — when a client cancels a response, interrupt the in-flight LLM call
+  or tool execution rather than waiting for the current step to finish.
