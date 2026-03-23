@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+import pytest
+
 from agent_plane.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+
+@pytest.fixture()
+def file_store(db_uri: str) -> SqlAlchemyFileStore:
+    return SqlAlchemyFileStore(db_uri)
 
 
 def test_create_and_get(file_store: SqlAlchemyFileStore) -> None:
