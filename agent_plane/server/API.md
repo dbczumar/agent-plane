@@ -39,9 +39,13 @@ POST /api/agents
 Content-Type: multipart/form-data
 
 Parts:
-  bundle: <tarball>       required
-  name: string            required, unique, this becomes the "model" name for inference
-  description: string     optional
+  bundle: <tarball>       required — must contain config.yaml with a unique
+                          name and optional description. The name becomes
+                          the "model" for inference requests.
+
+The server validates the bundle on upload: extracts it to a temporary
+directory, parses config.yaml, and runs the spec validator. Name and
+description are derived from the spec — no separate form fields.
 
 201 Created
 {
@@ -53,7 +57,8 @@ Parts:
 }
 
 409 Conflict — name already exists
-400 Bad Request — invalid bundle
+400 Bad Request — invalid bundle (corrupt tarball, missing config.yaml,
+    spec validation failure, missing name, path traversal, etc.)
 ```
 
 ### List Agents

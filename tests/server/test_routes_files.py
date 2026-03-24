@@ -69,7 +69,7 @@ async def test_get_file(client: httpx.AsyncClient) -> None:
 async def test_get_file_not_found(client: httpx.AsyncClient) -> None:
     resp = await client.get("/v1/files/nonexistent")
     assert resp.status_code == 404
-    assert isinstance(resp.json()["detail"], str)
+    assert isinstance(resp.json()["error"]["message"], str)
 
 
 async def test_get_file_content(client: httpx.AsyncClient) -> None:
@@ -107,7 +107,7 @@ async def test_delete_file(client: httpx.AsyncClient) -> None:
 async def test_delete_file_not_found(client: httpx.AsyncClient) -> None:
     resp = await client.delete("/v1/files/nonexistent")
     assert resp.status_code == 404
-    assert isinstance(resp.json()["detail"], str)
+    assert isinstance(resp.json()["error"]["message"], str)
 
 
 async def test_list_files_pagination(client: httpx.AsyncClient) -> None:

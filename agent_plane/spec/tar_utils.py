@@ -79,10 +79,15 @@ def extract_safe(
 def _open_tar(source: Path | bytes) -> tarfile.TarFile:
     """
     Open a tarball from a file path or raw bytes.
+
+    Raises ExtractionError if the data is not a valid tarball.
     """
-    if isinstance(source, bytes):
-        return tarfile.open(fileobj=io.BytesIO(source), mode="r:*")
-    return tarfile.open(source, "r:*")
+    try:
+        if isinstance(source, bytes):
+            return tarfile.open(fileobj=io.BytesIO(source), mode="r:*")
+        return tarfile.open(source, "r:*")
+    except (tarfile.ReadError, tarfile.CompressionError) as exc:
+        raise ExtractionError(f"invalid tarball: {exc}") from exc
 
 
 def _check_member_safety(member: tarfile.TarInfo, resolved_dest: Path) -> None:

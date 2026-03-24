@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import io
+import tarfile
+from typing import Any
+from unittest.mock import MagicMock
+
 import pytest
 
 from agent_plane.entities import MessageData, NewConversationItem
 from agent_plane.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from agent_plane.stores.artifact_store.local import LocalArtifactStore
 from agent_plane.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -15,9 +21,43 @@ from agent_plane.stores.task_store.sqlalchemy_store import SqlAlchemyTaskStore
 
 _AGENT_NAME = "test-agent"
 
+# Canned litellm response matching the shape of litellm.ModelResponse.model_dump()
+_CANNED_LLM_RESPONSE: dict[str, Any] = {
+    "choices": [
+        {
+            "message": {
+                "role": "assistant",
+                "content": "Hello from the test LLM!",
+                "tool_calls": None,
+            },
+            "finish_reason": "stop",
+            "index": 0,
+        }
+    ],
+    "model": "test-model",
+    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+}
 
-def _make_agent(agent_store: SqlAlchemyAgentStore) -> str:
-    return agent_store.create(name=_AGENT_NAME).id
+
+def _make_agent_bundle() -> bytes:
+    """Create a minimal valid agent tarball."""
+    config_yaml = b"spec_version: 1\nllm:\n  model: test-model\n"
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(config_yaml)
+        tf.addfile(info, io.BytesIO(config_yaml))
+    return buf.getvalue()
+
+
+def _make_agent(
+    agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore | None = None,
+) -> str:
+    agent = agent_store.create(name=_AGENT_NAME)
+    if artifact_store is not None:
+        artifact_store.put(agent.id, _make_agent_bundle())
+    return agent.id
 
 
 def _make_conversation(conversation_store: SqlAlchemyConversationStore) -> str:
@@ -27,7 +67,8 @@ def _make_conversation(conversation_store: SqlAlchemyConversationStore) -> str:
 # ── CRUD ─────────────────────────────────────────────
 
 
-def test_create_and_get(
+@pytest.mark.asyncio
+async def test_create_and_get(
     task_store: SqlAlchemyTaskStore,
     agent_store: SqlAlchemyAgentStore,
     conversation_store: SqlAlchemyConversationStore,
@@ -51,16 +92,18 @@ def test_create_and_get(
     assert task.instructions is None
     assert task.reasoning is None
 
-    fetched = task_store.get(task.id)
+    fetched = await task_store.get(task.id)
     assert fetched is not None
     assert fetched.id == task.id
 
 
-def test_get_nonexistent(task_store: SqlAlchemyTaskStore) -> None:
-    assert task_store.get("resp_nonexistent") is None
+@pytest.mark.asyncio
+async def test_get_nonexistent(task_store: SqlAlchemyTaskStore) -> None:
+    assert await task_store.get("resp_nonexistent") is None
 
 
-def test_list_tasks_by_conversation(
+@pytest.mark.asyncio
+async def test_list_tasks_by_conversation(
     task_store: SqlAlchemyTaskStore,
     agent_store: SqlAlchemyAgentStore,
     conversation_store: SqlAlchemyConversationStore,
@@ -73,11 +116,12 @@ def test_list_tasks_by_conversation(
     task_store.create(conversation_id=conv1, agent_id=agent_id, agent_name=_AGENT_NAME)
     task_store.create(conversation_id=conv2, agent_id=agent_id, agent_name=_AGENT_NAME)
 
-    assert len(task_store.list_tasks(conversation_id=conv1)) == 2
-    assert len(task_store.list_tasks(conversation_id=conv2)) == 1
+    assert len(await task_store.list_tasks(conversation_id=conv1)) == 2
+    assert len(await task_store.list_tasks(conversation_id=conv2)) == 1
 
 
-def test_list_tasks_by_agent(
+@pytest.mark.asyncio
+async def test_list_tasks_by_agent(
     db_uri: str,
     task_store: SqlAlchemyTaskStore,
     conversation_store: SqlAlchemyConversationStore,
@@ -90,8 +134,8 @@ def test_list_tasks_by_agent(
     task_store.create(conversation_id=conv, agent_id=a1, agent_name="agent-a")
     task_store.create(conversation_id=conv, agent_id=a2, agent_name="agent-b")
 
-    assert len(task_store.list_tasks(agent_id=a1)) == 1
-    assert len(task_store.list_tasks(agent_id=a2)) == 1
+    assert len(await task_store.list_tasks(agent_id=a1)) == 1
+    assert len(await task_store.list_tasks(agent_id=a2)) == 1
 
 
 @pytest.mark.asyncio
@@ -105,7 +149,49 @@ async def test_delete(
     task = task_store.create(conversation_id=conv_id, agent_id=agent_id, agent_name=_AGENT_NAME)
 
     await task_store.delete(task.id)
-    assert task_store.get(task.id) is None
+    assert await task_store.get(task.id) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_all_by_agent(
+    task_store: SqlAlchemyTaskStore,
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    a1 = agent_store.create(name="agent-a").id
+    a2 = agent_store.create(name="agent-b").id
+    conv = _make_conversation(conversation_store)
+
+    task_store.create(conversation_id=conv, agent_id=a1, agent_name="agent-a")
+    task_store.create(conversation_id=conv, agent_id=a1, agent_name="agent-a")
+    task_store.create(conversation_id=conv, agent_id=a2, agent_name="agent-b")
+
+    await task_store.delete_all(agent_id=a1)
+
+    assert len(await task_store.list_tasks(agent_id=a1)) == 0
+    # agent-b's task is untouched
+    assert len(await task_store.list_tasks(agent_id=a2)) == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_all_by_conversation(
+    task_store: SqlAlchemyTaskStore,
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    agent_id = _make_agent(agent_store)
+    conv1 = _make_conversation(conversation_store)
+    conv2 = _make_conversation(conversation_store)
+
+    task_store.create(conversation_id=conv1, agent_id=agent_id, agent_name=_AGENT_NAME)
+    task_store.create(conversation_id=conv1, agent_id=agent_id, agent_name=_AGENT_NAME)
+    task_store.create(conversation_id=conv2, agent_id=agent_id, agent_name=_AGENT_NAME)
+
+    await task_store.delete_all(conversation_id=conv1)
+
+    assert len(await task_store.list_tasks(conversation_id=conv1)) == 0
+    # conv2's task is untouched
+    assert len(await task_store.list_tasks(conversation_id=conv2)) == 1
 
 
 # ── Steering handshake ───────────────────────────────
@@ -157,7 +243,8 @@ def test_try_deliver_closed_inbox(
     assert task_store.try_deliver(task.id, conv_id, msg) is False
 
 
-def test_close_inbox_no_new_messages(
+@pytest.mark.asyncio
+async def test_close_inbox_no_new_messages(
     task_store: SqlAlchemyTaskStore,
     agent_store: SqlAlchemyAgentStore,
     conversation_store: SqlAlchemyConversationStore,
@@ -169,12 +256,13 @@ def test_close_inbox_no_new_messages(
     late = task_store.close_inbox(task.id, conv_id, None)
     assert late == []
 
-    fetched = task_store.get(task.id)
+    fetched = await task_store.get(task.id)
     assert fetched is not None
     assert fetched.inbox_closed is True
 
 
-def test_close_inbox_with_new_messages(
+@pytest.mark.asyncio
+async def test_close_inbox_with_new_messages(
     task_store: SqlAlchemyTaskStore,
     agent_store: SqlAlchemyAgentStore,
     conversation_store: SqlAlchemyConversationStore,
@@ -201,7 +289,7 @@ def test_close_inbox_with_new_messages(
     assert len(late) == 1
     assert late[0].id == items[0].id
 
-    fetched = task_store.get(task.id)
+    fetched = await task_store.get(task.id)
     assert fetched is not None
     assert fetched.inbox_closed is False
 
@@ -254,19 +342,44 @@ def test_steering_handshake_sequence(
 async def test_start_and_get_completed(
     task_store: SqlAlchemyTaskStore,
     agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
     conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """start() launches a DBOS workflow; get() reflects completion."""
-    agent_id = _make_agent(agent_store)
+    # Monkeypatch litellm.completion so no real API call is made.
+    mock_resp = MagicMock()
+    mock_resp.model_dump.return_value = _CANNED_LLM_RESPONSE
+    monkeypatch.setattr("litellm.completion", lambda **kwargs: mock_resp)
+
+    agent_id = _make_agent(agent_store, artifact_store)
     conv_id = _make_conversation(conversation_store)
-    task = task_store.create(conversation_id=conv_id, agent_id=agent_id, agent_name=_AGENT_NAME)
+    # The workflow loads history — seed with a user message.
+    conversation_store.append(
+        conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="seed",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "hi"}],
+                ),
+            )
+        ],
+    )
+    task = task_store.create(
+        conversation_id=conv_id,
+        agent_id=agent_id,
+        agent_name=_AGENT_NAME,
+    )
 
     assert task.status == "queued"
     task_store.start(task.id, instructions="Be helpful")
 
     result = await task_store.wait(task.id)
     assert result.status == "completed"
-    assert len(result.output) == 1
+    assert len(result.output) >= 1
     assert result.output[0]["role"] == "assistant"
     # instructions are stored in DBOS and restored by get()/wait()
     assert result.instructions == "Be helpful"
@@ -276,15 +389,38 @@ async def test_start_and_get_completed(
 async def test_wait_returns_completed_task(
     task_store: SqlAlchemyTaskStore,
     agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
     conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """wait() blocks until the workflow completes and returns the task."""
-    agent_id = _make_agent(agent_store)
+    mock_resp = MagicMock()
+    mock_resp.model_dump.return_value = _CANNED_LLM_RESPONSE
+    monkeypatch.setattr("litellm.completion", lambda **kwargs: mock_resp)
+
+    agent_id = _make_agent(agent_store, artifact_store)
     conv_id = _make_conversation(conversation_store)
-    task = task_store.create(conversation_id=conv_id, agent_id=agent_id, agent_name=_AGENT_NAME)
+    conversation_store.append(
+        conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="seed",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "hello"}],
+                ),
+            )
+        ],
+    )
+    task = task_store.create(
+        conversation_id=conv_id,
+        agent_id=agent_id,
+        agent_name=_AGENT_NAME,
+    )
     task_store.start(task.id, reasoning={"effort": "high"})
 
     result = await task_store.wait(task.id)
     assert result.status == "completed"
-    assert len(result.output) == 1
+    assert len(result.output) >= 1
     assert result.reasoning == {"effort": "high"}

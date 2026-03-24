@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
 from agent_plane.entities import Conversation, ConversationItem
+from agent_plane.errors import AgentPlaneError, ErrorCode
 from agent_plane.server.schemas import (
     ConversationDeleted,
     ConversationObject,
@@ -90,7 +91,7 @@ def create_conversations_router(
     ) -> ConversationObject:
         conv = conversation_store.get_conversation(conversation_id)
         if conv is None:
-            raise HTTPException(status_code=404, detail="Conversation not found")
+            raise AgentPlaneError("Conversation not found", code=ErrorCode.NOT_FOUND)
         return _to_conversation_object(conv)
 
     # ── GET /conversations/{conversation_id}/items ────────────────
@@ -105,7 +106,7 @@ def create_conversations_router(
     ) -> PaginatedList:
         conv = conversation_store.get_conversation(conversation_id)
         if conv is None:
-            raise HTTPException(status_code=404, detail="Conversation not found")
+            raise AgentPlaneError("Conversation not found", code=ErrorCode.NOT_FOUND)
         page = conversation_store.list_items(
             conversation_id=conversation_id,
             limit=limit,
@@ -129,7 +130,7 @@ def create_conversations_router(
     ) -> ConversationObject:
         conv = conversation_store.update_conversation(conversation_id, title=body.title)
         if conv is None:
-            raise HTTPException(status_code=404, detail="Conversation not found")
+            raise AgentPlaneError("Conversation not found", code=ErrorCode.NOT_FOUND)
         return _to_conversation_object(conv)
 
     # ── DELETE /conversations/{conversation_id} ───────────────────
@@ -140,15 +141,11 @@ def create_conversations_router(
     ) -> ConversationDeleted:
         conv = conversation_store.get_conversation(conversation_id)
         if conv is None:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        # Cancel active tasks (graceful shutdown), then delete all
-        # task rows so the conversation FK can be removed. The CASCADE
-        # on tasks.conversation_id is a safety net, not the primary mechanism.
-        for task in task_store.list_tasks(conversation_id=conversation_id):
-            await task_store.delete(task.id)
+            raise AgentPlaneError("Conversation not found", code=ErrorCode.NOT_FOUND)
+        await task_store.delete_all(conversation_id=conversation_id)
         deleted = await conversation_store.delete_conversation(conversation_id)
         if not deleted:
-            raise HTTPException(status_code=404, detail="Conversation not found")
+            raise AgentPlaneError("Conversation not found", code=ErrorCode.NOT_FOUND)
         return ConversationDeleted(id=conversation_id)
 
     return router

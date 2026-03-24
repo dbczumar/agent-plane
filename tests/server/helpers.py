@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import io
+import tarfile
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
+import yaml
 
 
 @dataclass
@@ -17,19 +20,39 @@ class ApiResponse:
     body: dict[str, Any]
 
 
+def build_agent_bundle(
+    name: str,
+    description: str | None = None,
+) -> bytes:
+    """
+    Build a minimal valid agent bundle (tar.gz) for testing.
+
+    The bundle contains a single config.yaml with the given spec fields.
+    """
+    # Any: YAML config values are heterogeneous (str, int, etc.)
+    config: dict[str, Any] = {"spec_version": 1, "name": name}
+    if description is not None:
+        config["description"] = description
+    config_bytes = yaml.dump(config).encode()
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(config_bytes)
+        tf.addfile(info, io.BytesIO(config_bytes))
+    return buf.getvalue()
+
+
 async def create_test_agent(
     client: httpx.AsyncClient,
     name: str = "test-agent",
     description: str | None = None,
 ) -> dict[str, Any]:
     """Create an agent via the API and return the response JSON."""
-    data: dict[str, str] = {"name": name}
-    if description is not None:
-        data["description"] = description
+    bundle = build_agent_bundle(name=name, description=description)
     resp = await client.post(
         "/api/agents",
-        files={"bundle": ("agent.tar.gz", b"fake bundle", "application/gzip")},
-        data=data,
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
     )
     assert resp.status_code == 201
     return resp.json()

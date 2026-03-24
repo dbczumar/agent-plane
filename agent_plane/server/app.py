@@ -1,7 +1,11 @@
 """FastAPI application — main entry point for the agent-plane server."""
 
-from fastapi import FastAPI
+import logging
 
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from agent_plane.errors import AgentPlaneError
 from agent_plane.server.routes.agents import create_agents_router
 from agent_plane.server.routes.conversations import create_conversations_router
 from agent_plane.server.routes.files import create_files_router
@@ -13,6 +17,8 @@ from agent_plane.stores import (
     FileStore,
     TaskStore,
 )
+
+_logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -27,6 +33,15 @@ def create_app(
     Stores are injected here and passed to route factories.
     """
     app = FastAPI(title="Agent Plane Server")
+
+    @app.exception_handler(AgentPlaneError)
+    async def _handle_agent_plane_error(request: Request, exc: AgentPlaneError) -> JSONResponse:
+        if exc.http_status >= 500:
+            _logger.error("Internal error: %s", exc.message, exc_info=True)
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
 
     app.include_router(
         create_agents_router(agent_store, task_store, artifact_store),

@@ -80,7 +80,7 @@ class TaskStore(ABC):
         ...
 
     @abstractmethod
-    def get(self, task_id: str) -> Task | None:
+    async def get(self, task_id: str) -> Task | None:
         """
         Return a snapshot of the task's current state. Output is populated
         only when status is "completed". For all other terminal states
@@ -163,8 +163,21 @@ class TaskStore(ABC):
         """
         ...
 
+    async def delete_all(
+        self,
+        *,
+        agent_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> None:
+        """
+        Cancel and delete all tasks matching the filter. Delegates to
+        list_tasks + delete so DBOS workflow cleanup is honoured.
+        """
+        for task in await self.list_tasks(agent_id=agent_id, conversation_id=conversation_id):
+            await self.delete(task.id)
+
     @abstractmethod
-    def list_tasks(
+    async def list_tasks(
         self,
         conversation_id: str | None = None,
         agent_id: str | None = None,

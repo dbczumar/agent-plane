@@ -2,10 +2,11 @@
 
 import mimetypes
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, File, Query, UploadFile
 from starlette.responses import Response
 
 from agent_plane.entities import StoredFile
+from agent_plane.errors import AgentPlaneError, ErrorCode
 from agent_plane.server.schemas import FileDeleted, FileObject, PaginatedList
 from agent_plane.stores import ArtifactStore, FileStore
 
@@ -32,7 +33,7 @@ def create_files_router(
         file: UploadFile = File(...),
     ) -> FileObject:
         if not file.filename:
-            raise HTTPException(status_code=400, detail="filename is required")
+            raise AgentPlaneError("filename is required", code=ErrorCode.INVALID_INPUT)
         content = await file.read()
         content_type = mimetypes.guess_type(file.filename)[0]
         stored = file_store.create(
@@ -68,7 +69,7 @@ def create_files_router(
     async def get_file(file_id: str) -> FileObject:
         stored = file_store.get(file_id)
         if stored is None:
-            raise HTTPException(status_code=404, detail="File not found")
+            raise AgentPlaneError("File not found", code=ErrorCode.NOT_FOUND)
         return _to_file_object(stored)
 
     # ── DELETE /files/{file_id} ──────────────────────────────────
@@ -76,7 +77,7 @@ def create_files_router(
     @router.delete("/files/{file_id}")
     async def delete_file(file_id: str) -> FileDeleted:
         if not file_store.delete(file_id):
-            raise HTTPException(status_code=404, detail="File not found")
+            raise AgentPlaneError("File not found", code=ErrorCode.NOT_FOUND)
         artifact_store.delete(file_id)
         return FileDeleted(id=file_id)
 
@@ -86,7 +87,7 @@ def create_files_router(
     async def get_file_content(file_id: str) -> Response:
         stored = file_store.get(file_id)
         if stored is None:
-            raise HTTPException(status_code=404, detail="File not found")
+            raise AgentPlaneError("File not found", code=ErrorCode.NOT_FOUND)
 
         content = artifact_store.get(stored.id)
         media_type = mimetypes.guess_type(stored.filename)[0] or "application/octet-stream"

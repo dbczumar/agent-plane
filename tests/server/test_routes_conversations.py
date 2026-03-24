@@ -39,7 +39,7 @@ async def test_get_conversation(client: httpx.AsyncClient) -> None:
 async def test_get_conversation_not_found(client: httpx.AsyncClient) -> None:
     resp = await client.get("/v1/conversations/nonexistent")
     assert resp.status_code == 404
-    assert isinstance(resp.json()["detail"], str)
+    assert isinstance(resp.json()["error"]["message"], str)
 
 
 async def test_list_conversations_after_response(
@@ -85,7 +85,7 @@ async def test_update_conversation_not_found(
         json={"title": "Nope"},
     )
     assert resp.status_code == 404
-    assert isinstance(resp.json()["detail"], str)
+    assert isinstance(resp.json()["error"]["message"], str)
 
 
 async def test_delete_conversation(client: httpx.AsyncClient) -> None:
@@ -110,7 +110,7 @@ async def test_delete_conversation_not_found(
 ) -> None:
     resp = await client.delete("/v1/conversations/nonexistent")
     assert resp.status_code == 404
-    assert isinstance(resp.json()["detail"], str)
+    assert isinstance(resp.json()["error"]["message"], str)
 
 
 async def test_list_conversation_items(client: httpx.AsyncClient) -> None:
@@ -144,7 +144,7 @@ async def test_list_conversation_items_not_found(
 ) -> None:
     resp = await client.get("/v1/conversations/nonexistent/items")
     assert resp.status_code == 404
-    assert isinstance(resp.json()["detail"], str)
+    assert isinstance(resp.json()["error"]["message"], str)
 
 
 async def test_list_conversations_pagination(

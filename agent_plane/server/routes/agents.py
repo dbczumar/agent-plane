@@ -1,9 +1,14 @@
 """Routes for the /api/agents endpoints."""
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+import tempfile
+from pathlib import Path
+
+from fastapi import APIRouter, File, Query, UploadFile
 
 from agent_plane.entities import Agent
+from agent_plane.errors import AgentPlaneError, ErrorCode
 from agent_plane.server.schemas import AgentDeleted, AgentObject, PaginatedList
+from agent_plane.spec import ExtractionError, load
 from agent_plane.stores import AgentStore, ArtifactStore, TaskStore
 
 
@@ -28,19 +33,31 @@ def create_agents_router(
     @router.post("/agents", status_code=201)
     async def create_agent(
         bundle: UploadFile = File(...),
-        name: str = Form(...),
-        description: str | None = Form(default=None),
     ) -> AgentObject:
-        if agent_store.get_by_name(name) is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Agent with name '{name}' already exists",
+        bundle_bytes = await bundle.read()
+
+        # Validate bundle and extract agent spec
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                spec = load(bundle_bytes, dest=Path(tmpdir) / "agent")
+        except (ValueError, ExtractionError) as exc:
+            raise AgentPlaneError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+
+        if spec.name is None:
+            raise AgentPlaneError(
+                "agent spec must include a name",
+                code=ErrorCode.INVALID_INPUT,
             )
 
-        bundle_bytes = await bundle.read()
+        if agent_store.get_by_name(spec.name) is not None:
+            raise AgentPlaneError(
+                f"Agent with name '{spec.name}' already exists",
+                code=ErrorCode.ALREADY_EXISTS,
+            )
+
         agent = agent_store.create(
-            name=name,
-            description=description,
+            name=spec.name,
+            description=spec.description,
         )
         artifact_store.put(agent.id, bundle_bytes)
 
@@ -70,7 +87,7 @@ def create_agents_router(
     async def get_agent(agent_id: str) -> AgentObject:
         agent = agent_store.get(agent_id)
         if agent is None:
-            raise HTTPException(status_code=404, detail="Agent not found")
+            raise AgentPlaneError("Agent not found", code=ErrorCode.NOT_FOUND)
         return _to_agent_object(agent)
 
     # ── DELETE /agents/{agent_id} ──────────────────────────────────
@@ -79,13 +96,9 @@ def create_agents_router(
     async def delete_agent(agent_id: str) -> AgentDeleted:
         agent = agent_store.get(agent_id)
         if agent is None:
-            raise HTTPException(status_code=404, detail="Agent not found")
+            raise AgentPlaneError("Agent not found", code=ErrorCode.NOT_FOUND)
 
-        # Cancel active tasks (graceful shutdown), then delete all
-        # task rows so the agent FK can be removed. The CASCADE on
-        # tasks.agent_id is a safety net, not the primary mechanism.
-        for task in task_store.list_tasks(agent_id=agent_id):
-            await task_store.delete(task.id)
+        await task_store.delete_all(agent_id=agent_id)
         artifact_store.delete(agent_id)
         agent_store.delete(agent_id)
 

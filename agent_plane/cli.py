@@ -94,12 +94,34 @@ def server(
     if config_path and artifact_location is None and not Path(art_loc).is_absolute():
         art_loc = str(Path(config_path).parent / art_loc)
 
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    file_store = SqlAlchemyFileStore(db_uri)
+    task_store = SqlAlchemyTaskStore(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    artifact_store = LocalArtifactStore(art_loc)
+
+    # Initialize the runtime with store references so workflow code
+    # can access them via getter functions (get_agent_cache(), etc.).
+    from agent_plane.runtime import init as init_runtime
+    from agent_plane.runtime.agent_cache import AgentCache
+
+    agent_cache = AgentCache(
+        artifact_store=artifact_store,
+        cache_dir=Path(art_loc) / ".cache",
+    )
+    init_runtime(
+        conversation_store=conversation_store,
+        task_store=task_store,
+        agent_store=agent_store,
+        agent_cache=agent_cache,
+    )
+
     app = create_app(
-        agent_store=SqlAlchemyAgentStore(db_uri),
-        file_store=SqlAlchemyFileStore(db_uri),
-        task_store=SqlAlchemyTaskStore(db_uri),
-        conversation_store=SqlAlchemyConversationStore(db_uri),
-        artifact_store=LocalArtifactStore(art_loc),
+        agent_store=agent_store,
+        file_store=file_store,
+        task_store=task_store,
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
     )
 
     click.echo(f"Starting agent-plane server on {host}:{port}")
@@ -107,3 +129,53 @@ def server(
     click.echo(f"  artifacts: {art_loc}")
 
     uvicorn.run(app, host=host, port=port)
+
+
+@cli.command()
+@click.argument("path", type=click.Path(exists=True))
+@click.option(
+    "--server",
+    "-s",
+    default="http://localhost:8000",
+    show_default=True,
+    help="Agent-plane server URL.",
+)
+def deploy(path: str, server: str) -> None:
+    """Deploy an agent image to the server."""
+    import httpx
+
+    bundle_bytes = _bundle(Path(path))
+    url = f"{server.rstrip('/')}/api/agents"
+
+    resp = httpx.post(url, files={"bundle": ("agent.tar.gz", bundle_bytes, "application/gzip")})
+
+    if resp.status_code == 201:
+        body = resp.json()
+        click.echo(f"Deployed agent '{body['name']}' (id: {body['id']})")
+    else:
+        click.echo(f"Deploy failed ({resp.status_code}): {resp.text}", err=True)
+        raise SystemExit(1)
+
+
+def _bundle(source: Path) -> bytes:
+    """
+    Produce a tar.gz bundle from a directory or pass through an existing tarball.
+    """
+    if source.is_file():
+        return source.read_bytes()
+
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for file_path in source.rglob("*"):
+            if file_path.is_file():
+                # Relative path inside the bundle (e.g. "config.yaml")
+                arcname = str(file_path.relative_to(source))
+                tf.add(str(file_path), arcname=arcname)
+    return buf.getvalue()
+
+
+if __name__ == "__main__":
+    cli()

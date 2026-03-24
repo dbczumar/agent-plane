@@ -113,7 +113,7 @@ async def test_get_response(client: httpx.AsyncClient) -> None:
 async def test_get_response_not_found(client: httpx.AsyncClient) -> None:
     resp = await client.get("/v1/responses/nonexistent")
     assert resp.status_code == 404
-    assert isinstance(resp.json()["detail"], str)
+    assert isinstance(resp.json()["error"]["message"], str)
 
 
 async def test_delete_response(client: httpx.AsyncClient) -> None:
@@ -136,7 +136,7 @@ async def test_delete_response(client: httpx.AsyncClient) -> None:
 async def test_delete_response_not_found(client: httpx.AsyncClient) -> None:
     resp = await client.delete("/v1/responses/nonexistent")
     assert resp.status_code == 404
-    assert isinstance(resp.json()["detail"], str)
+    assert isinstance(resp.json()["error"]["message"], str)
 
 
 async def test_cancel_completed_response(client: httpx.AsyncClient) -> None:
@@ -176,7 +176,7 @@ async def test_cancel_active_response(
 async def test_cancel_response_not_found(client: httpx.AsyncClient) -> None:
     resp = await client.post("/v1/responses/nonexistent/cancel")
     assert resp.status_code == 404
-    assert isinstance(resp.json()["detail"], str)
+    assert isinstance(resp.json()["error"]["message"], str)
 
 
 async def test_create_response_unknown_model(client: httpx.AsyncClient) -> None:
@@ -185,7 +185,7 @@ async def test_create_response_unknown_model(client: httpx.AsyncClient) -> None:
         json={"model": "nonexistent-model", "input": "Hi"},
     )
     assert resp.status_code == 404
-    assert isinstance(resp.json()["detail"], str)
+    assert isinstance(resp.json()["error"]["message"], str)
 
 
 async def test_create_response_store_false(client: httpx.AsyncClient) -> None:
@@ -276,7 +276,7 @@ async def test_create_response_conversation_without_previous(
         },
     )
     assert resp.status_code == 400
-    assert isinstance(resp.json()["detail"], str)
+    assert isinstance(resp.json()["error"]["message"], str)
 
 
 async def test_create_response_conversation_mismatch(
@@ -303,7 +303,7 @@ async def test_create_response_conversation_mismatch(
         },
     )
     assert resp.status_code == 400
-    assert "does not belong" in resp.json()["detail"]
+    assert "does not belong" in resp.json()["error"]["message"]
 
 
 async def test_steering_try_deliver(
@@ -400,7 +400,7 @@ async def test_fork_detection(client: httpx.AsyncClient) -> None:
         },
     )
     assert fork_resp.status_code == 400
-    assert "fork" in fork_resp.json()["detail"].lower()
+    assert "fork" in fork_resp.json()["error"]["message"].lower()
 
 
 async def test_create_response_list_input(client: httpx.AsyncClient) -> None:

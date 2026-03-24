@@ -21,6 +21,7 @@ from agent_plane.db.utils import (
     now_epoch,
 )
 from agent_plane.entities import ConversationItem, NewConversationItem, Task, TaskStatus
+from agent_plane.runtime import live_stream
 from agent_plane.server.app import create_app
 from agent_plane.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from agent_plane.stores.artifact_store.local import LocalArtifactStore
@@ -232,6 +233,16 @@ class IntegrationTaskStore(TaskStore):
         }
         if not self.defer_all_completions:
             self._completed.add(task_id)
+        # Publish canned events to the live stream so streaming
+        # tests exercise the same path as production code.
+        live_stream.publish(
+            task_id,
+            {
+                "type": "response.output_text.delta",
+                "delta": "Hello from the test agent.",
+            },
+        )
+        live_stream.close(task_id)
 
     async def stream(self, task_id: str) -> AsyncIterator[dict[str, Any]]:
         yield {
@@ -239,7 +250,7 @@ class IntegrationTaskStore(TaskStore):
             "delta": "Hello from the test agent.",
         }
 
-    def get(self, task_id: str) -> Task | None:
+    async def get(self, task_id: str) -> Task | None:
         if task_id in self._deleted:
             return None
         with self._session() as session:
@@ -249,7 +260,7 @@ class IntegrationTaskStore(TaskStore):
             return self._row_to_task(row)
 
     async def wait(self, task_id: str) -> Task:
-        task = self.get(task_id)
+        task = await self.get(task_id)
         if task is None:
             raise LookupError(f"task {task_id!r} not found")
         return task
@@ -257,7 +268,7 @@ class IntegrationTaskStore(TaskStore):
     async def cancel(self, task_id: str) -> Task:
         self._cancelled.add(task_id)
         self._completed.discard(task_id)
-        task = self.get(task_id)
+        task = await self.get(task_id)
         if task is None:
             raise LookupError(f"task {task_id!r} not found")
         return task
@@ -269,7 +280,7 @@ class IntegrationTaskStore(TaskStore):
             if row:
                 session.delete(row)
 
-    def list_tasks(
+    async def list_tasks(
         self,
         conversation_id: str | None = None,
         agent_id: str | None = None,

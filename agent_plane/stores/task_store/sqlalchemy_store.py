@@ -46,7 +46,6 @@ from agent_plane.runtime.durability import (
     WorkflowStatusString,
     cancel_workflow_async,
     ensure_dbos,
-    get_workflow_status,
     get_workflow_status_async,
     read_stream_async,
     retrieve_workflow_async,
@@ -134,22 +133,8 @@ def _apply_workflow_status(task: Task, wf_status: WorkflowStatus) -> Task:
     return task
 
 
-def _enrich_from_dbos(task: Task) -> Task:
-    """
-    Sync enrichment — merge DBOS workflow state into a Task.
-    Must NOT be called from an async context (DBOS will raise).
-    """
-    wf_status: WorkflowStatus | None = get_workflow_status(task.id)
-    if wf_status is None:
-        return task
-    return _apply_workflow_status(task, wf_status)
-
-
-async def _enrich_from_dbos_async(task: Task) -> Task:
-    """
-    Async enrichment — for use in async methods where an event
-    loop is already running.
-    """
+async def _enrich_from_dbos(task: Task) -> Task:
+    """Merge DBOS workflow state (status, output, error) into a Task."""
     wf_status: WorkflowStatus | None = await get_workflow_status_async(task.id)
     if wf_status is None:
         return task
@@ -254,27 +239,18 @@ class SqlAlchemyTaskStore(TaskStore):
         async for event in read_stream_async(task_id, "output"):
             yield event
 
-    def get(self, task_id: str) -> Task | None:
+    async def get(self, task_id: str) -> Task | None:
         with self._session() as session:
             row = session.get(SqlTask, task_id)
             if row is None:
                 return None
             task = _to_entity(row)
-        return _enrich_from_dbos(task)
-
-    async def _get_async(self, task_id: str) -> Task | None:
-        """Async variant of get() for use in async methods."""
-        with self._session() as session:
-            row = session.get(SqlTask, task_id)
-            if row is None:
-                return None
-            task = _to_entity(row)
-        return await _enrich_from_dbos_async(task)
+        return await _enrich_from_dbos(task)
 
     async def wait(self, task_id: str) -> Task:
         handle: WorkflowHandleAsync[dict[str, Any]] = await retrieve_workflow_async(task_id)
         await handle.get_result()
-        task = await self._get_async(task_id)
+        task = await self.get(task_id)
         if task is None:
             raise LookupError(f"task {task_id!r} not found")
         return task
@@ -377,7 +353,7 @@ class SqlAlchemyTaskStore(TaskStore):
 
     async def cancel(self, task_id: str) -> Task:
         await cancel_workflow_async(task_id)
-        task = await self._get_async(task_id)
+        task = await self.get(task_id)
         if task is None:
             raise LookupError(f"task {task_id!r} not found")
         return task
@@ -395,7 +371,7 @@ class SqlAlchemyTaskStore(TaskStore):
 
     # ── List ──────────────────────────────────────────────
 
-    def list_tasks(
+    async def list_tasks(
         self,
         conversation_id: str | None = None,
         agent_id: str | None = None,
@@ -411,4 +387,7 @@ class SqlAlchemyTaskStore(TaskStore):
             rows = list(session.execute(stmt).scalars().all())
             tasks = [_to_entity(r) for r in rows]
 
-        return [_enrich_from_dbos(t) for t in tasks]
+        enriched: list[Task] = []
+        for t in tasks:
+            enriched.append(await _enrich_from_dbos(t))
+        return enriched

@@ -89,7 +89,26 @@ Check each file against this checklist:
     pass tuples as arguments. Use lightweight dataclasses with named
     fields. Tuples are positionally fragile and not extensible.
 
-19. ABSTRACTION VIOLATIONS: Code must respect abstraction boundaries.
+19. NO EMPTY STRING SENTINELS: Never use empty strings (`""`) as
+    sentinel values, default initializers, or "not yet set" placeholders.
+    Use `None` (with `Optional` / `| None` type) for absence. Never
+    assign `""` to a variable that will later be checked — use `None`
+    and `is not None`. Never pass `""` as an argument to mean "no value".
+    Empty strings hide bugs because they are falsy but not `None`,
+    causing subtle `if x` vs `if x is not None` mismatches.
+
+20. NO LARGE METHODS: Functions/methods must be <= 40 lines. If a
+    method exceeds this, split it into named helper functions. Common
+    splits: (a) extract validation into a helper that returns validated
+    data or raises, (b) extract each major code path (streaming,
+    blocking wait, background) into its own function, (c) extract
+    complex setup/teardown into context managers or helpers. The goal
+    is that each function does ONE thing and its logic fits on a
+    screen. Nested `async def` closures count toward the enclosing
+    function's length — extract them to module-level async functions
+    that accept explicit arguments instead.
+
+21. ABSTRACTION VIOLATIONS: Code must respect abstraction boundaries.
     This includes but is not limited to:
     - Importing from a package's internal submodules when it exposes a
       public API (e.g. import from `agent_plane.spec` not
@@ -104,6 +123,26 @@ Check each file against this checklist:
       public interface.
     If a needed abstraction doesn't exist, create it rather than
     working around the gap.
+
+22. NO COUNTER VARIABLES FOR FIXED SEQUENCES: When values are
+    deterministic constants (e.g. SSE sequence numbers 0, 1, 2 for a
+    known set of events), hardcode the literals instead of
+    incrementing a counter variable. Counter variables imply the
+    count is dynamic; use them only when iterating over data of
+    unknown length. A `seq = 0; seq += 1; seq += 1` sequence where
+    the values are always 0, 1, 2 should just be 0, 1, 2.
+
+23. NO RACE CONDITIONS: Zero tolerance. When bridging sync/async or
+    cross-thread boundaries, ordering guarantees must be enforced
+    structurally. "Register before start" not "register and hope."
+    No "negligible window" or "in practice" handwaving. If a
+    theoretical race exists, it must be eliminated by design.
+
+24. NO DUAL MODES / FALLBACK PATHS: Don't support two ways of doing
+    the same thing. If a new mechanism replaces an old one, make it
+    the only path. No `if use_X ... else use_Y` branching for the
+    same operation. Test infrastructure must use the same path as
+    production code.
 
 Report each finding as:
   [FILE:LINE] ISSUE — description of the problem and suggested fix

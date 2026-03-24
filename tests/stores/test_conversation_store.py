@@ -451,7 +451,7 @@ async def test_delete_conversation_with_tasks(
     )
     assert await conversation_store.delete_conversation(conv.id) is True
     assert conversation_store.get_conversation(conv.id) is None
-    assert task_store.list_tasks(conversation_id=conv.id) == []
+    assert await task_store.list_tasks(conversation_id=conv.id) == []
 
 
 # ── List conversations pagination ────────────────────
