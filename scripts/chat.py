@@ -32,9 +32,7 @@ BASE_URL = f"http://127.0.0.1:{PORT}"
 AGENT_NAME = "chat-agent"
 MODEL = "gpt-5.4"
 # MODEL = "gpt-4o-mini"
-SYSTEM_INSTRUCTIONS = (
-    "You are a helpful assistant. Be concise but thorough."
-)
+SYSTEM_INSTRUCTIONS = "You are a helpful assistant. Be concise but thorough."
 
 
 # ── Helpers ───────────────────────────────────────────
@@ -66,9 +64,7 @@ def wait_for_server(proc: subprocess.Popen[bytes], timeout: float = 15.0) -> Non
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             out = proc.stdout.read().decode(errors="replace") if proc.stdout else ""
-            raise RuntimeError(
-                f"Server exited with code {proc.returncode}.\n{out[-3000:]}"
-            )
+            raise RuntimeError(f"Server exited with code {proc.returncode}.\n{out[-3000:]}")
         try:
             resp = httpx.get(f"{BASE_URL}/v1/conversations", timeout=2.0)
             if resp.status_code in (200, 404):
@@ -232,11 +228,18 @@ def main() -> None:
         print("Starting server...")
         server_proc = subprocess.Popen(
             [
-                sys.executable, "-m", "agent_plane.cli", "server",
-                "--host", "127.0.0.1",
-                "--port", str(PORT),
-                "--database-uri", db_uri,
-                "--artifact-location", art_loc,
+                sys.executable,
+                "-m",
+                "agent_plane.cli",
+                "server",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(PORT),
+                "--database-uri",
+                db_uri,
+                "--artifact-location",
+                art_loc,
             ],
             env={**os.environ},
             stdout=subprocess.PIPE,
@@ -274,11 +277,12 @@ def main() -> None:
 
                 try:
                     previous_response_id = stream_response(
-                        client, user_input, previous_response_id,
+                        client,
+                        user_input,
+                        previous_response_id,
                     )
                 except httpx.HTTPStatusError as exc:
-                    print(f"\n[Error {exc.response.status_code}: "
-                          f"{exc.response.text}]")
+                    print(f"\n[Error {exc.response.status_code}: {exc.response.text}]")
                 except httpx.ConnectError:
                     print("\n[Server connection lost]")
                     break

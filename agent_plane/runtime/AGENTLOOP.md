@@ -267,8 +267,7 @@ def agent_execution_workflow(agent_id, conversation_id,
             llm_resp = call_llm(                     # [NEW] steps.py @step
                 messages, spec.llm.model,
                 tool_schemas,
-                spec.llm.max_completion_tokens,
-                spec.llm.reasoning_effort,
+                spec.llm.extra,  # arbitrary litellm kwargs
             )
 
             # If no tool calls → final response

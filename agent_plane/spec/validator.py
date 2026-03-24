@@ -13,7 +13,6 @@ _SKILL_DESC_MAX_LEN = 1024
 _VALID_TRANSPORTS = {"stdio", "http"}
 _VALID_INPUT_MODALITIES = {"text", "image", "audio", "video", "file"}
 _VALID_OUTPUT_MODALITIES = {"text", "image", "audio"}
-_VALID_REASONING_EFFORTS = {"low", "medium", "high"}
 
 
 @dataclass
@@ -65,13 +64,6 @@ def _validate_llm(spec: AgentSpec, result: ValidationResult) -> None:
         return
     if not spec.llm.model:
         result.add("llm.model", "must be present when llm block is present")
-    if spec.llm.reasoning_effort is not None:
-        if spec.llm.reasoning_effort not in _VALID_REASONING_EFFORTS:
-            result.add(
-                "llm.reasoning_effort",
-                f"must be one of {sorted(_VALID_REASONING_EFFORTS)}, "
-                f"got {spec.llm.reasoning_effort!r}",
-            )
 
 
 def _validate_interaction(spec: AgentSpec, result: ValidationResult) -> None:

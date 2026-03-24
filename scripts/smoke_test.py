@@ -64,8 +64,7 @@ def wait_for_server(
         if proc.poll() is not None:
             out = proc.stdout.read().decode(errors="replace") if proc.stdout else ""
             raise RuntimeError(
-                f"Server process exited with code {proc.returncode}.\n"
-                f"Output:\n{out[-3000:]}"
+                f"Server process exited with code {proc.returncode}.\nOutput:\n{out[-3000:]}"
             )
         try:
             resp = httpx.get(f"{BASE_URL}/v1/conversations", timeout=2.0)
@@ -210,11 +209,18 @@ def main() -> None:
         print(f"Starting server on port {PORT}...")
         server_proc = subprocess.Popen(
             [
-                sys.executable, "-m", "agent_plane.cli", "server",
-                "--host", "127.0.0.1",
-                "--port", str(PORT),
-                "--database-uri", db_uri,
-                "--artifact-location", art_loc,
+                sys.executable,
+                "-m",
+                "agent_plane.cli",
+                "server",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(PORT),
+                "--database-uri",
+                db_uri,
+                "--artifact-location",
+                art_loc,
             ],
             env={**os.environ},
             stdout=subprocess.PIPE,

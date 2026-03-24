@@ -8,11 +8,20 @@ from typing import Any
 
 @dataclass
 class LLMConfig:
-    """LLM configuration block from config.yaml."""
+    """
+    LLM configuration block from config.yaml.
+
+    Only ``model`` is a known field. All other keys from the YAML
+    ``llm:`` block are collected into ``extra`` and passed through
+    to litellm as-is, so any parameter litellm supports can be set
+    in the agent spec without code changes here.
+    """
 
     model: str
-    max_completion_tokens: int | None = None
-    reasoning_effort: str | None = None  # "low" | "medium" | "high"
+    # Arbitrary litellm kwargs from the YAML llm block (everything
+    # except ``model``). Values are heterogeneous (str, int, dict,
+    # etc.) so Any is the narrowest safe type.
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

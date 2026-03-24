@@ -80,8 +80,10 @@ def test_parse_full_config(tmp_path: Path) -> None:
     assert spec.description == "A fully configured agent."
     assert spec.llm is not None
     assert spec.llm.model == "openai/gpt-5.4"
-    assert spec.llm.max_completion_tokens == 4096
-    assert spec.llm.reasoning_effort == "medium"
+    assert spec.llm.extra == {
+        "max_completion_tokens": 4096,
+        "reasoning_effort": "medium",
+    }
     assert spec.interaction.conversational is True
     assert spec.interaction.modalities.input == ["text", "image", "file"]
     assert spec.interaction.modalities.output == ["text"]
@@ -94,6 +96,40 @@ def test_parse_llm_missing_model(tmp_path: Path) -> None:
     (tmp_path / "config.yaml").write_text(yaml.dump(config))
     with pytest.raises(ValueError, match="missing required field: model"):
         parse(tmp_path)
+
+
+def test_parse_llm_arbitrary_extra_keys(tmp_path: Path) -> None:
+    """All non-model keys in the llm block are collected into extra."""
+    config = {
+        "spec_version": 1,
+        "llm": {
+            "model": "anthropic/claude-sonnet-4-20250514",
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_tokens": 2048,
+            "stop": ["\n\n"],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.llm is not None
+    assert spec.llm.model == "anthropic/claude-sonnet-4-20250514"
+    assert spec.llm.extra == {
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "max_tokens": 2048,
+        "stop": ["\n\n"],
+    }
+
+
+def test_parse_llm_model_only(tmp_path: Path) -> None:
+    """LLM block with only model has empty extra."""
+    config = {"spec_version": 1, "llm": {"model": "openai/gpt-4o"}}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.llm is not None
+    assert spec.llm.model == "openai/gpt-4o"
+    assert spec.llm.extra == {}
 
 
 def test_parse_agents_md_fallback(agent_dir: Path) -> None:

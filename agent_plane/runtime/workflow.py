@@ -45,7 +45,7 @@ _logger = logging.getLogger(__name__)
 
 # Hard upper bound on LLM turns per execution. Prevents runaway loops.
 # See AGENTLOOP.md "Not Yet" for making this configurable.
-_MAX_ITERATIONS = 32
+_MAX_ITERATIONS = 1000
 
 
 def _write_output(task_id: str, event: dict[str, Any]) -> None:
@@ -68,27 +68,20 @@ def _call_llm(
     messages: list[dict[str, Any]],
     model: str,
     tools: list[dict[str, Any]],
-    max_tokens: int | None,
-    reasoning_effort: str | None,
+    extra: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Call the LLM via litellm (non-streaming). Returns the full response
-    as a dict (JSON-serializable for DBOS checkpointing).
+    Call the LLM via litellm (non-streaming). Returns the full
+    response as a dict (JSON-serializable for DBOS checkpointing).
     """
     kwargs: dict[str, Any] = {
         "model": model,
         "messages": messages,
+        **extra,
     }
     if tools:
         kwargs["tools"] = tools
-    if max_tokens is not None:
-        kwargs["max_tokens"] = max_tokens
-    if reasoning_effort is not None:
-        # litellm passes this through to providers that support it
-        kwargs["reasoning_effort"] = reasoning_effort
-
     resp = litellm.completion(**kwargs)
-    # litellm.completion returns ModelResponse which has model_dump()
     result: dict[str, Any] = resp.model_dump()
     return result
 
@@ -98,8 +91,7 @@ def _call_llm_streaming(
     messages: list[dict[str, Any]],
     model: str,
     tools: list[dict[str, Any]],
-    max_tokens: int | None,
-    reasoning_effort: str | None,
+    extra: dict[str, Any],
 ) -> dict[str, Any]:
     """
     Call the LLM via litellm with streaming enabled. Emits
@@ -114,18 +106,12 @@ def _call_llm_streaming(
         "model": model,
         "messages": messages,
         "stream": True,
+        **extra,
     }
     if tools:
         kwargs["tools"] = tools
-    if max_tokens is not None:
-        kwargs["max_tokens"] = max_tokens
-    if reasoning_effort is not None:
-        kwargs["reasoning_effort"] = reasoning_effort
-
     stream_resp = litellm.completion(**kwargs)
-
-    accumulated = _accumulate_stream(task_id, stream_resp)
-    return accumulated
+    return _accumulate_stream(task_id, stream_resp)
 
 
 def _accumulate_tool_call_delta(
@@ -552,15 +538,13 @@ def _call_llm_for_iteration(
             messages,
             llm_config.model,
             tool_schemas,
-            llm_config.max_completion_tokens,
-            llm_config.reasoning_effort,
+            llm_config.extra,
         )
     return _call_llm(
         messages,
         llm_config.model,
         tool_schemas,
-        llm_config.max_completion_tokens,
-        llm_config.reasoning_effort,
+        llm_config.extra,
     )
 
 

@@ -81,11 +81,9 @@ def _parse_llm(raw: dict[str, object] | None) -> LLMConfig | None:
     model = raw.get("model")
     if model is None:
         raise ValueError("llm block present but missing required field: model")
-    return LLMConfig(
-        model=str(model),
-        max_completion_tokens=raw.get("max_completion_tokens"),  # type: ignore[arg-type]
-        reasoning_effort=raw.get("reasoning_effort"),  # type: ignore[arg-type]
-    )
+    # Everything except ``model`` is passed through to litellm as-is.
+    extra = {k: v for k, v in raw.items() if k != "model"}
+    return LLMConfig(model=str(model), extra=extra)
 
 
 def _parse_interaction(raw: dict[str, object] | None) -> InteractionConfig:

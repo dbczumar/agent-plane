@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from agent_plane.spec.types import (
     AgentSpec,
     InteractionConfig,
@@ -48,16 +46,14 @@ def test_llm_empty_model() -> None:
     assert any("llm.model" in e.path for e in result.errors)
 
 
-def test_llm_invalid_reasoning_effort() -> None:
-    spec = _minimal_spec(llm=LLMConfig(model="openai/gpt-5.4", reasoning_effort="extreme"))
-    result = validate(spec)
-    assert not result.valid
-    assert any("reasoning_effort" in e.path for e in result.errors)
-
-
-@pytest.mark.parametrize("effort", ["low", "medium", "high"])
-def test_llm_valid_reasoning_efforts(effort: str) -> None:
-    spec = _minimal_spec(llm=LLMConfig(model="openai/gpt-5.4", reasoning_effort=effort))
+def test_llm_arbitrary_extra_passes_validation() -> None:
+    """Extra keys are passed through — validator does not reject them."""
+    spec = _minimal_spec(
+        llm=LLMConfig(
+            model="openai/gpt-5.4",
+            extra={"temperature": 0.7, "reasoning_effort": "extreme"},
+        )
+    )
     result = validate(spec)
     assert result.valid
 

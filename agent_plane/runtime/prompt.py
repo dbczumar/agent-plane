@@ -92,19 +92,23 @@ def history_to_messages(
                 if not messages[-1].get("content"):
                     messages[-1]["content"] = None
             else:
-                messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [tc],
-                })
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [tc],
+                    }
+                )
 
         elif item.type == "function_call_output":
             assert isinstance(item.data, FunctionCallOutputData)
-            messages.append({
-                "role": "tool",
-                "tool_call_id": item.data.call_id,
-                "content": item.data.output,
-            })
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": item.data.call_id,
+                    "content": item.data.output,
+                }
+            )
 
         # reasoning items are not included in the LLM prompt
         # (they are output-only)

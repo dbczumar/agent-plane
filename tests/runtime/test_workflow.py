@@ -31,7 +31,7 @@ def _make_user_message(index: int) -> NewConversationItem:
 # ── fetch_all_items ──────────────────────────────────
 
 
-def testfetch_all_items_empty_conversation(
+def test_fetch_all_items_empty_conversation(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     conv = conversation_store.create_conversation()
@@ -39,7 +39,7 @@ def testfetch_all_items_empty_conversation(
     assert items == []
 
 
-def testfetch_all_items_single_page(
+def test_fetch_all_items_single_page(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """Under the default limit of 100, all items come back in one page."""
@@ -52,7 +52,7 @@ def testfetch_all_items_single_page(
     assert len(items) == 5
 
 
-def testfetch_all_items_paginates_beyond_limit(
+def test_fetch_all_items_paginates_beyond_limit(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """
@@ -77,7 +77,7 @@ def testfetch_all_items_paginates_beyond_limit(
     assert texts == [f"msg {i}" for i in range(total)]
 
 
-def testfetch_all_items_with_after_cursor(
+def test_fetch_all_items_with_after_cursor(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """
@@ -98,7 +98,9 @@ def testfetch_all_items_with_after_cursor(
     cursor = first_page.last_id
 
     items = fetch_all_items(
-        conversation_store, conv.id, after=cursor,
+        conversation_store,
+        conv.id,
+        after=cursor,
     )
     # Should get items 50..149 (the remaining 100)
     assert len(items) == 100
@@ -107,7 +109,7 @@ def testfetch_all_items_with_after_cursor(
     assert texts == [f"msg {i}" for i in range(50, total)]
 
 
-def testfetch_all_items_exactly_at_page_boundary(
+def test_fetch_all_items_exactly_at_page_boundary(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """

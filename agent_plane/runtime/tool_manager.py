@@ -62,26 +62,28 @@ class ToolManager:
         # Built-in: load_skill (only if the agent has skills)
         if self._spec.skills:
             skill_names = [s.name for s in self._spec.skills]
-            schemas.append({
-                "type": "function",
-                "function": {
-                    "name": "load_skill",
-                    "description": (
-                        "Load a skill's full instructions by name. "
-                        f"Available skills: {', '.join(skill_names)}"
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "The skill name to load",
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "load_skill",
+                        "description": (
+                            "Load a skill's full instructions by name. "
+                            f"Available skills: {', '.join(skill_names)}"
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string",
+                                    "description": "The skill name to load",
+                                },
                             },
+                            "required": ["name"],
                         },
-                        "required": ["name"],
                     },
-                },
-            })
+                }
+            )
 
         return schemas
 
@@ -107,7 +109,4 @@ class ToolManager:
                 return skill.content
 
         available = [s.name for s in self._spec.skills]
-        return (
-            f"Error: skill {skill_name!r} not found. "
-            f"Available skills: {available}"
-        )
+        return f"Error: skill {skill_name!r} not found. Available skills: {available}"
