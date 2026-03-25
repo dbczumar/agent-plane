@@ -7,23 +7,9 @@ All durably checkpointed by DBOS.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, cast
-
-import openai
-from openai import Stream
-from openai.types.responses import (
-    Response as OpenAIResponse,
-)
-from openai.types.responses import (
-    ResponseCompletedEvent,
-    ResponseOutputItemAddedEvent,
-    ResponseReasoningSummaryTextDeltaEvent,
-    ResponseReasoningTextDeltaEvent,
-    ResponseStreamEvent,
-    ResponseTextDeltaEvent,
-)
-from openai.types.shared_params import Reasoning as OpenAIReasoning
 
 from agent_plane.entities import (
     ConversationItem,
@@ -54,6 +40,19 @@ from agent_plane.runtime.tool_manager import ToolManager
 from agent_plane.spec import AgentSpec
 from agent_plane.spec.types import LLMConfig
 from agent_plane.stores import ConversationStore, TaskStore
+from llms import Client as LLMClient
+from llms.types import (
+    FunctionCallOutput,
+    MessageOutput,
+    ResponseCompletedEvent,
+    ResponseReasoningSummaryTextDeltaEvent,
+    ResponseReasoningTextDeltaEvent,
+    ResponseStreamEvent,
+    ResponseTextDeltaEvent,
+)
+from llms.types import (
+    Response as LLMResponse,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -62,16 +61,16 @@ _logger = logging.getLogger(__name__)
 _MAX_ITERATIONS = 1000
 
 # Lazy singleton — created on first LLM call so import doesn't
-# fail when OPENAI_API_KEY is not yet set.
-_openai_client: openai.OpenAI | None = None
+# fail when provider API keys are not yet set.
+_llm_client: LLMClient | None = None
 
 
-def _get_openai_client() -> openai.OpenAI:
-    """Return the shared OpenAI client, creating it on first use."""
-    global _openai_client
-    if _openai_client is None:
-        _openai_client = openai.OpenAI()
-    return _openai_client
+def _get_llm_client() -> LLMClient:
+    """Return the shared LLM client, creating it on first use."""
+    global _llm_client
+    if _llm_client is None:
+        _llm_client = LLMClient()
+    return _llm_client
 
 
 def _write_output(task_id: str, event: dict[str, Any]) -> None:
@@ -104,6 +103,21 @@ def _close_output(task_id: str) -> None:
 
 
 @dataclass
+class _SteeringRetry:
+    """
+    Returned by ``_handle_final_response`` when late steering
+    messages were found and the agent loop should continue.
+
+    :param last_seen: The store cursor to use on the next
+        iteration — the ID of the item with the highest
+        store position among all items processed, e.g.
+        ``"msg_abc123"``.
+    """
+
+    last_seen: str
+
+
+@dataclass
 class _ResponsesCallArgs:
     """
     Parsed arguments for a ``client.responses.create()`` call.
@@ -116,7 +130,7 @@ class _ResponsesCallArgs:
     """
 
     kwargs: dict[str, Any]
-    reasoning: OpenAIReasoning | None
+    reasoning: dict[str, str] | None
 
 
 def _build_responses_args(
@@ -141,10 +155,10 @@ def _build_responses_args(
     """
     remaining = dict(extra)
     reasoning_effort = remaining.pop("reasoning_effort", None)
-    reasoning: OpenAIReasoning | None = None
+    reasoning: dict[str, str] | None = None
     if reasoning_effort:
-        # summary="concise" enables reasoning summary streaming events.
-        reasoning = OpenAIReasoning(effort=reasoning_effort, summary="concise")
+        # summary="detailed" enables reasoning summary streaming events.
+        reasoning = {"effort": reasoning_effort, "summary": "detailed"}
 
     kwargs: dict[str, Any] = {"model": model, **remaining}
     if tools:
@@ -152,13 +166,13 @@ def _build_responses_args(
     return _ResponsesCallArgs(kwargs=kwargs, reasoning=reasoning)
 
 
-def _response_to_dict(resp: OpenAIResponse) -> dict[str, Any]:
+def _response_to_dict(resp: LLMResponse) -> dict[str, Any]:
     """
     Extract text and tool calls from a Responses API ``Response``
     object into a JSON-serializable dict.
 
-    :param resp: A completed ``openai.types.responses.Response``
-        object from ``client.responses.create(stream=False)``.
+    :param resp: A completed ``llms.types.Response`` object from
+        ``client.responses.create(stream=False)``.
     :returns: A dict with ``"model"`` (str or None), ``"text"``
         (str or None), and ``"tool_calls"`` (list of
         ``{"call_id", "name", "arguments"}`` dicts).
@@ -167,12 +181,12 @@ def _response_to_dict(resp: OpenAIResponse) -> dict[str, Any]:
     tool_calls: list[dict[str, Any]] = []
 
     for item in resp.output:
-        if item.type == "message":
+        if isinstance(item, MessageOutput):
             for part in item.content:
                 if part.type == "output_text" and part.text:
                     text = part.text
                     break
-        elif item.type == "function_call":
+        elif isinstance(item, FunctionCallOutput):
             tool_calls.append(
                 {
                     "call_id": item.call_id,
@@ -214,12 +228,10 @@ def _call_llm(
         and ``"tool_calls"`` keys.
     """
     args = _build_responses_args(model, tools, extra)
-    # cast: responses.create() without stream returns OpenAIResponse
     resp = cast(
-        OpenAIResponse,
-        _get_openai_client().responses.create(
-            # cast: our dict list is structurally compatible with the TypedDict union
-            input=cast(Any, input_items),
+        LLMResponse,
+        _get_llm_client().responses.create(
+            input=input_items,
             instructions=instructions,
             reasoning=args.reasoning,
             **args.kwargs,
@@ -262,12 +274,10 @@ def _call_llm_streaming(
         as :func:`_call_llm`.
     """
     args = _build_responses_args(model, tools, extra)
-    # cast: responses.create() with stream=True returns Stream[ResponseStreamEvent]
     stream_resp = cast(
-        Stream[ResponseStreamEvent],
-        _get_openai_client().responses.create(
-            # cast: our dict list is structurally compatible with the TypedDict union
-            input=cast(Any, input_items),
+        Iterator[ResponseStreamEvent],
+        _get_llm_client().responses.create(
+            input=input_items,
             instructions=instructions,
             reasoning=args.reasoning,
             stream=True,
@@ -280,12 +290,11 @@ def _call_llm_streaming(
 # SSE event types emitted for reasoning content
 _REASONING_TEXT_EVENT = "response.reasoning_text.delta"
 _REASONING_SUMMARY_EVENT = "response.reasoning_summary_text.delta"
-_REASONING_STARTED_EVENT = "response.reasoning.started"
 
 
 def _accumulate_stream(
     task_id: str,
-    stream_resp: Stream[ResponseStreamEvent],
+    stream_resp: Iterator[ResponseStreamEvent],
 ) -> dict[str, Any]:
     """
     Consume a Responses API streaming response, emit text and
@@ -293,8 +302,6 @@ def _accumulate_stream(
     stream), and return the full response dict.
 
     Emitted SSE event types:
-    - ``response.reasoning.started`` — fired once when reasoning begins
-      (always emitted for reasoning models, even when content is encrypted)
     - ``response.output_text.delta`` — visible text tokens
     - ``response.reasoning_text.delta`` — full reasoning tokens
       (model-dependent; gated by ``reasoning_effort``)
@@ -308,18 +315,10 @@ def _accumulate_stream(
     :returns: The accumulated response dict in the same shape as
         :func:`_call_llm`.
     """
-    completed_response: OpenAIResponse | None = None
+    completed_response: LLMResponse | None = None
 
     for event in stream_resp:
-        # Use isinstance for type narrowing — string comparison on
-        # the discriminant field doesn't narrow the union for mypy.
-        if isinstance(event, ResponseOutputItemAddedEvent):
-            # Emit a signal when a reasoning item begins so clients
-            # can show a "thinking..." indicator even when reasoning
-            # content is encrypted (org not yet verified for summaries).
-            if hasattr(event.item, "type") and event.item.type == "reasoning":
-                _write_output(task_id, {"type": _REASONING_STARTED_EVENT})
-        elif isinstance(event, ResponseTextDeltaEvent):
+        if isinstance(event, ResponseTextDeltaEvent):
             _write_output(
                 task_id,
                 {"type": "response.output_text.delta", "delta": event.delta},
@@ -540,7 +539,7 @@ def _handle_final_response(
     output_items: list[dict[str, Any]],
     task_store: TaskStore,
     conv_store: ConversationStore,
-) -> dict[str, Any] | None:
+) -> dict[str, Any] | _SteeringRetry:
     """
     Handle the no-tool-calls path using persist-first-then-check.
 
@@ -552,9 +551,6 @@ def _handle_final_response(
     LLM will generate a follow-up addressing the new input,
     producing two valid committed messages instead of one spliced
     ghost.
-
-    Returns ``None`` if late messages arrived and the caller
-    should continue the loop.
 
     :param task_id: The task identifier, e.g.
         ``"task_abc123"``.
@@ -573,8 +569,9 @@ def _handle_final_response(
     :param task_store: The TaskStore for inbox operations.
     :param conv_store: The ConversationStore for persistence.
     :returns: A result dict with ``"task_id"``,
-        ``"status"``, and ``"output"`` if the response was
-        finalized, or ``None`` if the loop should continue.
+        ``"status"``, and ``"output"`` when the response is
+        finalized. A ``_SteeringRetry`` when late messages
+        arrived and the caller should continue the loop.
     """
     # ── Step 1: Persist first ──────────────────────────────
     # Commit the assistant message BEFORE checking the inbox.
@@ -613,14 +610,17 @@ def _handle_final_response(
 
     if steered:
         # ── Step 3a: Late messages arrived ─────────────────
-        # Add the persisted assistant response and the late
-        # steered messages to history so the LLM sees both
-        # on the next iteration. The assistant response is
-        # already committed — the next LLM call will produce
-        # a follow-up addressing the new user input.
+        # Add the persisted assistant response first (it
+        # answers the original input), then the steered user
+        # messages (new input for the next iteration). This
+        # matches conversational order.
         history.extend(persisted)
         history.extend(steered)
-        return None
+        # The persisted assistant message has the highest
+        # store position (appended AFTER steered messages
+        # arrived during streaming). Use its ID as the
+        # cursor so _sync_history doesn't re-fetch it.
+        return _SteeringRetry(last_seen=persisted[-1].id)
 
     # ── Step 3b: No late messages — we're done ─────────────
     return {
@@ -938,16 +938,17 @@ def _run_agent_loop(
                 task_store,
                 conv_store,
             )
-            if result is not None:
-                return result
-            # Late steered messages arrived during streaming.
-            # _handle_final_response persisted the assistant
-            # response and appended both it and the steered
-            # messages to history. Advance last_seen to the
-            # final steered message so the next iteration
-            # doesn't re-process them.
-            last_seen = history[-1].id
-            continue
+            if isinstance(result, _SteeringRetry):
+                # Late steered messages arrived during streaming.
+                # _handle_final_response persisted the assistant
+                # response and appended both it and the steered
+                # messages to history. Use the cursor from the
+                # retry (the assistant message's ID, which has
+                # the highest store position) so _sync_history
+                # doesn't re-fetch already-processed items.
+                last_seen = result.last_seen
+                continue
+            return result
 
         last_seen = _handle_tool_calls(
             task_id,

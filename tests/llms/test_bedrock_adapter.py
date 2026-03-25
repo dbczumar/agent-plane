@@ -9,7 +9,6 @@ from llms.adapters.bedrock import (
     _messages_to_converse,
 )
 
-
 # ── Request translation ──────────────────────────────────
 
 
@@ -124,9 +123,7 @@ def test_tools_converted_to_tool_spec() -> None:
     spec = result[0]["toolSpec"]
     assert spec["name"] == "get_weather"
     assert spec["description"] == "Get weather"
-    assert spec["inputSchema"] == {
-        "json": {"type": "object", "properties": {}}
-    }
+    assert spec["inputSchema"] == {"json": {"type": "object", "properties": {}}}
 
 
 def test_tool_config_added_to_kwargs() -> None:
@@ -177,13 +174,15 @@ def test_converse_tool_use_response_to_chat() -> None:
         "output": {
             "message": {
                 "role": "assistant",
-                "content": [{
-                    "toolUse": {
-                        "toolUseId": "tu_1",
-                        "name": "get_weather",
-                        "input": {"city": "London"},
+                "content": [
+                    {
+                        "toolUse": {
+                            "toolUseId": "tu_1",
+                            "name": "get_weather",
+                            "input": {"city": "London"},
+                        }
                     }
-                }],
+                ],
             }
         },
         "stopReason": "tool_use",
@@ -194,9 +193,7 @@ def test_converse_tool_use_response_to_chat() -> None:
     assert len(tool_calls) == 1
     assert tool_calls[0]["id"] == "tu_1"
     assert tool_calls[0]["function"]["name"] == "get_weather"
-    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
-        "city": "London"
-    }
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"city": "London"}
     assert chat["choices"][0]["finish_reason"] == "tool_calls"
 
 

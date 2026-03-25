@@ -9,11 +9,25 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 import httpx
 
 from llms.adapters.base import BaseAdapter
+from llms.types import (
+    FunctionCallOutput,
+    MessageOutput,
+    OutputText,
+    Response,
+    ResponseCompletedEvent,
+    ResponseReasoningStartedEvent,
+    ResponseReasoningSummaryTextDeltaEvent,
+    ResponseReasoningTextDeltaEvent,
+    ResponseStreamEvent,
+    ResponseTextDeltaEvent,
+    Usage,
+)
 
 # Timeout for non-streaming requests (seconds)
 _REQUEST_TIMEOUT = 120
@@ -138,7 +152,8 @@ class OpenAICompatibleAdapter(BaseAdapter):
         with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
             resp = client.post(url, headers=headers, json=payload)
             resp.raise_for_status()
-            return resp.json()
+            result: dict[str, Any] = resp.json()
+            return result
 
     def _stream_request(
         self,
@@ -155,9 +170,7 @@ class OpenAICompatibleAdapter(BaseAdapter):
         :returns: Iterator of parsed Chat Completions chunk dicts.
         """
         with httpx.Client(timeout=_STREAM_TIMEOUT) as client:
-            with client.stream(
-                "POST", url, headers=headers, json=payload
-            ) as resp:
+            with client.stream("POST", url, headers=headers, json=payload) as resp:
                 resp.raise_for_status()
                 for line in resp.iter_lines():
                     parsed = _parse_sse_line(line)
@@ -178,7 +191,8 @@ def _parse_sse_line(line: str) -> dict[str, Any] | None:
     """
     if not line.startswith("data: "):
         return None
-    data = line[len("data: "):]
+    data = line[len("data: ") :]
     if data.strip() == "[DONE]":
         return None
-    return json.loads(data)
+    result: dict[str, Any] = json.loads(data)
+    return result

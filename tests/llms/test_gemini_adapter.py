@@ -12,7 +12,6 @@ from llms.adapters.gemini import (
     _normalize_finish_reason,
 )
 
-
 # ── Request translation ──────────────────────────────────
 
 
@@ -22,9 +21,7 @@ def test_system_messages_become_system_instruction() -> None:
         {"role": "user", "content": "Hi"},
     ]
     payload = _chat_to_gemini(messages, None, {})
-    assert payload["system_instruction"] == {
-        "parts": [{"text": "Be helpful."}]
-    }
+    assert payload["system_instruction"] == {"parts": [{"text": "Be helpful."}]}
     # System message should not appear in contents
     assert len(payload["contents"]) == 1
     assert payload["contents"][0]["role"] == "user"
@@ -179,12 +176,14 @@ def test_gemini_function_call_response_to_chat() -> None:
         "candidates": [
             {
                 "content": {
-                    "parts": [{
-                        "functionCall": {
-                            "name": "get_weather",
-                            "args": {"city": "London"},
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "get_weather",
+                                "args": {"city": "London"},
+                            }
                         }
-                    }],
+                    ],
                     "role": "model",
                 },
                 "finishReason": "STOP",
@@ -197,9 +196,7 @@ def test_gemini_function_call_response_to_chat() -> None:
     assert len(tool_calls) == 1
     assert tool_calls[0]["id"].startswith("call_")
     assert tool_calls[0]["function"]["name"] == "get_weather"
-    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
-        "city": "London"
-    }
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"city": "London"}
 
 
 def test_gemini_empty_candidates_returns_empty_response() -> None:

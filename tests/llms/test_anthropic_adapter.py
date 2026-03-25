@@ -76,9 +76,7 @@ def test_tool_messages_converted_to_tool_result() -> None:
 
 def test_temperature_halved() -> None:
     messages = [{"role": "user", "content": "Hi"}]
-    payload = _chat_to_anthropic(
-        messages, "claude-test", None, {"temperature": 1.0}
-    )
+    payload = _chat_to_anthropic(messages, "claude-test", None, {"temperature": 1.0})
     assert payload["temperature"] == 0.5
 
 
@@ -163,9 +161,7 @@ def test_anthropic_tool_use_response_to_chat() -> None:
     assert len(tool_calls) == 1
     assert tool_calls[0]["id"] == "tu_1"
     assert tool_calls[0]["function"]["name"] == "get_weather"
-    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
-        "city": "London"
-    }
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"city": "London"}
     assert chat["choices"][0]["finish_reason"] == "tool_calls"
 
 

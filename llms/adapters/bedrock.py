@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 from llms.adapters.base import BaseAdapter
 
@@ -34,7 +35,7 @@ class BedrockAdapter(BaseAdapter):
         :returns: A boto3 ``bedrock-runtime`` client.
         """
         if self._client is None:
-            import boto3
+            import boto3  # type: ignore[import-untyped]
 
             self._client = boto3.client("bedrock-runtime")
         return self._client
@@ -99,14 +100,10 @@ def _build_converse_kwargs(
         inference_config["temperature"] = extra.pop("temperature")
     if "top_p" in extra:
         inference_config["topP"] = extra.pop("top_p")
-    if max_tokens := extra.pop("max_tokens", None) or extra.pop(
-        "max_completion_tokens", None
-    ):
+    if max_tokens := extra.pop("max_tokens", None) or extra.pop("max_completion_tokens", None):
         inference_config["maxTokens"] = max_tokens
     if stop := extra.pop("stop", None):
-        inference_config["stopSequences"] = (
-            stop if isinstance(stop, list) else [stop]
-        )
+        inference_config["stopSequences"] = stop if isinstance(stop, list) else [stop]
     if inference_config:
         kwargs["inferenceConfig"] = inference_config
 
@@ -140,33 +137,43 @@ def _messages_to_converse(
                 content_blocks.append({"text": text})
             for tc in msg.get("tool_calls") or []:
                 func = tc["function"]
-                content_blocks.append({
-                    "toolUse": {
-                        "toolUseId": tc["id"],
-                        "name": func["name"],
-                        "input": json.loads(func["arguments"]),
+                content_blocks.append(
+                    {
+                        "toolUse": {
+                            "toolUseId": tc["id"],
+                            "name": func["name"],
+                            "input": json.loads(func["arguments"]),
+                        }
                     }
-                })
+                )
             if content_blocks:
-                converse_messages.append({
-                    "role": "assistant",
-                    "content": content_blocks,
-                })
-        elif role == "tool":
-            converse_messages.append({
-                "role": "user",
-                "content": [{
-                    "toolResult": {
-                        "toolUseId": msg["tool_call_id"],
-                        "content": [{"text": msg["content"]}],
+                converse_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": content_blocks,
                     }
-                }],
-            })
+                )
+        elif role == "tool":
+            converse_messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "toolResult": {
+                                "toolUseId": msg["tool_call_id"],
+                                "content": [{"text": msg["content"]}],
+                            }
+                        }
+                    ],
+                }
+            )
         else:
-            converse_messages.append({
-                "role": "user",
-                "content": [{"text": msg.get("content") or ""}],
-            })
+            converse_messages.append(
+                {
+                    "role": "user",
+                    "content": [{"text": msg.get("content") or ""}],
+                }
+            )
 
     return converse_messages, system_prompts or None
 
@@ -185,13 +192,15 @@ def _convert_tools(
         if tool.get("type") != "function":
             continue
         func = tool["function"]
-        bedrock_tools.append({
-            "toolSpec": {
-                "name": func["name"],
-                "description": func.get("description", ""),
-                "inputSchema": {"json": func.get("parameters", {})},
+        bedrock_tools.append(
+            {
+                "toolSpec": {
+                    "name": func["name"],
+                    "description": func.get("description", ""),
+                    "inputSchema": {"json": func.get("parameters", {})},
+                }
             }
-        })
+        )
     return bedrock_tools
 
 
@@ -221,14 +230,16 @@ def _converse_to_chat(
             text_parts.append(block["text"])
         elif "toolUse" in block:
             tu = block["toolUse"]
-            tool_calls.append({
-                "id": tu["toolUseId"],
-                "type": "function",
-                "function": {
-                    "name": tu["name"],
-                    "arguments": json.dumps(tu.get("input", {})),
-                },
-            })
+            tool_calls.append(
+                {
+                    "id": tu["toolUseId"],
+                    "type": "function",
+                    "function": {
+                        "name": tu["name"],
+                        "arguments": json.dumps(tu.get("input", {})),
+                    },
+                }
+            )
 
     stop_reason = response.get("stopReason", "end_turn")
     finish_reason = "tool_calls" if stop_reason == "tool_use" else "stop"
@@ -245,9 +256,7 @@ def _converse_to_chat(
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": (
-                        "\n".join(text_parts) if text_parts else None
-                    ),
+                    "content": ("\n".join(text_parts) if text_parts else None),
                     "tool_calls": tool_calls or None,
                 },
                 "finish_reason": finish_reason,
@@ -303,11 +312,13 @@ def _stream_converse(
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": text},
-                        "finish_reason": None,
-                    }],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": text},
+                            "finish_reason": None,
+                        }
+                    ],
                 }
         elif "messageStop" in event:
             stop_reason = event["messageStop"].get("stopReason", "end_turn")
@@ -317,11 +328,13 @@ def _stream_converse(
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": finish,
-                }],
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": finish,
+                    }
+                ],
             }
         elif "metadata" in event:
             usage = event["metadata"].get("usage", {})
@@ -331,11 +344,13 @@ def _stream_converse(
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": None,
-                    }],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": None,
+                        }
+                    ],
                     "usage": {
                         "prompt_tokens": usage.get("inputTokens"),
                         "completion_tokens": usage.get("outputTokens"),

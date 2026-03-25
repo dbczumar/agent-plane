@@ -40,17 +40,16 @@ class VertexAdapter(GeminiAdapter):
         :returns: A ``google.auth.credentials.Credentials`` object
             with a valid access token.
         """
-        if (
-            self._cached_credentials is not None
-            and self._cached_credentials.valid
-        ):
+        if self._cached_credentials is not None and self._cached_credentials.valid:
             return self._cached_credentials
 
         import google.auth
         import google.auth.transport.requests
 
-        credentials, _ = google.auth.default(scopes=_DEFAULT_SCOPES)
-        credentials.refresh(google.auth.transport.requests.Request())
+        credentials, _ = google.auth.default(scopes=_DEFAULT_SCOPES)  # type: ignore[no-untyped-call]
+        credentials.refresh(
+            google.auth.transport.requests.Request()  # type: ignore[no-untyped-call]
+        )
         self._cached_credentials = credentials
         return credentials
 

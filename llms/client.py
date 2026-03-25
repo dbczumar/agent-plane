@@ -5,7 +5,8 @@ routes to provider adapters.
 
 from __future__ import annotations
 
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 from llms._responses_to_chat import (
     chat_response_to_response,
@@ -68,15 +69,11 @@ class _ResponsesNamespace:
             extra["reasoning_effort"] = reasoning.get("effort")
 
         if stream:
-            chunks = adapter.chat_completions(
-                messages, routed.model, tools, True, extra
-            )
+            chunks = adapter.chat_completions(messages, routed.model, tools, True, extra)
             assert not isinstance(chunks, dict)
             return chat_stream_to_response_events(chunks, model=routed.model)
 
-        result = adapter.chat_completions(
-            messages, routed.model, tools, False, extra
-        )
+        result = adapter.chat_completions(messages, routed.model, tools, False, extra)
         assert isinstance(result, dict)
         return chat_response_to_response(result)
 

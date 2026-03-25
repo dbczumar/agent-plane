@@ -1,7 +1,5 @@
 """Tests for llms._responses_to_chat — bidirectional translation."""
 
-import pytest
-
 from llms._responses_to_chat import (
     chat_response_to_response,
     chat_stream_to_response_events,
@@ -10,13 +8,11 @@ from llms._responses_to_chat import (
 from llms.types import (
     FunctionCallOutput,
     MessageOutput,
-    OutputText,
     Response,
     ResponseCompletedEvent,
     ResponseTextDeltaEvent,
     Usage,
 )
-
 
 # ── Input direction: Responses API -> Chat Completions ────
 
@@ -164,9 +160,7 @@ def test_chat_text_response_to_response() -> None:
     assert len(resp.output) == 1
     assert isinstance(resp.output[0], MessageOutput)
     assert resp.output[0].content[0].text == "Hello!"
-    assert resp.usage == Usage(
-        input_tokens=10, output_tokens=5, total_tokens=15
-    )
+    assert resp.usage == Usage(input_tokens=10, output_tokens=5, total_tokens=15)
 
 
 def test_chat_tool_calls_to_response() -> None:
@@ -237,15 +231,9 @@ def test_chat_mixed_text_and_tool_calls() -> None:
 
 def test_streaming_text_deltas() -> None:
     chunks = [
-        {
-            "choices": [{"delta": {"content": "Hello"}, "finish_reason": None}]
-        },
-        {
-            "choices": [{"delta": {"content": " world"}, "finish_reason": None}]
-        },
-        {
-            "choices": [{"delta": {}, "finish_reason": "stop"}]
-        },
+        {"choices": [{"delta": {"content": "Hello"}, "finish_reason": None}]},
+        {"choices": [{"delta": {"content": " world"}, "finish_reason": None}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
     ]
     events = list(chat_stream_to_response_events(iter(chunks), model="test"))
 
@@ -262,39 +250,51 @@ def test_streaming_text_deltas() -> None:
 def test_streaming_tool_calls() -> None:
     chunks = [
         {
-            "choices": [{
-                "delta": {
-                    "tool_calls": [{
-                        "index": 0,
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {"name": "get_weather"},
-                    }]
-                },
-                "finish_reason": None,
-            }]
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "get_weather"},
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
         },
         {
-            "choices": [{
-                "delta": {
-                    "tool_calls": [{
-                        "index": 0,
-                        "function": {"arguments": '{"city":'},
-                    }]
-                },
-                "finish_reason": None,
-            }]
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"arguments": '{"city":'},
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
         },
         {
-            "choices": [{
-                "delta": {
-                    "tool_calls": [{
-                        "index": 0,
-                        "function": {"arguments": '"London"}'},
-                    }]
-                },
-                "finish_reason": None,
-            }]
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"arguments": '"London"}'},
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
         },
         {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
     ]
@@ -312,9 +312,7 @@ def test_streaming_tool_calls() -> None:
 
 def test_streaming_with_usage() -> None:
     chunks = [
-        {
-            "choices": [{"delta": {"content": "Hi"}, "finish_reason": None}]
-        },
+        {"choices": [{"delta": {"content": "Hi"}, "finish_reason": None}]},
         {
             "choices": [{"delta": {}, "finish_reason": "stop"}],
             "usage": {
@@ -327,6 +325,4 @@ def test_streaming_with_usage() -> None:
     events = list(chat_stream_to_response_events(iter(chunks), model="test"))
     completed = events[-1]
     assert isinstance(completed, ResponseCompletedEvent)
-    assert completed.response.usage == Usage(
-        input_tokens=5, output_tokens=1, total_tokens=6
-    )
+    assert completed.response.usage == Usage(input_tokens=5, output_tokens=1, total_tokens=6)

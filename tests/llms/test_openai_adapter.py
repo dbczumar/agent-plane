@@ -4,7 +4,6 @@ import json
 
 from llms.adapters.openai import OpenAICompatibleAdapter, _parse_sse_line
 
-
 # ── Payload building ─────────────────────────────────────
 
 
@@ -105,8 +104,6 @@ def test_headers_without_api_key() -> None:
 
 
 def test_headers_with_api_key(monkeypatch: object) -> None:
-    import os
-
     # Use monkeypatch via pytest fixture type
     monkeypatch.setenv("TEST_API_KEY", "sk-test-123")  # type: ignore[union-attr]
     adapter = OpenAICompatibleAdapter(

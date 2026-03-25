@@ -11,7 +11,8 @@ import hashlib
 import json
 import os
 import time
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 import httpx
 
@@ -137,14 +138,12 @@ class GeminiAdapter(BaseAdapter):
         :returns: Iterator of Chat Completions chunk dicts.
         """
         with httpx.Client(timeout=_STREAM_TIMEOUT) as client:
-            with client.stream(
-                "POST", url, headers=headers, json=payload
-            ) as resp:
+            with client.stream("POST", url, headers=headers, json=payload) as resp:
                 resp.raise_for_status()
                 for line in resp.iter_lines():
                     if not line.startswith("data: "):
                         continue
-                    data = json.loads(line[len("data: "):])
+                    data = json.loads(line[len("data: ") :])
                     yield from _gemini_stream_chunk_to_chat(data)
 
 
@@ -167,13 +166,9 @@ def _chat_to_gemini(
     payload: dict[str, Any] = {}
 
     # System instruction
-    system_parts = [
-        m["content"] for m in messages if m["role"] == "system"
-    ]
+    system_parts = [m["content"] for m in messages if m["role"] == "system"]
     if system_parts:
-        payload["system_instruction"] = {
-            "parts": [{"text": text} for text in system_parts]
-        }
+        payload["system_instruction"] = {"parts": [{"text": text} for text in system_parts]}
 
     # Convert messages
     contents: list[dict[str, Any]] = []
@@ -188,23 +183,29 @@ def _chat_to_gemini(
             parts = _assistant_tool_calls_to_parts(m)
             contents.append({"role": gemini_role, "parts": parts})
         elif role == "tool":
-            contents.append({
-                "role": "user",
-                "parts": [{
-                    "functionResponse": {
-                        # Gemini requires the function name in the response;
-                        # _tool_name is injected by the caller. Falls back to
-                        # "function" for legacy tool messages that lack it.
-                        "name": m.get("_tool_name", "function"),
-                        "response": {"result": m["content"]},
-                    }
-                }],
-            })
+            contents.append(
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                # Gemini requires the function name in the response;
+                                # _tool_name is injected by the caller. Falls back to
+                                # "function" for legacy tool messages that lack it.
+                                "name": m.get("_tool_name", "function"),
+                                "response": {"result": m["content"]},
+                            }
+                        }
+                    ],
+                }
+            )
         else:
-            contents.append({
-                "role": gemini_role,
-                "parts": [{"text": m.get("content") or ""}],
-            })
+            contents.append(
+                {
+                    "role": gemini_role,
+                    "parts": [{"text": m.get("content") or ""}],
+                }
+            )
 
     payload["contents"] = contents
 
@@ -222,9 +223,7 @@ def _chat_to_gemini(
 
     # Tools
     if tools:
-        payload["tools"] = [
-            {"functionDeclarations": _convert_tools(tools)}
-        ]
+        payload["tools"] = [{"functionDeclarations": _convert_tools(tools)}]
 
     return payload
 
@@ -243,12 +242,14 @@ def _assistant_tool_calls_to_parts(
         parts.append({"text": content})
     for tc in m["tool_calls"]:
         func = tc["function"]
-        parts.append({
-            "functionCall": {
-                "name": func["name"],
-                "args": json.loads(func["arguments"]),
+        parts.append(
+            {
+                "functionCall": {
+                    "name": func["name"],
+                    "args": json.loads(func["arguments"]),
+                }
             }
-        })
+        )
     return parts
 
 
@@ -306,21 +307,19 @@ def _gemini_to_chat(
         elif "functionCall" in part:
             fc = part["functionCall"]
             # Gemini doesn't provide call IDs — generate deterministic ones
-            call_id = hashlib.md5(
-                json.dumps(fc, sort_keys=True).encode()
-            ).hexdigest()[:12]
-            tool_calls.append({
-                "id": f"call_{call_id}",
-                "type": "function",
-                "function": {
-                    "name": fc["name"],
-                    "arguments": json.dumps(fc.get("args", {})),
-                },
-            })
+            call_id = hashlib.md5(json.dumps(fc, sort_keys=True).encode()).hexdigest()[:12]
+            tool_calls.append(
+                {
+                    "id": f"call_{call_id}",
+                    "type": "function",
+                    "function": {
+                        "name": fc["name"],
+                        "arguments": json.dumps(fc.get("args", {})),
+                    },
+                }
+            )
 
-    finish_reason = _normalize_finish_reason(
-        candidate.get("finishReason")
-    )
+    finish_reason = _normalize_finish_reason(candidate.get("finishReason"))
 
     content = "\n".join(text_parts) if text_parts else None
     usage = _extract_usage(resp.get("usageMetadata", {}))
@@ -363,18 +362,14 @@ def _gemini_stream_chunk_to_chat(
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": "",
-                "choices": [
-                    {"index": 0, "delta": {}, "finish_reason": None}
-                ],
+                "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
                 "usage": _extract_usage(usage_meta),
             }
         return
 
     candidate = candidates[0]
     parts = candidate.get("content", {}).get("parts", [])
-    finish_reason = _normalize_finish_reason(
-        candidate.get("finishReason")
-    )
+    finish_reason = _normalize_finish_reason(candidate.get("finishReason"))
 
     for part in parts:
         if "text" in part:
@@ -393,9 +388,7 @@ def _gemini_stream_chunk_to_chat(
             }
         elif "functionCall" in part:
             fc = part["functionCall"]
-            call_id = hashlib.md5(
-                json.dumps(fc, sort_keys=True).encode()
-            ).hexdigest()[:12]
+            call_id = hashlib.md5(json.dumps(fc, sort_keys=True).encode()).hexdigest()[:12]
             yield {
                 "id": f"gemini-{int(time.time())}",
                 "object": "chat.completion.chunk",
@@ -405,17 +398,17 @@ def _gemini_stream_chunk_to_chat(
                     {
                         "index": 0,
                         "delta": {
-                            "tool_calls": [{
-                                "index": 0,
-                                "id": f"call_{call_id}",
-                                "type": "function",
-                                "function": {
-                                    "name": fc["name"],
-                                    "arguments": json.dumps(
-                                        fc.get("args", {})
-                                    ),
-                                },
-                            }]
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": f"call_{call_id}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": fc["name"],
+                                        "arguments": json.dumps(fc.get("args", {})),
+                                    },
+                                }
+                            ]
                         },
                         "finish_reason": None,
                     }

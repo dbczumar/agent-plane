@@ -67,8 +67,7 @@ def parse_model_string(model: str) -> RoutedModel:
 
     if provider not in PROVIDER_CONFIGS:
         raise ValueError(
-            f"Unknown provider {provider!r}. "
-            f"Known providers: {sorted(PROVIDER_CONFIGS)}"
+            f"Unknown provider {provider!r}. Known providers: {sorted(PROVIDER_CONFIGS)}"
         )
 
     return RoutedModel(provider=provider, model=model_name)

@@ -30,7 +30,7 @@ import httpx
 PORT = 18400
 BASE_URL = f"http://127.0.0.1:{PORT}"
 AGENT_NAME = "chat-agent"
-MODEL = "gpt-5.4"
+MODEL = "o4-mini"
 # MODEL = "gpt-4o-mini"
 SYSTEM_INSTRUCTIONS = "You are a helpful assistant. Be concise but thorough."
 

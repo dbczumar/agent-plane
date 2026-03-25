@@ -9,9 +9,6 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from openai.types.responses import (
-    ResponseCompletedEvent,
-)
 
 from agent_plane.entities import MessageData, NewConversationItem
 from agent_plane.runtime import live_stream
@@ -21,40 +18,41 @@ from agent_plane.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from agent_plane.stores.task_store.sqlalchemy_store import SqlAlchemyTaskStore
+from llms.types import (
+    MessageOutput,
+    OutputText,
+    Response,
+    ResponseCompletedEvent,
+)
 
 # ── Helpers ──────────────────────────────────────────
 
 _AGENT_NAME = "test-agent"
 
 
-def _make_completed_event(text: str = "Hello from the test LLM!") -> MagicMock:
+def _make_completed_event(
+    text: str = "Hello from the test LLM!",
+) -> ResponseCompletedEvent:
     """
-    Build a mock ``ResponseCompletedEvent`` with a single text
-    output item. Uses ``spec=ResponseCompletedEvent`` so
-    ``isinstance`` checks in ``_accumulate_stream`` pass.
+    Build a ``ResponseCompletedEvent`` with a single text output
+    item. Uses real ``llms.types`` dataclasses so ``isinstance``
+    checks in ``_accumulate_stream`` pass.
 
     :param text: The assistant's reply text, e.g.
         ``"Hello from the test LLM!"``.
-    :returns: A MagicMock that passes
-        ``isinstance(m, ResponseCompletedEvent)``.
+    :returns: A ``ResponseCompletedEvent`` ready to be yielded
+        from a mock stream.
     """
-    mock_content = MagicMock()
-    mock_content.type = "output_text"
-    mock_content.text = text
-
-    mock_output_item = MagicMock()
-    mock_output_item.type = "message"
-    mock_output_item.content = [mock_content]
-
-    mock_response = MagicMock()
-    mock_response.output = [mock_output_item]
-    mock_response.model = "test-model"
-
-    # spec= makes isinstance(event, ResponseCompletedEvent) True
-    mock_event = MagicMock(spec=ResponseCompletedEvent)
-    mock_event.type = "response.completed"
-    mock_event.response = mock_response
-    return mock_event
+    return ResponseCompletedEvent(
+        response=Response(
+            output=[
+                MessageOutput(
+                    content=[OutputText(text=text)],
+                ),
+            ],
+            model="test-model",
+        ),
+    )
 
 
 def _make_mock_streaming_client() -> MagicMock:
@@ -383,7 +381,7 @@ async def test_start_and_get_completed(
     # Monkeypatch the OpenAI client so no real API call is made.
     mock_client = _make_mock_streaming_client()
     monkeypatch.setattr(
-        "agent_plane.runtime.workflow._get_openai_client",
+        "agent_plane.runtime.workflow._get_llm_client",
         lambda: mock_client,
     )
 
@@ -432,7 +430,7 @@ async def test_wait_returns_completed_task(
     # Monkeypatch the OpenAI client so no real API call is made.
     mock_client = _make_mock_streaming_client()
     monkeypatch.setattr(
-        "agent_plane.runtime.workflow._get_openai_client",
+        "agent_plane.runtime.workflow._get_llm_client",
         lambda: mock_client,
     )
 
@@ -485,7 +483,7 @@ async def test_stream_closed_on_workflow_exception(
     mock_client = MagicMock()
     mock_client.responses.create.side_effect = RuntimeError("simulated LLM timeout")
     monkeypatch.setattr(
-        "agent_plane.runtime.workflow._get_openai_client",
+        "agent_plane.runtime.workflow._get_llm_client",
         lambda: mock_client,
     )
 
@@ -635,7 +633,7 @@ async def test_persist_first_prevents_ghost_tokens(
 
     mock_client = _make_streaming_client_with_steering(conversation_store, conv_id)
     monkeypatch.setattr(
-        "agent_plane.runtime.workflow._get_openai_client",
+        "agent_plane.runtime.workflow._get_llm_client",
         lambda: mock_client,
     )
 
@@ -665,3 +663,24 @@ async def test_persist_first_prevents_ghost_tokens(
     ]
     assert "First response (before steering)" in assistant_texts
     assert "Follow-up addressing steering" in assistant_texts
+
+    # Verify no duplicate items in the conversation — each
+    # message should appear exactly once. A broken last_seen
+    # cursor would cause _sync_history to re-fetch the
+    # assistant message, producing duplicates in the LLM
+    # prompt (even if the store itself has no duplicates).
+    all_ids = [item.id for item in all_items.data]
+    assert len(all_ids) == len(set(all_ids)), f"Duplicate items in conversation: {all_ids}"
+
+    # Verify the second LLM call's input contains the first
+    # assistant response and the steering message — and that
+    # each appears exactly once (no re-fetch duplicates).
+    second_call_kwargs = mock_client.responses.create.call_args_list[1].kwargs
+    second_call_input = second_call_kwargs["input"]
+    assistant_in_prompt = [item for item in second_call_input if item.get("role") == "assistant"]
+    user_in_prompt = [item for item in second_call_input if item.get("role") == "user"]
+    # Exactly one assistant message (the first response)
+    assert len(assistant_in_prompt) == 1
+    assert "First response" in assistant_in_prompt[0]["content"]
+    # Two user messages: the seed + the steering message
+    assert len(user_in_prompt) == 2

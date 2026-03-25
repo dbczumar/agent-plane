@@ -10,7 +10,7 @@ and ``.arguments`` attributes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -136,6 +136,22 @@ class ResponseReasoningSummaryTextDeltaEvent:
 
 
 @dataclass
+class ResponseReasoningStartedEvent:
+    """
+    Emitted once when a reasoning block begins.
+
+    Fired when the model starts reasoning, even when reasoning content
+    is encrypted and no delta events will follow. Allows clients to
+    show a ``[thinking...]`` indicator regardless of org verification
+    status.
+
+    :param type: Always ``"response.reasoning.started"``.
+    """
+
+    type: str = "response.reasoning.started"
+
+
+@dataclass
 class ResponseCompletedEvent:
     """
     Emitted when the full response is complete.
@@ -153,5 +169,6 @@ ResponseStreamEvent = (
     ResponseTextDeltaEvent
     | ResponseReasoningTextDeltaEvent
     | ResponseReasoningSummaryTextDeltaEvent
+    | ResponseReasoningStartedEvent
     | ResponseCompletedEvent
 )
