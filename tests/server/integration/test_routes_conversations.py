@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from tests.server.conftest import IntegrationTaskStore
+from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import create_test_agent, create_test_response
 
 pytestmark = pytest.mark.asyncio
@@ -175,8 +175,15 @@ async def test_list_conversation_items_pagination(
     """Conversation items support cursor-based pagination."""
     await create_test_agent(client)
 
-    # Create a multi-turn conversation (each turn adds a user message item)
-    first = await create_test_response(client, input_text="Turn 1")
+    # Create a multi-turn conversation (each turn adds a user message item).
+    # background=False so Turn 1 completes before Turn 2 starts,
+    # avoiding position races with the background workflow thread.
+    first = await create_test_response(
+        client,
+        input_text="Turn 1",
+        background=False,
+        stream=False,
+    )
     conv_id = first.body["conversation"]["id"]
     first_id = first.body["id"]
 
@@ -219,13 +226,13 @@ async def test_delete_conversation_deletes_tasks(
 
 async def test_delete_conversation_with_active_tasks(
     client: httpx.AsyncClient,
-    task_store: IntegrationTaskStore,
+    mock_llm: ControllableMockClient,
 ) -> None:
     """Deleting a conversation with in-flight tasks deletes the tasks and the conversation."""
     await create_test_agent(client)
 
-    # Keep the task active (not auto-completed)
-    task_store.defer_all_completions = True
+    # Block the LLM call so the task stays active
+    mock_llm.add_call(block=True)
     result = await create_test_response(client)
     conv_id = result.body["conversation"]["id"]
     response_id = result.body["id"]

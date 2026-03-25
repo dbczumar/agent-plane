@@ -1,9 +1,17 @@
-"""Shared fixtures for server integration tests."""
+"""Shared fixtures for server integration tests.
+
+Uses real SqlAlchemyTaskStore + real DBOS workflow with a
+ControllableMockClient that replaces the LLM. The mock auto-completes
+by default so existing tests pass without modification. For concurrency
+tests, use MockCall.block_until / MockCall.release to create
+deterministic race windows.
+"""
 
 from __future__ import annotations
 
-import json
-from collections.abc import AsyncIterator
+import threading
+from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -11,17 +19,10 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
-from sqlalchemy import select
 
-from agent_plane.db.db_models import SqlTask
-from agent_plane.db.utils import (
-    ensure_fts_table,
-    get_or_create_engine,
-    make_managed_session_maker,
-    now_epoch,
-)
-from agent_plane.entities import ConversationItem, NewConversationItem, Task, TaskStatus
-from agent_plane.runtime import live_stream
+from agent_plane.runtime import init as init_runtime
+from agent_plane.runtime.agent_cache import AgentCache
+from agent_plane.runtime.durability import destroy_dbos
 from agent_plane.server.app import create_app
 from agent_plane.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from agent_plane.stores.artifact_store.local import LocalArtifactStore
@@ -29,287 +30,262 @@ from agent_plane.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from agent_plane.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
-from agent_plane.stores.task_store import TaskStore
+from agent_plane.stores.task_store.sqlalchemy_store import SqlAlchemyTaskStore
+from llms.types import (
+    MessageOutput,
+    OutputText,
+    Response,
+    ResponseCompletedEvent,
+    ResponseStreamEvent,
+    ResponseTextDeltaEvent,
+)
 
-# Canned output for completed tasks — a single assistant message.
-_CANNED_OUTPUT: list[dict[str, Any]] = [
-    {
-        "type": "message",
-        "role": "assistant",
-        "content": [{"type": "output_text", "text": "Hello from the test agent."}],
-    }
-]
+# ── Controllable mock LLM ─────────────────────────────
 
 
-class IntegrationTaskStore(TaskStore):
+@dataclass
+class MockCall:
     """
-    Task store for integration tests — no DBOS runtime dependency.
+    A single configured LLM call with optional synchronization
+    gates.
 
-    Uses real SQLAlchemy for persistence (create, try_deliver, close_inbox)
-    by replicating the essential DB logic from SqlAlchemyTaskStore.
-    Replaces the DBOS runtime with deterministic in-memory behavior:
-
-    - start() immediately marks the task as completed with canned output
-    - stream() yields a single text delta event
-    - wait() returns immediately (task is already completed)
-    - get() reads from DB and applies in-memory completion/cancellation
-    - cancel() marks the task as cancelled
-    - delete() removes the DB row
+    :param text: The assistant response text, e.g.
+        ``"Hello from mock"``.
+    :param block_before_response: If set, the mock blocks on this
+        event before producing any output. Call ``release()`` from
+        the test to unblock.
+    :param call_event: Set by the mock when this call is entered.
+        Tests can ``call_event.wait()`` to know the LLM was called.
+    :param stream_tokens: If ``True``, yield individual text delta
+        events before the completed event. If ``False``, yield only
+        the completed event.
     """
 
-    def __init__(self, db_uri: str) -> None:
-        super().__init__(db_uri)
-        self._engine = get_or_create_engine(db_uri)
-        self._session = make_managed_session_maker(self._engine)
-        ensure_fts_table(self._engine)
-        # In-memory runtime state (no DBOS)
-        self._completed: set[str] = set()
-        self._cancelled: set[str] = set()
-        self._deleted: set[str] = set()
-        # Workflow inputs stored in-memory (simulates DBOS workflow_status.input)
-        self._workflow_inputs: dict[str, dict[str, Any]] = {}
-        # When True, start() does NOT auto-complete tasks (for steering tests)
-        self.defer_all_completions: bool = False
+    text: str = "Hello from the test agent."
+    block_before_response: threading.Event | None = None
+    call_event: threading.Event = field(default_factory=threading.Event)
+    stream_tokens: bool = False
 
-    # ── Internal helpers ──────────────────────────────────
+    def release(self) -> None:
+        """
+        Unblock a call that is waiting on ``block_before_response``.
+        """
+        if self.block_before_response is not None:
+            self.block_before_response.set()
 
-    def _row_to_task(self, row: SqlTask) -> Task:
-        """Build a Task from a DB row and apply in-memory runtime state."""
-        task = Task(
-            id=row.id,
-            conversation_id=row.conversation_id,
-            agent_id=row.agent_id,
-            agent_name=row.agent_name,
-            created_at=row.created_at,
-            inbox_closed=row.inbox_closed,
-            previous_response_id=row.previous_response_id,
-            background=row.background,
-            status=TaskStatus.QUEUED,
+
+def _build_completed_event(text: str) -> ResponseCompletedEvent:
+    """
+    Build a ``ResponseCompletedEvent`` with a single text output.
+
+    :param text: The assistant response text.
+    :returns: A completed event with real ``llms.types`` dataclasses.
+    """
+    return ResponseCompletedEvent(
+        response=Response(
+            output=[MessageOutput(content=[OutputText(text=text)])],
+            model="test-model",
+        ),
+    )
+
+
+class ControllableMockClient:
+    """
+    Mock LLM client with per-call synchronization gates.
+
+    Replaces ``_get_llm_client()`` in ``workflow.py``. Each call to
+    ``responses.create()`` consumes the next ``MockCall`` from the
+    queue. If the queue is exhausted, uses a default auto-completing
+    call.
+
+    Usage::
+
+        client = ControllableMockClient()
+        # First LLM call blocks until released
+        call_1 = client.add_call(text="First", block=True)
+        # ... start workflow ...
+        call_1.call_event.wait()  # know the LLM was called
+        # ... inject steering message ...
+        call_1.release()  # unblock
+
+    :param default_text: Text for auto-generated default calls when
+        the queue is empty, e.g. ``"Hello from the test agent."``.
+    """
+
+    def __init__(self, default_text: str = "Hello from the test agent.") -> None:
+        self._calls: list[MockCall] = []
+        self._call_index = 0
+        self._lock = threading.Lock()
+        self._default_text = default_text
+        self.responses = _MockResponsesNamespace(self)
+
+    def add_call(
+        self,
+        text: str | None = None,
+        block: bool = False,
+        stream_tokens: bool = False,
+    ) -> MockCall:
+        """
+        Enqueue a configured call.
+
+        :param text: Response text. Defaults to ``default_text``.
+        :param block: If ``True``, the call blocks until
+            ``MockCall.release()`` is called.
+        :param stream_tokens: If ``True``, emit text delta events
+            before the completed event.
+        :returns: The ``MockCall`` for synchronization.
+        """
+        call = MockCall(
+            text=text or self._default_text,
+            block_before_response=threading.Event() if block else None,
+            stream_tokens=stream_tokens,
         )
-        # Restore instructions/reasoning from in-memory workflow inputs
-        inputs = self._workflow_inputs.get(row.id, {})
-        task.instructions = inputs.get("instructions")
-        task.reasoning = inputs.get("reasoning")
+        self._calls.append(call)
+        return call
 
-        if row.id in self._cancelled:
-            task.status = TaskStatus.CANCELLED
-        elif row.id in self._completed:
-            task.status = TaskStatus.COMPLETED
-            task.output = list(_CANNED_OUTPUT)
-            task.completed_at = now_epoch()
-        return task
+    def _next_call(self) -> MockCall:
+        """
+        Return the next MockCall, or a default if queue exhausted.
 
-    # ── DB-only methods (real SQL, no DBOS) ───────────────
+        :returns: The next ``MockCall`` to execute.
+        """
+        with self._lock:
+            if self._call_index < len(self._calls):
+                call = self._calls[self._call_index]
+                self._call_index += 1
+                return call
+            # Default: auto-complete immediately
+            return MockCall(text=self._default_text)
 
-    def create(
-        self,
-        conversation_id: str,
-        agent_id: str,
-        agent_name: str,
-        previous_response_id: str | None = None,
-        background: bool = False,
-    ) -> Task:
-        from agent_plane.db.utils import generate_task_id
+    def release_all(self) -> None:
+        """
+        Release every blocked call so DBOS workflow threads can exit.
 
-        row = SqlTask(
-            id=generate_task_id(),
-            agent_id=agent_id,
-            agent_name=agent_name,
-            conversation_id=conversation_id,
-            previous_response_id=previous_response_id,
-            created_at=now_epoch(),
-            inbox_closed=False,
-            background=background,
-        )
-        with self._session() as session:
-            session.add(row)
-            return self._row_to_task(row)
+        Called during fixture teardown to prevent the event loop from
+        hanging on shutdown.
+        """
+        for call in self._calls:
+            call.release()
 
-    def try_deliver(
-        self,
-        task_id: str,
-        conversation_id: str,
-        item: NewConversationItem,
-    ) -> bool:
-        from sqlalchemy import func
+    @property
+    def call_count(self) -> int:
+        """
+        Number of ``responses.create()`` invocations so far.
 
-        from agent_plane.db.db_models import SqlConversationItem
-        from agent_plane.db.utils import (
-            extract_search_text,
-            generate_item_id,
-            insert_fts,
-        )
+        :returns: The total call count.
+        """
+        with self._lock:
+            return self._call_index
 
-        with self._session() as session:
-            stmt = select(SqlTask).where(SqlTask.id == task_id)
-            row = session.execute(stmt).scalar_one_or_none()
-            if row is None or row.inbox_closed:
-                return False
 
-            max_pos: int = session.execute(
-                select(func.coalesce(func.max(SqlConversationItem.position), -1)).where(
-                    SqlConversationItem.conversation_id == conversation_id
-                )
-            ).scalar_one()
+class _MockResponsesNamespace:
+    """
+    ``client.responses`` namespace that dispatches to
+    ``ControllableMockClient``.
 
-            data_dict = item.data.model_dump(exclude_none=True)
-            search = extract_search_text(item)
-            item_id = generate_item_id(item.type)
-            session.add(
-                SqlConversationItem(
-                    id=item_id,
-                    conversation_id=conversation_id,
-                    response_id=item.response_id,
-                    created_at=now_epoch(),
-                    status="completed",
-                    position=max_pos + 1,
-                    type=item.type,
-                    data=json.dumps(data_dict),
-                    search_text=search,
-                )
-            )
-            insert_fts(session, item_id, conversation_id, search)
-            return True
+    :param client: The parent mock client.
+    """
 
-    def close_inbox(
-        self,
-        task_id: str,
-        conversation_id: str,
-        last_seen_item_id: str | None,
-    ) -> list[ConversationItem]:
-        from agent_plane.db.db_models import SqlConversationItem
-        from agent_plane.entities import parse_item_data
+    def __init__(self, client: ControllableMockClient) -> None:
+        self._client = client
 
-        with self._session() as session:
-            stmt = select(SqlConversationItem).where(
-                SqlConversationItem.conversation_id == conversation_id
-            )
-            if last_seen_item_id is not None:
-                sub = (
-                    select(SqlConversationItem.position)
-                    .where(SqlConversationItem.id == last_seen_item_id)
-                    .scalar_subquery()
-                )
-                stmt = stmt.where(SqlConversationItem.position > sub)
+    def create(self, **kwargs: Any) -> Response | Iterator[ResponseStreamEvent]:
+        """
+        Mock ``responses.create()``. Consumes the next MockCall,
+        optionally blocking, then returns a Response or stream.
 
-            stmt = stmt.order_by(SqlConversationItem.position.asc())
-            new_rows = list(session.execute(stmt).scalars().all())
+        :param kwargs: Ignored (accepts any Responses API kwargs).
+        :returns: A ``Response`` if ``stream`` is falsy, or an
+            iterator of ``ResponseStreamEvent`` if ``stream=True``.
+        """
+        call = self._client._next_call()
+        # Signal that this call has been entered
+        call.call_event.set()
+        # Optionally block until the test releases us
+        if call.block_before_response is not None:
+            call.block_before_response.wait()
 
-            if new_rows:
-                return [
-                    ConversationItem(
-                        id=r.id,
-                        type=r.type,
-                        status=r.status,
-                        response_id=r.response_id,
-                        created_at=r.created_at,
-                        data=parse_item_data(r.type, json.loads(r.data)),
-                    )
-                    for r in new_rows
-                ]
+        stream = kwargs.get("stream", False)
+        if stream:
+            return self._stream(call)
+        return _build_completed_event(call.text).response
 
-            row_stmt = select(SqlTask).where(SqlTask.id == task_id)
-            row = session.execute(row_stmt).scalar_one_or_none()
-            if row is not None:
-                row.inbox_closed = True
-            return []
+    def _stream(self, call: MockCall) -> Iterator[ResponseStreamEvent]:
+        """
+        Yield streaming events for a call.
 
-    # ── Runtime-replacement methods (in-memory, no DBOS) ──
-
-    def start(
-        self,
-        task_id: str,
-        instructions: str | None = None,
-        reasoning: dict[str, str] | None = None,
-    ) -> None:
-        with self._session() as session:
-            row = session.get(SqlTask, task_id)
-            if row is None:
-                raise LookupError(f"task {task_id!r} not found")
-        # Store workflow inputs in-memory (simulates DBOS)
-        self._workflow_inputs[task_id] = {
-            "instructions": instructions,
-            "reasoning": reasoning,
-        }
-        if not self.defer_all_completions:
-            self._completed.add(task_id)
-        # Publish canned events to the live stream so streaming
-        # tests exercise the same path as production code.
-        live_stream.publish(
-            task_id,
-            {
-                "type": "response.output_text.delta",
-                "delta": "Hello from the test agent.",
-            },
-        )
-        live_stream.close(task_id)
-
-    async def stream(self, task_id: str) -> AsyncIterator[dict[str, Any]]:
-        yield {
-            "type": "response.output_text.delta",
-            "delta": "Hello from the test agent.",
-        }
-
-    async def get(self, task_id: str) -> Task | None:
-        if task_id in self._deleted:
-            return None
-        with self._session() as session:
-            row = session.get(SqlTask, task_id)
-            if row is None:
-                return None
-            return self._row_to_task(row)
-
-    async def wait(self, task_id: str) -> Task:
-        task = await self.get(task_id)
-        if task is None:
-            raise LookupError(f"task {task_id!r} not found")
-        return task
-
-    async def cancel(self, task_id: str) -> Task:
-        self._cancelled.add(task_id)
-        self._completed.discard(task_id)
-        task = await self.get(task_id)
-        if task is None:
-            raise LookupError(f"task {task_id!r} not found")
-        return task
-
-    async def delete(self, task_id: str) -> None:
-        self._deleted.add(task_id)
-        with self._session() as session:
-            row = session.get(SqlTask, task_id)
-            if row:
-                session.delete(row)
-
-    async def list_tasks(
-        self,
-        conversation_id: str | None = None,
-        agent_id: str | None = None,
-    ) -> list[Task]:
-        with self._session() as session:
-            stmt = select(SqlTask)
-            if conversation_id:
-                stmt = stmt.where(SqlTask.conversation_id == conversation_id)
-            if agent_id:
-                stmt = stmt.where(SqlTask.agent_id == agent_id)
-            stmt = stmt.order_by(SqlTask.created_at.desc())
-            rows = list(session.execute(stmt).scalars().all())
-            # Build tasks inside the session so row attributes are accessible
-            tasks = [self._row_to_task(r) for r in rows if r.id not in self._deleted]
-        return tasks
+        :param call: The ``MockCall`` controlling this stream.
+        :returns: An iterator of ``ResponseStreamEvent``.
+        """
+        if call.stream_tokens:
+            # Yield individual word tokens as deltas
+            for word in call.text.split():
+                yield ResponseTextDeltaEvent(delta=word + " ")
+        yield _build_completed_event(call.text)
 
 
 # ── Fixtures ──────────────────────────────────────────
 
 
 @pytest.fixture()
-def task_store(db_uri: str) -> IntegrationTaskStore:
-    """IntegrationTaskStore exposed for tests that need to control task behavior."""
-    return IntegrationTaskStore(db_uri)
+def mock_llm() -> Iterator[ControllableMockClient]:
+    """
+    A ``ControllableMockClient`` instance for the current test.
+
+    Tests that need to control LLM timing should call
+    ``mock_llm.add_call(block=True)`` before creating responses.
+
+    On teardown, releases all blocked calls so DBOS workflow threads
+    can exit cleanly and the event loop shuts down.
+    """
+    client = ControllableMockClient()
+    yield client
+    client.release_all()
 
 
 @pytest.fixture()
-def app(task_store: IntegrationTaskStore, db_uri: str, tmp_path: Path) -> FastAPI:
-    """Build the FastAPI app with real stores and a stubbed task runtime."""
+def task_store(
+    db_uri: str,
+    tmp_path: Path,
+    mock_llm: ControllableMockClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[SqlAlchemyTaskStore]:
+    """
+    Real SqlAlchemyTaskStore with runtime initialized and mock LLM
+    patched in.
+
+    On teardown, releases all blocked mock calls and destroys the
+    DBOS singleton so background threads exit before the event loop
+    shuts down.
+    """
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_cache = AgentCache(
+        artifact_store=artifact_store,
+        cache_dir=tmp_path / ".cache",
+    )
+    ts = SqlAlchemyTaskStore(db_uri)
+    init_runtime(
+        conversation_store=conversation_store,
+        task_store=ts,
+        agent_store=agent_store,
+        agent_cache=agent_cache,
+    )
+    # Patch the LLM client so the real workflow uses our mock
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._get_llm_client",
+        lambda: mock_llm,
+    )
+    yield ts
+
+
+@pytest.fixture()
+def app(task_store: SqlAlchemyTaskStore, db_uri: str, tmp_path: Path) -> FastAPI:
+    """
+    Build the FastAPI app with real stores and real workflow
+    execution (mock LLM is patched in via task_store fixture).
+    """
     return create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
@@ -320,8 +296,22 @@ def app(task_store: IntegrationTaskStore, db_uri: str, tmp_path: Path) -> FastAP
 
 
 @pytest_asyncio.fixture()
-async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
-    """Async HTTP client wired to the FastAPI app (no real server)."""
+async def client(
+    app: FastAPI,
+    mock_llm: ControllableMockClient,
+) -> AsyncIterator[httpx.AsyncClient]:
+    """
+    Async HTTP client wired to the FastAPI app (no real server).
+
+    On teardown, releases blocked mock calls and destroys DBOS
+    before the event loop shuts down. This must happen in an async
+    fixture because the pytest-asyncio runner closes the event loop
+    immediately after async fixture teardown completes.
+    """
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+    # Release blocked mock calls so DBOS workflow threads can finish
+    mock_llm.release_all()
+    # Destroy DBOS to stop scheduler/queue/event-loop threads
+    destroy_dbos()

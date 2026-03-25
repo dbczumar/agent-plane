@@ -7,7 +7,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from tests.server.conftest import IntegrationTaskStore
+from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import build_agent_bundle, create_test_agent, create_test_response
 
 pytestmark = pytest.mark.asyncio
@@ -136,14 +136,14 @@ async def test_delete_agent_with_tasks(client: httpx.AsyncClient) -> None:
 
 async def test_delete_agent_with_active_tasks(
     client: httpx.AsyncClient,
-    task_store: IntegrationTaskStore,
+    mock_llm: ControllableMockClient,
 ) -> None:
     """Deleting an agent with in-flight tasks deletes the tasks and the agent."""
     created = await create_test_agent(client, name="busy-agent")
     agent_id = created["id"]
 
-    # Keep the task active (not auto-completed)
-    task_store.defer_all_completions = True
+    # Block the LLM call so the task stays active
+    mock_llm.add_call(block=True)
     result = await create_test_response(client, model="busy-agent")
     response_id = result.body["id"]
     assert result.body["status"] == "queued"

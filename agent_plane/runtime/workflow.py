@@ -7,6 +7,7 @@ All durably checkpointed by DBOS.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, cast
@@ -642,6 +643,7 @@ def _handle_final_response(
         "task_id": task_id,
         "status": "completed",
         "output": output_items,
+        "completed_at": int(time.time()),
     }
 
 

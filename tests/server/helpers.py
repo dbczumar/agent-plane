@@ -30,7 +30,14 @@ def build_agent_bundle(
     The bundle contains a single config.yaml with the given spec fields.
     """
     # Any: YAML config values are heterogeneous (str, int, etc.)
-    config: dict[str, Any] = {"spec_version": 1, "name": name}
+    config: dict[str, Any] = {
+        "spec_version": 1,
+        "name": name,
+        # LLM config is required for the real workflow to execute.
+        # The model value must match the agent name used in
+        # create_test_response(model=...).
+        "llm": {"model": name},
+    }
     if description is not None:
         config["description"] = description
     config_bytes = yaml.dump(config).encode()

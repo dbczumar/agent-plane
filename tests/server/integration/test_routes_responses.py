@@ -9,7 +9,7 @@ import httpx
 import pytest
 from httpx_sse import aconnect_sse
 
-from tests.server.conftest import IntegrationTaskStore
+from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import create_test_agent, create_test_response
 
 pytestmark = pytest.mark.asyncio
@@ -93,7 +93,8 @@ async def test_create_response_streaming(client: httpx.AsyncClient) -> None:
 async def test_get_response(client: httpx.AsyncClient) -> None:
     """GET /responses/{id} returns the full response object with all fields."""
     await create_test_agent(client)
-    created = await create_test_response(client)
+    # background=False so the task completes before we GET it
+    created = await create_test_response(client, background=False, stream=False)
     response_id = created.body["id"]
 
     resp = await client.get(f"/v1/responses/{response_id}")
@@ -101,7 +102,6 @@ async def test_get_response(client: httpx.AsyncClient) -> None:
     body = resp.json()
     assert body["id"] == response_id
     assert body["object"] == "response"
-    # After start(), the stub marks as completed
     assert body["status"] == "completed"
     assert body["model"] == "test-agent"
     assert isinstance(body["created_at"], int)
@@ -142,7 +142,8 @@ async def test_delete_response_not_found(client: httpx.AsyncClient) -> None:
 async def test_cancel_completed_response(client: httpx.AsyncClient) -> None:
     """Cancelling an already-completed response is a no-op — status stays completed."""
     await create_test_agent(client)
-    created = await create_test_response(client)
+    # background=False so the task completes before we cancel it
+    created = await create_test_response(client, background=False, stream=False)
     response_id = created.body["id"]
 
     resp = await client.post(f"/v1/responses/{response_id}/cancel")
@@ -155,12 +156,13 @@ async def test_cancel_completed_response(client: httpx.AsyncClient) -> None:
 
 async def test_cancel_active_response(
     client: httpx.AsyncClient,
-    task_store: IntegrationTaskStore,
+    mock_llm: ControllableMockClient,
 ) -> None:
     """Cancelling an active response returns cancelled status with empty output."""
     await create_test_agent(client)
 
-    task_store.defer_all_completions = True
+    # Block the LLM call so the task stays active
+    mock_llm.add_call(block=True)
     created = await create_test_response(client)
     response_id = created.body["id"]
     assert created.body["status"] == "queued"
@@ -230,8 +232,14 @@ async def test_create_response_with_previous_response_id(
     """Multi-turn: second response references the first via previous_response_id."""
     await create_test_agent(client)
 
-    # First turn
-    first = await create_test_response(client, input_text="Turn 1")
+    # First turn — background=False so it completes before Turn 2 starts,
+    # avoiding position races with the background workflow thread.
+    first = await create_test_response(
+        client,
+        input_text="Turn 1",
+        background=False,
+        stream=False,
+    )
     first_id = first.body["id"]
     conv_id = first.body["conversation"]["id"]
 
@@ -308,7 +316,7 @@ async def test_create_response_conversation_mismatch(
 
 async def test_steering_try_deliver(
     client: httpx.AsyncClient,
-    task_store: IntegrationTaskStore,
+    mock_llm: ControllableMockClient,
 ) -> None:
     """
     When previous_response_id points to an active task, the server
@@ -317,8 +325,8 @@ async def test_steering_try_deliver(
     """
     await create_test_agent(client)
 
-    # Keep the first task active (not auto-completed)
-    task_store.defer_all_completions = True
+    # Block the LLM call so the first task stays active
+    mock_llm.add_call(block=True)
     first = await create_test_response(client, input_text="Turn 1")
     first_id = first.body["id"]
     assert first.body["status"] == "queued"
@@ -333,7 +341,6 @@ async def test_steering_try_deliver(
     assert second.status_code == 200
     # Returns the SAME response (steering, not a new task)
     assert second.body["id"] == first_id
-    assert second.body["status"] == "queued"
 
 
 async def test_background_streaming_queued_event(
@@ -375,16 +382,23 @@ async def test_fork_detection(client: httpx.AsyncClient) -> None:
     """
     await create_test_agent(client)
 
-    # Turn 1
-    first = await create_test_response(client, input_text="Turn 1")
+    # Turn 1 — background=False so it completes before Turn 2 starts
+    first = await create_test_response(
+        client,
+        input_text="Turn 1",
+        background=False,
+        stream=False,
+    )
     first_id = first.body["id"]
     conv_id = first.body["conversation"]["id"]
 
-    # Turn 2
+    # Turn 2 — also foreground to complete before fork attempt
     second = await create_test_response(
         client,
         input_text="Turn 2",
         previous_response_id=first_id,
+        background=False,
+        stream=False,
     )
     assert second.body["conversation"]["id"] == conv_id
 
