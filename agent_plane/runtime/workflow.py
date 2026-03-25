@@ -17,6 +17,7 @@ from openai.types.responses import (
 )
 from openai.types.responses import (
     ResponseCompletedEvent,
+    ResponseOutputItemAddedEvent,
     ResponseReasoningSummaryTextDeltaEvent,
     ResponseReasoningTextDeltaEvent,
     ResponseStreamEvent,
@@ -279,6 +280,7 @@ def _call_llm_streaming(
 # SSE event types emitted for reasoning content
 _REASONING_TEXT_EVENT = "response.reasoning_text.delta"
 _REASONING_SUMMARY_EVENT = "response.reasoning_summary_text.delta"
+_REASONING_STARTED_EVENT = "response.reasoning.started"
 
 
 def _accumulate_stream(
@@ -291,11 +293,14 @@ def _accumulate_stream(
     stream), and return the full response dict.
 
     Emitted SSE event types:
+    - ``response.reasoning.started`` — fired once when reasoning begins
+      (always emitted for reasoning models, even when content is encrypted)
     - ``response.output_text.delta`` — visible text tokens
     - ``response.reasoning_text.delta`` — full reasoning tokens
       (model-dependent; gated by ``reasoning_effort``)
     - ``response.reasoning_summary_text.delta`` — reasoning summary
-      tokens (enabled when ``reasoning.summary`` is set)
+      tokens (enabled when ``reasoning.summary`` is set; requires
+      OpenAI org verification)
 
     :param task_id: The task identifier, e.g. ``"task_abc123"``.
     :param stream_resp: The Responses API streaming response to
@@ -308,7 +313,13 @@ def _accumulate_stream(
     for event in stream_resp:
         # Use isinstance for type narrowing — string comparison on
         # the discriminant field doesn't narrow the union for mypy.
-        if isinstance(event, ResponseTextDeltaEvent):
+        if isinstance(event, ResponseOutputItemAddedEvent):
+            # Emit a signal when a reasoning item begins so clients
+            # can show a "thinking..." indicator even when reasoning
+            # content is encrypted (org not yet verified for summaries).
+            if hasattr(event.item, "type") and event.item.type == "reasoning":
+                _write_output(task_id, {"type": _REASONING_STARTED_EVENT})
+        elif isinstance(event, ResponseTextDeltaEvent):
             _write_output(
                 task_id,
                 {"type": "response.output_text.delta", "delta": event.delta},

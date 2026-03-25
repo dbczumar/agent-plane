@@ -186,7 +186,12 @@ def _handle_event(event_type: str, data: str) -> None:
     """Process a single SSE event and print to terminal."""
     global _had_text_deltas, _reasoning_text_started, _reasoning_summary_started
 
-    if event_type == "response.reasoning_text.delta":
+    if event_type == "response.reasoning.started":
+        # Reasoning began but content may be encrypted (org not verified).
+        # Show a dim indicator so it's clear the model is thinking.
+        sys.stdout.write("\x1b[2;36m[thinking...]\x1b[0m\n")
+        sys.stdout.flush()
+    elif event_type == "response.reasoning_text.delta":
         payload = json.loads(data)
         if not _reasoning_text_started:
             # Cyan header to make the reasoning block unmistakable
