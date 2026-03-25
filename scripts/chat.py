@@ -176,20 +176,33 @@ def stream_response(
 # so we don't double-print text from response.output_item.done.
 _had_text_deltas = False
 
+# Tracks whether we've printed the section header for the current
+# reasoning block so we only print it once per response.
+_reasoning_text_started = False
+_reasoning_summary_started = False
+
 
 def _handle_event(event_type: str, data: str) -> None:
     """Process a single SSE event and print to terminal."""
-    global _had_text_deltas
+    global _had_text_deltas, _reasoning_text_started, _reasoning_summary_started
 
     if event_type == "response.reasoning_text.delta":
-        # Full reasoning tokens — dim display to distinguish from final answer
         payload = json.loads(data)
-        sys.stdout.write(f"\x1b[2m{payload['delta']}\x1b[0m")
+        if not _reasoning_text_started:
+            # Cyan header to make the reasoning block unmistakable
+            sys.stdout.write("\x1b[36m── reasoning ──────────────────────────────────\x1b[0m\n")
+            _reasoning_text_started = True
+        # Dim cyan text for reasoning content
+        sys.stdout.write(f"\x1b[2;36m{payload['delta']}\x1b[0m")
         sys.stdout.flush()
     elif event_type == "response.reasoning_summary_text.delta":
-        # Reasoning summary tokens — shown before the final answer
         payload = json.loads(data)
-        sys.stdout.write(f"\x1b[3m{payload['delta']}\x1b[0m")
+        if not _reasoning_summary_started:
+            # Yellow header for the summary block
+            sys.stdout.write("\x1b[33m── reasoning summary ──────────────────────────\x1b[0m\n")
+            _reasoning_summary_started = True
+        # Yellow italic text for the summary
+        sys.stdout.write(f"\x1b[3;33m{payload['delta']}\x1b[0m")
         sys.stdout.flush()
     elif event_type == "response.output_text.delta":
         # Real-time text deltas — print each token immediately
@@ -207,8 +220,14 @@ def _handle_event(event_type: str, data: str) -> None:
                     if block.get("type") == "output_text":
                         sys.stdout.write(block["text"])
                         sys.stdout.flush()
+            # Print closing separator if a reasoning block was open
+            if _reasoning_text_started or _reasoning_summary_started:
+                sys.stdout.write("\x1b[2m── answer ─────────────────────────────────────\x1b[0m\n")
+                sys.stdout.flush()
             print()
             _had_text_deltas = False
+            _reasoning_text_started = False
+            _reasoning_summary_started = False
         elif item.get("type") == "function_call":
             name = item.get("name", "?")
             args = item.get("arguments", "")
