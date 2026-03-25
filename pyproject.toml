@@ -13,7 +13,6 @@ dependencies = [
     "sqlalchemy>=2.0",
     "alembic",
     "uvicorn[standard]",
-    "openai>=1.0",
 ]
 
 [project.scripts]
