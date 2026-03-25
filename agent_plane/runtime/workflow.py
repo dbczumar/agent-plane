@@ -542,9 +542,16 @@ def _handle_final_response(
     conv_store: ConversationStore,
 ) -> dict[str, Any] | None:
     """
-    Handle the no-tool-calls path: close inbox, check for
-    late messages, persist assistant message, stream it, and
-    return the result dict.
+    Handle the no-tool-calls path using persist-first-then-check.
+
+    Persists the assistant response BEFORE checking the steering
+    inbox. This prevents ghost tokens: since we already streamed
+    tokens to SSE consumers, we must commit the response so those
+    tokens correspond to a real persisted message. If late steering
+    messages arrived during streaming, we continue the loop — the
+    LLM will generate a follow-up addressing the new input,
+    producing two valid committed messages instead of one spliced
+    ghost.
 
     Returns ``None`` if late messages arrived and the caller
     should continue the loop.
@@ -569,21 +576,14 @@ def _handle_final_response(
         ``"status"``, and ``"output"`` if the response was
         finalized, or ``None`` if the loop should continue.
     """
-    # Final text response — check steering inbox
-    late = task_store.close_inbox(
-        task_id,
-        conversation_id,
-        last_seen,
-    )
-    if late:
-        # New messages arrived — add to history and retry
-        history.extend(late)
-        return None
-
-    # Persist assistant message to conversation
+    # ── Step 1: Persist first ──────────────────────────────
+    # Commit the assistant message BEFORE checking the inbox.
+    # Tokens were already streamed to SSE consumers, so this
+    # message must exist in the conversation regardless of
+    # whether late steering messages arrived.
     text = _get_text_content(llm_resp)
     item = _build_assistant_item(task_id, agent_name, text)
-    _persist_and_stream(
+    persisted = _persist_and_stream(
         task_id,
         conv_store,
         conversation_id,
@@ -591,6 +591,38 @@ def _handle_final_response(
         output_items,
     )
 
+    # ── Step 2: Check steering inbox ───────────────────────
+    # Use the ORIGINAL last_seen (from before the LLM call),
+    # not the newly-persisted item's ID. This ensures we
+    # detect any steered messages that were delivered while
+    # the LLM was streaming — those messages have positions
+    # between last_seen and the assistant message we just
+    # persisted.
+    late = task_store.close_inbox(
+        task_id,
+        conversation_id,
+        last_seen,
+    )
+
+    # Filter out our own output — close_inbox returns ALL
+    # items newer than last_seen, which includes the
+    # assistant message we just persisted (it has a position
+    # after last_seen). We only care about external steered
+    # messages.
+    steered = [ci for ci in late if ci.response_id != task_id]
+
+    if steered:
+        # ── Step 3a: Late messages arrived ─────────────────
+        # Add the persisted assistant response and the late
+        # steered messages to history so the LLM sees both
+        # on the next iteration. The assistant response is
+        # already committed — the next LLM call will produce
+        # a follow-up addressing the new user input.
+        history.extend(persisted)
+        history.extend(steered)
+        return None
+
+    # ── Step 3b: No late messages — we're done ─────────────
     return {
         "task_id": task_id,
         "status": "completed",
@@ -908,8 +940,12 @@ def _run_agent_loop(
             )
             if result is not None:
                 return result
-            # Late messages arrived — _handle_final_response
-            # extended history with non-empty late items
+            # Late steered messages arrived during streaming.
+            # _handle_final_response persisted the assistant
+            # response and appended both it and the steered
+            # messages to history. Advance last_seen to the
+            # final steered message so the next iteration
+            # doesn't re-process them.
             last_seen = history[-1].id
             continue
 

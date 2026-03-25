@@ -9,6 +9,9 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from openai.types.responses import (
+    ResponseCompletedEvent,
+)
 
 from agent_plane.entities import MessageData, NewConversationItem
 from agent_plane.runtime import live_stream
@@ -24,17 +27,20 @@ from agent_plane.stores.task_store.sqlalchemy_store import SqlAlchemyTaskStore
 _AGENT_NAME = "test-agent"
 
 
-def _make_mock_streaming_client() -> MagicMock:
+def _make_completed_event(text: str = "Hello from the test LLM!") -> MagicMock:
     """
-    Build a mock OpenAI client whose ``responses.create()`` returns a
-    one-event stream yielding a ``response.completed`` event with a
-    single text output item.
+    Build a mock ``ResponseCompletedEvent`` with a single text
+    output item. Uses ``spec=ResponseCompletedEvent`` so
+    ``isinstance`` checks in ``_accumulate_stream`` pass.
 
-    :returns: A MagicMock suitable for patching ``_get_openai_client``.
+    :param text: The assistant's reply text, e.g.
+        ``"Hello from the test LLM!"``.
+    :returns: A MagicMock that passes
+        ``isinstance(m, ResponseCompletedEvent)``.
     """
     mock_content = MagicMock()
     mock_content.type = "output_text"
-    mock_content.text = "Hello from the test LLM!"
+    mock_content.text = text
 
     mock_output_item = MagicMock()
     mock_output_item.type = "message"
@@ -44,14 +50,25 @@ def _make_mock_streaming_client() -> MagicMock:
     mock_response.output = [mock_output_item]
     mock_response.model = "test-model"
 
-    mock_completed_event = MagicMock()
-    mock_completed_event.type = "response.completed"
-    mock_completed_event.response = mock_response
+    # spec= makes isinstance(event, ResponseCompletedEvent) True
+    mock_event = MagicMock(spec=ResponseCompletedEvent)
+    mock_event.type = "response.completed"
+    mock_event.response = mock_response
+    return mock_event
 
+
+def _make_mock_streaming_client() -> MagicMock:
+    """
+    Build a mock OpenAI client whose ``responses.create()`` returns a
+    one-event stream yielding a ``response.completed`` event with a
+    single text output item.
+
+    :returns: A MagicMock suitable for patching ``_get_openai_client``.
+    """
     mock_client = MagicMock()
     # responses.create is called with stream=True; return an iterable
     # that yields one completed event so _accumulate_stream terminates.
-    mock_client.responses.create.return_value = iter([mock_completed_event])
+    mock_client.responses.create.return_value = iter([_make_completed_event()])
     return mock_client
 
 
@@ -516,3 +533,135 @@ async def test_stream_closed_on_workflow_exception(
         assert events == []
     finally:
         live_stream.unregister(task.id)
+
+
+def _make_streaming_client_with_steering(
+    conv_store: SqlAlchemyConversationStore,
+    conv_id: str,
+) -> MagicMock:
+    """
+    Build a mock OpenAI client that injects a steering message
+    into the conversation on the FIRST ``responses.create()``
+    call (simulating a user message arriving during LLM
+    streaming). Returns different text on each call so the
+    test can distinguish the first response from the follow-up.
+
+    :param conv_store: ConversationStore to inject the
+        steering message into.
+    :param conv_id: Conversation ID to append the steering
+        message to, e.g. ``"conv_abc123"``.
+    :returns: A MagicMock suitable for patching
+        ``_get_openai_client``.
+    """
+    call_count = 0
+
+    def _fake_responses_create(**kwargs: Any) -> list[MagicMock]:
+        nonlocal call_count
+        call_count += 1
+
+        if call_count == 1:
+            # Simulate a steering message arriving while the
+            # LLM is "streaming" — inject it into the
+            # conversation so close_inbox will find it.
+            conv_store.append(
+                conv_id,
+                [
+                    NewConversationItem(
+                        type="message",
+                        # Use a distinct response_id to mark
+                        # this as an external steering message
+                        # (not the agent's own output).
+                        response_id="user-steered",
+                        data=MessageData(
+                            role="user",
+                            content=[
+                                {
+                                    "type": "input_text",
+                                    "text": "new priority!",
+                                }
+                            ],
+                        ),
+                    )
+                ],
+            )
+            text = "First response (before steering)"
+        else:
+            text = "Follow-up addressing steering"
+
+        return iter([_make_completed_event(text)])
+
+    mock_client = MagicMock()
+    mock_client.responses.create.side_effect = _fake_responses_create
+    return mock_client
+
+
+@pytest.mark.asyncio
+async def test_persist_first_prevents_ghost_tokens(
+    task_store: SqlAlchemyTaskStore,
+    agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When a steering message arrives during LLM streaming,
+    the persist-first-then-check pattern ensures:
+    1. The first assistant response is persisted (not ghost
+       tokens that vanish).
+    2. The LLM is called again to address the steering
+       message.
+    3. Both responses exist in the conversation.
+
+    Before the fix, the first response would be discarded,
+    leaving SSE consumers with ghost tokens that don't
+    correspond to any persisted message.
+    """
+    agent_id = _make_agent(agent_store, artifact_store)
+    conv_id = _make_conversation(conversation_store)
+    # Seed with a user message so the workflow has input.
+    conversation_store.append(
+        conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="seed",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "hi"}],
+                ),
+            )
+        ],
+    )
+
+    mock_client = _make_streaming_client_with_steering(conversation_store, conv_id)
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._get_openai_client",
+        lambda: mock_client,
+    )
+
+    task = task_store.create(
+        conversation_id=conv_id,
+        agent_id=agent_id,
+        agent_name=_AGENT_NAME,
+    )
+    task_store.start(task.id)
+    result = await task_store.wait(task.id)
+
+    assert result.status == "completed"
+
+    # The LLM should have been called twice: once for the
+    # original request, once for the follow-up after steering.
+    assert mock_client.responses.create.call_count == 2
+
+    # Both assistant responses must be persisted in the
+    # conversation — the first is NOT discarded.
+    all_items = conversation_store.list_items(conv_id)
+    assistant_texts = [
+        item.data.content[0]["text"]
+        for item in all_items.data
+        if item.type == "message"
+        and isinstance(item.data, MessageData)
+        and item.data.role == "assistant"
+    ]
+    assert "First response (before steering)" in assistant_texts
+    assert "Follow-up addressing steering" in assistant_texts
