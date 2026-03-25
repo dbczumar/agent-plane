@@ -20,7 +20,7 @@ dependencies = [
 ap = "agent_plane.cli:cli"
 
 [tool.setuptools.packages.find]
-include = ["agent_plane*"]
+include = ["agent_plane*", "llms*"]
 
 [build-system]
 requires = ["setuptools>=68.0"]
