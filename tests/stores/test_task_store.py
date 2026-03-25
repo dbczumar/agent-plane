@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import tarfile
 from typing import Any
@@ -10,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent_plane.entities import MessageData, NewConversationItem
+from agent_plane.runtime import live_stream
 from agent_plane.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from agent_plane.stores.artifact_store.local import LocalArtifactStore
 from agent_plane.stores.conversation_store.sqlalchemy_store import (
@@ -21,22 +23,36 @@ from agent_plane.stores.task_store.sqlalchemy_store import SqlAlchemyTaskStore
 
 _AGENT_NAME = "test-agent"
 
-# Canned litellm response matching the shape of litellm.ModelResponse.model_dump()
-_CANNED_LLM_RESPONSE: dict[str, Any] = {
-    "choices": [
-        {
-            "message": {
-                "role": "assistant",
-                "content": "Hello from the test LLM!",
-                "tool_calls": None,
-            },
-            "finish_reason": "stop",
-            "index": 0,
-        }
-    ],
-    "model": "test-model",
-    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
-}
+
+def _make_mock_streaming_client() -> MagicMock:
+    """
+    Build a mock OpenAI client whose ``responses.create()`` returns a
+    one-event stream yielding a ``response.completed`` event with a
+    single text output item.
+
+    :returns: A MagicMock suitable for patching ``_get_openai_client``.
+    """
+    mock_content = MagicMock()
+    mock_content.type = "output_text"
+    mock_content.text = "Hello from the test LLM!"
+
+    mock_output_item = MagicMock()
+    mock_output_item.type = "message"
+    mock_output_item.content = [mock_content]
+
+    mock_response = MagicMock()
+    mock_response.output = [mock_output_item]
+    mock_response.model = "test-model"
+
+    mock_completed_event = MagicMock()
+    mock_completed_event.type = "response.completed"
+    mock_completed_event.response = mock_response
+
+    mock_client = MagicMock()
+    # responses.create is called with stream=True; return an iterable
+    # that yields one completed event so _accumulate_stream terminates.
+    mock_client.responses.create.return_value = iter([mock_completed_event])
+    return mock_client
 
 
 def _make_agent_bundle() -> bytes:
@@ -347,10 +363,12 @@ async def test_start_and_get_completed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """start() launches a DBOS workflow; get() reflects completion."""
-    # Monkeypatch litellm.completion so no real API call is made.
-    mock_resp = MagicMock()
-    mock_resp.model_dump.return_value = _CANNED_LLM_RESPONSE
-    monkeypatch.setattr("litellm.completion", lambda **kwargs: mock_resp)
+    # Monkeypatch the OpenAI client so no real API call is made.
+    mock_client = _make_mock_streaming_client()
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._get_openai_client",
+        lambda: mock_client,
+    )
 
     agent_id = _make_agent(agent_store, artifact_store)
     conv_id = _make_conversation(conversation_store)
@@ -394,9 +412,12 @@ async def test_wait_returns_completed_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """wait() blocks until the workflow completes and returns the task."""
-    mock_resp = MagicMock()
-    mock_resp.model_dump.return_value = _CANNED_LLM_RESPONSE
-    monkeypatch.setattr("litellm.completion", lambda **kwargs: mock_resp)
+    # Monkeypatch the OpenAI client so no real API call is made.
+    mock_client = _make_mock_streaming_client()
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._get_openai_client",
+        lambda: mock_client,
+    )
 
     agent_id = _make_agent(agent_store, artifact_store)
     conv_id = _make_conversation(conversation_store)
@@ -424,3 +445,74 @@ async def test_wait_returns_completed_task(
     assert result.status == "completed"
     assert len(result.output) >= 1
     assert result.reasoning == {"effort": "high"}
+
+
+@pytest.mark.asyncio
+async def test_stream_closed_on_workflow_exception(
+    task_store: SqlAlchemyTaskStore,
+    agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When the workflow raises mid-loop, the finally block still
+    calls _close_output so the live stream's _DONE sentinel is
+    pushed and SSE consumers don't hang forever.
+
+    Without the fix (finally-block _close_output), subscribe()
+    would block indefinitely on ``await queue.get()`` and this
+    test would time out.
+    """
+    # Make the LLM call raise to simulate a mid-loop crash.
+    mock_client = MagicMock()
+    mock_client.responses.create.side_effect = RuntimeError("simulated LLM timeout")
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._get_openai_client",
+        lambda: mock_client,
+    )
+
+    agent_id = _make_agent(agent_store, artifact_store)
+    conv_id = _make_conversation(conversation_store)
+    conversation_store.append(
+        conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="seed",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "hi"}],
+                ),
+            )
+        ],
+    )
+    task = task_store.create(
+        conversation_id=conv_id,
+        agent_id=agent_id,
+        agent_name=_AGENT_NAME,
+    )
+
+    # Register the live stream BEFORE starting the workflow so the
+    # finally-block's _close_output can push _DONE to the queue.
+    loop = asyncio.get_running_loop()
+    live_stream.register(task.id, loop)
+
+    try:
+        task_store.start(task.id)
+
+        # Drain the live stream. If the fix were missing, subscribe()
+        # would hang forever — the 10 s timeout catches that.
+        async def drain() -> list[dict[str, Any]]:
+            """Collect all events until _DONE sentinel."""
+            items: list[dict[str, Any]] = []
+            async for event in live_stream.subscribe(task.id):
+                items.append(event)
+            return items
+
+        events = await asyncio.wait_for(drain(), timeout=10.0)
+        # subscribe() terminated — _DONE sentinel was received.
+        # LLM raised before producing output, so no events.
+        assert events == []
+    finally:
+        live_stream.unregister(task.id)

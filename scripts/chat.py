@@ -181,7 +181,17 @@ def _handle_event(event_type: str, data: str) -> None:
     """Process a single SSE event and print to terminal."""
     global _had_text_deltas
 
-    if event_type == "response.output_text.delta":
+    if event_type == "response.reasoning_text.delta":
+        # Full reasoning tokens — dim display to distinguish from final answer
+        payload = json.loads(data)
+        sys.stdout.write(f"\x1b[2m{payload['delta']}\x1b[0m")
+        sys.stdout.flush()
+    elif event_type == "response.reasoning_summary_text.delta":
+        # Reasoning summary tokens — shown before the final answer
+        payload = json.loads(data)
+        sys.stdout.write(f"\x1b[3m{payload['delta']}\x1b[0m")
+        sys.stdout.flush()
+    elif event_type == "response.output_text.delta":
         # Real-time text deltas — print each token immediately
         _had_text_deltas = True
         payload = json.loads(data)

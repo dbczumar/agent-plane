@@ -1,4 +1,4 @@
-"""Prompt construction — build litellm message lists from spec + history."""
+"""Prompt construction — build Responses API inputs from spec + history."""
 
 from __future__ import annotations
 
@@ -16,7 +16,13 @@ from agent_plane.spec import AgentSpec
 def _extract_text(content_blocks: list[dict[str, Any]]) -> str:
     """
     Extract plain text from heterogeneous content blocks.
-    Handles input_text, output_text, and bare text block types.
+    Handles ``input_text``, ``output_text``, and bare ``text``
+    block types.
+
+    :param content_blocks: List of content block dicts, e.g.
+        ``[{"type": "input_text", "text": "Hello"}]``.
+    :returns: Joined text from all recognized blocks, or
+        empty string if none contain text.
     """
     parts: list[str] = []
     for block in content_blocks:
@@ -28,14 +34,26 @@ def _extract_text(content_blocks: list[dict[str, Any]]) -> str:
     return "\n".join(parts) if parts else ""
 
 
-def build_system_message(
+def build_instructions(
     spec: AgentSpec,
     per_request_instructions: str | None,
     tool_schemas: list[dict[str, Any]],
-) -> dict[str, str]:
+) -> str:
     """
-    Build the system message from the agent's instructions,
-    per-request instructions, and skill metadata.
+    Build the system instructions string from the agent's
+    instructions, per-request instructions, and skill metadata.
+    Passed as the ``instructions`` parameter to
+    ``client.responses.create()``.
+
+    :param spec: The parsed AgentSpec containing the agent's
+        base instructions and skill definitions.
+    :param per_request_instructions: Optional additional
+        instructions for this specific request, appended
+        after the agent's base instructions.
+    :param tool_schemas: OpenAI-format tool schemas (used
+        only for future skill-awareness hinting; currently
+        not included in the instructions body).
+    :returns: The assembled instructions string.
     """
     parts: list[str] = []
 
@@ -53,80 +71,55 @@ def build_system_message(
             skill_lines.append(f"- {skill.name}: {skill.description}")
         parts.append("\n".join(skill_lines))
 
-    content = "\n\n".join(parts) if parts else "You are a helpful assistant."
-    return {"role": "system", "content": content}
+    return "\n\n".join(parts) if parts else "You are a helpful assistant."
 
 
-def history_to_messages(
+def history_to_input_items(
     items: list[ConversationItem],
 ) -> list[dict[str, Any]]:
     """
-    Convert persisted ConversationItems into litellm/OpenAI chat messages.
+    Convert persisted ConversationItems into Responses API input items.
 
-    Merges consecutive function_call items into the preceding assistant
-    message's tool_calls list (OpenAI expects them in one message).
+    Each item type maps directly to a Responses API input item format:
+    ``message`` → role/content pair, ``function_call`` → function call
+    item, ``function_call_output`` → function call output item. This
+    is simpler than Chat Completions format because function calls are
+    kept as separate items rather than embedded in assistant messages.
+
+    :param items: Persisted conversation items in chronological order.
+    :returns: A list of Responses API input item dicts suitable for
+        ``client.responses.create(input=...)``.
     """
-    messages: list[dict[str, Any]] = []
+    result: list[dict[str, Any]] = []
 
     for item in items:
         if item.type == "message":
             assert isinstance(item.data, MessageData)
-            content = _extract_text(item.data.content)
-            messages.append({"role": item.data.role, "content": content})
+            text = _extract_text(item.data.content)
+            result.append({"role": item.data.role, "content": text})
 
         elif item.type == "function_call":
             assert isinstance(item.data, FunctionCallData)
-            tc: dict[str, Any] = {
-                "id": item.data.call_id,
-                "type": "function",
-                "function": {
+            result.append(
+                {
+                    "type": "function_call",
+                    "call_id": item.data.call_id,
                     "name": item.data.name,
                     "arguments": item.data.arguments,
-                },
-            }
-            # Merge with preceding assistant message if one exists
-            if messages and messages[-1]["role"] == "assistant":
-                messages[-1].setdefault("tool_calls", []).append(tc)
-                # OpenAI requires content to be null (not missing)
-                # when tool_calls is present and there was no text
-                if not messages[-1].get("content"):
-                    messages[-1]["content"] = None
-            else:
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [tc],
-                    }
-                )
+                }
+            )
 
         elif item.type == "function_call_output":
             assert isinstance(item.data, FunctionCallOutputData)
-            messages.append(
+            result.append(
                 {
-                    "role": "tool",
-                    "tool_call_id": item.data.call_id,
-                    "content": item.data.output,
+                    "type": "function_call_output",
+                    "call_id": item.data.call_id,
+                    "output": item.data.output,
                 }
             )
 
         # reasoning items are not included in the LLM prompt
         # (they are output-only)
 
-    return messages
-
-
-def build_messages(
-    spec: AgentSpec,
-    history: list[ConversationItem],
-    instructions: str | None,
-    tool_schemas: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """
-    Build the complete message list for a litellm.completion() call.
-    """
-    messages: list[dict[str, Any]] = [
-        build_system_message(spec, instructions, tool_schemas),
-    ]
-    messages.extend(history_to_messages(history))
-    return messages
+    return result
