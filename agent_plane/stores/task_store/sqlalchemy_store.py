@@ -21,7 +21,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from agent_plane.db.db_models import SqlConversationItem, SqlTask
+from agent_plane.db.db_models import SqlConversation, SqlConversationItem, SqlTask
 from agent_plane.db.utils import (
     ensure_fts_table,
     extract_search_text,
@@ -378,6 +378,27 @@ class SqlAlchemyTaskStore(TaskStore):
 
     # ── Steering handshake (DB-only, unchanged) ──────────
 
+    def _lock_conversation(self, session: Session, conversation_id: str) -> None:
+        """
+        Acquire a row-level lock on the conversation to serialize
+        position writes.
+
+        On PostgreSQL, issues ``SELECT ... FOR UPDATE`` on the
+        conversation row. On SQLite, this is a no-op because
+        database-level locking already serializes transactions.
+
+        :param session: The active SQLAlchemy session.
+        :param conversation_id: The conversation to lock,
+            e.g. ``"conv_abc123"``.
+        """
+        if self._supports_for_update:
+            stmt = (
+                select(SqlConversation.id)
+                .where(SqlConversation.id == conversation_id)
+                .with_for_update()
+            )
+            session.execute(stmt)
+
     def _get_task_for_update(self, session: Session, task_id: str) -> SqlTask | None:
         """
         Fetch a task row with ``FOR UPDATE`` locking on PostgreSQL.
@@ -423,6 +444,12 @@ class SqlAlchemyTaskStore(TaskStore):
             row = self._get_task_for_update(session, task_id)
             if row is None or row.inbox_closed:
                 return False
+
+            # Lock the conversation row to serialize position writes
+            # with concurrent append() calls. On PostgreSQL this is a
+            # row-level FOR UPDATE lock; on SQLite the database-level
+            # lock already serializes.
+            self._lock_conversation(session, conversation_id)
 
             max_pos: int = session.execute(
                 select(func.coalesce(func.max(SqlConversationItem.position), -1)).where(

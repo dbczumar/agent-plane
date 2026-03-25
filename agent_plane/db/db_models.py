@@ -173,6 +173,7 @@ class SqlConversationItem(Base):
             "ix_conversation_items_conversation_id_position",
             "conversation_id",
             "position",
+            unique=True,
         ),
         Index("ix_conversation_items_response_id", "response_id"),
     )

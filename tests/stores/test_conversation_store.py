@@ -156,6 +156,53 @@ def test_position_ordering(conversation_store: SqlAlchemyConversationStore) -> N
     assert texts == ["First", "Second"]
 
 
+def test_unique_position_constraint(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    The (conversation_id, position) pair has a unique index.
+
+    Verify that manually inserting a duplicate position raises
+    IntegrityError, confirming the safety net is in place.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from agent_plane.db.db_models import SqlConversationItem
+    from agent_plane.db.utils import generate_item_id
+
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_dup",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "first"}],
+                ),
+            ),
+        ],
+    )
+    # Directly insert a row at position 0 (already taken) to
+    # confirm the unique constraint rejects it.
+    with pytest.raises(IntegrityError):
+        with conversation_store._session() as session:
+            session.add(
+                SqlConversationItem(
+                    id=generate_item_id("message"),
+                    conversation_id=conv.id,
+                    response_id="resp_dup",
+                    created_at=0,
+                    status="completed",
+                    position=0,  # duplicate
+                    type="message",
+                    data='{"role":"user","content":[]}',
+                    search_text="",
+                )
+            )
+
+
 def _make_5_items(conversation_store: SqlAlchemyConversationStore, conv_id: str):
     """Helper: append 5 messages and return the persisted items."""
     return conversation_store.append(

@@ -72,7 +72,7 @@ def upgrade() -> None:
         "ix_conversation_items_conversation_id_position",
         "conversation_items",
         ["conversation_id", "position"],
-        unique=False,
+        unique=True,
     )
     op.create_index(
         "ix_conversation_items_response_id", "conversation_items", ["response_id"], unique=False

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from sqlalchemy import and_, asc, delete, desc, func, or_, select, text
+from sqlalchemy.orm import Session
 
 from agent_plane.db.db_models import SqlConversation, SqlConversationItem, SqlTask
 from agent_plane.db.utils import (
@@ -87,7 +88,29 @@ class SqlAlchemyConversationStore(ConversationStore):
         super().__init__(storage_location)
         self._engine = get_or_create_engine(storage_location)
         self._session = make_managed_session_maker(self._engine)
+        self._supports_for_update = self._engine.dialect.name != "sqlite"
         ensure_fts_table(self._engine)
+
+    def _lock_conversation(self, session: Session, conversation_id: str) -> None:
+        """
+        Acquire a row-level lock on the conversation to serialize
+        position writes.
+
+        On PostgreSQL, issues ``SELECT ... FOR UPDATE`` on the
+        conversation row. On SQLite, this is a no-op because
+        database-level locking already serializes transactions.
+
+        :param session: The active SQLAlchemy session.
+        :param conversation_id: The conversation to lock,
+            e.g. ``"conv_abc123"``.
+        """
+        if self._supports_for_update:
+            stmt = (
+                select(SqlConversation.id)
+                .where(SqlConversation.id == conversation_id)
+                .with_for_update()
+            )
+            session.execute(stmt)
 
     def create_conversation(self) -> Conversation:
         """
@@ -294,6 +317,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         persisted: list[ConversationItem] = []
 
         with self._session() as session:
+            # Lock the conversation row to serialize position writes.
+            # On PostgreSQL this is a row-level FOR UPDATE lock; on
+            # SQLite the database-level lock already serializes.
+            self._lock_conversation(session, conversation_id)
+
             # coalesce to -1 so the first appended item gets position 0.
             max_pos = session.execute(
                 select(func.coalesce(func.max(SqlConversationItem.position), -1)).where(
