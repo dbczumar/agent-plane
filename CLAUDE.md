@@ -154,6 +154,19 @@ Check each file against this checklist:
     docstring with `:param:` entries. Missing or incomplete
     docstrings are a blocking issue.
 
+26. MOCK INTEGRITY: Test mocks must use real types (dataclasses,
+    Pydantic models) from the same module the production code imports —
+    never MagicMock for objects checked with isinstance. After any
+    import-path refactor, grep tests for stale type references. Stale
+    mock *targets* (monkeypatch of renamed function) raise errors;
+    stale mock *types* silently degrade.
+
+27. ASSERTION DEPTH: Test assertions must verify actual content values,
+    not just structural properties. `assert len(x) >= 1` and
+    `assert x[0]["role"] == "assistant"` pass even when the payload
+    is None/empty. Always assert on the value that proves the mock
+    data traversed the full pipeline.
+
 Report each finding as:
   [FILE:LINE] ISSUE — description of the problem and suggested fix
 
@@ -166,6 +179,46 @@ If no issues found, say "No issues found."
 - After refactoring or renaming
 - After adding new store implementations or route handlers
 - NOT needed for: documentation-only changes, memory updates, test-only changes
+
+## Testing: Mock Integrity and Assertion Depth
+
+### Never let mocks silently degrade
+
+When mocking an external boundary (LLM client, MCP server, etc.):
+
+1. **Use real types, not MagicMock, for data objects.** If the production
+   code does `isinstance(event, SomeType)`, a `MagicMock()` will silently
+   fail the check and fall through to a default path. Use the real
+   dataclass/type from the same module the production code imports. If
+   the import path changes (e.g. `openai.types` → `llms.types`), the
+   mock must change too — a stale mock won't error, it will just stop
+   matching.
+
+2. **Assert on content, not just structure.** `assert len(result) >= 1`
+   and `assert result[0]["role"] == "assistant"` pass even when text is
+   `None`. Always assert the actual value that proves the mock's data
+   made it through the full pipeline.
+
+3. **After any refactor that changes imports or type paths, grep test
+   files for the old names.** Stale mock targets (`monkeypatch.setattr`
+   of a renamed function) raise `AttributeError` — those are easy to
+   catch. Stale *type* references in mock construction are silent.
+
+### Test invariants at the right layer
+
+Workflow integration tests (mock LLM → run full workflow → check result)
+are good for "does the happy path complete?" They are **bad** for testing
+ordering invariants, cursor arithmetic, or concurrency handshakes.
+
+When a function has position-ordering or state-machine invariants
+(e.g. `close_inbox` cursor advancement, `last_seen` tracking):
+
+- Write a **focused unit test** that calls the function directly with
+  controlled store state. Set up specific position orderings by hand,
+  call the function, assert the exact cursor value and store mutations.
+- The workflow integration test should verify the *outcome* (both
+  responses persisted, inbox closed) but should NOT be the only test
+  covering the ordering logic.
 
 ## Development Conventions
 

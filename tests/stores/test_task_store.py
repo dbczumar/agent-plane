@@ -414,6 +414,9 @@ async def test_start_and_get_completed(
     assert result.status == "completed"
     assert len(result.output) >= 1
     assert result.output[0]["role"] == "assistant"
+    # Verify the mock's text actually made it through the full
+    # pipeline (_accumulate_stream → _response_to_dict → persist).
+    assert result.output[0]["content"][0]["text"] == "Hello from the test LLM!"
     # instructions are stored in DBOS and restored by get()/wait()
     assert result.instructions == "Be helpful"
 
@@ -459,6 +462,7 @@ async def test_wait_returns_completed_task(
     result = await task_store.wait(task.id)
     assert result.status == "completed"
     assert len(result.output) >= 1
+    assert result.output[0]["content"][0]["text"] == "Hello from the test LLM!"
     assert result.reasoning == {"effort": "high"}
 
 
