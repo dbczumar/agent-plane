@@ -10,7 +10,8 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 import httpx
 
@@ -79,9 +80,7 @@ def _chat_to_anthropic(
     payload: dict[str, Any] = {"model": model}
 
     # Extract system messages
-    system_parts = [
-        m["content"] for m in messages if m["role"] == "system"
-    ]
+    system_parts = [m["content"] for m in messages if m["role"] == "system"]
     if system_parts:
         payload["system"] = "\n".join(system_parts)
 
@@ -150,12 +149,14 @@ def _convert_assistant_message(m: dict[str, Any]) -> dict[str, Any]:
         if text := m.get("content"):
             content.append({"type": "text", "text": text})
         for tc in tool_calls:
-            content.append({
-                "type": "tool_use",
-                "id": tc["id"],
-                "name": tc["function"]["name"],
-                "input": json.loads(tc["function"]["arguments"]),
-            })
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "input": json.loads(tc["function"]["arguments"]),
+                }
+            )
         return {"role": "assistant", "content": content}
     return {"role": "assistant", "content": m.get("content")}
 
@@ -191,11 +192,13 @@ def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if tool.get("type") != "function":
             continue
         func = tool["function"]
-        converted.append({
-            "name": func["name"],
-            "description": func.get("description", ""),
-            "input_schema": func.get("parameters", {}),
-        })
+        converted.append(
+            {
+                "name": func["name"],
+                "description": func.get("description", ""),
+                "input_schema": func.get("parameters", {}),
+            }
+        )
     return converted
 
 
@@ -256,14 +259,16 @@ def _anthropic_to_chat(resp: dict[str, Any]) -> dict[str, Any]:
         if block.get("type") == "text":
             text_parts.append(block["text"])
         elif block.get("type") == "tool_use":
-            tool_calls.append({
-                "id": block["id"],
-                "type": "function",
-                "function": {
-                    "name": block["name"],
-                    "arguments": json.dumps(block["input"]),
-                },
-            })
+            tool_calls.append(
+                {
+                    "id": block["id"],
+                    "type": "function",
+                    "function": {
+                        "name": block["name"],
+                        "arguments": json.dumps(block["input"]),
+                    },
+                }
+            )
 
     stop_reason = resp.get("stop_reason", "end_turn")
     finish_reason = "length" if stop_reason == "max_tokens" else "stop"
@@ -294,9 +299,7 @@ def _anthropic_to_chat(resp: dict[str, Any]) -> dict[str, Any]:
             "prompt_tokens": usage.get("input_tokens"),
             "completion_tokens": usage.get("output_tokens"),
             "total_tokens": (
-                (usage.get("input_tokens") or 0)
-                + (usage.get("output_tokens") or 0)
-                or None
+                (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0) or None
             ),
         },
     }
@@ -322,7 +325,7 @@ def _stream_to_chat_chunks(
         if not line.startswith("data: "):
             continue
 
-        data = json.loads(line[len("data: "):])
+        data = json.loads(line[len("data: ") :])
         event_type = data.get("type", "")
 
         if event_type == "message_start":
@@ -340,12 +343,14 @@ def _stream_to_chat_chunks(
                 yield _make_chunk(
                     metadata,
                     delta={
-                        "tool_calls": [{
-                            "index": tool_call_index,
-                            "id": block["id"],
-                            "type": "function",
-                            "function": {"name": block["name"]},
-                        }]
+                        "tool_calls": [
+                            {
+                                "index": tool_call_index,
+                                "id": block["id"],
+                                "type": "function",
+                                "function": {"name": block["name"]},
+                            }
+                        ]
                     },
                 )
             continue
@@ -361,21 +366,21 @@ def _stream_to_chat_chunks(
                 yield _make_chunk(
                     metadata,
                     delta={
-                        "tool_calls": [{
-                            "index": tool_call_index,
-                            "function": {
-                                "arguments": delta_block["partial_json"],
-                            },
-                        }]
+                        "tool_calls": [
+                            {
+                                "index": tool_call_index,
+                                "function": {
+                                    "arguments": delta_block["partial_json"],
+                                },
+                            }
+                        ]
                     },
                 )
             continue
 
         if event_type == "message_delta":
             if delta_usage := data.get("usage"):
-                usage_data["output_tokens"] = delta_usage.get(
-                    "output_tokens", 0
-                )
+                usage_data["output_tokens"] = delta_usage.get("output_tokens", 0)
             stop_reason = data.get("delta", {}).get("stop_reason")
             finish = "length" if stop_reason == "max_tokens" else "stop"
             yield _make_chunk(
@@ -386,8 +391,7 @@ def _stream_to_chat_chunks(
                     "prompt_tokens": usage_data.get("input_tokens"),
                     "completion_tokens": usage_data.get("output_tokens"),
                     "total_tokens": (
-                        usage_data.get("input_tokens", 0)
-                        + usage_data.get("output_tokens", 0)
+                        usage_data.get("input_tokens", 0) + usage_data.get("output_tokens", 0)
                     ),
                 },
             )

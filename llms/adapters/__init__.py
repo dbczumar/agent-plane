@@ -90,10 +90,10 @@ def _create_adapter(provider: str, **kwargs: Any) -> BaseAdapter:
 
         return DatabricksAdapter(**kwargs)
 
-    raise ValueError(
-        f"Unknown provider {provider!r}. "
-        f"Supported: {sorted(openai_compat_providers.keys() | {'anthropic', 'gemini', 'bedrock', 'vertex', 'databricks'})}"
+    all_providers = sorted(
+        openai_compat_providers.keys() | {"anthropic", "gemini", "bedrock", "vertex", "databricks"}
     )
+    raise ValueError(f"Unknown provider {provider!r}. Supported: {all_providers}")
 
 
 def clear_cache() -> None:

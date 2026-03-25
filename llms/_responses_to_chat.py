@@ -9,7 +9,8 @@ Responses API format that the public ``Client`` exposes.
 
 from __future__ import annotations
 
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 from llms.types import (
     FunctionCallOutput,
@@ -21,7 +22,6 @@ from llms.types import (
     ResponseTextDeltaEvent,
     Usage,
 )
-
 
 # ── Input direction: Responses API -> Chat Completions ────
 
@@ -57,46 +57,56 @@ def responses_input_to_chat_messages(
         item_type = item.get("type")
 
         if item_type == "function_call":
-            pending_tool_calls.append({
-                "id": item["call_id"],
-                "type": "function",
-                "function": {
-                    "name": item["name"],
-                    "arguments": item["arguments"],
-                },
-            })
+            pending_tool_calls.append(
+                {
+                    "id": item["call_id"],
+                    "type": "function",
+                    "function": {
+                        "name": item["name"],
+                        "arguments": item["arguments"],
+                    },
+                }
+            )
             continue
 
         # Flush any pending tool calls into an assistant message
         # before processing the next non-function_call item.
         if pending_tool_calls:
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": pending_tool_calls,
-            })
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": pending_tool_calls,
+                }
+            )
             pending_tool_calls = []
 
         if item_type == "function_call_output":
-            messages.append({
-                "role": "tool",
-                "tool_call_id": item["call_id"],
-                "content": item["output"],
-            })
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": item["call_id"],
+                    "content": item["output"],
+                }
+            )
         else:
             # Regular message (user or assistant)
-            messages.append({
-                "role": item["role"],
-                "content": item.get("content"),
-            })
+            messages.append(
+                {
+                    "role": item["role"],
+                    "content": item.get("content"),
+                }
+            )
 
     # Flush any trailing tool calls
     if pending_tool_calls:
-        messages.append({
-            "role": "assistant",
-            "content": None,
-            "tool_calls": pending_tool_calls,
-        })
+        messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": pending_tool_calls,
+            }
+        )
 
     return messages
 
@@ -127,11 +137,13 @@ def chat_response_to_response(
     # Tool calls
     for tc in message.get("tool_calls") or []:
         func = tc["function"]
-        output.append(FunctionCallOutput(
-            call_id=tc["id"],
-            name=func["name"],
-            arguments=func["arguments"],
-        ))
+        output.append(
+            FunctionCallOutput(
+                call_id=tc["id"],
+                name=func["name"],
+                arguments=func["arguments"],
+            )
+        )
 
     usage = _extract_usage(chat_dict.get("usage"))
 
@@ -226,16 +238,16 @@ def chat_stream_to_response_events(
     # Assemble the final Response
     output: list[MessageOutput | FunctionCallOutput] = []
     if accumulated_text:
-        output.append(
-            MessageOutput(content=[OutputText(text=accumulated_text)])
-        )
+        output.append(MessageOutput(content=[OutputText(text=accumulated_text)]))
     for _idx in sorted(tool_calls_by_index):
         tc = tool_calls_by_index[_idx]
-        output.append(FunctionCallOutput(
-            call_id=tc["id"],
-            name=tc["name"],
-            arguments=tc["arguments"],
-        ))
+        output.append(
+            FunctionCallOutput(
+                call_id=tc["id"],
+                name=tc["name"],
+                arguments=tc["arguments"],
+            )
+        )
 
     usage = _extract_usage(usage_dict)
     response = Response(output=output, model=model, usage=usage)
