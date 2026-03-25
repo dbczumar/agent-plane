@@ -57,13 +57,19 @@ def _create_adapter(provider: str, **kwargs: Any) -> BaseAdapter:
     }
 
     if provider in openai_compat_providers:
+        base_url, api_key_env = openai_compat_providers[provider]
+        resolved_url = kwargs.get("base_url", base_url)
+        resolved_key = kwargs.get("api_key_env", api_key_env)
+        if provider == "openai":
+            # OpenAI supports the Responses API natively; use the
+            # subclass that calls /v1/responses directly so reasoning
+            # token events (reasoning_summary_text.delta etc.) flow through.
+            from llms.adapters.openai import OpenAIAdapter
+
+            return OpenAIAdapter(base_url=resolved_url, api_key_env=resolved_key)
         from llms.adapters.openai import OpenAICompatibleAdapter
 
-        base_url, api_key_env = openai_compat_providers[provider]
-        return OpenAICompatibleAdapter(
-            base_url=kwargs.get("base_url", base_url),
-            api_key_env=kwargs.get("api_key_env", api_key_env),
-        )
+        return OpenAICompatibleAdapter(base_url=resolved_url, api_key_env=resolved_key)
 
     if provider == "anthropic":
         from llms.adapters.anthropic import AnthropicAdapter

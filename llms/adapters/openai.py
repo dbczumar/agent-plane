@@ -196,3 +196,189 @@ def _parse_sse_line(line: str) -> dict[str, Any] | None:
         return None
     result: dict[str, Any] = json.loads(data)
     return result
+
+
+def _parse_responses_output(
+    output_items: list[dict[str, Any]],
+) -> list[MessageOutput | FunctionCallOutput]:
+    """
+    Convert Responses API output items to ``llms.types`` output objects.
+
+    Skips ``reasoning`` items — only ``message`` and ``function_call``
+    items are returned.
+
+    :param output_items: List of output item dicts from the Responses
+        API response, e.g. the ``response.output`` list.
+    :returns: List of :class:`MessageOutput` and/or
+        :class:`FunctionCallOutput` instances.
+    """
+    output: list[MessageOutput | FunctionCallOutput] = []
+    for item in output_items:
+        if item.get("type") == "message":
+            parts = [
+                OutputText(text=p["text"])
+                for p in item.get("content", [])
+                if p.get("type") == "output_text" and p.get("text")
+            ]
+            if parts:
+                output.append(MessageOutput(content=parts))
+        elif item.get("type") == "function_call":
+            output.append(
+                FunctionCallOutput(
+                    call_id=item["call_id"],
+                    name=item["name"],
+                    arguments=item["arguments"],
+                )
+            )
+    return output
+
+
+def _parse_responses_response(data: dict[str, Any]) -> Response:
+    """
+    Convert a Responses API response dict to a :class:`Response`.
+
+    :param data: The full Responses API response JSON dict.
+    :returns: A :class:`Response` with parsed output and usage.
+    """
+    output = _parse_responses_output(data.get("output", []))
+    usage_data: dict[str, Any] = data.get("usage") or {}
+    usage = (
+        Usage(
+            input_tokens=usage_data.get("input_tokens"),
+            output_tokens=usage_data.get("output_tokens"),
+            total_tokens=usage_data.get("total_tokens"),
+        )
+        if usage_data
+        else None
+    )
+    return Response(output=output, model=data.get("model", ""), usage=usage)
+
+
+def _parse_responses_event(
+    event_type: str,
+    data: dict[str, Any],
+) -> ResponseStreamEvent | None:
+    """
+    Convert a single Responses API SSE event to a
+    :class:`ResponseStreamEvent`, or ``None`` if the event type
+    is not handled.
+
+    :param event_type: The SSE event name, e.g.
+        ``"response.output_text.delta"``.
+    :param data: The parsed JSON payload from the ``data:`` line.
+    :returns: A streaming event dataclass, or ``None``.
+    """
+    if event_type == "response.output_text.delta":
+        return ResponseTextDeltaEvent(delta=data["delta"])
+    if event_type == "response.reasoning_summary_text.delta":
+        return ResponseReasoningSummaryTextDeltaEvent(delta=data["delta"])
+    if event_type == "response.reasoning_text.delta":
+        return ResponseReasoningTextDeltaEvent(delta=data["delta"])
+    if event_type == "response.output_item.added":
+        if data.get("item", {}).get("type") == "reasoning":
+            return ResponseReasoningStartedEvent()
+    if event_type == "response.completed":
+        return ResponseCompletedEvent(response=_parse_responses_response(data["response"]))
+    return None
+
+
+class OpenAIAdapter(OpenAICompatibleAdapter):
+    """
+    OpenAI-specific adapter that calls ``/v1/responses`` natively.
+
+    Extends :class:`OpenAICompatibleAdapter` (which uses Chat
+    Completions) by adding :meth:`responses_create` — a direct
+    Responses API path that preserves reasoning token streaming events
+    that Chat Completions does not expose.
+
+    :param base_url: The OpenAI API base URL.
+    :param api_key_env: Environment variable name for the API key.
+    """
+
+    def responses_create(
+        self,
+        *,
+        input: list[dict[str, Any]],  # noqa: A002 — mirrors OpenAI SDK parameter name
+        instructions: str | None,
+        model: str,
+        tools: list[dict[str, Any]] | None,
+        reasoning: dict[str, str] | None,
+        stream: bool,
+        **kwargs: Any,
+    ) -> Response | Iterator[ResponseStreamEvent]:
+        """
+        Call the OpenAI Responses API (``/v1/responses``) directly.
+
+        Used instead of Chat Completions so that reasoning token
+        streaming events (``response.reasoning_summary_text.delta``,
+        ``response.reasoning_text.delta``) flow through unmodified.
+
+        :param input: Responses API input items.
+        :param instructions: System instructions string, or ``None``.
+        :param model: Model name without provider prefix, e.g.
+            ``"o4-mini"``.
+        :param tools: OpenAI-format tool schemas, or ``None``.
+        :param reasoning: Reasoning config dict, e.g.
+            ``{"effort": "high", "summary": "detailed"}``, or ``None``.
+        :param stream: If ``True``, return an iterator of
+            :class:`ResponseStreamEvent`. If ``False``, return a
+            :class:`Response`.
+        :param kwargs: Additional API kwargs (temperature, etc.).
+        :returns: A :class:`Response` or an iterator of
+            :class:`ResponseStreamEvent`.
+        """
+        payload: dict[str, Any] = {"model": model, "input": input, **kwargs}
+        if instructions:
+            payload["instructions"] = instructions
+        if tools:
+            payload["tools"] = tools
+        if reasoning:
+            payload["reasoning"] = reasoning
+        if stream:
+            payload["stream"] = True
+
+        url = f"{self._base_url}/responses"
+        headers = self._build_headers()
+
+        if stream:
+            return self._stream_responses(url, headers, payload)
+        resp_data = self._send_request(url, headers, payload)
+        return _parse_responses_response(resp_data)
+
+    def _stream_responses(
+        self,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+    ) -> Iterator[ResponseStreamEvent]:
+        """
+        Stream the Responses API and yield typed
+        :class:`ResponseStreamEvent` instances.
+
+        Parses SSE ``event:`` + ``data:`` pairs, mapping each to the
+        appropriate event dataclass. Unknown event types are skipped.
+
+        :param url: The ``/v1/responses`` endpoint URL.
+        :param headers: HTTP headers including Authorization.
+        :param payload: The request payload with ``stream: true``.
+        :yields: :class:`ResponseStreamEvent` instances.
+        """
+        current_event: str | None = None
+        buf = ""
+        with httpx.Client(timeout=_STREAM_TIMEOUT) as client:
+            with client.stream("POST", url, headers=headers, json=payload) as resp:
+                resp.raise_for_status()
+                for chunk in resp.iter_bytes():
+                    buf += chunk.decode("utf-8", errors="replace")
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        line = line.rstrip("\r")
+                        if line.startswith("event: "):
+                            current_event = line[7:]
+                        elif line.startswith("data: ") and current_event:
+                            data_str = line[6:]
+                            if data_str.strip() != "[DONE]":
+                                event = _parse_responses_event(current_event, json.loads(data_str))
+                                if event is not None:
+                                    yield event
+                            current_event = None

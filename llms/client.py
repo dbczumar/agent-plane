@@ -14,6 +14,7 @@ from llms._responses_to_chat import (
     responses_input_to_chat_messages,
 )
 from llms.adapters import get_adapter
+from llms.adapters.openai import OpenAIAdapter
 from llms.routing import parse_model_string
 from llms.types import Response, ResponseStreamEvent
 
@@ -62,6 +63,20 @@ class _ResponsesNamespace:
         """
         routed = parse_model_string(model)
         adapter = get_adapter(routed.provider)
+
+        # OpenAI supports the Responses API natively — use it directly
+        # so reasoning token events flow through unmodified.
+        if isinstance(adapter, OpenAIAdapter):
+            return adapter.responses_create(
+                input=input,
+                instructions=instructions,
+                model=routed.model,
+                tools=tools,
+                reasoning=reasoning,
+                stream=stream,
+                **kwargs,
+            )
+
         messages = responses_input_to_chat_messages(input, instructions)
 
         extra: dict[str, Any] = dict(kwargs)

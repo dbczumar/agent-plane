@@ -45,6 +45,7 @@ from llms.types import (
     FunctionCallOutput,
     MessageOutput,
     ResponseCompletedEvent,
+    ResponseReasoningStartedEvent,
     ResponseReasoningSummaryTextDeltaEvent,
     ResponseReasoningTextDeltaEvent,
     ResponseStreamEvent,
@@ -290,6 +291,7 @@ def _call_llm_streaming(
 # SSE event types emitted for reasoning content
 _REASONING_TEXT_EVENT = "response.reasoning_text.delta"
 _REASONING_SUMMARY_EVENT = "response.reasoning_summary_text.delta"
+_REASONING_STARTED_EVENT = "response.reasoning.started"
 
 
 def _accumulate_stream(
@@ -318,7 +320,9 @@ def _accumulate_stream(
     completed_response: LLMResponse | None = None
 
     for event in stream_resp:
-        if isinstance(event, ResponseTextDeltaEvent):
+        if isinstance(event, ResponseReasoningStartedEvent):
+            _write_output(task_id, {"type": _REASONING_STARTED_EVENT})
+        elif isinstance(event, ResponseTextDeltaEvent):
             _write_output(
                 task_id,
                 {"type": "response.output_text.delta", "delta": event.delta},
