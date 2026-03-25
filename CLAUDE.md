@@ -144,6 +144,16 @@ Check each file against this checklist:
     same operation. Test infrastructure must use the same path as
     production code.
 
+25. **COMPREHENSIVE DOCSTRINGS (CRITICAL)**: Every function, method,
+    class, and dataclass MUST have a docstring. Docstrings MUST
+    include `:param name: description` for EVERY parameter. For
+    parameters whose values are not obvious from the name/type,
+    include an example value (e.g. ``:param model: The litellm model
+    identifier, e.g. ``"openai/gpt-4o"````). Dataclass fields must
+    be documented either with field-level comments or in the class
+    docstring with `:param:` entries. Missing or incomplete
+    docstrings are a blocking issue.
+
 Report each finding as:
   [FILE:LINE] ISSUE — description of the problem and suggested fix
 

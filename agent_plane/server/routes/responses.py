@@ -39,8 +39,13 @@ from agent_plane.stores import AgentStore, ConversationStore, TaskStore
 def _build_response_object(task: Task) -> ResponseObject:
     """
     Convert a runtime Task into an API-layer ResponseObject.
-    Uses task.agent_name (persisted at creation) for the model field
-    so the value is stable even if the agent is renamed or deleted.
+
+    Uses ``task.agent_name`` (persisted at creation) for the model
+    field so the value is stable even if the agent is renamed or
+    deleted.
+
+    :param task: The runtime task entity to convert.
+    :returns: A fully populated :class:`ResponseObject`.
     """
     return ResponseObject(
         id=task.id,
@@ -68,8 +73,15 @@ def _normalize_input(
     raw_input: str | list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """
-    Normalize the request input into a list of content parts. A plain
-    string is converted into a single input_text content block.
+    Normalize the request input into a list of content parts.
+
+    A plain string is converted into a single ``input_text``
+    content block.
+
+    :param raw_input: Either a plain string (e.g. ``"Hello"``)
+        or a list of content-block dicts, e.g.
+        ``[{"type": "input_text", "text": "Hello"}]``.
+    :returns: A list of content-block dicts.
     """
     if isinstance(raw_input, str):
         return [{"type": "input_text", "text": raw_input}]
@@ -77,13 +89,28 @@ def _normalize_input(
 
 
 def _format_sse(event_type: str, data: dict[str, Any] | str) -> str:
-    """Format a single SSE event string."""
+    """
+    Format a single Server-Sent Event string.
+
+    :param event_type: SSE event name, e.g.
+        ``"response.created"``, ``"response.completed"``.
+    :param data: Payload to serialize. Dicts are JSON-encoded;
+        strings are sent as-is.
+    :returns: A complete SSE frame (``event: ...\\ndata: ...\\n\\n``).
+    """
     payload = data if isinstance(data, str) else json.dumps(data)
     return f"event: {event_type}\ndata: {payload}\n\n"
 
 
 async def _poll_disconnect(request: Request) -> None:
-    """Block until the client disconnects."""
+    """
+    Block until the client disconnects.
+
+    Polls every 0.5 seconds and returns once the client
+    has closed the connection.
+
+    :param request: The incoming FastAPI request to monitor.
+    """
     while not await request.is_disconnected():
         await asyncio.sleep(0.5)
 
@@ -98,12 +125,23 @@ async def _resolve_conversation(
     conversation_store: ConversationStore,
 ) -> ResponseObject | str:
     """
-    Handle the previous_response_id path: resolve conversation_id,
-    validate the conversation/response relationship, attempt steering
-    delivery, and wait if the inbox is closed.
+    Handle the ``previous_response_id`` path: resolve
+    ``conversation_id``, validate the conversation/response
+    relationship, attempt steering delivery, and wait if the
+    inbox is closed.
 
-    Returns a ResponseObject if steering succeeded (caller should
-    return it immediately) or a conversation_id string for normal flow.
+    :param req: The incoming create-response request.
+    :param content: Normalized user input content blocks,
+        e.g. ``[{"type": "input_text", "text": "Hello"}]``.
+    :param task_store: Store for task lifecycle operations.
+    :param conversation_store: Store for conversation
+        persistence.
+    :returns: A :class:`ResponseObject` if steering succeeded
+        (caller should return it immediately) or a
+        ``conversation_id`` string for normal task-creation
+        flow.
+    :raises AgentPlaneError: If ``previous_response_id`` cannot
+        be resolved.
     """
     if not req.previous_response_id:
         # No previous response — create a fresh conversation
@@ -131,8 +169,18 @@ def _validate_conversation_relationship(
     conversation_store: ConversationStore,
 ) -> None:
     """
-    Validate that conversation and previous_response_id are
-    consistent: same conversation and no fork.
+    Validate that ``conversation`` and ``previous_response_id``
+    are consistent: same conversation and no fork.
+
+    :param req: The incoming create-response request containing
+        both ``conversation`` and ``previous_response_id``.
+    :param conversation_id: The resolved conversation ID from
+        the ``previous_response_id`` lookup.
+    :param conversation_store: Store for conversation queries.
+    :raises AgentPlaneError: If the conversation reference does
+        not match the resolved conversation or if the
+        ``previous_response_id`` is not the latest response
+        (fork detected).
     """
     if not req.conversation:
         return
@@ -158,9 +206,21 @@ async def _attempt_steering(
     task_store: TaskStore,
 ) -> ResponseObject | str:
     """
-    Check if the previous response is still active and try to deliver
-    the message to the running agent's inbox. Returns a ResponseObject
-    if steering succeeded, otherwise the conversation_id for normal flow.
+    Check if the previous response is still active and try to
+    deliver the message to the running agent's inbox.
+
+    :param previous_response_id: ID of the prior response,
+        e.g. ``"resp_abc123"``.
+    :param content: Normalized user input content blocks,
+        e.g. ``[{"type": "input_text", "text": "..."}]``.
+    :param conversation_id: The resolved conversation ID.
+    :param task_store: Store for task lifecycle operations.
+    :returns: A :class:`ResponseObject` if steering succeeded
+        (message delivered to the running agent), otherwise
+        the ``conversation_id`` string for normal
+        task-creation flow.
+    :raises AgentPlaneError: If the previous response does
+        not exist (deleted).
     """
     # Check if previous response exists (None means deleted).
     # Must use get_async — this is an async handler with a running
@@ -207,11 +267,28 @@ def _create_task(
     conversation_store: ConversationStore,
 ) -> Task:
     """
-    Create a new task and append the user message to the conversation.
-    Does NOT start the workflow — the caller must call
-    _start_task() separately. This split allows the caller to
-    register the live stream between create and start, eliminating
-    the race where early events are lost.
+    Create a new task and append the user message to the
+    conversation.
+
+    Does NOT start the workflow -- the caller must call
+    :func:`_start_task` separately. This split allows the
+    caller to register the live stream between create and
+    start, eliminating the race where early events are lost.
+
+    :param req: The incoming create-response request.
+    :param conversation_id: ID of the conversation to append
+        to, e.g. ``"conv_abc123"``.
+    :param agent_id: ID of the agent executing the task.
+    :param agent_name: Denormalized agent name persisted on the
+        task for stable API responses, e.g.
+        ``"research-agent"``.
+    :param content: Normalized user input content blocks,
+        e.g. ``[{"type": "input_text", "text": "..."}]``.
+    :param task_store: Store for task creation.
+    :param conversation_store: Store for appending conversation
+        items.
+    :returns: The newly created (but not yet started)
+        :class:`Task`.
     """
     task = task_store.create(
         conversation_id=conversation_id,
@@ -241,6 +318,11 @@ def _start_task(
     """
     Start the DBOS workflow for a previously created task and
     set workflow inputs on the task entity.
+
+    :param task: The task entity returned by :func:`_create_task`.
+    :param req: The incoming create-response request (provides
+        ``instructions`` and ``reasoning``).
+    :param task_store: Store used to launch the DBOS workflow.
     """
     task_store.start(
         task.id,
@@ -257,8 +339,16 @@ def _start_task(
 class _InitialEvents:
     """
     Result of building the initial SSE events (created, queued,
-    in_progress). Carries the serialized events and the initial
-    response dict needed for the terminal fallback.
+    in_progress).
+
+    Carries the serialized events and the initial response dict
+    needed for the terminal fallback.
+
+    :param sse_strings: Pre-formatted SSE frame strings ready to
+        yield to the client.
+    :param initial_dict: Serialized :class:`ResponseObject` dict
+        for the initial (queued) state, reused when building
+        the terminal fallback on error.
     """
 
     sse_strings: list[str] = field(default_factory=list)
@@ -270,8 +360,14 @@ def _build_initial_events(
     background: bool,
 ) -> _InitialEvents:
     """
-    Build the response.created, optional response.queued, and
-    response.in_progress SSE events.
+    Build the ``response.created``, optional ``response.queued``,
+    and ``response.in_progress`` SSE events.
+
+    :param task: The newly created task entity.
+    :param background: Whether this is a background task.
+        Background tasks include a ``response.queued`` event.
+    :returns: An :class:`_InitialEvents` containing the
+        formatted SSE strings and the initial response dict.
     """
     initial = _build_response_object(task)
     initial_dict = initial.model_dump()
@@ -325,7 +421,14 @@ def _build_initial_events(
 
 @dataclass
 class _TerminalEvent:
-    """Result of building the terminal SSE event."""
+    """
+    Result of building the terminal SSE event.
+
+    :param event_type: SSE event name, e.g.
+        ``"response.completed"``, ``"response.failed"``.
+    :param response_dict: Serialized :class:`ResponseObject`
+        dict for the final state.
+    """
 
     event_type: str
     response_dict: dict[str, Any]
@@ -337,8 +440,20 @@ async def _build_terminal_event(
     task_store: TaskStore,
 ) -> _TerminalEvent:
     """
-    Wait for the task workflow to fully exit and build the terminal
-    SSE event. Falls back to a minimal failed response on error.
+    Wait for the task workflow to fully exit and build the
+    terminal SSE event.
+
+    Falls back to a minimal failed response on error so the
+    client receives a clean SSE close instead of a dropped
+    connection.
+
+    :param task_id: ID of the task to wait on,
+        e.g. ``"resp_abc123"``.
+    :param initial_dict: Serialized initial response dict used
+        as the base for the fallback error payload.
+    :param task_store: Store for waiting on task completion.
+    :returns: A :class:`_TerminalEvent` with the final event
+        type and response dict.
     """
     # Stream ended — wait for the workflow to
     # fully exit (the finally block may still be
@@ -378,11 +493,22 @@ async def _stream_events(
 ) -> AsyncIterator[str]:
     """
     Async generator that yields SSE strings for a streaming
-    response. Reads from the in-process live stream for
-    real-time token delivery.
+    response.
 
-    The caller MUST register the live stream before starting the
-    task to guarantee no events are lost (no race condition).
+    Reads from the in-process live stream for real-time token
+    delivery. The caller MUST register the live stream before
+    starting the task to guarantee no events are lost (no race
+    condition).
+
+    On foreground tasks, cancels the task if the client
+    disconnects before the stream completes.
+
+    :param task: The task entity to stream events for.
+    :param task_store: Store for task lifecycle operations
+        (wait, cancel, get).
+    :param background: Whether this is a background task.
+        Background tasks are not cancelled on disconnect.
+    :yields: Formatted SSE frame strings.
     """
     completed_normally = False
     try:
@@ -433,6 +559,14 @@ async def _handle_blocking_wait(
     """
     Race task completion against client disconnect so foreground
     requests are cancelled when the client drops.
+
+    :param task: The task entity to wait on.
+    :param request: The incoming FastAPI request, used to detect
+        client disconnect.
+    :param task_store: Store for waiting on and cancelling the
+        task.
+    :returns: A :class:`ResponseObject` for the completed (or
+        cancelled) task.
     """
     # -- background=false, stream=false: blocking wait --
     # Race task completion against client disconnect so
@@ -460,8 +594,17 @@ def create_responses_router(
     agent_store: AgentStore,
 ) -> APIRouter:
     """
-    Factory that builds the responses router. Stores are closed
-    over — no dependency injection.
+    Factory that builds the responses router.
+
+    Stores are closed over -- no dependency injection.
+
+    :param task_store: Store for task lifecycle operations.
+    :param conversation_store: Store for conversation
+        persistence.
+    :param agent_store: Store for agent lookups (model
+        resolution).
+    :returns: A configured :class:`APIRouter` with all
+        ``/responses`` endpoints.
     """
     router = APIRouter()
 
@@ -474,6 +617,22 @@ def create_responses_router(
     async def create_response(
         req: CreateResponseRequest, request: Request
     ) -> ResponseObject | StreamingResponse:
+        """
+        Create a new response (task execution).
+
+        Validates the request, resolves the conversation (or
+        steers an active response), creates and starts the
+        task, and returns the result according to the
+        ``stream`` and ``background`` flags.
+
+        :param req: The create-response request body.
+        :param request: The raw FastAPI request, used for
+            disconnect detection on blocking waits.
+        :returns: A :class:`ResponseObject` (blocking or
+            background) or a :class:`StreamingResponse` (SSE).
+        :raises AgentPlaneError: On validation failures or
+            unknown model.
+        """
         # -- Validate store --
         if not req.store:
             raise AgentPlaneError(
@@ -538,6 +697,14 @@ def create_responses_router(
 
     @router.get("/responses/{response_id}")
     async def get_response(response_id: str) -> ResponseObject:
+        """
+        Retrieve a single response by ID.
+
+        :param response_id: The response/task identifier,
+            e.g. ``"resp_abc123"``.
+        :returns: The matching :class:`ResponseObject`.
+        :raises AgentPlaneError: If the response is not found.
+        """
         task = await task_store.get(response_id)
         if not task:
             raise AgentPlaneError("Response not found", code=ErrorCode.NOT_FOUND)
@@ -549,6 +716,18 @@ def create_responses_router(
     async def cancel_response(
         response_id: str,
     ) -> ResponseObject:
+        """
+        Cancel an in-progress response.
+
+        If the response is already in a terminal state, returns
+        it unchanged.
+
+        :param response_id: The response/task identifier,
+            e.g. ``"resp_abc123"``.
+        :returns: The cancelled (or already-terminal)
+            :class:`ResponseObject`.
+        :raises AgentPlaneError: If the response is not found.
+        """
         task = await task_store.get(response_id)
         if not task:
             raise AgentPlaneError("Response not found", code=ErrorCode.NOT_FOUND)
@@ -563,6 +742,14 @@ def create_responses_router(
     async def delete_response(
         response_id: str,
     ) -> ResponseDeleted:
+        """
+        Delete a response by ID.
+
+        :param response_id: The response/task identifier,
+            e.g. ``"resp_abc123"``.
+        :returns: A :class:`ResponseDeleted` confirmation.
+        :raises AgentPlaneError: If the response is not found.
+        """
         task = await task_store.get(response_id)
         if not task:
             raise AgentPlaneError("Response not found", code=ErrorCode.NOT_FOUND)

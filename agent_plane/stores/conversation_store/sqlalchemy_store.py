@@ -29,6 +29,13 @@ from agent_plane.stores.conversation_store import ConversationStore
 
 
 def _to_conversation(row: SqlConversation) -> Conversation:
+    """
+    Convert a :class:`SqlConversation` ORM row to a
+    :class:`Conversation` entity.
+
+    :param row: The SQLAlchemy ORM row to convert.
+    :returns: A :class:`Conversation` dataclass instance.
+    """
     return Conversation(
         id=row.id,
         created_at=row.created_at,
@@ -37,6 +44,16 @@ def _to_conversation(row: SqlConversation) -> Conversation:
 
 
 def _to_item(row: SqlConversationItem) -> ConversationItem:
+    """
+    Convert a :class:`SqlConversationItem` ORM row to a
+    :class:`ConversationItem` entity.
+
+    Deserializes the JSON ``data`` column and parses it into
+    the appropriate typed data model.
+
+    :param row: The SQLAlchemy ORM row to convert.
+    :returns: A :class:`ConversationItem` Pydantic model.
+    """
     return ConversationItem(
         id=row.id,
         type=row.type,
@@ -48,13 +65,36 @@ def _to_item(row: SqlConversationItem) -> ConversationItem:
 
 
 class SqlAlchemyConversationStore(ConversationStore):
+    """
+    SQLAlchemy-backed implementation of :class:`ConversationStore`.
+
+    Persists conversations and their items in a relational database
+    via SQLAlchemy ORM. Also manages a full-text search (FTS) table
+    for item content.
+    """
+
     def __init__(self, storage_location: str) -> None:
+        """
+        Initialize the SQLAlchemy conversation store.
+
+        Creates or reuses a SQLAlchemy engine and session factory,
+        and ensures the FTS virtual table exists.
+
+        :param storage_location: SQLAlchemy database URI,
+            e.g. ``"sqlite:///conversations.db"`` or
+            ``"postgresql://user:pass@host/db"``.
+        """
         super().__init__(storage_location)
         self._engine = get_or_create_engine(storage_location)
         self._session = make_managed_session_maker(self._engine)
         ensure_fts_table(self._engine)
 
     def create_conversation(self) -> Conversation:
+        """
+        Create a new conversation in the database.
+
+        :returns: The newly created :class:`Conversation`.
+        """
         row = SqlConversation(
             id=generate_conversation_id(),
             created_at=now_epoch(),
@@ -64,11 +104,28 @@ class SqlAlchemyConversationStore(ConversationStore):
             return _to_conversation(row)
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
+        """
+        Fetch a conversation by its unique ID.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :returns: The :class:`Conversation` if found, otherwise
+            ``None``.
+        """
         with self._session() as session:
             row = session.get(SqlConversation, conversation_id)
             return _to_conversation(row) if row else None
 
     def get_conversation_id(self, response_id: str) -> str:
+        """
+        Resolve a response_id to the conversation it belongs to.
+
+        :param response_id: The task/response ID to resolve,
+            e.g. ``"resp_abc123"``.
+        :returns: The conversation ID string.
+        :raises LookupError: If no item with the given
+            response_id exists.
+        """
         with self._session() as session:
             conv_id = session.execute(
                 select(SqlConversationItem.conversation_id)
@@ -80,6 +137,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             return conv_id
 
     def get_latest_response_id(self, conversation_id: str) -> str | None:
+        """
+        Return the response_id of the most recent item in the
+        conversation.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :returns: The response_id string, or ``None`` if the
+            conversation has no items.
+        """
         with self._session() as session:
             return session.execute(
                 select(SqlConversationItem.response_id)
@@ -94,6 +160,20 @@ class SqlAlchemyConversationStore(ConversationStore):
         conversation_id: str | None = None,
         limit: int = 20,
     ) -> list[ConversationItem]:
+        """
+        Full-text search over conversation items.
+
+        Uses the FTS virtual table to match items by
+        ``search_text``, ranked by relevance.
+
+        :param query: The FTS search query string,
+            e.g. ``"deployment error"``.
+        :param conversation_id: Optional conversation to scope
+            the search to, e.g. ``"conv_abc123"``.
+        :param limit: Maximum number of results to return.
+        :returns: A list of matching :class:`ConversationItem`
+            objects in relevance order.
+        """
         with self._session() as session:
             stmt = text(
                 "SELECT item_id FROM conversation_items_fts "
@@ -132,6 +212,22 @@ class SqlAlchemyConversationStore(ConversationStore):
         before: str | None = None,
         order: str = "asc",
     ) -> PagedList[ConversationItem]:
+        """
+        List items in a conversation with cursor-based pagination.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param limit: Maximum number of items to return.
+        :param after: Cursor item ID; return items appearing
+            after this item in sort order,
+            e.g. ``"msg_xyz789"``.
+        :param before: Cursor item ID; return items appearing
+            before this item in sort order.
+        :param order: Sort direction on position,
+            ``"asc"`` or ``"desc"``.
+        :returns: A :class:`PagedList` of
+            :class:`ConversationItem` objects.
+        """
         with self._session() as session:
             is_asc = order == "asc"
             sort_fn = asc if is_asc else desc
@@ -180,6 +276,20 @@ class SqlAlchemyConversationStore(ConversationStore):
         conversation_id: str,
         items: list[NewConversationItem],
     ) -> list[ConversationItem]:
+        """
+        Append items to a conversation.
+
+        Assigns a globally unique ID, timestamp, and incrementing
+        position to each item. Also inserts FTS records for
+        searchability.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param items: List of :class:`NewConversationItem` objects
+            to persist.
+        :returns: The persisted :class:`ConversationItem` list
+            with store-assigned IDs and timestamps.
+        """
         now = now_epoch()
         persisted: list[ConversationItem] = []
 
@@ -229,6 +339,21 @@ class SqlAlchemyConversationStore(ConversationStore):
         before: str | None = None,
         order: str = "desc",
     ) -> PagedList[Conversation]:
+        """
+        List conversations with cursor-based pagination.
+
+        :param limit: Maximum number of conversations to return.
+        :param after: Cursor conversation ID; return
+            conversations appearing after this one in sort
+            order, e.g. ``"conv_abc123"``.
+        :param before: Cursor conversation ID; return
+            conversations appearing before this one in sort
+            order.
+        :param order: Sort direction on ``created_at``,
+            ``"desc"`` or ``"asc"``.
+        :returns: A :class:`PagedList` of :class:`Conversation`
+            objects.
+        """
         with self._session() as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
@@ -281,6 +406,15 @@ class SqlAlchemyConversationStore(ConversationStore):
     def update_conversation(
         self, conversation_id: str, title: str | None = None
     ) -> Conversation | None:
+        """
+        Update mutable fields on a conversation.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param title: New title, or ``None`` to leave unchanged.
+        :returns: The updated :class:`Conversation`, or ``None``
+            if the conversation does not exist.
+        """
         with self._session() as session:
             row = session.get(SqlConversation, conversation_id)
             if not row:
@@ -290,6 +424,18 @@ class SqlAlchemyConversationStore(ConversationStore):
             return _to_conversation(row)
 
     async def delete_conversation(self, conversation_id: str) -> bool:
+        """
+        Delete a conversation, its items, related tasks, and FTS
+        records.
+
+        Deletes in FK-safe order: tasks, FTS records, items,
+        then the conversation itself.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :returns: ``True`` if the conversation existed,
+            ``False`` otherwise.
+        """
         with self._session() as session:
             row = session.get(SqlConversation, conversation_id)
             if not row:

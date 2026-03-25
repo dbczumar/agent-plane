@@ -16,6 +16,12 @@ from agent_plane.stores.file_store import FileStore
 
 
 def _to_entity(row: SqlFile) -> StoredFile:
+    """
+    Convert a :class:`SqlFile` ORM row to a :class:`StoredFile` entity.
+
+    :param row: The SQLAlchemy ORM row to convert.
+    :returns: A :class:`StoredFile` dataclass instance.
+    """
     return StoredFile(
         id=row.id,
         created_at=row.created_at,
@@ -26,7 +32,24 @@ def _to_entity(row: SqlFile) -> StoredFile:
 
 
 class SqlAlchemyFileStore(FileStore):
+    """
+    SQLAlchemy-backed implementation of :class:`FileStore`.
+
+    Persists file metadata in a relational database via
+    SQLAlchemy ORM.
+    """
+
     def __init__(self, storage_location: str) -> None:
+        """
+        Initialize the SQLAlchemy file store.
+
+        Creates or reuses a SQLAlchemy engine and session factory
+        for the given database URI.
+
+        :param storage_location: SQLAlchemy database URI,
+            e.g. ``"sqlite:///files.db"`` or
+            ``"postgresql://user:pass@host/db"``.
+        """
         super().__init__(storage_location)
         self._engine = get_or_create_engine(storage_location)
         self._session = make_managed_session_maker(self._engine)
@@ -37,6 +60,16 @@ class SqlAlchemyFileStore(FileStore):
         bytes: int,
         content_type: str | None = None,
     ) -> StoredFile:
+        """
+        Record a new file in the database.
+
+        :param filename: Original filename,
+            e.g. ``"report.pdf"``.
+        :param bytes: File size in bytes.
+        :param content_type: MIME type, e.g.
+            ``"application/pdf"``.
+        :returns: The newly created :class:`StoredFile`.
+        """
         row = SqlFile(
             id=generate_file_id(),
             created_at=now_epoch(),
@@ -49,6 +82,14 @@ class SqlAlchemyFileStore(FileStore):
             return _to_entity(row)
 
     def get(self, file_id: str) -> StoredFile | None:
+        """
+        Fetch file metadata by its unique ID.
+
+        :param file_id: Unique file identifier,
+            e.g. ``"file_abc123"``.
+        :returns: The :class:`StoredFile` if found, otherwise
+            ``None``.
+        """
         with self._session() as session:
             row = session.get(SqlFile, file_id)
             return _to_entity(row) if row else None
@@ -60,6 +101,19 @@ class SqlAlchemyFileStore(FileStore):
         before: str | None = None,
         order: str = "desc",
     ) -> PagedList[StoredFile]:
+        """
+        List files with cursor-based pagination.
+
+        :param limit: Maximum number of files to return.
+        :param after: Cursor file ID; return files appearing
+            after this file in sort order,
+            e.g. ``"file_abc123"``.
+        :param before: Cursor file ID; return files appearing
+            before this file in sort order.
+        :param order: Sort direction, ``"desc"`` or ``"asc"``.
+        :returns: A :class:`PagedList` of :class:`StoredFile`
+            objects.
+        """
         with self._session() as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
@@ -90,6 +144,14 @@ class SqlAlchemyFileStore(FileStore):
             )
 
     def delete(self, file_id: str) -> bool:
+        """
+        Delete file metadata by ID.
+
+        :param file_id: Unique file identifier,
+            e.g. ``"file_abc123"``.
+        :returns: ``True`` if the file was deleted, ``False`` if
+            it did not exist.
+        """
         with self._session() as session:
             row = session.get(SqlFile, file_id)
             if not row:

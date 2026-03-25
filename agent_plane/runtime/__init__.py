@@ -26,6 +26,15 @@ def init(
     """
     Initialize the runtime with store references.
     Called once at server startup before any workflows run.
+
+    :param conversation_store: The ConversationStore instance
+        for persisting conversation items.
+    :param task_store: The TaskStore instance for managing
+        task lifecycle and durable execution.
+    :param agent_store: The AgentStore instance for
+        CRUD operations on registered agents.
+    :param agent_cache: The AgentCache instance for
+        loading and caching parsed agent specs.
     """
     _globals.init(
         conversation_store=conversation_store,
@@ -36,7 +45,13 @@ def init(
 
 
 def get_conversation_store() -> ConversationStore:
-    """Return the canonical ConversationStore instance."""
+    """
+    Return the canonical ConversationStore instance.
+
+    :returns: The ConversationStore set during :func:`init`.
+    :raises RuntimeError: If the runtime has not been
+        initialized.
+    """
     store = _globals._conversation_store
     if store is None:
         raise RuntimeError("runtime not initialized — call init() first")
@@ -44,7 +59,13 @@ def get_conversation_store() -> ConversationStore:
 
 
 def get_task_store() -> TaskStore:
-    """Return the canonical TaskStore instance."""
+    """
+    Return the canonical TaskStore instance.
+
+    :returns: The TaskStore set during :func:`init`.
+    :raises RuntimeError: If the runtime has not been
+        initialized.
+    """
     store = _globals._task_store
     if store is None:
         raise RuntimeError("runtime not initialized — call init() first")
@@ -52,7 +73,13 @@ def get_task_store() -> TaskStore:
 
 
 def get_agent_store() -> AgentStore:
-    """Return the canonical AgentStore instance."""
+    """
+    Return the canonical AgentStore instance.
+
+    :returns: The AgentStore set during :func:`init`.
+    :raises RuntimeError: If the runtime has not been
+        initialized.
+    """
     store = _globals._agent_store
     if store is None:
         raise RuntimeError("runtime not initialized — call init() first")
@@ -60,7 +87,13 @@ def get_agent_store() -> AgentStore:
 
 
 def get_agent_cache() -> AgentCache:
-    """Return the canonical AgentCache instance."""
+    """
+    Return the canonical AgentCache instance.
+
+    :returns: The AgentCache set during :func:`init`.
+    :raises RuntimeError: If the runtime has not been
+        initialized.
+    """
     cache = _globals._agent_cache
     if cache is None:
         raise RuntimeError("runtime not initialized — call init() first")
@@ -69,8 +102,13 @@ def get_agent_cache() -> AgentCache:
 
 def get_tool_manager() -> ToolManager:
     """
-    Return the current workflow's ToolManager from the ContextVar.
-    Must be called within a workflow that has set the tool manager.
+    Return the current workflow's ToolManager from the
+    ContextVar. Must be called within a workflow that has
+    set the tool manager.
+
+    :returns: The ToolManager for the current workflow.
+    :raises RuntimeError: If no ToolManager has been set for
+        the current workflow context.
     """
     mgr = _globals._tool_manager_var.get()
     if mgr is None:
@@ -79,5 +117,11 @@ def get_tool_manager() -> ToolManager:
 
 
 def set_tool_manager(mgr: ToolManager | None) -> None:
-    """Set or clear the per-workflow ToolManager ContextVar."""
+    """
+    Set or clear the per-workflow ToolManager ContextVar.
+
+    :param mgr: The ToolManager for the current workflow,
+        or ``None`` to clear the binding (e.g. in a
+        ``finally`` block after the workflow completes).
+    """
     _globals._tool_manager_var.set(mgr)

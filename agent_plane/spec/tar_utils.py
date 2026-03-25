@@ -14,7 +14,12 @@ DEFAULT_MAX_ENTRIES = 10_000
 
 
 class ExtractionError(Exception):
-    """Raised when a tarball fails safety checks during extraction."""
+    """
+    Raised when a tarball fails safety checks during extraction.
+
+    Safety violations include path traversal, symlinks/hardlinks,
+    decompression bombs, and entry count bombs.
+    """
 
 
 def extract_safe(
@@ -25,26 +30,27 @@ def extract_safe(
     max_entries: int = DEFAULT_MAX_ENTRIES,
 ) -> Path:
     """
-    Extract a tarball to dest with safety checks.
+    Extract a tarball to *dest* with safety checks.
 
     Rejects:
-    - Path traversal (members outside dest via ``..`` or absolute paths)
-    - Symlinks and hardlinks (could escape dest)
-    - Decompression bombs (total extracted bytes > max_bytes)
-    - Entry count bombs (more than max_entries files)
 
-    Args:
-        source: Path to a .tar.gz / .tar file, or raw tarball bytes.
-        dest: Directory to extract into (created if needed).
-        max_bytes: Maximum total extracted size in bytes.
-        max_entries: Maximum number of tar entries.
+    - Path traversal (members outside *dest* via ``..`` or
+      absolute paths)
+    - Symlinks and hardlinks (could escape *dest*)
+    - Decompression bombs (total extracted bytes > *max_bytes*)
+    - Entry count bombs (more than *max_entries* files)
 
-    Returns:
-        The dest path for convenience.
-
-    Raises:
-        ExtractionError: If any safety check fails.
-        FileNotFoundError: If source is a Path and does not exist.
+    :param source: Path to a ``.tar.gz`` / ``.tar`` file, or raw
+        tarball bytes (e.g. from an HTTP upload).
+    :param dest: Directory to extract into (created if needed).
+    :param max_bytes: Maximum total extracted size in bytes.
+        Defaults to 500 MB.
+    :param max_entries: Maximum number of tar entries. Defaults
+        to 10,000.
+    :returns: The *dest* path for convenience.
+    :raises ExtractionError: If any safety check fails.
+    :raises FileNotFoundError: If *source* is a :class:`Path` and
+        does not exist.
     """
     if isinstance(source, Path):
         if not source.exists():
@@ -80,7 +86,11 @@ def _open_tar(source: Path | bytes) -> tarfile.TarFile:
     """
     Open a tarball from a file path or raw bytes.
 
-    Raises ExtractionError if the data is not a valid tarball.
+    :param source: Path to a ``.tar.gz`` / ``.tar`` file, or raw
+        tarball bytes.
+    :returns: An opened :class:`tarfile.TarFile` ready for
+        iteration.
+    :raises ExtractionError: If the data is not a valid tarball.
     """
     try:
         if isinstance(source, bytes):
@@ -94,7 +104,12 @@ def _check_member_safety(member: tarfile.TarInfo, resolved_dest: Path) -> None:
     """
     Validate a single tar member against safety rules.
 
-    Raises ExtractionError on any violation.
+    :param member: The :class:`tarfile.TarInfo` entry to validate.
+    :param resolved_dest: The resolved (absolute) extraction
+        destination directory, used for containment checks.
+    :raises ExtractionError: If the member is a symlink/hardlink,
+        uses an absolute path, contains ``..`` traversal, or
+        resolves outside *resolved_dest*.
     """
     # Reject symlinks and hardlinks
     if member.issym() or member.islnk():

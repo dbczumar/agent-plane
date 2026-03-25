@@ -29,6 +29,15 @@ class ToolManager:
     """
 
     def __init__(self, spec: AgentSpec, work_dir: Path) -> None:
+        """
+        Initialize the tool manager for a single workflow.
+
+        :param spec: The parsed AgentSpec defining which tools
+            (skills, MCP servers) are available.
+        :param work_dir: Path to the extracted agent image
+            directory on disk, used as the working directory
+            for local tool execution.
+        """
         self._spec = spec
         self._work_dir = work_dir
         self._started = False
@@ -55,7 +64,12 @@ class ToolManager:
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         """
-        Return OpenAI-format tool schemas for all available tools.
+        Return OpenAI-format tool schemas for all available
+        tools.
+
+        :returns: A list of OpenAI tool schema dicts, each
+            with ``"type": "function"`` and a ``"function"``
+            sub-dict describing the tool.
         """
         schemas: list[dict[str, Any]] = []
 
@@ -91,6 +105,13 @@ class ToolManager:
         """
         Route a tool call to the appropriate handler.
         Returns the tool output as a string.
+
+        :param name: The tool function name, e.g.
+            ``"load_skill"``.
+        :param arguments: JSON-encoded arguments string from
+            the LLM, e.g. ``'{"name": "summarize"}'``.
+        :returns: The tool's string result, or an error
+            message if the tool is not found.
         """
         if name == "load_skill":
             return self._load_skill(arguments)
@@ -98,7 +119,16 @@ class ToolManager:
         return f"Error: tool {name!r} not found or not yet supported"
 
     def _load_skill(self, arguments: str) -> str:
-        """Built-in: look up a skill by name and return its content."""
+        """
+        Built-in: look up a skill by name and return its
+        content.
+
+        :param arguments: JSON-encoded arguments string
+            containing a ``"name"`` key, e.g.
+            ``'{"name": "summarize"}'``.
+        :returns: The skill's full content string, or an
+            error message if the skill is not found.
+        """
         args: dict[str, Any] = json.loads(arguments)
         skill_name = args.get("name")
         if skill_name is None:

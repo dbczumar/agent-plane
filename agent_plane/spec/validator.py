@@ -17,7 +17,13 @@ _VALID_OUTPUT_MODALITIES = {"text", "image", "audio"}
 
 @dataclass
 class ValidationError:
-    """A single validation issue."""
+    """
+    A single validation issue.
+
+    :param path: Dot-separated location of the invalid field,
+        e.g. ``"skills[0].name"`` or ``"llm.model"``.
+    :param message: Human-readable description of the violation.
+    """
 
     path: str  # dot-separated location, e.g. "skills[0].name"
     message: str
@@ -25,23 +31,44 @@ class ValidationError:
 
 @dataclass
 class ValidationResult:
-    """Aggregated validation outcome."""
+    """
+    Aggregated validation outcome.
+
+    :param errors: Collected validation issues. An empty list
+        means the spec is valid.
+    """
 
     errors: list[ValidationError] = field(default_factory=list)
 
     @property
     def valid(self) -> bool:
+        """
+        Whether the spec passed all validation checks.
+
+        :returns: ``True`` when no errors were recorded,
+            ``False`` otherwise.
+        """
         return len(self.errors) == 0
 
     def add(self, path: str, message: str) -> None:
+        """
+        Record a validation error.
+
+        :param path: Dot-separated location of the invalid field,
+            e.g. ``"skills[0].name"``.
+        :param message: Human-readable description of the
+            violation.
+        """
         self.errors.append(ValidationError(path=path, message=message))
 
 
 def validate(spec: AgentSpec) -> ValidationResult:
     """
-    Validate an AgentSpec against AGENTSPEC.md rules.
+    Validate an :class:`AgentSpec` against AGENTSPEC.md rules.
 
-    Returns a ValidationResult; check .valid to see if the spec passes.
+    :param spec: The parsed agent spec to validate.
+    :returns: A :class:`ValidationResult`; check ``.valid`` to see
+        if the spec passes all checks.
     """
     result = ValidationResult()
     _validate_spec_version(spec, result)
@@ -55,11 +82,23 @@ def validate(spec: AgentSpec) -> ValidationResult:
 
 
 def _validate_spec_version(spec: AgentSpec, result: ValidationResult) -> None:
+    """
+    Validate that ``spec_version`` is a supported value.
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
     if spec.spec_version != 1:
         result.add("spec_version", f"must be 1, got {spec.spec_version}")
 
 
 def _validate_llm(spec: AgentSpec, result: ValidationResult) -> None:
+    """
+    Validate the ``llm`` block, if present.
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
     if spec.llm is None:
         return
     if not spec.llm.model:
@@ -67,6 +106,12 @@ def _validate_llm(spec: AgentSpec, result: ValidationResult) -> None:
 
 
 def _validate_interaction(spec: AgentSpec, result: ValidationResult) -> None:
+    """
+    Validate input and output modalities against allowed values.
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
     modalities = spec.interaction.modalities
     for m in modalities.input:
         if m not in _VALID_INPUT_MODALITIES:
@@ -83,6 +128,12 @@ def _validate_interaction(spec: AgentSpec, result: ValidationResult) -> None:
 
 
 def _validate_skills(spec: AgentSpec, result: ValidationResult) -> None:
+    """
+    Validate skill names, descriptions, and uniqueness.
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
     seen_names: set[str] = set()
     for i, skill in enumerate(spec.skills):
         prefix = f"skills[{i}]"
@@ -111,6 +162,13 @@ def _validate_skills(spec: AgentSpec, result: ValidationResult) -> None:
 
 
 def _validate_mcp_servers(spec: AgentSpec, result: ValidationResult) -> None:
+    """
+    Validate MCP server transport, required fields, and name
+    uniqueness.
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
     seen_names: set[str] = set()
     for i, mcp in enumerate(spec.mcp_servers):
         prefix = f"mcp_servers[{i}]"
@@ -133,6 +191,13 @@ def _validate_mcp_servers(spec: AgentSpec, result: ValidationResult) -> None:
 
 
 def _validate_local_tools(spec: AgentSpec, result: ValidationResult) -> None:
+    """
+    Validate local tool name uniqueness across all tool sources
+    (MCP servers and local tools).
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
     # Check for duplicate tool names across all tool sources (MCP + local)
     all_tool_names: set[str] = set()
     for mcp in spec.mcp_servers:
@@ -147,6 +212,13 @@ def _validate_local_tools(spec: AgentSpec, result: ValidationResult) -> None:
 
 
 def _validate_sub_agents(spec: AgentSpec, result: ValidationResult) -> None:
+    """
+    Validate that every name in ``tools.agents`` has a
+    corresponding parsed sub-agent.
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
     # Every name in tools.agents must have a corresponding sub-agent
     sub_agent_names = {sa.name for sa in spec.sub_agents if sa.name is not None}
     for agent_ref in spec.tools.agents:

@@ -26,6 +26,15 @@ class AgentCache:
     """
 
     def __init__(self, artifact_store: ArtifactStore, cache_dir: Path) -> None:
+        """
+        Initialize the two-tier agent cache.
+
+        :param artifact_store: The ArtifactStore holding agent
+            bundle tarballs (source of truth).
+        :param cache_dir: Root directory for the disk cache.
+            Each agent is extracted to
+            ``<cache_dir>/<agent_id>/``.
+        """
         self._artifact_store = artifact_store
         self._cache_dir = cache_dir
         self._specs: dict[str, AgentSpec] = {}
@@ -36,6 +45,11 @@ class AgentCache:
 
         Raises KeyError if the agent bundle does not exist in the
         ArtifactStore. Raises ValueError if the spec is invalid.
+
+        :param agent_id: Unique agent identifier,
+            e.g. ``"ag_abc123"``.
+        :returns: A LoadedAgent with the parsed spec and the
+            on-disk working directory.
         """
         workdir = self._cache_dir / agent_id
 
@@ -65,8 +79,11 @@ class AgentCache:
 
     def evict(self, agent_id: str) -> None:
         """
-        Remove an agent from both cache tiers. Called when an agent
-        is deleted. No-op if the agent is not cached.
+        Remove an agent from both cache tiers. Called when an
+        agent is deleted. No-op if the agent is not cached.
+
+        :param agent_id: Unique agent identifier,
+            e.g. ``"ag_abc123"``.
         """
         self._specs.pop(agent_id, None)
         workdir = self._cache_dir / agent_id

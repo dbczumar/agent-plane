@@ -24,17 +24,15 @@ _FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n(.*)", re.DOTALL)
 
 def parse(root: Path) -> AgentSpec:
     """
-    Parse an agent image directory into an AgentSpec.
+    Parse an agent image directory into an :class:`AgentSpec`.
 
-    Args:
-        root: Path to the agent image directory. Must contain config.yaml.
-
-    Returns:
-        A fully populated AgentSpec (not yet validated).
-
-    Raises:
-        FileNotFoundError: If config.yaml is missing.
-        ValueError: If config.yaml is not valid YAML or has structural issues.
+    :param root: Path to the agent image directory. Must contain
+        ``config.yaml``.
+    :returns: A fully populated :class:`AgentSpec` (not yet
+        validated).
+    :raises FileNotFoundError: If ``config.yaml`` is missing.
+    :raises ValueError: If ``config.yaml`` is not valid YAML or has
+        structural issues.
     """
     config_path = root / "config.yaml"
     if not config_path.exists():
@@ -76,17 +74,42 @@ def parse(root: Path) -> AgentSpec:
 
 
 def _parse_llm(raw: dict[str, object] | None) -> LLMConfig | None:
+    """
+    Parse the ``llm:`` block from config.yaml into an
+    :class:`LLMConfig`.
+
+    :param raw: The raw ``llm:`` mapping from config.yaml, or
+        ``None`` if the block was absent. Example:
+        ``{"model": "openai/gpt-4o", "temperature": 0.7}``.
+    :returns: A populated :class:`LLMConfig`, or ``None`` when
+        the ``llm:`` block is absent.
+    :raises ValueError: If the ``llm:`` block is present but
+        missing the required ``model`` field.
+    """
     if raw is None:
         return None
     model = raw.get("model")
     if model is None:
         raise ValueError("llm block present but missing required field: model")
-    # Everything except ``model`` is passed through to litellm as-is.
+    # Everything except ``model`` is passed through to the OpenAI SDK as-is.
     extra = {k: v for k, v in raw.items() if k != "model"}
     return LLMConfig(model=str(model), extra=extra)
 
 
-def _parse_interaction(raw: dict[str, object] | None) -> InteractionConfig:
+def _parse_interaction(
+    raw: dict[str, object] | None,
+) -> InteractionConfig:
+    """
+    Parse the ``interaction:`` block from config.yaml into an
+    :class:`InteractionConfig`.
+
+    :param raw: The raw ``interaction:`` mapping from config.yaml,
+        or ``None`` if the block was absent. Example:
+        ``{"conversational": false, "modalities": {"input":
+        ["text", "image"]}}``.
+    :returns: A populated :class:`InteractionConfig`. Returns
+        defaults when *raw* is ``None``.
+    """
     if raw is None:
         return InteractionConfig()
     modalities_raw = raw.get("modalities")
@@ -104,7 +127,19 @@ def _parse_interaction(raw: dict[str, object] | None) -> InteractionConfig:
     )
 
 
-def _parse_tools_config(raw: dict[str, object] | None) -> ToolsConfig:
+def _parse_tools_config(
+    raw: dict[str, object] | None,
+) -> ToolsConfig:
+    """
+    Parse the ``tools:`` block from config.yaml into a
+    :class:`ToolsConfig`.
+
+    :param raw: The raw ``tools:`` mapping from config.yaml, or
+        ``None`` if the block was absent. Example:
+        ``{"agents": ["summarizer", "code-reviewer"]}``.
+    :returns: A populated :class:`ToolsConfig`. Returns defaults
+        when *raw* is ``None``.
+    """
     if raw is None:
         return ToolsConfig()
     return ToolsConfig(
@@ -116,10 +151,21 @@ def _resolve_instructions(root: Path, raw_value: object) -> str | None:
     """
     Resolve the instructions for an agent image.
 
-    - If ``instructions`` is set in config.yaml and the value is a path to an
-      existing file relative to root, read that file.
-    - If ``instructions`` is set but is not a file path, treat as inline text.
-    - If ``instructions`` is not set, fall back to reading AGENTS.md.
+    - If ``instructions`` is set in config.yaml and the value is
+      a path to an existing file relative to *root*, read that
+      file.
+    - If ``instructions`` is set but is not a file path, treat
+      the value as inline text.
+    - If ``instructions`` is not set, fall back to reading
+      ``AGENTS.md``.
+
+    :param root: Path to the agent image directory.
+    :param raw_value: The raw ``instructions`` value from
+        config.yaml, or ``None`` if the key was absent. May be
+        a relative file path (e.g. ``"prompts/system.md"``) or
+        inline text.
+    :returns: The resolved instruction text, or ``None`` if no
+        instructions are available.
     """
     if raw_value is not None:
         text = str(raw_value)
@@ -135,6 +181,17 @@ def _resolve_instructions(root: Path, raw_value: object) -> str | None:
 
 
 def _discover_skills(skills_dir: Path) -> list[SkillSpec]:
+    """
+    Discover and parse all skills under the ``skills/`` directory.
+
+    Each subdirectory containing a ``SKILL.md`` file is parsed via
+    :func:`_parse_skill`.
+
+    :param skills_dir: Path to the ``skills/`` directory, e.g.
+        ``root / "skills"``.
+    :returns: A sorted list of parsed :class:`SkillSpec` objects.
+        Returns an empty list if *skills_dir* does not exist.
+    """
     if not skills_dir.is_dir():
         return []
     skills: list[SkillSpec] = []
@@ -150,6 +207,18 @@ def _discover_skills(skills_dir: Path) -> list[SkillSpec]:
 
 
 def _parse_skill(skill_md: Path) -> SkillSpec:
+    """
+    Parse a single ``SKILL.md`` file into a :class:`SkillSpec`.
+
+    The file must begin with YAML frontmatter delimited by ``---``
+    lines, containing at least ``name`` and ``description`` keys.
+
+    :param skill_md: Path to the ``SKILL.md`` file, e.g.
+        ``skills/code-review/SKILL.md``.
+    :returns: A populated :class:`SkillSpec`.
+    :raises ValueError: If the frontmatter is missing, malformed,
+        or lacks required fields.
+    """
     text = skill_md.read_text()
     match = _FRONTMATTER_RE.match(text)
     if not match:
@@ -172,7 +241,24 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     )
 
 
-def _discover_mcp_servers(mcp_dir: Path) -> list[MCPServerConfig]:
+def _discover_mcp_servers(
+    mcp_dir: Path,
+) -> list[MCPServerConfig]:
+    """
+    Discover and parse all MCP server configs under
+    ``tools/mcp/``.
+
+    Each ``.yaml`` file in the directory is parsed into an
+    :class:`MCPServerConfig`.
+
+    :param mcp_dir: Path to the ``tools/mcp/`` directory, e.g.
+        ``root / "tools" / "mcp"``.
+    :returns: A sorted list of parsed :class:`MCPServerConfig`
+        objects. Returns an empty list if *mcp_dir* does not
+        exist.
+    :raises ValueError: If any YAML file is malformed or missing
+        required fields (``name``, ``transport``).
+    """
     if not mcp_dir.is_dir():
         return []
     servers: list[MCPServerConfig] = []
@@ -201,7 +287,22 @@ def _discover_mcp_servers(mcp_dir: Path) -> list[MCPServerConfig]:
     return servers
 
 
-def _discover_local_tools(tools_dir: Path) -> list[LocalToolInfo]:
+def _discover_local_tools(
+    tools_dir: Path,
+) -> list[LocalToolInfo]:
+    """
+    Discover local tool files under ``tools/python/`` and
+    ``tools/typescript/``.
+
+    Tool names are derived from the file stem by replacing
+    underscores with dots (e.g. ``arxiv_search.py`` becomes
+    ``"arxiv.search"``).
+
+    :param tools_dir: Path to the ``tools/`` directory, e.g.
+        ``root / "tools"``.
+    :returns: A sorted list of :class:`LocalToolInfo` objects
+        covering both Python and TypeScript tools.
+    """
     tools: list[LocalToolInfo] = []
     for language, subdir, ext in [
         ("python", "python", ".py"),
@@ -220,6 +321,18 @@ def _discover_local_tools(tools_dir: Path) -> list[LocalToolInfo]:
 
 
 def _discover_sub_agents(agents_dir: Path) -> list[AgentSpec]:
+    """
+    Recursively discover and parse sub-agents under ``agents/``.
+
+    Each subdirectory containing a ``config.yaml`` is parsed via
+    :func:`parse`, producing a nested :class:`AgentSpec`.
+
+    :param agents_dir: Path to the ``agents/`` directory, e.g.
+        ``root / "agents"``.
+    :returns: A sorted list of recursively parsed
+        :class:`AgentSpec` objects. Returns an empty list if
+        *agents_dir* does not exist.
+    """
     if not agents_dir.is_dir():
         return []
     sub_agents: list[AgentSpec] = []

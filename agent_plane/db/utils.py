@@ -33,6 +33,11 @@ def get_or_create_engine(db_uri: str) -> Engine:
     On first creation, runs Alembic migrations to ensure the schema is
     up to date. Subsequent calls with the same URI return the cached
     engine without re-running migrations.
+
+    :param db_uri: SQLAlchemy database connection string, e.g.
+        ``"sqlite:///mydb.db"`` or
+        ``"postgresql://user:pass@host/dbname"``.
+    :returns: A :class:`~sqlalchemy.engine.Engine` for the given URI.
     """
     if db_uri not in _engine_cache:
         with _engine_lock:
@@ -46,8 +51,13 @@ def get_or_create_engine(db_uri: str) -> Engine:
 def _run_migrations(engine: Engine, db_uri: str) -> None:
     """
     Run Alembic migrations against the database if the schema is not
-    current. Checks whether our application tables exist first to avoid
-    unnecessary work on already-initialized databases.
+    current. Checks whether our application tables exist first to
+    avoid unnecessary work on already-initialized databases.
+
+    :param engine: The SQLAlchemy engine to inspect and migrate.
+    :param db_uri: Database connection string forwarded to Alembic's
+        ``sqlalchemy.url`` config option, e.g.
+        ``"sqlite:///mydb.db"``.
     """
     from agent_plane.db.db_models import Base
     from alembic import command
@@ -71,7 +81,12 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
 
 
 def clear_engine_cache() -> None:
-    """Clear the engine cache. Used by tests."""
+    """
+    Dispose of all cached engines and clear the engine cache.
+
+    Intended for test teardown to ensure a fresh database state
+    between test runs.
+    """
     with _engine_lock:
         for engine in _engine_cache.values():
             engine.dispose()
@@ -86,14 +101,28 @@ def make_managed_session_maker(
 ) -> ManagedSessionMaker:
     """
     Create a context-manager factory for database sessions.
-    Sessions auto-commit on success, auto-rollback on failure.
-    SQLite gets PRAGMA foreign_keys and busy_timeout.
+
+    Sessions auto-commit on success and auto-rollback on failure.
+    When the underlying dialect is SQLite, each session
+    additionally enables ``PRAGMA foreign_keys`` and sets a 20-second
+    ``busy_timeout``.
+
+    :param engine: The SQLAlchemy engine to bind sessions to.
+    :returns: A callable that, when invoked, returns a context
+        manager yielding a :class:`~sqlalchemy.orm.Session`.
     """
     factory = sessionmaker(bind=engine)
     is_sqlite = engine.dialect.name == "sqlite"
 
     @contextmanager
     def managed_session() -> Iterator[Session]:
+        """
+        Yield a managed :class:`~sqlalchemy.orm.Session`.
+
+        Commits on clean exit, rolls back on exception. For SQLite
+        backends, enables foreign key enforcement and sets a
+        busy timeout before yielding.
+        """
         with factory() as session:
             try:
                 if is_sqlite:
@@ -119,22 +148,61 @@ _ITEM_TYPE_PREFIX: dict[str, str] = {
 
 
 def generate_agent_id() -> str:
+    """
+    Generate a unique agent identifier.
+
+    :returns: A string of the form ``"ag_<32-char hex>"``,
+        e.g. ``"ag_0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c"``.
+    """
     return f"ag_{uuid.uuid4().hex}"
 
 
 def generate_file_id() -> str:
+    """
+    Generate a unique file identifier.
+
+    :returns: A string of the form ``"file_<32-char hex>"``,
+        e.g. ``"file_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+    """
     return f"file_{uuid.uuid4().hex}"
 
 
 def generate_conversation_id() -> str:
+    """
+    Generate a unique conversation identifier.
+
+    :returns: A string of the form ``"conv_<32-char hex>"``,
+        e.g. ``"conv_e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9"``.
+    """
     return f"conv_{uuid.uuid4().hex}"
 
 
 def generate_task_id() -> str:
+    """
+    Generate a unique task (response) identifier.
+
+    :returns: A string of the form ``"resp_<32-char hex>"``,
+        e.g. ``"resp_d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3"``.
+    """
     return f"resp_{uuid.uuid4().hex}"
 
 
 def generate_item_id(item_type: str) -> str:
+    """
+    Generate a unique conversation-item identifier.
+
+    The prefix is determined by the item type:
+
+    - ``"message"`` -> ``"msg_"``
+    - ``"function_call"`` -> ``"fc_"``
+    - ``"function_call_output"`` -> ``"fco_"``
+    - ``"reasoning"`` -> ``"rs_"``
+
+    :param item_type: One of ``"message"``, ``"function_call"``,
+        ``"function_call_output"``, or ``"reasoning"``.
+    :returns: A prefixed identifier, e.g. ``"msg_a1b2c3d4..."``.
+    :raises ValueError: If *item_type* is not a recognised type.
+    """
     prefix = _ITEM_TYPE_PREFIX.get(item_type)
     if prefix is None:
         raise ValueError(f"unknown item type: {item_type!r}")
@@ -152,15 +220,41 @@ _CREATE_FTS = text(
 
 
 def ensure_fts_table(engine: Engine) -> None:
-    """Create the FTS5 virtual table if on SQLite. Idempotent."""
+    """
+    Create the FTS5 virtual table if on SQLite. Idempotent.
+
+    On non-SQLite dialects this is a no-op.
+
+    :param engine: The SQLAlchemy engine whose dialect is inspected.
+        If SQLite, the ``conversation_items_fts`` virtual table is
+        created (if it does not already exist).
+    """
     if engine.dialect.name == "sqlite":
         with engine.connect() as conn:
             conn.execute(_CREATE_FTS)
             conn.commit()
 
 
-def insert_fts(session: Session, item_id: str, conversation_id: str, search_text: str) -> None:
-    """Dual-write a row into the FTS5 table (SQLite only)."""
+def insert_fts(
+    session: Session,
+    item_id: str,
+    conversation_id: str,
+    search_text: str,
+) -> None:
+    """
+    Dual-write a row into the FTS5 table (SQLite only).
+
+    On non-SQLite dialects this is a no-op.
+
+    :param session: An active SQLAlchemy session. Its bound engine's
+        dialect is checked to decide whether to write.
+    :param item_id: The conversation-item ID to index, e.g.
+        ``"msg_a1b2c3d4..."``.
+    :param conversation_id: The parent conversation ID, e.g.
+        ``"conv_e4f5a6b7..."``.
+    :param search_text: Plain-text content to store in the FTS
+        index for this item.
+    """
     if session.bind and session.bind.dialect.name == "sqlite":
         session.execute(
             text(
@@ -173,7 +267,16 @@ def insert_fts(session: Session, item_id: str, conversation_id: str, search_text
 
 
 def delete_fts_by_conversation(session: Session, conversation_id: str) -> None:
-    """Remove all FTS rows for a conversation (SQLite only)."""
+    """
+    Remove all FTS rows for a conversation (SQLite only).
+
+    On non-SQLite dialects this is a no-op.
+
+    :param session: An active SQLAlchemy session. Its bound engine's
+        dialect is checked to decide whether to delete.
+    :param conversation_id: The conversation whose FTS rows should be
+        removed, e.g. ``"conv_e4f5a6b7..."``.
+    """
     if session.bind and session.bind.dialect.name == "sqlite":
         session.execute(
             text(f"DELETE FROM {_FTS_TABLE} WHERE conversation_id = :cid"),
@@ -189,12 +292,18 @@ def extract_search_text(item: NewConversationItem) -> str:
     Extract plain text for FTS from an item's data, per DBSPEC.
 
     The item has already been Pydantic-validated, so required fields
-    (content, name, arguments, output, summary) are guaranteed present.
-    We use direct dict access to fail loud if that assumption is ever
-    violated.
+    (content, name, arguments, output, summary) are guaranteed
+    present. We use direct dict access to fail loud if that
+    assumption is ever violated.
 
-    Content/summary blocks are heterogeneous (text, image, etc.) so
-    we filter to only text-bearing blocks via .get("text").
+    Content/summary blocks are heterogeneous (text, image, etc.)
+    so we filter to only text-bearing blocks via ``.get("text")``.
+
+    :param item: A Pydantic-validated conversation item whose
+        ``type`` is one of ``"message"``, ``"function_call"``,
+        ``"function_call_output"``, or ``"reasoning"``.
+    :returns: A single plain-text string suitable for FTS indexing.
+    :raises ValueError: If *item.type* is not a recognised type.
     """
     data = item.data.model_dump()
     if item.type == "message":
@@ -220,5 +329,10 @@ def extract_search_text(item: NewConversationItem) -> str:
 
 
 def now_epoch() -> int:
-    """Current time as Unix epoch seconds."""
+    """
+    Return the current time as Unix epoch seconds (integer).
+
+    :returns: Seconds since 1970-01-01 00:00:00 UTC, truncated to
+        an integer.
+    """
     return int(time.time())

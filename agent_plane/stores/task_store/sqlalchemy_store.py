@@ -71,7 +71,19 @@ _DBOS_ACTIVE = frozenset({WorkflowStatusString.PENDING.value, WorkflowStatusStri
 
 
 def _map_dbos_status(dbos_status_value: str) -> str:
-    """Map a DBOS WorkflowStatusString value to our TaskStatus."""
+    """
+    Map a DBOS ``WorkflowStatusString`` value to a
+    :class:`TaskStatus` string.
+
+    Falls back to :attr:`TaskStatus.FAILED` for unknown statuses
+    so that unmapped DBOS states surface as failures rather than
+    silently misclassifying the task.
+
+    :param dbos_status_value: The raw DBOS status string,
+        e.g. ``"SUCCESS"``, ``"PENDING"``.
+    :returns: The corresponding :class:`TaskStatus` value,
+        e.g. ``"completed"``, ``"in_progress"``.
+    """
     # Fallback to FAILED: if DBOS introduces a status we haven't mapped,
     # treating it as failed is the safest option — it surfaces the gap
     # via the API rather than silently misclassifying the task.
@@ -83,9 +95,15 @@ def _map_dbos_status(dbos_status_value: str) -> str:
 
 def _to_entity(row: SqlTask) -> Task:
     """
-    Build a Task from a DB row with status="queued" as default.
-    Call _enrich_from_dbos() afterwards to merge DBOS workflow state
-    (including instructions and reasoning from workflow inputs).
+    Build a :class:`Task` from a DB row with ``status="queued"``
+    as the default.
+
+    Call :func:`_enrich_from_dbos` afterwards to merge DBOS
+    workflow state (status, output, error, instructions, reasoning).
+
+    :param row: The :class:`SqlTask` ORM row to convert.
+    :returns: A :class:`Task` dataclass instance with status
+        defaulting to ``"queued"``.
     """
     return Task(
         id=row.id,
@@ -104,8 +122,14 @@ def _to_entity(row: SqlTask) -> Task:
 
 def _apply_workflow_status(task: Task, wf_status: WorkflowStatus) -> Task:
     """
-    Apply a DBOS WorkflowStatus to a Task, populating status/output/error
-    and restoring instructions/reasoning from the workflow inputs.
+    Apply a DBOS :class:`WorkflowStatus` to a :class:`Task`,
+    populating status, output, error, and restoring instructions
+    and reasoning from the workflow inputs.
+
+    :param task: The :class:`Task` to mutate.
+    :param wf_status: The DBOS workflow status containing the
+        execution state.
+    :returns: The same :class:`Task` instance, mutated in place.
     """
     # wf_status.status is a plain string (e.g. "SUCCESS", "PENDING")
     task.status = _map_dbos_status(str(wf_status.status))
@@ -134,7 +158,17 @@ def _apply_workflow_status(task: Task, wf_status: WorkflowStatus) -> Task:
 
 
 async def _enrich_from_dbos(task: Task) -> Task:
-    """Merge DBOS workflow state (status, output, error) into a Task."""
+    """
+    Merge DBOS workflow state (status, output, error) into a
+    :class:`Task`.
+
+    Fetches the workflow status from DBOS and applies it. If no
+    workflow status exists (e.g. workflow not yet registered),
+    returns the task unchanged.
+
+    :param task: The :class:`Task` to enrich.
+    :returns: The enriched :class:`Task`.
+    """
     wf_status: WorkflowStatus | None = await get_workflow_status_async(task.id)
     if wf_status is None:
         return task
@@ -142,6 +176,16 @@ async def _enrich_from_dbos(task: Task) -> Task:
 
 
 def _row_to_item(row: SqlConversationItem) -> ConversationItem:
+    """
+    Convert a :class:`SqlConversationItem` ORM row to a
+    :class:`ConversationItem` entity.
+
+    Deserializes the JSON ``data`` column and parses it into
+    the appropriate typed data model.
+
+    :param row: The SQLAlchemy ORM row to convert.
+    :returns: A :class:`ConversationItem` Pydantic model.
+    """
     return ConversationItem(
         id=row.id,
         type=row.type,
@@ -153,7 +197,27 @@ def _row_to_item(row: SqlConversationItem) -> ConversationItem:
 
 
 class SqlAlchemyTaskStore(TaskStore):
+    """
+    SQLAlchemy-backed implementation of :class:`TaskStore` with DBOS
+    durable execution.
+
+    DB-only methods (create, try_deliver, close_inbox, list_tasks)
+    use SQLAlchemy directly. Execution-related methods (start, get,
+    stream, wait, cancel, delete) delegate to the DBOS runtime.
+    """
+
     def __init__(self, storage_location: str) -> None:
+        """
+        Initialize the SQLAlchemy task store.
+
+        Creates or reuses a SQLAlchemy engine and session factory,
+        ensures the FTS virtual table exists, and initializes
+        the DBOS durable execution engine.
+
+        :param storage_location: SQLAlchemy database URI,
+            e.g. ``"sqlite:///tasks.db"`` or
+            ``"postgresql://user:pass@host/db"``.
+        """
         super().__init__(storage_location)
         self._engine = get_or_create_engine(storage_location)
         self._session = make_managed_session_maker(self._engine)
@@ -171,6 +235,21 @@ class SqlAlchemyTaskStore(TaskStore):
         previous_response_id: str | None = None,
         background: bool = False,
     ) -> Task:
+        """
+        Create a new task in the database.
+
+        :param conversation_id: ID of the conversation,
+            e.g. ``"conv_abc123"``.
+        :param agent_id: ID of the agent to execute,
+            e.g. ``"agent_xyz789"``.
+        :param agent_name: Human-readable agent name,
+            e.g. ``"code-assistant"``.
+        :param previous_response_id: ID of the prior response
+            in the thread, or ``None`` for the first turn.
+        :param background: Whether this is a background task.
+        :returns: The newly created :class:`Task` with status
+            ``"queued"``.
+        """
         row = SqlTask(
             id=generate_task_id(),
             agent_id=agent_id,
@@ -193,6 +272,21 @@ class SqlAlchemyTaskStore(TaskStore):
         instructions: str | None = None,
         reasoning: dict[str, str] | None = None,
     ) -> None:
+        """
+        Begin execution of a previously created task.
+
+        Launches the DBOS workflow asynchronously pinned to the
+        task_id. If the workflow fails to start, deletes the
+        orphaned task row (compensating transaction).
+
+        :param task_id: Unique task identifier,
+            e.g. ``"task_abc123"``.
+        :param instructions: Optional per-request system
+            instructions override.
+        :param reasoning: Optional reasoning configuration,
+            e.g. ``{"effort": "medium"}``.
+        :raises LookupError: If the task does not exist.
+        """
         with self._session() as session:
             row = session.get(SqlTask, task_id)
             if row is None:
@@ -234,12 +328,29 @@ class SqlAlchemyTaskStore(TaskStore):
             raise
 
     async def stream(self, task_id: str) -> AsyncIterator[dict[str, Any]]:
+        """
+        Yield streaming events from the DBOS output stream.
+
+        :param task_id: Unique task identifier,
+            e.g. ``"task_abc123"``.
+        :returns: An async iterator of event dicts, each with a
+            ``"type"`` field (e.g. ``"text_delta"``).
+        """
         # read_stream_async yields events as they arrive from the
         # DBOS stream. Layer 2 will add richer event types.
         async for event in read_stream_async(task_id, "output"):
             yield event
 
     async def get(self, task_id: str) -> Task | None:
+        """
+        Return a snapshot of the task's current state, enriched
+        with DBOS workflow state.
+
+        :param task_id: Unique task identifier,
+            e.g. ``"task_abc123"``.
+        :returns: The :class:`Task` snapshot, or ``None`` if the
+            task does not exist.
+        """
         with self._session() as session:
             row = session.get(SqlTask, task_id)
             if row is None:
@@ -248,6 +359,16 @@ class SqlAlchemyTaskStore(TaskStore):
         return await _enrich_from_dbos(task)
 
     async def wait(self, task_id: str) -> Task:
+        """
+        Await until the task reaches a terminal state and return
+        the final :class:`Task`.
+
+        :param task_id: Unique task identifier,
+            e.g. ``"task_abc123"``.
+        :returns: The final :class:`Task` in a terminal state.
+        :raises LookupError: If the task does not exist after
+            completion.
+        """
         handle: WorkflowHandleAsync[dict[str, Any]] = await retrieve_workflow_async(task_id)
         await handle.get_result()
         task = await self.get(task_id)
@@ -259,8 +380,14 @@ class SqlAlchemyTaskStore(TaskStore):
 
     def _get_task_for_update(self, session: Session, task_id: str) -> SqlTask | None:
         """
-        Fetch a task row with FOR UPDATE locking on PostgreSQL.
+        Fetch a task row with ``FOR UPDATE`` locking on PostgreSQL.
         SQLite relies on database-level locking instead.
+
+        :param session: The active SQLAlchemy session.
+        :param task_id: Unique task identifier,
+            e.g. ``"task_abc123"``.
+        :returns: The :class:`SqlTask` row, or ``None`` if not
+            found.
         """
         stmt = select(SqlTask).where(SqlTask.id == task_id)
         if self._supports_for_update:
@@ -274,15 +401,23 @@ class SqlAlchemyTaskStore(TaskStore):
         item: NewConversationItem,
     ) -> bool:
         """
-        Server-side steering handshake. Within a single transaction:
-        check inbox_closed; if open, append the item and return True;
-        if closed, return False.
+        Server-side steering handshake.
 
-        This inserts into conversation_items directly (rather than
-        delegating to ConversationStore.append) because the inbox check
-        and the item insert MUST be atomic — if they were separate
-        operations, close_inbox could run between them, and the
-        delivered message would never be seen by the agent.
+        Within a single transaction: check ``inbox_closed``; if
+        open, append the item and return ``True``; if closed,
+        return ``False``.
+
+        Inserts into ``conversation_items`` directly (rather than
+        delegating to ``ConversationStore.append``) because the
+        inbox check and the item insert MUST be atomic.
+
+        :param task_id: Unique task identifier,
+            e.g. ``"task_abc123"``.
+        :param conversation_id: ID of the conversation to append
+            the item to, e.g. ``"conv_abc123"``.
+        :param item: The :class:`NewConversationItem` to deliver.
+        :returns: ``True`` if the item was delivered, ``False``
+            if the inbox was already closed.
         """
         with self._session() as session:
             row = self._get_task_for_update(session, task_id)
@@ -322,9 +457,22 @@ class SqlAlchemyTaskStore(TaskStore):
         last_seen_item_id: str | None,
     ) -> list[ConversationItem]:
         """
-        Agent-side steering handshake. Within a single transaction:
-        check for items newer than last_seen_item_id. If found, return
-        them (inbox stays open). If none, set inbox_closed=1 and return [].
+        Agent-side steering handshake.
+
+        Within a single transaction: check for items newer than
+        ``last_seen_item_id``. If found, return them (inbox stays
+        open). If none, set ``inbox_closed=True`` and return
+        an empty list.
+
+        :param task_id: Unique task identifier,
+            e.g. ``"task_abc123"``.
+        :param conversation_id: ID of the conversation to check
+            for new items, e.g. ``"conv_abc123"``.
+        :param last_seen_item_id: ID of the last item the agent
+            has processed, or ``None`` to check all items,
+            e.g. ``"msg_xyz789"``.
+        :returns: List of unseen :class:`ConversationItem` objects
+            (empty if inbox was successfully closed).
         """
         with self._session() as session:
             stmt = select(SqlConversationItem).where(
@@ -352,6 +500,15 @@ class SqlAlchemyTaskStore(TaskStore):
     # ── Cancel / Delete ───────────────────────────────────
 
     async def cancel(self, task_id: str) -> Task:
+        """
+        Cancel a task by stopping its DBOS workflow.
+
+        :param task_id: Unique task identifier,
+            e.g. ``"task_abc123"``.
+        :returns: The cancelled :class:`Task`.
+        :raises LookupError: If the task does not exist after
+            cancellation.
+        """
         await cancel_workflow_async(task_id)
         task = await self.get(task_id)
         if task is None:
@@ -359,6 +516,15 @@ class SqlAlchemyTaskStore(TaskStore):
         return task
 
     async def delete(self, task_id: str) -> None:
+        """
+        Remove a task record entirely.
+
+        Cancels any active DBOS workflow first, then deletes the
+        database row.
+
+        :param task_id: Unique task identifier,
+            e.g. ``"task_abc123"``.
+        """
         # Cancel the DBOS workflow if it's still running
         wf_status = await get_workflow_status_async(task_id)
         if wf_status is not None and str(wf_status.status) in _DBOS_ACTIVE:
@@ -376,6 +542,17 @@ class SqlAlchemyTaskStore(TaskStore):
         conversation_id: str | None = None,
         agent_id: str | None = None,
     ) -> list[Task]:
+        """
+        Return tasks matching the given filters, enriched with
+        DBOS workflow state.
+
+        :param conversation_id: Optional conversation ID filter,
+            e.g. ``"conv_abc123"``.
+        :param agent_id: Optional agent ID filter,
+            e.g. ``"agent_xyz789"``.
+        :returns: A list of matching :class:`Task` objects,
+            ordered by ``created_at`` descending.
+        """
         with self._session() as session:
             stmt = select(SqlTask)
             if conversation_id:

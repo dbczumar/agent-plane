@@ -38,27 +38,25 @@ __all__ = [
 
 def load(source: Path | bytes, *, dest: Path | None = None) -> AgentSpec:
     """
-    Load an agent spec from a directory, tarball path, or raw bytes.
+    Load an agent spec from a directory, tarball path, or raw
+    bytes.
 
     If *source* is a directory, parse and validate it directly.
     If *source* is a file path (tarball) or raw bytes, extract to
     *dest* first, then parse and validate the extracted directory.
 
-    Args:
-        source: Path to an agent image directory or .tar.gz bundle,
-            or raw tarball bytes (e.g. from an HTTP upload).
-        dest: Extraction destination — required when source is a
-              tarball or bytes, ignored when source is a directory.
-
-    Returns:
-        A validated AgentSpec.
-
-    Raises:
-        ValueError: If the spec fails validation, or if source is a
-            tarball/bytes and dest is not provided.
-        FileNotFoundError: If source is a Path that does not exist,
-            or if the extracted directory is missing config.yaml.
-        ExtractionError: If the tarball fails safety checks.
+    :param source: Path to an agent image directory or ``.tar.gz``
+        bundle, or raw tarball bytes (e.g. from an HTTP upload).
+    :param dest: Extraction destination -- required when *source*
+        is a tarball or bytes, ignored when *source* is a
+        directory.
+    :returns: A validated :class:`AgentSpec`.
+    :raises ValueError: If the spec fails validation, or if
+        *source* is a tarball/bytes and *dest* is not provided.
+    :raises FileNotFoundError: If *source* is a :class:`Path` that
+        does not exist, or if the extracted directory is missing
+        ``config.yaml``.
+    :raises ExtractionError: If the tarball fails safety checks.
     """
     if isinstance(source, bytes):
         if dest is None:

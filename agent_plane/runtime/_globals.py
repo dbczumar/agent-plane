@@ -36,7 +36,17 @@ def init(
     agent_cache: AgentCache,
 ) -> None:
     """
-    Set the runtime's store references. Called once at server startup.
+    Set the runtime's store references. Called once at server
+    startup.
+
+    :param conversation_store: The ConversationStore instance
+        for persisting conversation items.
+    :param task_store: The TaskStore instance for managing
+        task lifecycle and durable execution.
+    :param agent_store: The AgentStore instance for CRUD
+        operations on registered agents.
+    :param agent_cache: The AgentCache instance for loading
+        and caching parsed agent specs.
     """
     global _conversation_store, _task_store, _agent_store, _agent_cache
     _conversation_store = conversation_store

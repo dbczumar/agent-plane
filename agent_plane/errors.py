@@ -16,8 +16,13 @@ class ErrorCode:
     """
     Error codes and their HTTP status mappings.
 
-    Add new codes here as needed. The string value is what appears in
-    the JSON response body.
+    Add new codes here as needed. The string value is what appears
+    in the JSON response body.
+
+    :cvar NOT_FOUND: Resource does not exist (HTTP 404).
+    :cvar INVALID_INPUT: Request validation failed (HTTP 400).
+    :cvar ALREADY_EXISTS: Duplicate resource (HTTP 409).
+    :cvar INTERNAL_ERROR: Unexpected server error (HTTP 500).
     """
 
     NOT_FOUND = "not_found"
@@ -44,10 +49,23 @@ class AgentPlaneError(Exception):
     """
 
     def __init__(self, message: str, *, code: str = ErrorCode.INTERNAL_ERROR) -> None:
+        """
+        Create a new application error.
+
+        :param message: Human-readable error description.
+        :param code: Machine-readable error code from
+            :class:`ErrorCode`, e.g. ``ErrorCode.NOT_FOUND``.
+        """
         super().__init__(message)
         self.code = code
         self.message = message
 
     @property
     def http_status(self) -> int:
+        """
+        Map this error's code to an HTTP status code.
+
+        :returns: HTTP status (e.g. 404 for ``NOT_FOUND``).
+            Defaults to 500 for unknown codes.
+        """
         return _CODE_TO_HTTP_STATUS.get(self.code, 500)

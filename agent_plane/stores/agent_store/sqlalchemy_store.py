@@ -16,6 +16,12 @@ from agent_plane.stores.agent_store import AgentStore
 
 
 def _to_entity(row: SqlAgent) -> Agent:
+    """
+    Convert a :class:`SqlAgent` ORM row to an :class:`Agent` entity.
+
+    :param row: The SQLAlchemy ORM row to convert.
+    :returns: An :class:`Agent` dataclass instance.
+    """
     return Agent(
         id=row.id,
         created_at=row.created_at,
@@ -25,7 +31,23 @@ def _to_entity(row: SqlAgent) -> Agent:
 
 
 class SqlAlchemyAgentStore(AgentStore):
+    """
+    SQLAlchemy-backed implementation of :class:`AgentStore`.
+
+    Persists agents in a relational database via SQLAlchemy ORM.
+    """
+
     def __init__(self, storage_location: str) -> None:
+        """
+        Initialize the SQLAlchemy agent store.
+
+        Creates or reuses a SQLAlchemy engine and session factory
+        for the given database URI.
+
+        :param storage_location: SQLAlchemy database URI,
+            e.g. ``"sqlite:///agents.db"`` or
+            ``"postgresql://user:pass@host/db"``.
+        """
         super().__init__(storage_location)
         self._engine = get_or_create_engine(storage_location)
         self._session = make_managed_session_maker(self._engine)
@@ -35,6 +57,14 @@ class SqlAlchemyAgentStore(AgentStore):
         name: str,
         description: str | None = None,
     ) -> Agent:
+        """
+        Register a new agent in the database.
+
+        :param name: Human-readable agent name. Must be unique,
+            e.g. ``"code-assistant"``.
+        :param description: Optional free-text description.
+        :returns: The newly created :class:`Agent`.
+        """
         row = SqlAgent(
             id=generate_agent_id(),
             created_at=now_epoch(),
@@ -46,11 +76,25 @@ class SqlAlchemyAgentStore(AgentStore):
             return _to_entity(row)
 
     def get(self, agent_id: str) -> Agent | None:
+        """
+        Fetch an agent by its unique ID.
+
+        :param agent_id: Unique agent identifier,
+            e.g. ``"agent_abc123"``.
+        :returns: The :class:`Agent` if found, otherwise ``None``.
+        """
         with self._session() as session:
             row = session.get(SqlAgent, agent_id)
             return _to_entity(row) if row else None
 
     def get_by_name(self, name: str) -> Agent | None:
+        """
+        Look up an agent by its unique name.
+
+        :param name: The agent's unique name,
+            e.g. ``"code-assistant"``.
+        :returns: The :class:`Agent` if found, otherwise ``None``.
+        """
         with self._session() as session:
             row = session.execute(
                 select(SqlAgent).where(SqlAgent.name == name)
@@ -64,6 +108,18 @@ class SqlAlchemyAgentStore(AgentStore):
         before: str | None = None,
         order: str = "desc",
     ) -> PagedList[Agent]:
+        """
+        List agents with cursor-based pagination.
+
+        :param limit: Maximum number of agents to return.
+        :param after: Cursor agent ID; return agents appearing
+            after this agent in sort order,
+            e.g. ``"agent_abc123"``.
+        :param before: Cursor agent ID; return agents appearing
+            before this agent in sort order.
+        :param order: Sort direction, ``"desc"`` or ``"asc"``.
+        :returns: A :class:`PagedList` of :class:`Agent` objects.
+        """
         with self._session() as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
@@ -96,6 +152,14 @@ class SqlAlchemyAgentStore(AgentStore):
             )
 
     def delete(self, agent_id: str) -> bool:
+        """
+        Delete an agent by ID.
+
+        :param agent_id: Unique agent identifier,
+            e.g. ``"agent_abc123"``.
+        :returns: ``True`` if the agent was deleted, ``False`` if
+            it did not exist.
+        """
         with self._session() as session:
             row = session.get(SqlAgent, agent_id)
             if not row:

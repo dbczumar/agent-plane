@@ -30,7 +30,20 @@ def create_app(
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
-    Stores are injected here and passed to route factories.
+
+    Stores are injected here and passed to route factories. Each store
+    is forwarded to the router factories that need it; the app itself
+    only wires them together.
+
+    :param agent_store: Store for agent CRUD operations.
+    :param file_store: Store for uploaded-file metadata.
+    :param task_store: Store for response/task lifecycle and
+        workflow execution.
+    :param conversation_store: Store for conversation and
+        conversation-item persistence.
+    :param artifact_store: Store for binary blobs (agent bundles,
+        file content).
+    :returns: A fully configured :class:`FastAPI` application.
     """
     app = FastAPI(title="Agent Plane Server")
 

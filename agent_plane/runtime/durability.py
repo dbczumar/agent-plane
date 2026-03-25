@@ -26,7 +26,14 @@ _init_lock = threading.Lock()
 
 
 def ensure_dbos(uri: str) -> None:
-    """Initialize the DBOS singleton. Idempotent — safe to call repeatedly."""
+    """
+    Initialize the DBOS singleton. Idempotent — safe to call
+    repeatedly.
+
+    :param uri: PostgreSQL connection URI for the DBOS system
+        database, e.g.
+        ``"postgresql://user:pass@localhost:5432/dbos"``.
+    """
     global _dbos_initialized
     if _dbos_initialized:
         return
@@ -48,6 +55,9 @@ def destroy_dbos() -> None:
 
 
 def is_dbos_initialized() -> bool:
+    """
+    Return whether the DBOS singleton has been initialized.
+    """
     return _dbos_initialized
 
 
@@ -74,7 +84,12 @@ read_stream_async = DBOS.read_stream_async
 
 
 def get_workflow_id() -> str:
-    """Return the current workflow's ID. Must be called within a workflow."""
+    """
+    Return the current workflow's ID. Must be called within
+    a DBOS workflow context.
+
+    :returns: The workflow ID string, e.g. ``"task_abc123"``.
+    """
     return str(DBOS.workflow_id)
 
 

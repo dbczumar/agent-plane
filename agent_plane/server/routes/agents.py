@@ -13,6 +13,12 @@ from agent_plane.stores import AgentStore, ArtifactStore, TaskStore
 
 
 def _to_agent_object(agent: Agent) -> AgentObject:
+    """
+    Convert a runtime Agent entity to an API-layer AgentObject.
+
+    :param agent: The runtime agent entity.
+    :returns: A :class:`AgentObject` for the API response.
+    """
     return AgentObject(
         id=agent.id,
         name=agent.name,
@@ -26,6 +32,18 @@ def create_agents_router(
     task_store: TaskStore,
     artifact_store: ArtifactStore,
 ) -> APIRouter:
+    """
+    Factory that builds the agents router.
+
+    Stores are closed over -- no dependency injection.
+
+    :param agent_store: Store for agent CRUD operations.
+    :param task_store: Store for task deletion when an agent is
+        deleted.
+    :param artifact_store: Store for agent bundle binary blobs.
+    :returns: A configured :class:`APIRouter` with all
+        ``/agents`` endpoints.
+    """
     router = APIRouter()
 
     # ── POST /agents ───────────────────────────────────────────────
@@ -34,6 +52,20 @@ def create_agents_router(
     async def create_agent(
         bundle: UploadFile = File(...),
     ) -> AgentObject:
+        """
+        Create a new agent from an uploaded bundle archive.
+
+        Validates the bundle, extracts the agent spec, ensures
+        the agent name is unique, persists metadata, and stores
+        the bundle binary.
+
+        :param bundle: Uploaded ``.tar.gz`` agent bundle file
+            containing a ``config.yaml`` agent spec.
+        :returns: The newly created :class:`AgentObject`.
+        :raises AgentPlaneError: If the bundle is invalid, the
+            spec is missing a name, or an agent with the same
+            name already exists.
+        """
         bundle_bytes = await bundle.read()
 
         # Validate bundle and extract agent spec
@@ -72,6 +104,18 @@ def create_agents_router(
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
     ) -> PaginatedList:
+        """
+        List agents with cursor-based pagination.
+
+        :param limit: Maximum number of items to return
+            (1-100).
+        :param after: Cursor — return items after this agent
+            ID, e.g. ``"ag_abc123"``.
+        :param before: Cursor — return items before this
+            agent ID.
+        :param order: Sort order, ``"asc"`` or ``"desc"``.
+        :returns: A :class:`PaginatedList` of agents.
+        """
         page = agent_store.list(limit=limit, after=after, before=before, order=order)
         data = [_to_agent_object(a) for a in page.data]
         return PaginatedList(
@@ -85,6 +129,14 @@ def create_agents_router(
 
     @router.get("/agents/{agent_id}")
     async def get_agent(agent_id: str) -> AgentObject:
+        """
+        Retrieve a single agent by ID.
+
+        :param agent_id: The agent identifier,
+            e.g. ``"ag_abc123"``.
+        :returns: The matching :class:`AgentObject`.
+        :raises AgentPlaneError: If the agent is not found.
+        """
         agent = agent_store.get(agent_id)
         if agent is None:
             raise AgentPlaneError("Agent not found", code=ErrorCode.NOT_FOUND)
@@ -94,6 +146,14 @@ def create_agents_router(
 
     @router.delete("/agents/{agent_id}")
     async def delete_agent(agent_id: str) -> AgentDeleted:
+        """
+        Delete an agent, its tasks, and its bundle artifact.
+
+        :param agent_id: The agent identifier,
+            e.g. ``"ag_abc123"``.
+        :returns: An :class:`AgentDeleted` confirmation.
+        :raises AgentPlaneError: If the agent is not found.
+        """
         agent = agent_store.get(agent_id)
         if agent is None:
             raise AgentPlaneError("Agent not found", code=ErrorCode.NOT_FOUND)

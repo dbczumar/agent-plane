@@ -27,15 +27,29 @@ class LocalArtifactStore(ArtifactStore):
     """
 
     def __init__(self, storage_location: str) -> None:
+        """
+        Initialize the local artifact store.
+
+        Creates the root directory if it does not exist.
+
+        :param storage_location: Filesystem path to the root
+            directory, e.g. ``"/data/artifacts"``.
+        """
         super().__init__(storage_location)
         self._root = Path(storage_location)
         self._root.mkdir(parents=True, exist_ok=True)
 
     def _resolve(self, key: str) -> Path:
         """
-        Map *key* (forward-slash separated) to an absolute filesystem
-        path.  Raises ``ValueError`` if the key is empty, contains
-        traversal sequences, or resolves outside the root.
+        Map *key* (forward-slash separated) to an absolute
+        filesystem path.
+
+        :param key: Forward-slash-separated artifact key,
+            e.g. ``"agents/agent_abc123/bundle.tar.gz"``.
+        :returns: The resolved absolute :class:`Path`.
+        :raises ValueError: If the key is empty, contains
+            traversal sequences (``..``), backslashes, or
+            resolves outside the root directory.
         """
         parts = PurePosixPath(key).parts
         if (
@@ -56,20 +70,52 @@ class LocalArtifactStore(ArtifactStore):
     # ── ArtifactStore interface ──────────────────────────────
 
     def put(self, key: str, data: bytes) -> None:
+        """
+        Write bytes to a file under the root directory.
+
+        Creates intermediate directories as needed. Overwrites
+        the file if it already exists.
+
+        :param key: Forward-slash-separated artifact key,
+            e.g. ``"agents/agent_abc123/bundle.tar.gz"``.
+        :param data: Raw bytes to write.
+        """
         path = self._resolve(key)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
 
     def get(self, key: str) -> bytes:
+        """
+        Read bytes from a file under the root directory.
+
+        :param key: Forward-slash-separated artifact key,
+            e.g. ``"agents/agent_abc123/bundle.tar.gz"``.
+        :returns: The raw bytes of the file.
+        :raises KeyError: If no file exists at the resolved path.
+        """
         path = self._resolve(key)
         if not path.exists():
             raise KeyError(key)
         return path.read_bytes()
 
     def delete(self, key: str) -> None:
+        """
+        Remove a file under the root directory. No-op if the file
+        does not exist.
+
+        :param key: Forward-slash-separated artifact key,
+            e.g. ``"agents/agent_abc123/bundle.tar.gz"``.
+        """
         path = self._resolve(key)
         if path.exists():
             path.unlink()
 
     def exists(self, key: str) -> bool:
+        """
+        Check whether a file exists under the root directory.
+
+        :param key: Forward-slash-separated artifact key,
+            e.g. ``"agents/agent_abc123/bundle.tar.gz"``.
+        :returns: ``True`` if the file exists, ``False`` otherwise.
+        """
         return self._resolve(key).exists()
