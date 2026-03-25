@@ -61,7 +61,7 @@ def _make_mock_streaming_client() -> MagicMock:
     one-event stream yielding a ``response.completed`` event with a
     single text output item.
 
-    :returns: A MagicMock suitable for patching ``_get_openai_client``.
+    :returns: A MagicMock suitable for patching ``_get_llm_client``.
     """
     mock_client = MagicMock()
     # responses.create is called with stream=True; return an iterable
@@ -549,7 +549,7 @@ def _make_streaming_client_with_steering(
     :param conv_id: Conversation ID to append the steering
         message to, e.g. ``"conv_abc123"``.
     :returns: A MagicMock suitable for patching
-        ``_get_openai_client``.
+        ``_get_llm_client``.
     """
     call_count = 0
 
@@ -684,3 +684,11 @@ async def test_persist_first_prevents_ghost_tokens(
     assert "First response" in assistant_in_prompt[0]["content"]
     # Two user messages: the seed + the steering message
     assert len(user_in_prompt) == 2
+
+    # Verify the inbox is closed after completion — further
+    # try_deliver calls must be rejected. Without the second
+    # close_inbox call (to advance past own output), the inbox
+    # would remain open and accept orphaned messages.
+    fetched = await task_store.get(task.id)
+    assert fetched is not None
+    assert fetched.inbox_closed is True

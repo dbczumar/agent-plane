@@ -626,7 +626,18 @@ def _handle_final_response(
         # cursor so _sync_history doesn't re-fetch it.
         return _SteeringRetry(last_seen=persisted[-1].id)
 
-    # ── Step 3b: No late messages — we're done ─────────────
+    # ── Step 3b: No late messages — close inbox and finish ──
+    # The first close_inbox call found items (our own persisted
+    # output), so the inbox is still open. Call again with the
+    # persisted item's ID so close_inbox sees zero new items
+    # and atomically sets inbox_closed=True. This prevents
+    # try_deliver from injecting orphaned messages after we
+    # return "completed".
+    task_store.close_inbox(
+        task_id,
+        conversation_id,
+        persisted[-1].id,
+    )
     return {
         "task_id": task_id,
         "status": "completed",
