@@ -1,6 +1,6 @@
 """Tests for llms.adapters.vertex — connection_params resolution."""
 
-import os
+import pytest
 
 from llms.adapters.vertex import _build_vertex_url, _resolve_vertex_params
 
@@ -35,17 +35,51 @@ def test_resolve_builds_url_from_project_and_location() -> None:
 
 
 def test_resolve_falls_back_to_env_for_missing_project(
-    monkeypatch: object,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     If only ``"location"`` is provided, ``"project"`` falls back to
     the ``VERTEX_PROJECT`` env var.
     """
-    monkeypatch.setenv("VERTEX_PROJECT", "env-proj")  # type: ignore[union-attr]
+    monkeypatch.setenv("VERTEX_PROJECT", "env-proj")
     params = {"location": "asia-east1"}
     result = _resolve_vertex_params(params)
     assert result is not None
     assert result["base_url"] == _build_vertex_url("env-proj", "asia-east1")
+
+
+def test_resolve_falls_back_to_env_for_missing_location(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    If only ``"project"`` is provided, ``"location"`` falls back to
+    the ``VERTEX_LOCATION`` env var.
+    """
+    monkeypatch.setenv("VERTEX_LOCATION", "europe-west4")
+    params = {"project": "my-proj"}
+    result = _resolve_vertex_params(params)
+    assert result is not None
+    assert result["base_url"] == _build_vertex_url("my-proj", "europe-west4")
+
+
+def test_resolve_raises_when_project_missing_from_params_and_env() -> None:
+    """
+    ValueError when ``"location"`` is in params but ``"project"`` is
+    neither in params nor in ``VERTEX_PROJECT`` env var.
+    """
+    params = {"location": "us-east1"}
+    with pytest.raises(ValueError, match="requires 'project'"):
+        _resolve_vertex_params(params)
+
+
+def test_resolve_raises_when_location_missing_from_params_and_env() -> None:
+    """
+    ValueError when ``"project"`` is in params but ``"location"`` is
+    neither in params nor in ``VERTEX_LOCATION`` env var.
+    """
+    params = {"project": "my-proj"}
+    with pytest.raises(ValueError, match="requires 'location'"):
+        _resolve_vertex_params(params)
 
 
 def test_resolve_no_project_or_location_passes_through() -> None:
