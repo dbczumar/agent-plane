@@ -25,14 +25,26 @@ _dbos_initialized = False
 _init_lock = threading.Lock()
 
 
-def ensure_dbos(uri: str) -> None:
+def ensure_dbos(
+    uri: str,
+    *,
+    application_version: str | None = None,
+) -> None:
     """
     Initialize the DBOS singleton. Idempotent — safe to call
     repeatedly.
 
-    :param uri: PostgreSQL connection URI for the DBOS system
+    :param uri: Database connection URI for the DBOS system
         database, e.g.
-        ``"postgresql://user:pass@localhost:5432/dbos"``.
+        ``"postgresql://user:pass@localhost:5432/dbos"``
+        or ``"sqlite:///path/to/db.db"``.
+    :param application_version: Optional fixed application
+        version string, e.g. ``"v1"``. When omitted, DBOS
+        auto-computes a version from registered workflow
+        source code. Pinning the version is required for
+        crash recovery: the restarted instance must use
+        the same version as the crashed one so DBOS can
+        identify pending workflows to recover.
     """
     global _dbos_initialized
     if _dbos_initialized:
@@ -40,7 +52,13 @@ def ensure_dbos(uri: str) -> None:
     with _init_lock:
         if _dbos_initialized:
             return
-        DBOS(config=DBOSConfig(name="agent-plane", system_database_url=uri))
+        config = DBOSConfig(
+            name="agent-plane",
+            system_database_url=uri,
+        )
+        if application_version is not None:
+            config["application_version"] = application_version
+        DBOS(config=config)
         DBOS.launch()
         _dbos_initialized = True
 
@@ -57,6 +75,9 @@ def destroy_dbos() -> None:
 def is_dbos_initialized() -> bool:
     """
     Return whether the DBOS singleton has been initialized.
+
+    :returns: ``True`` if ``ensure_dbos`` has been called and
+        ``destroy_dbos`` has not been called since.
     """
     return _dbos_initialized
 
