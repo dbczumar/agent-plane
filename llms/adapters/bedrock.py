@@ -40,6 +40,31 @@ class BedrockAdapter(BaseAdapter):
             self._client = boto3.client("bedrock-runtime")
         return self._client
 
+    def _create_client_from_params(
+        self,
+        params: dict[str, str],
+    ) -> Any:
+        """
+        Create a fresh boto3 client from explicit connection params.
+
+        :param params: Connection overrides. Supported keys:
+            ``"aws_region"``, ``"aws_access_key_id"``,
+            ``"aws_secret_access_key"``, ``"aws_session_token"``.
+        :returns: A boto3 ``bedrock-runtime`` client.
+        """
+        import boto3
+
+        boto_kwargs: dict[str, str] = {}
+        if region := params.get("aws_region"):
+            boto_kwargs["region_name"] = region
+        if access_key := params.get("aws_access_key_id"):
+            boto_kwargs["aws_access_key_id"] = access_key
+        if secret_key := params.get("aws_secret_access_key"):
+            boto_kwargs["aws_secret_access_key"] = secret_key
+        if session_token := params.get("aws_session_token"):
+            boto_kwargs["aws_session_token"] = session_token
+        return boto3.client("bedrock-runtime", **boto_kwargs)
+
     def chat_completions(
         self,
         messages: list[dict[str, Any]],
@@ -47,6 +72,8 @@ class BedrockAdapter(BaseAdapter):
         tools: list[dict[str, Any]] | None,
         stream: bool,
         extra: dict[str, Any],
+        *,
+        connection_params: dict[str, str] | None = None,
     ) -> dict[str, Any] | Iterator[dict[str, Any]]:
         """
         Send a request via Bedrock Converse API.
@@ -57,14 +84,20 @@ class BedrockAdapter(BaseAdapter):
         :param tools: Tool schemas or ``None``.
         :param stream: Enable streaming.
         :param extra: Additional kwargs (temperature, etc.).
+        :param connection_params: Per-call overrides. Supported keys:
+            ``"aws_region"``, ``"aws_access_key_id"``,
+            ``"aws_secret_access_key"``, ``"aws_session_token"``.
         :returns: Chat Completions response dict or chunk iterator.
         """
-        kwargs = _build_converse_kwargs(messages, model, tools, extra)
-        client = self._get_client()
+        converse_kwargs = _build_converse_kwargs(messages, model, tools, extra)
+        if connection_params:
+            client = self._create_client_from_params(connection_params)
+        else:
+            client = self._get_client()
 
         if stream:
-            return _stream_converse(client, kwargs)
-        return _send_converse(client, kwargs)
+            return _stream_converse(client, converse_kwargs)
+        return _send_converse(client, converse_kwargs)
 
 
 # ── Request translation ───────────────────────────────────

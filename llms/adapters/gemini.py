@@ -61,13 +61,18 @@ class GeminiAdapter(BaseAdapter):
         """
         return _BASE_URL
 
-    def _get_headers(self) -> dict[str, str]:
+    def _get_headers(
+        self,
+        api_key_override: str | None = None,
+    ) -> dict[str, str]:
         """
         Build HTTP headers. Overridden by VertexAdapter for OAuth.
 
+        :param api_key_override: Explicit API key to use instead of
+            the environment variable.
         :returns: Headers dict with API key.
         """
-        api_key = os.environ["GOOGLE_API_KEY"]
+        api_key = api_key_override or os.environ["GOOGLE_API_KEY"]
         return {
             "Content-Type": "application/json",
             "x-goog-api-key": api_key,
@@ -80,6 +85,8 @@ class GeminiAdapter(BaseAdapter):
         tools: list[dict[str, Any]] | None,
         stream: bool,
         extra: dict[str, Any],
+        *,
+        connection_params: dict[str, str] | None = None,
     ) -> dict[str, Any] | Iterator[dict[str, Any]]:
         """
         Send a request to the Gemini API.
@@ -89,17 +96,21 @@ class GeminiAdapter(BaseAdapter):
         :param tools: Tool schemas or ``None``.
         :param stream: Enable streaming.
         :param extra: Additional kwargs.
+        :param connection_params: Per-call overrides. Supported keys:
+            ``"api_key"``, ``"base_url"``.
         :returns: Chat Completions response dict or chunk iterator.
         """
+        params = connection_params or {}
         payload = _chat_to_gemini(messages, tools, extra)
-        headers = self._get_headers()
-        base_url = self._get_base_url()
+        headers = self._get_headers(api_key_override=params.get("api_key"))
+        override_base = params.get("base_url")
+        effective_base = override_base.rstrip("/") if override_base else self._get_base_url()
 
         if stream:
-            url = f"{base_url}/models/{model}:streamGenerateContent?alt=sse"
+            url = f"{effective_base}/models/{model}:streamGenerateContent?alt=sse"
             return self._stream_request(url, headers, payload)
 
-        url = f"{base_url}/models/{model}:generateContent"
+        url = f"{effective_base}/models/{model}:generateContent"
         return self._send_request(url, headers, payload, model)
 
     def _send_request(

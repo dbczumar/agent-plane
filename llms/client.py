@@ -39,6 +39,7 @@ class _ResponsesNamespace:
         tools: list[dict[str, Any]] | None = None,
         reasoning: dict[str, str] | None = None,
         stream: bool = False,
+        connection_params: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> Response | Iterator[ResponseStreamEvent]:
         """
@@ -55,6 +56,12 @@ class _ResponsesNamespace:
             ``{"effort": "high", "summary": "concise"}``.
         :param stream: If ``True``, return an iterator of streaming
             events. If ``False``, return a :class:`Response`.
+        :param connection_params: Per-call connection overrides.
+            Keys are provider-specific, e.g.
+            ``{"api_key": "...", "base_url": "..."}`` for
+            OpenAI-compatible providers, or
+            ``{"aws_region": "us-west-2"}`` for Bedrock.
+            ``None`` uses the adapter's default credentials.
         :param kwargs: Additional provider-specific kwargs (e.g.
             ``temperature``, ``max_tokens``).
         :returns: A :class:`Response` when ``stream=False``, or an
@@ -74,6 +81,7 @@ class _ResponsesNamespace:
                 tools=tools,
                 reasoning=reasoning,
                 stream=stream,
+                connection_params=connection_params,
                 **kwargs,
             )
 
@@ -84,11 +92,25 @@ class _ResponsesNamespace:
             extra["reasoning_effort"] = reasoning.get("effort")
 
         if stream:
-            chunks = adapter.chat_completions(messages, routed.model, tools, True, extra)
+            chunks = adapter.chat_completions(
+                messages,
+                routed.model,
+                tools,
+                True,
+                extra,
+                connection_params=connection_params,
+            )
             assert not isinstance(chunks, dict)
             return chat_stream_to_response_events(chunks, model=routed.model)
 
-        result = adapter.chat_completions(messages, routed.model, tools, False, extra)
+        result = adapter.chat_completions(
+            messages,
+            routed.model,
+            tools,
+            False,
+            extra,
+            connection_params=connection_params,
+        )
         assert isinstance(result, dict)
         return chat_response_to_response(result)
 

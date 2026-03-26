@@ -66,15 +66,21 @@ class OpenAICompatibleAdapter(BaseAdapter):
             return None
         return os.environ.get(self._api_key_env)
 
-    def _build_headers(self) -> dict[str, str]:
+    def _build_headers(
+        self,
+        api_key_override: str | None = None,
+    ) -> dict[str, str]:
         """
         Build HTTP headers for the request.
 
+        :param api_key_override: Explicit API key to use instead of
+            the environment variable. ``None`` falls back to env.
         :returns: Headers dict with Authorization if an API key is
             available.
         """
         headers: dict[str, str] = {"Content-Type": "application/json"}
-        if api_key := self._get_api_key():
+        api_key = api_key_override or self._get_api_key()
+        if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         return headers
 
@@ -115,6 +121,8 @@ class OpenAICompatibleAdapter(BaseAdapter):
         tools: list[dict[str, Any]] | None,
         stream: bool,
         extra: dict[str, Any],
+        *,
+        connection_params: dict[str, str] | None = None,
     ) -> dict[str, Any] | Iterator[dict[str, Any]]:
         """
         Send a Chat Completions request to the provider.
@@ -124,11 +132,16 @@ class OpenAICompatibleAdapter(BaseAdapter):
         :param tools: Tool schemas or ``None``.
         :param stream: Enable streaming.
         :param extra: Additional kwargs.
+        :param connection_params: Per-call overrides. Supported keys:
+            ``"api_key"``, ``"base_url"``.
         :returns: Response dict or iterator of chunk dicts.
         """
+        params = connection_params or {}
         payload = self._build_payload(messages, model, tools, stream, extra)
-        url = f"{self._base_url}/chat/completions"
-        headers = self._build_headers()
+        override_base = params.get("base_url")
+        effective_base = override_base.rstrip("/") if override_base else self._base_url
+        url = f"{effective_base}/chat/completions"
+        headers = self._build_headers(api_key_override=params.get("api_key"))
 
         if stream:
             return self._stream_request(url, headers, payload)
@@ -304,6 +317,7 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         tools: list[dict[str, Any]] | None,
         reasoning: dict[str, str] | None,
         stream: bool,
+        connection_params: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> Response | Iterator[ResponseStreamEvent]:
         """
@@ -323,10 +337,13 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         :param stream: If ``True``, return an iterator of
             :class:`ResponseStreamEvent`. If ``False``, return a
             :class:`Response`.
+        :param connection_params: Per-call overrides. Supported keys:
+            ``"api_key"``, ``"base_url"``.
         :param kwargs: Additional API kwargs (temperature, etc.).
         :returns: A :class:`Response` or an iterator of
             :class:`ResponseStreamEvent`.
         """
+        params = connection_params or {}
         payload: dict[str, Any] = {"model": model, "input": input, **kwargs}
         if instructions:
             payload["instructions"] = instructions
@@ -337,8 +354,10 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         if stream:
             payload["stream"] = True
 
-        url = f"{self._base_url}/responses"
-        headers = self._build_headers()
+        override_base = params.get("base_url")
+        effective_base = override_base.rstrip("/") if override_base else self._base_url
+        url = f"{effective_base}/responses"
+        headers = self._build_headers(api_key_override=params.get("api_key"))
 
         if stream:
             return self._stream_responses(url, headers, payload)

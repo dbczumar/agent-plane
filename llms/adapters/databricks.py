@@ -21,6 +21,9 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
     - ``DATABRICKS_HOST``: Workspace URL, e.g.
       ``"https://my-workspace.databricks.com"``.
     - ``DATABRICKS_TOKEN``: Personal access token.
+
+    Both can be overridden per-call via ``connection_params``
+    with keys ``"api_key"`` and ``"base_url"``.
     """
 
     def __init__(self) -> None:

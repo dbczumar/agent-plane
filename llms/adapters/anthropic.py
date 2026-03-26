@@ -38,6 +38,8 @@ class AnthropicAdapter(BaseAdapter):
         tools: list[dict[str, Any]] | None,
         stream: bool,
         extra: dict[str, Any],
+        *,
+        connection_params: dict[str, str] | None = None,
     ) -> dict[str, Any] | Iterator[dict[str, Any]]:
         """
         Send a request to the Anthropic Messages API.
@@ -47,16 +49,21 @@ class AnthropicAdapter(BaseAdapter):
         :param tools: Tool schemas or ``None``.
         :param stream: Enable streaming.
         :param extra: Additional kwargs (temperature, etc.).
+        :param connection_params: Per-call overrides. Supported keys:
+            ``"api_key"``, ``"base_url"``.
         :returns: Chat Completions response dict or chunk iterator.
         """
+        params = connection_params or {}
         payload = _chat_to_anthropic(messages, model, tools, extra)
-        headers = _build_headers()
+        headers = _build_headers(api_key_override=params.get("api_key"))
+        override_base = params.get("base_url")
+        effective_base = override_base.rstrip("/") if override_base else _BASE_URL
 
         if stream:
             payload["stream"] = True
-            return _stream_request(headers, payload)
+            return _stream_request(headers, payload, effective_base)
 
-        return _send_request(headers, payload)
+        return _send_request(headers, payload, effective_base)
 
 
 # ── Request translation ───────────────────────────────────
@@ -434,13 +441,17 @@ def _make_chunk(
 # ── HTTP helpers ──────────────────────────────────────────
 
 
-def _build_headers() -> dict[str, str]:
+def _build_headers(
+    api_key_override: str | None = None,
+) -> dict[str, str]:
     """
     Build Anthropic API headers.
 
+    :param api_key_override: Explicit API key to use instead of
+        the environment variable.
     :returns: Headers dict with API key and version.
     """
-    api_key = os.environ["ANTHROPIC_API_KEY"]
+    api_key = api_key_override or os.environ["ANTHROPIC_API_KEY"]
     return {
         "Content-Type": "application/json",
         "x-api-key": api_key,
@@ -451,6 +462,7 @@ def _build_headers() -> dict[str, str]:
 def _send_request(
     headers: dict[str, str],
     payload: dict[str, Any],
+    base_url: str,
 ) -> dict[str, Any]:
     """
     Send a non-streaming request to Anthropic and return a Chat
@@ -458,9 +470,11 @@ def _send_request(
 
     :param headers: HTTP headers.
     :param payload: Anthropic API payload.
+    :param base_url: API base URL, e.g.
+        ``"https://api.anthropic.com/v1"``.
     :returns: Chat Completions response dict.
     """
-    url = f"{_BASE_URL}/messages"
+    url = f"{base_url}/messages"
     with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
         resp = client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
@@ -470,6 +484,7 @@ def _send_request(
 def _stream_request(
     headers: dict[str, str],
     payload: dict[str, Any],
+    base_url: str,
 ) -> Iterator[dict[str, Any]]:
     """
     Send a streaming request to Anthropic and yield Chat Completions
@@ -477,9 +492,11 @@ def _stream_request(
 
     :param headers: HTTP headers.
     :param payload: Anthropic API payload with ``stream: true``.
+    :param base_url: API base URL, e.g.
+        ``"https://api.anthropic.com/v1"``.
     :returns: Iterator of Chat Completions chunk dicts.
     """
-    url = f"{_BASE_URL}/messages"
+    url = f"{base_url}/messages"
     with httpx.Client(timeout=_STREAM_TIMEOUT) as client:
         with client.stream("POST", url, headers=headers, json=payload) as resp:
             resp.raise_for_status()
