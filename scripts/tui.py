@@ -29,8 +29,8 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
-from textual.widgets import Footer, Header, Input, RichLog
+from textual.containers import VerticalScroll
+from textual.widgets import Footer, Header, Input, Static
 
 # ── Configuration ─────────────────────────────────────
 
@@ -108,9 +108,7 @@ def wait_for_server(
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             out = proc.stdout.read().decode(errors="replace") if proc.stdout else ""
-            raise RuntimeError(
-                f"Server exited with code {proc.returncode}.\n{out[-3000:]}"
-            )
+            raise RuntimeError(f"Server exited with code {proc.returncode}.\n{out[-3000:]}")
         try:
             resp = httpx.get(f"{BASE_URL}/v1/conversations", timeout=2.0)
             if resp.status_code in (200, 404):
@@ -152,9 +150,7 @@ class _StreamAccumulator:
     Accumulates SSE events for a single assistant turn.
 
     Collects text deltas into a buffer and tracks which
-    sections (reasoning, summary) are active. When the
-    message completes, the full text is written to the
-    RichLog as a single entry.
+    sections (reasoning, summary) are active.
 
     :param text: Accumulated assistant text.
     :param reasoning: Accumulated reasoning text.
@@ -172,6 +168,53 @@ class _StreamAccumulator:
     had_text: bool = False
 
 
+# ── Message widgets ───────────────────────────────────
+
+
+class UserMessage(Static):
+    """
+    A user message in the chat log.
+
+    Styled with cyan bold prefix.
+    """
+
+    DEFAULT_CSS = """
+    UserMessage {
+        margin: 0 0 0 0;
+        color: $text;
+    }
+    """
+
+
+class AssistantMessage(Static):
+    """
+    An assistant message in the chat log.
+
+    Updated token-by-token during streaming via
+    ``update()``, then left in place as the final message.
+    """
+
+    DEFAULT_CSS = """
+    AssistantMessage {
+        margin: 0 0 0 0;
+        color: $text;
+    }
+    """
+
+
+class SystemInfo(Static):
+    """
+    A system info line (reasoning headers, tool calls, etc.).
+    """
+
+    DEFAULT_CSS = """
+    SystemInfo {
+        margin: 0;
+        color: $text-muted;
+    }
+    """
+
+
 # ── Textual App ───────────────────────────────────────
 
 
@@ -179,9 +222,9 @@ class ChatApp(App[None]):
     """
     Agent-plane chat TUI.
 
-    Provides a scrollable message log with streaming responses,
-    tool call display, and reasoning block rendering. Supports
-    steering (typing while the assistant is responding).
+    Uses a VerticalScroll container with individual Static
+    widgets per message. Assistant messages are updated
+    token-by-token via ``Static.update()`` during streaming.
     """
 
     TITLE = "agent-plane"
@@ -192,7 +235,7 @@ class ChatApp(App[None]):
         layout: vertical;
     }
 
-    #chat-log {
+    #chat-scroll {
         height: 1fr;
         scrollbar-size: 1 1;
         padding: 0 1;
@@ -227,34 +270,31 @@ class ChatApp(App[None]):
         self._previous_response_id: str | None = None
         self._current_response_id: str | None = None
         self._streaming = False
+        # The live Static widget being updated during streaming.
+        self._live_widget: Static | None = None
 
     def compose(self) -> ComposeResult:
         """Build the UI layout."""
         yield Header()
-        with Vertical():
-            yield RichLog(
-                id="chat-log",
-                markup=True,
-                wrap=True,
-                highlight=False,
-            )
-            yield Input(
-                id="user-input",
-                placeholder="Type a message… (Enter to send, Ctrl+C to quit)",
-            )
+        yield VerticalScroll(id="chat-scroll")
+        yield Input(
+            id="user-input",
+            placeholder="Type a message… (Enter to send, Ctrl+C to quit)",
+        )
         yield Footer()
 
     def on_mount(self) -> None:
         """Focus the input on startup and show welcome."""
-        log = self.query_one("#chat-log", RichLog)
-        log.write(
-            Text.from_markup(
-                f"[dim]Agent [bold]{AGENT_NAME}[/bold] ready "
-                f"· model [bold]{MODEL}[/bold] "
-                f"· type below to chat[/dim]"
+        scroll = self.query_one("#chat-scroll", VerticalScroll)
+        scroll.mount(
+            SystemInfo(
+                Text.from_markup(
+                    f"[dim]Agent [bold]{AGENT_NAME}[/bold] ready "
+                    f"· model [bold]{MODEL}[/bold] "
+                    f"· type below to chat[/dim]"
+                )
             )
         )
-        log.write("")
         self.query_one("#user-input", Input).focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -270,20 +310,20 @@ class ChatApp(App[None]):
             return
         event.input.value = ""
 
-        log = self.query_one("#chat-log", RichLog)
+        scroll = self.query_one("#chat-scroll", VerticalScroll)
 
         if self._streaming and self._current_response_id is not None:
             self._send_steering(text)
-            log.write(
-                Text.from_markup(
-                    f"[dim italic]steered: {escape(text[:80])}[/dim italic]"
+            scroll.mount(
+                SystemInfo(
+                    Text.from_markup(f"[dim italic]steered: {escape(text[:80])}[/dim italic]")
                 )
             )
+            scroll.scroll_end()
             return
 
-        log.write(
-            Text.from_markup(f"[bold cyan]you>[/bold cyan] {escape(text)}")
-        )
+        scroll.mount(UserMessage(Text.from_markup(f"[bold cyan]you>[/bold cyan] {escape(text)}")))
+        scroll.scroll_end()
         self._start_stream(text)
 
     @work(exclusive=True, group="stream")
@@ -291,16 +331,24 @@ class ChatApp(App[None]):
         """
         Stream a response from the agent in a background worker.
 
-        Accumulates text deltas and writes the full response
-        to the chat log when complete. Shows section headers
-        for reasoning blocks and tool calls as they arrive.
+        Mounts a live ``AssistantMessage`` widget and updates it
+        token-by-token as text deltas arrive. When the message
+        completes, the widget stays as the final rendered message.
 
         :param user_input: The user's message text.
         """
         self._streaming = True
         self._current_response_id = None
-        log = self.query_one("#chat-log", RichLog)
+        scroll = self.query_one("#chat-scroll", VerticalScroll)
         acc = _StreamAccumulator()
+
+        # Mount the live assistant widget for streaming output.
+        live = AssistantMessage(
+            Text.from_markup("[bold green]assistant>[/bold green] [dim]…[/dim]")
+        )
+        self._live_widget = live
+        await scroll.mount(live)
+        scroll.scroll_end()
 
         body: dict[str, object] = {
             "model": AGENT_NAME,
@@ -311,52 +359,21 @@ class ChatApp(App[None]):
             body["previous_response_id"] = self._previous_response_id
 
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                async with client.stream(
-                    "POST",
-                    f"{BASE_URL}/v1/responses",
-                    json=body,
-                ) as resp:
-                    resp.raise_for_status()
-                    current_event: str | None = None
-                    buf = ""
-                    async for chunk in resp.aiter_bytes():
-                        buf += chunk.decode("utf-8", errors="replace")
-                        while "\n" in buf:
-                            line, buf = buf.split("\n", 1)
-                            line = line.rstrip("\r")
-                            if line.startswith("event: "):
-                                current_event = line[7:]
-                            elif (
-                                line.startswith("data: ")
-                                and current_event is not None
-                            ):
-                                data_str = line[6:]
-                                if data_str.strip() == "[DONE]":
-                                    current_event = None
-                                    continue
-                                data = json.loads(data_str)
-                                _handle_sse(
-                                    log, current_event, data, acc, self
-                                )
-                                current_event = None
-                            elif line == "":
-                                current_event = None
+            await _run_sse_stream(self, scroll, live, acc, body)
         except httpx.HTTPStatusError as exc:
-            log.write(
+            live.update(
                 Text.from_markup(
-                    f"[bold red]Error {exc.response.status_code}:[/bold red]"
-                    f" {escape(exc.response.text[:200])}"
+                    f"[bold red]Error {exc.response.status_code}:"
+                    f"[/bold red] {escape(exc.response.text[:200])}"
                 )
             )
         except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
-            log.write(
-                Text.from_markup(
-                    f"[bold red]Connection error:[/bold red] {escape(str(exc))}"
-                )
+            live.update(
+                Text.from_markup(f"[bold red]Connection error:[/bold red] {escape(str(exc))}")
             )
         finally:
             self._streaming = False
+            self._live_widget = None
             if self._current_response_id is not None:
                 self._previous_response_id = self._current_response_id
 
@@ -382,12 +399,13 @@ class ChatApp(App[None]):
             )
             resp.raise_for_status()
         except httpx.HTTPStatusError:
-            log = self.query_one("#chat-log", RichLog)
-            log.write(Text.from_markup("[dim red]steering failed[/dim red]"))
+            scroll = self.query_one("#chat-scroll", VerticalScroll)
+            scroll.mount(SystemInfo(Text.from_markup("[dim red]steering failed[/dim red]")))
 
     def action_clear_log(self) -> None:
         """Clear the chat log (Ctrl+L)."""
-        self.query_one("#chat-log", RichLog).clear()
+        scroll = self.query_one("#chat-scroll", VerticalScroll)
+        scroll.remove_children()
 
     def on_unmount(self) -> None:
         """Shut down the server on exit."""
@@ -398,52 +416,109 @@ class ChatApp(App[None]):
             self._server_proc.kill()
 
 
-# ── SSE event dispatch ────────────────────────────────
+# ── SSE streaming ─────────────────────────────────────
+
+
+async def _run_sse_stream(
+    app: ChatApp,
+    scroll: VerticalScroll,
+    live: AssistantMessage,
+    acc: _StreamAccumulator,
+    body: dict[str, object],
+) -> None:
+    """
+    Open an SSE connection and dispatch events.
+
+    Updates the live ``AssistantMessage`` widget on each text
+    delta for real-time streaming output.
+
+    :param app: The ChatApp instance.
+    :param scroll: The scrollable container.
+    :param live: The live assistant message widget.
+    :param acc: The stream accumulator.
+    :param body: The request body for ``/v1/responses``.
+    """
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        async with client.stream(
+            "POST",
+            f"{BASE_URL}/v1/responses",
+            json=body,
+        ) as resp:
+            resp.raise_for_status()
+            current_event: str | None = None
+            buf = ""
+            async for chunk in resp.aiter_bytes():
+                buf += chunk.decode("utf-8", errors="replace")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.rstrip("\r")
+                    if line.startswith("event: "):
+                        current_event = line[7:]
+                    elif line.startswith("data: ") and current_event is not None:
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            current_event = None
+                            continue
+                        data = json.loads(data_str)
+                        _handle_sse(app, scroll, live, current_event, data, acc)
+                        current_event = None
+                    elif line == "":
+                        current_event = None
 
 
 def _handle_sse(
-    log: RichLog,
+    app: ChatApp,
+    scroll: VerticalScroll,
+    live: AssistantMessage,
     event_type: str,
     data: dict[str, object],
     acc: _StreamAccumulator,
-    app: ChatApp,
 ) -> None:
     """
-    Dispatch a single SSE event to the chat log.
+    Dispatch a single SSE event.
 
-    Accumulates text in ``acc`` and writes completed sections
-    to the RichLog. Reasoning and summary blocks are written
-    when a new section begins or the message ends. Text
-    deltas are accumulated and written as a single block
-    when the output item completes.
+    Text deltas update the live widget in-place for real-time
+    streaming. Reasoning, tool calls, and completion events
+    mount new widgets or finalize the live widget.
 
-    :param log: The RichLog widget to write to.
-    :param event_type: SSE event name, e.g.
-        ``"response.output_text.delta"``.
+    :param app: The ChatApp instance.
+    :param scroll: The scrollable container.
+    :param live: The live assistant message widget.
+    :param event_type: SSE event name.
     :param data: Parsed JSON payload.
-    :param acc: Accumulator for the current turn.
-    :param app: The ChatApp instance for state updates.
+    :param acc: The stream accumulator.
     """
     if event_type == "response.created":
-        _handle_response_created(data, app)
+        _extract_response_id(data, app)
 
     elif event_type == "response.reasoning.started":
         if not acc.in_reasoning:
-            log.write(Text.from_markup("[dim cyan]thinking…[/dim cyan]"))
+            live.update(
+                Text.from_markup(
+                    "[bold green]assistant>[/bold green] [dim cyan]thinking…[/dim cyan]"
+                )
+            )
             acc.in_reasoning = True
 
     elif event_type == "response.reasoning_text.delta":
         delta = data.get("delta")
         if isinstance(delta, str):
-            if not acc.in_reasoning:
-                acc.in_reasoning = True
+            acc.in_reasoning = True
             acc.reasoning += delta
+            # Show reasoning progress in the live widget
+            live.update(
+                Text.from_markup(
+                    "[bold green]assistant>[/bold green]"
+                    " [dim cyan]thinking…[/dim cyan]\n"
+                    f"[dim cyan]{escape(acc.reasoning[-200:])}[/dim cyan]"
+                )
+            )
+            scroll.scroll_end()
 
     elif event_type == "response.reasoning_summary_text.delta":
         delta = data.get("delta")
         if isinstance(delta, str):
-            if not acc.in_summary:
-                acc.in_summary = True
+            acc.in_summary = True
             acc.summary += delta
 
     elif event_type == "response.output_text.delta":
@@ -451,15 +526,20 @@ def _handle_sse(
         if isinstance(delta, str):
             acc.had_text = True
             acc.text += delta
+            # Update the live widget with accumulated text
+            live.update(
+                Text.from_markup(f"[bold green]assistant>[/bold green] {escape(acc.text)}")
+            )
+            scroll.scroll_end()
 
     elif event_type == "response.output_item.done":
-        _handle_output_item_done(log, data, acc)
+        _handle_item_done(app, scroll, live, data, acc)
 
     elif event_type == "response.completed":
-        _handle_response_created(data, app)
+        _extract_response_id(data, app)
 
 
-def _handle_response_created(
+def _extract_response_id(
     data: dict[str, object],
     app: ChatApp,
 ) -> None:
@@ -476,19 +556,24 @@ def _handle_response_created(
             app._current_response_id = rid
 
 
-def _handle_output_item_done(
-    log: RichLog,
+def _handle_item_done(
+    app: ChatApp,
+    scroll: VerticalScroll,
+    live: AssistantMessage,
     data: dict[str, object],
     acc: _StreamAccumulator,
 ) -> None:
     """
-    Handle a completed output item (message, tool call, tool result).
+    Handle a completed output item.
 
-    Writes accumulated content to the log and resets the
-    accumulator for the next item.
+    For messages: finalize the live widget with the full
+    content including any reasoning sections. For tool calls
+    and results: mount new SystemInfo widgets.
 
-    :param log: The RichLog widget.
-    :param data: The ``response.output_item.done`` payload.
+    :param app: The ChatApp instance.
+    :param scroll: The scrollable container.
+    :param live: The live assistant message widget.
+    :param data: The output_item.done payload.
     :param acc: The stream accumulator.
     """
     item = data.get("item")
@@ -496,87 +581,65 @@ def _handle_output_item_done(
         return
 
     item_type = item.get("type")
-
     if item_type == "message":
-        _write_message(log, item, acc)
+        _finalize_message(scroll, live, item, acc)
     elif item_type == "function_call":
-        _write_tool_call(log, item)
+        _mount_tool_call(scroll, item)
     elif item_type == "function_call_output":
-        _write_tool_result(log, item)
+        _mount_tool_result(scroll, item)
 
 
-def _write_message(
-    log: RichLog,
+def _finalize_message(
+    scroll: VerticalScroll,
+    live: AssistantMessage,
     item: dict[str, object],
     acc: _StreamAccumulator,
 ) -> None:
     """
-    Write a completed assistant message to the log.
+    Finalize the live assistant widget with completed content.
 
-    Includes reasoning/summary sections if present, followed
-    by the main text content.
+    Builds a Rich Text with optional reasoning/summary sections
+    above the main text, then calls ``live.update()`` to set
+    the final content.
 
-    :param log: The RichLog widget.
+    :param scroll: The scrollable container.
+    :param live: The live assistant message widget.
     :param item: The message output item dict.
-    :param acc: The stream accumulator with collected text.
+    :param acc: The stream accumulator.
     """
-    # Write reasoning block if we collected any
+    parts: list[str] = []
+
     if acc.reasoning:
-        log.write(
-            Text.from_markup(
-                "[cyan]── reasoning ──────────────────[/cyan]"
-            )
-        )
-        log.write(Text(acc.reasoning, style="dim cyan"))
+        parts.append("[cyan]── reasoning ──────────────────[/cyan]")
+        parts.append(f"[dim cyan]{escape(acc.reasoning)}[/dim cyan]")
 
-    # Write summary block if we collected any
     if acc.summary:
-        log.write(
-            Text.from_markup(
-                "[yellow]── reasoning summary ──────────[/yellow]"
-            )
-        )
-        log.write(Text(acc.summary, style="dim italic yellow"))
+        parts.append("[yellow]── reasoning summary ──────────[/yellow]")
+        parts.append(f"[dim italic yellow]{escape(acc.summary)}[/dim italic yellow]")
 
-    # Section divider if reasoning was shown
     if acc.reasoning or acc.summary:
-        log.write(
-            Text.from_markup(
-                "[dim]── answer ─────────────────────[/dim]"
-            )
-        )
+        parts.append("[dim]── answer ─────────────────────[/dim]")
 
-    # Write the assistant's text
-    if acc.had_text and acc.text:
-        log.write(
-            Text.from_markup(
-                f"[bold green]assistant>[/bold green] {escape(acc.text)}"
-            )
-        )
-    elif not acc.had_text:
-        # Fallback: no deltas received, use full content
+    # Get the final text content
+    final_text = acc.text
+    if not acc.had_text:
+        # Fallback: extract from the full content
         content = item.get("content", [])
         if isinstance(content, list):
-            parts: list[str] = []
+            text_parts: list[str] = []
             for block in content:
-                if (
-                    isinstance(block, dict)
-                    and block.get("type") == "output_text"
-                ):
-                    text = block.get("text")
-                    if isinstance(text, str):
-                        parts.append(text)
-            if parts:
-                log.write(
-                    Text.from_markup(
-                        f"[bold green]assistant>[/bold green]"
-                        f" {escape(''.join(parts))}"
-                    )
-                )
+                if isinstance(block, dict) and block.get("type") == "output_text":
+                    t = block.get("text")
+                    if isinstance(t, str):
+                        text_parts.append(t)
+            final_text = "".join(text_parts)
 
-    log.write("")  # Blank line after message
+    parts.append(f"[bold green]assistant>[/bold green] {escape(final_text)}")
 
-    # Reset for next message in same turn (multi-output)
+    live.update(Text.from_markup("\n".join(parts)))
+    scroll.scroll_end()
+
+    # Reset for next message in multi-output turns
     acc.text = ""
     acc.reasoning = ""
     acc.summary = ""
@@ -585,52 +648,57 @@ def _write_message(
     acc.had_text = False
 
 
-def _write_tool_call(log: RichLog, item: dict[str, object]) -> None:
+def _mount_tool_call(
+    scroll: VerticalScroll,
+    item: dict[str, object],
+) -> None:
     """
-    Write a tool call to the log.
+    Mount a tool call widget in the chat scroll.
 
-    :param log: The RichLog widget.
+    :param scroll: The scrollable container.
     :param item: The function_call output item dict.
     """
     name = item.get("name", "?")
     args = item.get("arguments", "")
-    log.write(
-        Text.from_markup(
-            f"[bold green]── tool call ──────────────────[/bold green]"
+    scroll.mount(
+        SystemInfo(
+            Text.from_markup(
+                f"[bold green]── tool call"
+                f" ──────────────────[/bold green]\n"
+                f"  [green]{escape(str(name))}"
+                f"({escape(str(args)[:200])})[/green]"
+            )
         )
     )
-    log.write(
-        Text.from_markup(
-            f"  [green]{escape(str(name))}"
-            f"({escape(str(args)[:200])})[/green]"
-        )
-    )
+    scroll.scroll_end()
 
 
-def _write_tool_result(log: RichLog, item: dict[str, object]) -> None:
+def _mount_tool_result(
+    scroll: VerticalScroll,
+    item: dict[str, object],
+) -> None:
     """
-    Write a tool result to the log.
+    Mount a tool result widget in the chat scroll.
 
-    :param log: The RichLog widget.
+    :param scroll: The scrollable container.
     :param item: The function_call_output item dict.
     """
     output = str(item.get("output", ""))
     display = output[:300]
     if len(output) > 300:
         display += "…"
-    log.write(
-        Text.from_markup(
-            f"[dim green]── tool result ────────────────[/dim green]"
+    scroll.mount(
+        SystemInfo(
+            Text.from_markup(
+                f"[dim green]── tool result"
+                f" ────────────────[/dim green]\n"
+                f"  [dim green]{escape(display)}[/dim green]\n"
+                f"[dim green]─────────────────────────"
+                f"──────[/dim green]"
+            )
         )
     )
-    log.write(
-        Text.from_markup(f"  [dim green]{escape(display)}[/dim green]")
-    )
-    log.write(
-        Text.from_markup(
-            f"[dim green]───────────────────────────────[/dim green]"
-        )
-    )
+    scroll.scroll_end()
 
 
 # ── Entry point ───────────────────────────────────────
