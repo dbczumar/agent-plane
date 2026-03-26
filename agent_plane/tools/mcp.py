@@ -1,0 +1,629 @@
+"""MCP server connections with tool discovery and caching.
+
+Manages connections to MCP servers (stdio and HTTP transports),
+discovers tools via the MCP ``tools/list`` protocol, and caches
+discovery results with a configurable TTL to avoid repeated
+round-trips on every workflow execution.
+
+Each ``McpServerConnection`` wraps a single MCP server. The
+``ToolManager`` creates one per ``MCPServerConfig`` in the agent
+spec, calls ``connect()`` at workflow start, and ``close()`` in
+the finally block.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import json
+import logging
+import time
+from collections.abc import Awaitable
+from contextlib import AsyncExitStack
+from dataclasses import dataclass, field
+from typing import Any, TypeVar
+
+from anyio.streams.memory import (
+    MemoryObjectReceiveStream,
+    MemoryObjectSendStream,
+)
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.sse import sse_client
+from mcp.client.stdio import stdio_client
+from mcp.shared.exceptions import McpError
+from mcp.shared.message import SessionMessage
+from mcp.types import CONNECTION_CLOSED, CallToolResult, ContentBlock
+from mcp.types import Tool as McpToolDef
+
+from agent_plane.spec.types import MCPServerConfig
+from agent_plane.tools.base import Tool
+
+_T = TypeVar("_T")
+
+# Type aliases for the (read, write) stream pair returned by MCP
+# transports. Uses anyio's concrete stream types parameterized
+# over the MCP session message type.
+_ReadStream = MemoryObjectReceiveStream[SessionMessage | Exception]
+_WriteStream = MemoryObjectSendStream[SessionMessage]
+
+_logger = logging.getLogger(__name__)
+
+def _run_async(coro: Awaitable[_T]) -> _T:
+    """
+    Run an async coroutine from synchronous code.
+
+    If no event loop is running on the current thread, creates
+    a new loop and runs the coroutine directly. If an event
+    loop IS running (e.g. inside ``pytest-asyncio`` or Jupyter),
+    spawns a background thread with its own loop to avoid the
+    ``"Cannot run the event loop while another loop is
+    running"`` error.
+
+    :param coro: An awaitable object, e.g.
+        ``session.call_tool("name", {})``.
+    :returns: The coroutine's return value, typed via
+        ``TypeVar`` so callers preserve the concrete type.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No event loop running — safe to create one directly.
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    # An event loop is already running on this thread.
+    # Run the coroutine in a separate thread with its own loop.
+    return _run_in_thread(coro)
+
+
+def _run_in_thread(coro: Awaitable[_T]) -> _T:
+    """
+    Run an async coroutine in a separate thread with its own
+    event loop.
+
+    Used by ``_run_async()`` when the calling thread already
+    has a running event loop.
+
+    :param coro: An awaitable object.
+    :returns: The coroutine's return value.
+    """
+
+    def _target() -> _T:
+        """
+        Thread target that creates a fresh event loop.
+
+        :returns: The coroutine's return value.
+        """
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=1
+    ) as pool:
+        future = pool.submit(_target)
+        return future.result()
+
+
+# Default discovery cache TTL in seconds (5 minutes).
+_DEFAULT_CACHE_TTL_SECONDS = 300
+
+
+@dataclass
+class _CachedDiscovery:
+    """
+    Cached result of an MCP ``tools/list`` call.
+
+    :param tools: The discovered MCP tool definitions.
+    :param fetched_at: Monotonic timestamp when the discovery
+        was performed, from ``time.monotonic()``.
+    """
+
+    tools: list[McpToolDef]
+    fetched_at: float
+
+
+# Module-level discovery cache keyed by a stable server identity
+# string. Survives across ToolManager instances so that sequential
+# workflow executions against the same agent don't re-discover
+# tools if the cache is still fresh.
+_discovery_cache: dict[str, _CachedDiscovery] = {}
+
+
+def _cache_key(config: MCPServerConfig) -> str:
+    """
+    Build a stable cache key for an MCP server config.
+
+    Uses the server name + transport-specific identity (command+args
+    for stdio, url for http) so that two configs pointing at the
+    same server share the cache entry.
+
+    :param config: The MCP server configuration.
+    :returns: A string suitable as a dict key.
+    """
+    if config.transport == "stdio":
+        return f"stdio:{config.name}:{config.command}:{config.args}"
+    # http transport — url is the identity
+    return f"http:{config.name}:{config.url}"
+
+
+def clear_discovery_cache() -> None:
+    """
+    Clear all cached MCP tool discovery results.
+
+    Useful in tests to ensure a clean state.
+    """
+    _discovery_cache.clear()
+
+
+@dataclass
+class McpServerConnection:
+    """
+    Manages the lifecycle of a single MCP server connection.
+
+    Handles both stdio and HTTP transports. On ``connect()``,
+    establishes the transport, initializes the MCP session, and
+    discovers tools (from cache if fresh, otherwise via
+    ``tools/list``). On ``close()``, tears down the session and
+    transport.
+
+    :param config: The MCP server configuration from the agent
+        spec, e.g. ``MCPServerConfig(name="github",
+        transport="stdio", command="npx", ...)``.
+    :param cache_ttl_seconds: How long discovery results are
+        considered fresh, in seconds. Defaults to 300 (5 minutes).
+    """
+
+    config: MCPServerConfig
+    cache_ttl_seconds: float = _DEFAULT_CACHE_TTL_SECONDS
+    _session: ClientSession | None = field(
+        default=None, init=False, repr=False
+    )
+    _exit_stack: AsyncExitStack | None = field(
+        default=None, init=False, repr=False
+    )
+    _discovered_tools: list[McpToolDef] = field(
+        default_factory=list, init=False, repr=False
+    )
+
+    async def connect(self) -> list[McpToolDef]:
+        """
+        Establish the MCP connection and discover tools.
+
+        Always opens a live transport and session so that
+        ``call_tool()`` works after ``connect()`` returns. If
+        the discovery cache is fresh, skips the ``tools/list``
+        round-trip and returns cached tool definitions. Otherwise
+        performs a live ``tools/list`` call and updates the cache.
+
+        :returns: List of MCP tool definitions exposed by this
+            server.
+        :raises ValueError: If the transport type is not
+            ``"stdio"`` or ``"http"``.
+        """
+        await self._open_session()
+        return await self._discover_or_use_cache()
+
+    async def call_tool(
+        self,
+        name: str,
+        # Values are Any because MCP tool arguments are JSON
+        # objects with heterogeneous value types (str, int,
+        # bool, nested dicts, etc.). Matches the MCP SDK's
+        # own ClientSession.call_tool() signature.
+        arguments: dict[str, Any],
+    ) -> str:
+        """
+        Invoke a tool on this MCP server.
+
+        If the call fails due to a dead connection (server
+        process crashed, transport dropped), attempts one
+        reconnect and retries. Permanent errors (invalid args,
+        tool not found) are not retried.
+
+        :param name: The tool name as returned by discovery.
+        :param arguments: The tool arguments dict (already parsed
+            from the LLM's JSON string).
+        :returns: The tool result as a string. For multi-content
+            results, text blocks are joined with newlines.
+        :raises RuntimeError: If ``connect()`` has not been called.
+        """
+        if self._session is None:
+            raise RuntimeError(
+                f"MCP server {self.config.name!r} has no live "
+                f"session — call connect() before call_tool()"
+            )
+        try:
+            return await self._invoke_tool(name, arguments)
+        except Exception as exc:
+            if not _is_connection_error(exc):
+                raise
+            _logger.warning(
+                "MCP server %r: connection lost during "
+                "tool call %r, reconnecting",
+                self.config.name,
+                name,
+            )
+            await self._reconnect()
+            return await self._invoke_tool(name, arguments)
+
+    async def _invoke_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],  # JSON values — see call_tool
+    ) -> str:
+        """
+        Send a single ``tools/call`` request to the MCP session.
+
+        :param name: The tool name.
+        :param arguments: The tool arguments dict.
+        :returns: The formatted tool result string.
+        """
+        assert self._session is not None
+        result = await self._session.call_tool(
+            name=name, arguments=arguments
+        )
+        return _format_call_result(result)
+
+    async def _reconnect(self) -> None:
+        """
+        Tear down the dead session and open a fresh one.
+
+        Called by ``call_tool()`` after detecting a connection
+        error. Does not re-discover tools — the tool list from
+        the original ``connect()`` is still valid.
+        """
+        await self.close()
+        await self._open_session()
+
+    async def _open_session(self) -> None:
+        """
+        Open transport and initialize the MCP session.
+
+        Always creates a live session regardless of cache state,
+        so that ``call_tool()`` works after ``connect()``.
+        """
+        self._exit_stack = AsyncExitStack()
+        await self._exit_stack.__aenter__()
+
+        read_stream, write_stream = (
+            await self._open_transport()
+        )
+        self._session = ClientSession(
+            read_stream, write_stream
+        )
+        # Enter the session's async context via the exit stack
+        # so it gets cleaned up on close().
+        await self._exit_stack.enter_async_context(
+            self._session
+        )
+        await self._session.initialize()
+
+    async def _discover_or_use_cache(
+        self,
+    ) -> list[McpToolDef]:
+        """
+        Return tool definitions from cache or live discovery.
+
+        If the cache is fresh, returns cached definitions without
+        calling ``tools/list``. Otherwise performs a live
+        ``tools/list`` call and updates the cache.
+
+        Must be called after ``_open_session()`` so that
+        ``self._session`` is live.
+
+        :returns: List of MCP tool definitions.
+        """
+        cached = self._check_cache()
+        if cached is not None:
+            self._discovered_tools = cached
+            _logger.debug(
+                "MCP server %r: using cached discovery "
+                "(%d tools)",
+                self.config.name,
+                len(cached),
+            )
+            return cached
+
+        # Guaranteed by _open_session() which runs before this.
+        assert self._session is not None
+        tools_result = await self._session.list_tools()
+        self._discovered_tools = tools_result.tools
+        self._update_cache(tools_result.tools)
+        _logger.info(
+            "MCP server %r: discovered %d tool(s)",
+            self.config.name,
+            len(tools_result.tools),
+        )
+        return tools_result.tools
+
+    async def close(self) -> None:
+        """
+        Tear down the MCP session and transport.
+
+        Safe to call multiple times or if ``connect()`` was never
+        called.
+        """
+        if self._exit_stack is not None:
+            await self._exit_stack.aclose()
+            self._exit_stack = None
+        self._session = None
+
+    @property
+    def discovered_tools(self) -> list[McpToolDef]:
+        """
+        Tools discovered on the last ``connect()`` call.
+
+        :returns: The list of MCP tool definitions. Empty if
+            ``connect()`` has not been called.
+        """
+        return self._discovered_tools
+
+    def _check_cache(self) -> list[McpToolDef] | None:
+        """
+        Return cached discovery if still fresh, else ``None``.
+
+        :returns: Cached tool list or ``None`` if expired or
+            absent.
+        """
+        key = _cache_key(self.config)
+        cached = _discovery_cache.get(key)
+        if cached is None:
+            return None
+        age = time.monotonic() - cached.fetched_at
+        if age > self.cache_ttl_seconds:
+            del _discovery_cache[key]
+            return None
+        return cached.tools
+
+    def _update_cache(
+        self, tools: list[McpToolDef]
+    ) -> None:
+        """
+        Store discovery results in the module-level cache.
+
+        :param tools: The freshly discovered tool definitions.
+        """
+        key = _cache_key(self.config)
+        _discovery_cache[key] = _CachedDiscovery(
+            tools=tools,
+            fetched_at=time.monotonic(),
+        )
+
+    async def _open_transport(
+        self,
+    ) -> tuple[_ReadStream, _WriteStream]:
+        """
+        Open the MCP transport and return (read, write) streams.
+
+        The transport's async context is registered on the exit
+        stack so it gets torn down on ``close()``.
+
+        :returns: A ``(read_stream, write_stream)`` tuple of
+            anyio memory object streams parameterized over
+            ``SessionMessage``.
+        :raises ValueError: If the transport type is unsupported.
+        """
+        if self.config.transport == "stdio":
+            return await self._open_stdio()
+        if self.config.transport == "http":
+            return await self._open_http()
+        raise ValueError(
+            f"Unsupported MCP transport: "
+            f"{self.config.transport!r}"
+        )
+
+    async def _open_stdio(
+        self,
+    ) -> tuple[_ReadStream, _WriteStream]:
+        """
+        Open a stdio MCP transport.
+
+        :returns: A ``(read_stream, write_stream)`` tuple from
+            the stdio client context manager.
+        """
+        assert self._exit_stack is not None
+        assert self.config.command is not None
+        params = StdioServerParameters(
+            command=self.config.command,
+            args=self.config.args,
+            env=self.config.env or None,
+        )
+        read_stream, write_stream = (
+            await self._exit_stack.enter_async_context(
+                stdio_client(params)
+            )
+        )
+        return read_stream, write_stream
+
+    async def _open_http(
+        self,
+    ) -> tuple[_ReadStream, _WriteStream]:
+        """
+        Open an HTTP (SSE) MCP transport.
+
+        :returns: A ``(read_stream, write_stream)`` tuple from
+            the SSE client context manager.
+        """
+        assert self._exit_stack is not None
+        assert self.config.url is not None
+        read_stream, write_stream = (
+            await self._exit_stack.enter_async_context(
+                sse_client(
+                    url=self.config.url,
+                    headers=self.config.headers or None,
+                )
+            )
+        )
+        return read_stream, write_stream
+
+
+class McpTool(Tool):
+    """
+    Proxy tool that delegates invocation to an MCP server session.
+
+    Created by ``ToolManager`` during MCP discovery — one
+    ``McpTool`` per tool exposed by each MCP server. The tool's
+    schema is derived from the MCP ``Tool`` definition returned
+    by ``tools/list``.
+
+    :param tool_def: The MCP tool definition from discovery.
+    :param connection: The ``McpServerConnection`` that owns
+        the session for invoking this tool.
+    """
+
+    def __init__(
+        self,
+        tool_def: McpToolDef,
+        connection: McpServerConnection,
+    ) -> None:
+        """
+        Initialize the MCP tool proxy.
+
+        :param tool_def: The MCP tool definition from discovery,
+            containing name, description, and input schema.
+        :param connection: The ``McpServerConnection`` to use
+            for invocation.
+        """
+        self._tool_def = tool_def
+        self._connection = connection
+
+    @property
+    def name(self) -> str:
+        """
+        Unique tool name from the MCP server.
+
+        :returns: The tool name, e.g. ``"github_list_issues"``.
+        """
+        return self._tool_def.name
+
+    # Returns dict[str, Any] — defined by the Tool ABC. OpenAI
+    # tool schemas are inherently heterogeneous (nested dicts,
+    # strings, lists) so Any is the narrowest safe value type.
+    def get_schema(self) -> dict[str, Any]:
+        """
+        Return OpenAI Chat Completions tool schema.
+
+        Converts the MCP tool definition's ``inputSchema`` to
+        the OpenAI format expected by litellm.
+
+        :returns: An OpenAI-format tool schema dict.
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": self._tool_def.name,
+                # OpenAI tool schema requires description to be
+                # a string, not None.
+                "description": (
+                    self._tool_def.description or ""
+                ),
+                "parameters": (
+                    self._tool_def.inputSchema
+                ),
+            },
+        }
+
+    def invoke(self, arguments: str) -> str:
+        """
+        Invoke the MCP tool via the server session.
+
+        Parses the JSON arguments string and delegates to the
+        ``McpServerConnection.call_tool()`` async method via
+        ``_run_async()``, which creates an isolated event loop.
+
+        :param arguments: JSON-encoded arguments string from
+            the LLM.
+        :returns: The tool result as a string.
+        """
+        parsed = json.loads(arguments) if arguments else {}
+        return _run_async(
+            self._connection.call_tool(
+                self.name, parsed
+            )
+        )
+
+
+# Exception types that indicate a dead/broken connection
+# rather than a legitimate tool error. These are worth
+# retrying after a reconnect.
+_CONNECTION_ERROR_TYPES = (
+    EOFError,
+    BrokenPipeError,
+    ConnectionError,
+    OSError,
+)
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    """
+    Determine if an exception indicates a dead MCP connection.
+
+    Returns ``True`` for transport-level failures (broken pipe,
+    EOF, connection reset) and MCP-level connection-closed
+    errors. Returns ``False`` for tool-level errors (invalid
+    args, tool not found) which should not trigger a reconnect.
+
+    :param exc: The exception to classify.
+    :returns: ``True`` if the error is connection-related.
+    """
+    if isinstance(exc, _CONNECTION_ERROR_TYPES):
+        return True
+    if isinstance(exc, McpError):
+        return exc.error.code == CONNECTION_CLOSED
+    return False
+
+
+def _format_call_result(result: CallToolResult) -> str:
+    """
+    Convert an MCP ``CallToolResult`` to a plain string.
+
+    Extracts text content blocks and joins them. If the result
+    indicates an error, prefixes the output with ``"Error: "``.
+
+    :param result: The ``CallToolResult`` from
+        ``session.call_tool()``.
+    :returns: A string representation of the tool result.
+        Returns ``"(empty response)"`` when the server sends no
+        content blocks.
+    """
+    parts: list[str] = []
+    for block in result.content:
+        parts.append(_format_content_block(block))
+    joined = "\n".join(parts)
+    if not joined:
+        joined = "(empty response)"
+    if result.isError:
+        return f"Error: {joined}"
+    return joined
+
+
+def _format_content_block(block: ContentBlock) -> str:
+    """
+    Convert a single MCP content block to a string.
+
+    Prefers the ``.text`` attribute (present on ``TextContent``).
+    Falls back to Pydantic ``model_dump()`` for structured types
+    (``ImageContent``, ``AudioContent``, ``EmbeddedResource``,
+    ``ResourceLink``). Uses ``str()`` as a last resort if a future
+    SDK version adds a non-Pydantic content type.
+
+    :param block: A content block from ``CallToolResult.content``,
+        e.g. ``TextContent(type="text", text="hello")``.
+    :returns: A string representation of the block.
+    """
+    # TextContent has a .text attribute — the most common case.
+    text = getattr(block, "text", None)
+    if text is not None:
+        return str(text)
+    # All current MCP SDK content types are Pydantic BaseModels.
+    model_dump = getattr(block, "model_dump", None)
+    if model_dump is not None:
+        return json.dumps(model_dump())
+    # Defensive fallback for unknown future content types.
+    return str(block)

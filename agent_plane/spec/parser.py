@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -9,11 +10,13 @@ import yaml
 
 from agent_plane.spec.types import (
     AgentSpec,
+    ExecutionConfig,
     InteractionConfig,
     LLMConfig,
     LocalToolInfo,
     MCPServerConfig,
     ModalityConfig,
+    RetryConfig,
     SkillSpec,
     ToolsConfig,
 )
@@ -49,6 +52,7 @@ def parse(root: Path) -> AgentSpec:
     llm = _parse_llm(raw.get("llm"))
     interaction = _parse_interaction(raw.get("interaction"))
     tools_config = _parse_tools_config(raw.get("tools"))
+    execution = _parse_execution(raw.get("execution"))
     params = raw.get("params", {})
 
     instructions = _resolve_instructions(root, raw.get("instructions"))
@@ -64,6 +68,7 @@ def parse(root: Path) -> AgentSpec:
         llm=llm,
         interaction=interaction,
         tools=tools_config,
+        execution=execution,
         params=params,
         instructions=instructions,
         skills=skills,
@@ -91,9 +96,25 @@ def _parse_llm(raw: dict[str, object] | None) -> LLMConfig | None:
     model = raw.get("model")
     if model is None:
         raise ValueError("llm block present but missing required field: model")
-    # Everything except ``model`` is passed through to the OpenAI SDK as-is.
-    extra = {k: v for k, v in raw.items() if k != "model"}
-    return LLMConfig(model=str(model), extra=extra)
+    # ``connection``, ``timeout``, and ``retry`` are separated into
+    # their own typed fields; everything else is passed through to
+    # the LLM SDK as extra kwargs.
+    connection_raw = raw.get("connection")
+    connection: dict[str, str] | None = None
+    if isinstance(connection_raw, dict):
+        # Expand ${VAR} references so api_key: ${OPENAI_API_KEY} works.
+        connection = _expand_env_vars({str(k): str(v) for k, v in connection_raw.items()})
+    timeout = int(raw["timeout"]) if "timeout" in raw else 300
+    retry = _parse_retry(raw.get("retry"))
+    reserved = {"model", "connection", "timeout", "retry"}
+    extra = {k: v for k, v in raw.items() if k not in reserved}
+    return LLMConfig(
+        model=str(model),
+        extra=extra,
+        connection=connection,
+        timeout=timeout,
+        retry=retry,
+    )
 
 
 def _parse_interaction(
@@ -136,14 +157,61 @@ def _parse_tools_config(
 
     :param raw: The raw ``tools:`` mapping from config.yaml, or
         ``None`` if the block was absent. Example:
-        ``{"agents": ["summarizer", "code-reviewer"]}``.
+        ``{"agents": ["summarizer", "code-reviewer"],
+        "timeout": 60}``.
     :returns: A populated :class:`ToolsConfig`. Returns defaults
         when *raw* is ``None``.
     """
     if raw is None:
         return ToolsConfig()
+    timeout = int(raw["timeout"]) if "timeout" in raw else 60
+    retry = _parse_retry(raw.get("retry"))
     return ToolsConfig(
         agents=raw.get("agents", []),  # type: ignore[arg-type]
+        timeout=timeout,
+        retry=retry,
+    )
+
+
+def _parse_retry(
+    raw: dict[str, object] | None,
+) -> RetryConfig:
+    """
+    Parse a ``retry:`` block into a :class:`RetryConfig`.
+
+    Returns defaults when *raw* is ``None`` or empty.
+
+    :param raw: The raw ``retry:`` mapping, or ``None`` if absent.
+        Example: ``{"max_attempts": 5, "status_codes": [429, 502]}``.
+    :returns: A populated :class:`RetryConfig`.
+    """
+    if not raw:
+        return RetryConfig()
+    return RetryConfig(
+        max_attempts=int(raw.get("max_attempts", 3)),
+        backoff_base=float(raw.get("backoff_base", 2.0)),
+        backoff_max=float(raw.get("backoff_max", 30.0)),
+        status_codes=[int(c) for c in raw.get("status_codes", [429, 500, 502, 503])],
+    )
+
+
+def _parse_execution(
+    raw: dict[str, object] | None,
+) -> ExecutionConfig:
+    """
+    Parse the ``execution:`` block into an :class:`ExecutionConfig`.
+
+    Returns defaults when *raw* is ``None``.
+
+    :param raw: The raw ``execution:`` mapping, or ``None`` if
+        absent. Example: ``{"timeout": 3600, "max_iterations": 500}``.
+    :returns: A populated :class:`ExecutionConfig`.
+    """
+    if raw is None:
+        return ExecutionConfig()
+    return ExecutionConfig(
+        timeout=int(raw.get("timeout", 3600)),
+        max_iterations=int(raw.get("max_iterations", 1000)),
     )
 
 
@@ -169,9 +237,16 @@ def _resolve_instructions(root: Path, raw_value: object) -> str | None:
     """
     if raw_value is not None:
         text = str(raw_value)
-        candidate = root / text
-        if candidate.is_file():
-            return candidate.read_text()
+        # Only attempt file lookup for short single-line values
+        # that look like filenames (multiline text can't be a path).
+        if "\n" not in text:
+            candidate = root / text
+            try:
+                if candidate.is_file():
+                    return candidate.read_text()
+            except OSError:
+                # Path too long or invalid characters — treat as inline text.
+                pass
         return text
     # Default: read AGENTS.md if present
     agents_md = root / "AGENTS.md"
@@ -237,8 +312,26 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
         name=str(name),
         description=str(description),
         content=content.strip(),
-        allowed_tools=frontmatter.get("allowed_tools", []),
+        skill_dir=skill_md.parent,
     )
+
+
+def _expand_env_vars(
+    mapping: dict[str, str],
+) -> dict[str, str]:
+    """
+    Expand ``${VAR}`` and ``$VAR`` references in dict values
+    against the current process environment.
+
+    Uses :func:`os.path.expandvars`, which leaves unresolved
+    references as-is (e.g. ``${MISSING}`` stays literal if
+    the variable is not set).
+
+    :param mapping: A string-to-string dict, e.g.
+        ``{"TOKEN": "${GITHUB_TOKEN}"}``.
+    :returns: A new dict with expanded values.
+    """
+    return {key: os.path.expandvars(value) for key, value in mapping.items()}
 
 
 def _discover_mcp_servers(
@@ -279,9 +372,11 @@ def _discover_mcp_servers(
                 description=raw.get("description"),
                 command=raw.get("command"),
                 args=raw.get("args", []),
-                env=raw.get("env", {}),
+                env=_expand_env_vars(raw.get("env", {})),
                 url=raw.get("url"),
-                headers=raw.get("headers", {}),
+                headers=_expand_env_vars(raw.get("headers", {})),
+                timeout=int(raw["timeout"]) if "timeout" in raw else None,
+                retry=_parse_retry(raw["retry"]) if "retry" in raw else None,
             )
         )
     return servers

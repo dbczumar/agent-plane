@@ -123,13 +123,68 @@ def test_parse_llm_arbitrary_extra_keys(tmp_path: Path) -> None:
 
 
 def test_parse_llm_model_only(tmp_path: Path) -> None:
-    """LLM block with only model has empty extra."""
+    """LLM block with only model has empty extra and no connection."""
     config = {"spec_version": 1, "llm": {"model": "openai/gpt-4o"}}
     (tmp_path / "config.yaml").write_text(yaml.dump(config))
     spec = parse(tmp_path)
     assert spec.llm is not None
     assert spec.llm.model == "openai/gpt-4o"
     assert spec.llm.extra == {}
+    assert spec.llm.connection is None
+
+
+def test_parse_llm_connection_block(tmp_path: Path) -> None:
+    """The connection sub-block is parsed into LLMConfig.connection."""
+    config = {
+        "spec_version": 1,
+        "llm": {
+            "model": "databricks/databricks-gpt-5-4",
+            "temperature": 0.5,
+            "connection": {
+                "api_key": "dapi_test_key",
+                "base_url": "https://my-workspace.databricks.com/serving-endpoints",
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.llm is not None
+    assert spec.llm.model == "databricks/databricks-gpt-5-4"
+    assert spec.llm.extra == {"temperature": 0.5}
+    assert spec.llm.connection == {
+        "api_key": "dapi_test_key",
+        "base_url": "https://my-workspace.databricks.com/serving-endpoints",
+    }
+
+
+def test_parse_llm_connection_expands_env_vars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``${VAR}`` references in connection values are expanded."""
+    monkeypatch.setenv("MY_API_KEY", "sk-secret-123")
+    config = {
+        "spec_version": 1,
+        "llm": {
+            "model": "openai/gpt-5.4",
+            "connection": {"api_key": "${MY_API_KEY}"},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.llm is not None
+    assert spec.llm.connection == {"api_key": "sk-secret-123"}
+
+
+def test_parse_instructions_multiline_inline(tmp_path: Path) -> None:
+    """Multiline inline instructions are not treated as file paths."""
+    config = {
+        "spec_version": 1,
+        "instructions": "Line one.\nLine two.\nLine three.",
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.instructions == "Line one.\nLine two.\nLine three."
 
 
 def test_parse_agents_md_fallback(agent_dir: Path) -> None:
@@ -182,8 +237,6 @@ def test_parse_skill(agent_dir: Path) -> None:
         "---\n"
         "name: deep-search\n"
         "description: Search the web for sources.\n"
-        "allowed_tools:\n"
-        "  - search.web\n"
         "---\n"
         "When asked to research, use search.web."
     )
@@ -192,18 +245,8 @@ def test_parse_skill(agent_dir: Path) -> None:
     skill = spec.skills[0]
     assert skill.name == "deep-search"
     assert skill.description == "Search the web for sources."
-    assert skill.allowed_tools == ["search.web"]
     assert skill.content == "When asked to research, use search.web."
-
-
-def test_parse_skill_no_allowed_tools(agent_dir: Path) -> None:
-    skill_dir = agent_dir / "skills" / "simple"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
-        "---\nname: simple\ndescription: A simple skill.\n---\nJust do it."
-    )
-    spec = parse(agent_dir)
-    assert spec.skills[0].allowed_tools == []
+    assert skill.skill_dir == skill_dir
 
 
 def test_parse_skill_missing_frontmatter(agent_dir: Path) -> None:
@@ -230,7 +273,12 @@ def test_parse_skill_missing_description(agent_dir: Path) -> None:
         parse(agent_dir)
 
 
-def test_parse_mcp_stdio(agent_dir: Path) -> None:
+def test_parse_mcp_stdio(
+    agent_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Ensure the env var is NOT set so ${VAR} stays literal.
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     mcp_dir = agent_dir / "tools" / "mcp"
     mcp_dir.mkdir(parents=True)
     mcp_config = {
@@ -249,10 +297,16 @@ def test_parse_mcp_stdio(agent_dir: Path) -> None:
     assert mcp.transport == "stdio"
     assert mcp.command == "npx"
     assert mcp.args == ["-y", "@modelcontextprotocol/server-github"]
+    # Unset vars are left as literal ${VAR} by os.path.expandvars.
     assert mcp.env == {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}
 
 
-def test_parse_mcp_http(agent_dir: Path) -> None:
+def test_parse_mcp_http(
+    agent_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Ensure the env var is NOT set so ${VAR} stays literal.
+    monkeypatch.delenv("API_KEY", raising=False)
     mcp_dir = agent_dir / "tools" / "mcp"
     mcp_dir.mkdir(parents=True)
     mcp_config = {
@@ -266,6 +320,7 @@ def test_parse_mcp_http(agent_dir: Path) -> None:
     mcp = spec.mcp_servers[0]
     assert mcp.transport == "http"
     assert mcp.url == "http://localhost:9000/mcp"
+    # Unset vars are left as literal ${VAR} by os.path.expandvars.
     assert mcp.headers == {"Authorization": "Bearer ${API_KEY}"}
 
 
@@ -373,3 +428,81 @@ def test_parse_multiple_skills_sorted(agent_dir: Path) -> None:
         )
     spec = parse(agent_dir)
     assert [s.name for s in spec.skills] == ["alpha-skill", "beta-skill"]
+
+
+# ── Env var expansion in MCP configs ───────────────────
+
+
+def test_mcp_env_vars_expanded_from_environment(
+    agent_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``${VAR}`` references in MCP env and headers are expanded
+    against the process environment at parse time.
+    """
+    monkeypatch.setenv("MY_TOKEN", "secret-123")
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "token-server",
+        "transport": "stdio",
+        "command": "echo",
+        "env": {"TOKEN": "${MY_TOKEN}"},
+    }
+    (mcp_dir / "token.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    assert spec.mcp_servers[0].env == {"TOKEN": "secret-123"}
+
+
+def test_mcp_headers_expanded_from_environment(
+    agent_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``${VAR}`` references in HTTP headers are expanded at parse
+    time.
+    """
+    monkeypatch.setenv("MY_API_KEY", "key-abc")
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "auth-service",
+        "transport": "http",
+        "url": "http://localhost:9000/mcp",
+        "headers": {"Authorization": "Bearer ${MY_API_KEY}"},
+    }
+    (mcp_dir / "auth.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    assert spec.mcp_servers[0].headers == {
+        "Authorization": "Bearer key-abc",
+    }
+
+
+def test_mcp_env_expansion_mixed_set_and_unset(
+    agent_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Set vars are expanded; unset vars stay as literal ``${VAR}``.
+    """
+    monkeypatch.setenv("SET_VAR", "expanded")
+    monkeypatch.delenv("UNSET_VAR", raising=False)
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "mixed",
+        "transport": "stdio",
+        "command": "echo",
+        "env": {
+            "A": "${SET_VAR}",
+            "B": "${UNSET_VAR}",
+            "C": "plain-value",
+        },
+    }
+    (mcp_dir / "mixed.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    env = spec.mcp_servers[0].env
+    assert env["A"] == "expanded"
+    assert env["B"] == "${UNSET_VAR}"
+    assert env["C"] == "plain-value"

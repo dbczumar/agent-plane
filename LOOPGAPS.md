@@ -4,7 +4,12 @@ Gaps discovered during agent loop implementation. Review before committing.
 
 ## Addressed During Implementation
 
-_(Gaps that were found and fixed inline)_
+### MCP tool support
+`ToolManager.start()` now connects to MCP servers (stdio and HTTP transports), discovers tools
+via `tools/list`, and registers them as `McpTool` proxy objects. Discovery results are cached
+at the module level with a configurable TTL (default 5 minutes) so sequential workflow executions
+don't re-discover tools unnecessarily. Connection failures are logged and skipped — other servers
+and built-in tools still work. `ToolManager.shutdown()` tears down all MCP sessions.
 
 ## Open Gaps
 
@@ -14,11 +19,6 @@ Current implementation uses `stream=False` — the client gets the complete resp
 (still via SSE lifecycle events, just no `response.output_text.delta` events).
 **Reason**: Need to verify `write_stream()` works inside a DBOS `@step` first. The design
 doc flags this as an open question.
-
-### MCP tool support
-`ToolManager.start()` does not connect to MCP servers. Only the `load_skill` built-in is
-implemented. Agents with `mcp_servers` in their spec will have tools listed but MCP calls
-will fail at runtime.
 
 ### Output item `_to_api_item` duplication
 `_item_to_output()` in `workflow.py` duplicates `_to_api_item()` in
