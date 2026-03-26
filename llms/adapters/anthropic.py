@@ -8,7 +8,6 @@ Messages API. Ported from MLflow AI Gateway's AnthropicAdapter.
 from __future__ import annotations
 
 import json
-import os
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -28,7 +27,8 @@ class AnthropicAdapter(BaseAdapter):
     """
     Adapter for the Anthropic Messages API.
 
-    Reads ``ANTHROPIC_API_KEY`` from the environment.
+    API key must be provided via ``connection_params["api_key"]``
+    at call time (from the ``connection:`` block in agent spec).
     """
 
     def chat_completions(
@@ -199,13 +199,13 @@ def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if tool.get("type") != "function":
             continue
         func = tool["function"]
-        converted.append(
-            {
-                "name": func["name"],
-                "description": func.get("description", ""),
-                "input_schema": func.get("parameters", {}),
-            }
-        )
+        entry: dict[str, Any] = {
+            "name": func["name"],
+            "input_schema": func.get("parameters", {}),
+        }
+        if desc := func.get("description"):
+            entry["description"] = desc
+        converted.append(entry)
     return converted
 
 
@@ -333,7 +333,7 @@ def _stream_to_chat_chunks(
             continue
 
         data = json.loads(line[len("data: ") :])
-        event_type = data.get("type", "")
+        event_type = data.get("type")
 
         if event_type == "message_start":
             msg = data.get("message", {})
@@ -447,14 +447,18 @@ def _build_headers(
     """
     Build Anthropic API headers.
 
-    :param api_key_override: Explicit API key to use instead of
-        the environment variable.
+    :param api_key_override: API key from ``connection_params``.
     :returns: Headers dict with API key and version.
+    :raises ValueError: If no API key is provided.
     """
-    api_key = api_key_override or os.environ["ANTHROPIC_API_KEY"]
+    if not api_key_override:
+        raise ValueError(
+            "Anthropic adapter requires 'api_key' in"
+            " connection_params (from llm.connection config)"
+        )
     return {
         "Content-Type": "application/json",
-        "x-api-key": api_key,
+        "x-api-key": api_key_override,
         "anthropic-version": _API_VERSION,
     }
 

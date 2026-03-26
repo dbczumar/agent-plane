@@ -103,14 +103,14 @@ def test_headers_without_api_key() -> None:
     assert headers["Content-Type"] == "application/json"
 
 
-def test_headers_with_api_key(monkeypatch: object) -> None:
-    # Use monkeypatch via pytest fixture type
-    monkeypatch.setenv("TEST_API_KEY", "sk-test-123")  # type: ignore[union-attr]
+def test_headers_with_api_key() -> None:
+    """
+    API key from connection_params is set in the Authorization header.
+    """
     adapter = OpenAICompatibleAdapter(
         base_url="https://localhost",
-        api_key_env="TEST_API_KEY",
     )
-    headers = adapter._build_headers()
+    headers = adapter._build_headers(api_key_override="sk-test-123")
     assert headers["Authorization"] == "Bearer sk-test-123"
 
 

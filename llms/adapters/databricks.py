@@ -32,12 +32,9 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
     """
 
     def __init__(self) -> None:
-        # No env var defaults — connection info comes from
-        # connection_params at call time.
-        super().__init__(
-            base_url="",
-            api_key_env=None,
-        )
+        # Placeholder base_url — always overridden by connection_params
+        # at call time. chat_completions() validates this.
+        super().__init__(base_url="https://placeholder.invalid")
 
     def chat_completions(
         self,

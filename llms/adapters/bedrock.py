@@ -201,12 +201,9 @@ def _messages_to_converse(
                 }
             )
         else:
-            converse_messages.append(
-                {
-                    "role": "user",
-                    "content": [{"text": msg.get("content") or ""}],
-                }
-            )
+            content = msg.get("content")
+            blocks = [{"text": content}] if content else []
+            converse_messages.append({"role": "user", "content": blocks})
 
     return converse_messages, system_prompts or None
 
@@ -225,15 +222,13 @@ def _convert_tools(
         if tool.get("type") != "function":
             continue
         func = tool["function"]
-        bedrock_tools.append(
-            {
-                "toolSpec": {
-                    "name": func["name"],
-                    "description": func.get("description", ""),
-                    "inputSchema": {"json": func.get("parameters", {})},
-                }
-            }
-        )
+        spec: dict[str, Any] = {
+            "name": func["name"],
+            "inputSchema": {"json": func.get("parameters", {})},
+        }
+        if desc := func.get("description"):
+            spec["description"] = desc
+        bedrock_tools.append({"toolSpec": spec})
     return bedrock_tools
 
 

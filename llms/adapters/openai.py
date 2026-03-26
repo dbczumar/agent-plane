@@ -8,7 +8,6 @@ provider that speaks the OpenAI Chat Completions API format.
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Iterator
 from typing import Any
 
@@ -40,31 +39,21 @@ class OpenAICompatibleAdapter(BaseAdapter):
     """
     Adapter for providers using the OpenAI Chat Completions format.
 
-    :param base_url: The provider's API base URL, e.g.
+    API keys and base URL overrides come from ``connection_params``
+    at call time (from the ``connection:`` block in agent spec).
+
+    :param base_url: The provider's default API base URL, e.g.
         ``"https://api.openai.com/v1"``.
-    :param api_key_env: Environment variable name for the API key,
-        e.g. ``"OPENAI_API_KEY"``. ``None`` if no auth needed.
     """
 
     def __init__(
         self,
         base_url: str,
-        api_key_env: str | None,
+        # Kept for backward compat with tests; no longer used at runtime.
+        api_key_env: str | None = None,
     ) -> None:
         # Normalize so f"{base_url}/chat/completions" never double-slashes
         self._base_url = base_url.rstrip("/")
-        self._api_key_env = api_key_env
-
-    def _get_api_key(self) -> str | None:
-        """
-        Read the API key from the environment.
-
-        :returns: The API key string, or ``None`` if no key is
-            configured.
-        """
-        if self._api_key_env is None:
-            return None
-        return os.environ.get(self._api_key_env)
 
     def _build_headers(
         self,
@@ -73,15 +62,14 @@ class OpenAICompatibleAdapter(BaseAdapter):
         """
         Build HTTP headers for the request.
 
-        :param api_key_override: Explicit API key to use instead of
-            the environment variable. ``None`` falls back to env.
+        :param api_key_override: API key from ``connection_params``.
+            ``None`` means no auth header is added.
         :returns: Headers dict with Authorization if an API key is
-            available.
+            provided.
         """
         headers: dict[str, str] = {"Content-Type": "application/json"}
-        api_key = api_key_override or self._get_api_key()
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+        if api_key_override:
+            headers["Authorization"] = f"Bearer {api_key_override}"
         return headers
 
     def _build_payload(
@@ -211,6 +199,42 @@ def _parse_sse_line(line: str) -> dict[str, Any] | None:
     return result
 
 
+def _to_responses_tools(
+    tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Convert Chat Completions tool schemas to Responses API format.
+
+    Chat Completions uses ``{"type": "function", "function": {"name":
+    ..., "description": ..., "parameters": ...}}``. The Responses API
+    expects ``{"type": "function", "name": ..., "description": ...,
+    "parameters": ...}`` (top-level, no nesting).
+
+    If a tool is already in Responses API format (has ``"name"`` at
+    the top level), it is passed through unchanged.
+
+    :param tools: Tool schemas in Chat Completions format.
+    :returns: Tool schemas in Responses API format.
+    """
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        if "function" in tool and "name" not in tool:
+            # Chat Completions format — flatten
+            fn = tool["function"]
+            entry: dict[str, Any] = {
+                "type": tool.get("type", "function"),
+                "name": fn["name"],
+                "parameters": fn.get("parameters", {}),
+            }
+            if desc := fn.get("description"):
+                entry["description"] = desc
+            converted.append(entry)
+        else:
+            # Already in Responses format or unknown — pass through
+            converted.append(tool)
+    return converted
+
+
 def _parse_responses_output(
     output_items: list[dict[str, Any]],
 ) -> list[MessageOutput | FunctionCallOutput]:
@@ -264,7 +288,10 @@ def _parse_responses_response(data: dict[str, Any]) -> Response:
         if usage_data
         else None
     )
-    return Response(output=output, model=data.get("model", ""), usage=usage)
+    model = data.get("model")
+    if model is None:
+        raise ValueError("Response missing required 'model' field")
+    return Response(output=output, model=model, usage=usage)
 
 
 def _parse_responses_event(
@@ -348,7 +375,10 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         if instructions:
             payload["instructions"] = instructions
         if tools:
-            payload["tools"] = tools
+            # Convert Chat Completions tool format to Responses
+            # API format: flatten {"type", "function": {...}} to
+            # {"type", "name", "description", "parameters", ...}
+            payload["tools"] = _to_responses_tools(tools)
         if reasoning:
             payload["reasoning"] = reasoning
         if stream:

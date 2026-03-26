@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -50,7 +49,8 @@ class GeminiAdapter(BaseAdapter):
     """
     Adapter for the Google Gemini API.
 
-    Reads ``GOOGLE_API_KEY`` from the environment.
+    API key must be provided via ``connection_params["api_key"]``
+    at call time (from the ``connection:`` block in agent spec).
     """
 
     def _get_base_url(self) -> str:
@@ -68,14 +68,18 @@ class GeminiAdapter(BaseAdapter):
         """
         Build HTTP headers. Overridden by VertexAdapter for OAuth.
 
-        :param api_key_override: Explicit API key to use instead of
-            the environment variable.
+        :param api_key_override: API key from ``connection_params``.
         :returns: Headers dict with API key.
+        :raises ValueError: If no API key is provided.
         """
-        api_key = api_key_override or os.environ["GOOGLE_API_KEY"]
+        if not api_key_override:
+            raise ValueError(
+                "Gemini adapter requires 'api_key' in"
+                " connection_params (from llm.connection config)"
+            )
         return {
             "Content-Type": "application/json",
-            "x-goog-api-key": api_key,
+            "x-goog-api-key": api_key_override,
         }
 
     def chat_completions(
@@ -211,12 +215,9 @@ def _chat_to_gemini(
                 }
             )
         else:
-            contents.append(
-                {
-                    "role": gemini_role,
-                    "parts": [{"text": m.get("content") or ""}],
-                }
-            )
+            content = m.get("content")
+            parts = [{"text": content}] if content else []
+            contents.append({"role": gemini_role, "parts": parts})
 
     payload["contents"] = contents
 
@@ -280,8 +281,9 @@ def _convert_tools(
         func = tool["function"]
         decl: dict[str, Any] = {
             "name": func["name"],
-            "description": func.get("description", ""),
         }
+        if desc := func.get("description"):
+            decl["description"] = desc
         if params := func.get("parameters"):
             decl["parameters"] = params
         declarations.append(decl)
@@ -372,7 +374,7 @@ def _gemini_stream_chunk_to_chat(
                 "id": f"gemini-{int(time.time())}",
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
-                "model": "",
+                "model": None,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
                 "usage": _extract_usage(usage_meta),
             }
@@ -388,7 +390,7 @@ def _gemini_stream_chunk_to_chat(
                 "id": f"gemini-{int(time.time())}",
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
-                "model": "",
+                "model": None,
                 "choices": [
                     {
                         "index": 0,
@@ -404,7 +406,7 @@ def _gemini_stream_chunk_to_chat(
                 "id": f"gemini-{int(time.time())}",
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
-                "model": "",
+                "model": None,
                 "choices": [
                     {
                         "index": 0,

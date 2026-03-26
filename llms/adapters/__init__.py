@@ -46,30 +46,30 @@ def _create_adapter(provider: str, **kwargs: Any) -> BaseAdapter:
     :param kwargs: Extra kwargs for the adapter constructor.
     :returns: A :class:`BaseAdapter` instance.
     """
-    # OpenAI-compatible providers
+    # OpenAI-compatible providers — default base URLs only.
+    # API keys come from connection_params at call time, not env vars.
     openai_compat_providers = {
-        "openai": ("https://api.openai.com/v1", "OPENAI_API_KEY"),
-        "groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY"),
-        "deepseek": ("https://api.deepseek.com/v1", "DEEPSEEK_API_KEY"),
-        "xai": ("https://api.x.ai/v1", "XAI_API_KEY"),
-        "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
-        "ollama": ("http://localhost:11434/v1", None),
+        "openai": "https://api.openai.com/v1",
+        "groq": "https://api.groq.com/openai/v1",
+        "deepseek": "https://api.deepseek.com/v1",
+        "xai": "https://api.x.ai/v1",
+        "openrouter": "https://openrouter.ai/api/v1",
+        "ollama": "http://localhost:11434/v1",
     }
 
     if provider in openai_compat_providers:
-        base_url, api_key_env = openai_compat_providers[provider]
+        base_url = openai_compat_providers[provider]
         resolved_url = kwargs.get("base_url", base_url)
-        resolved_key = kwargs.get("api_key_env", api_key_env)
         if provider == "openai":
             # OpenAI supports the Responses API natively; use the
             # subclass that calls /v1/responses directly so reasoning
             # token events (reasoning_summary_text.delta etc.) flow through.
             from llms.adapters.openai import OpenAIAdapter
 
-            return OpenAIAdapter(base_url=resolved_url, api_key_env=resolved_key)
+            return OpenAIAdapter(base_url=resolved_url)
         from llms.adapters.openai import OpenAICompatibleAdapter
 
-        return OpenAICompatibleAdapter(base_url=resolved_url, api_key_env=resolved_key)
+        return OpenAICompatibleAdapter(base_url=resolved_url)
 
     if provider == "anthropic":
         from llms.adapters.anthropic import AnthropicAdapter

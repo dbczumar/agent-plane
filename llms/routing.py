@@ -10,24 +10,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Known providers and their default configurations.
-# Each entry maps provider name -> (base_url, api_key_env_var).
-# api_key_env of None means no auth required (e.g. Ollama).
-PROVIDER_CONFIGS: dict[str, tuple[str, str | None]] = {
-    "openai": ("https://api.openai.com/v1", "OPENAI_API_KEY"),
-    "anthropic": ("https://api.anthropic.com/v1", "ANTHROPIC_API_KEY"),
-    "gemini": (
-        "https://generativelanguage.googleapis.com/v1beta",
-        "GOOGLE_API_KEY",
-    ),
-    "bedrock": ("", None),
-    "vertex": ("", None),
-    "databricks": ("", "DATABRICKS_TOKEN"),
-    "groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY"),
-    "deepseek": ("https://api.deepseek.com/v1", "DEEPSEEK_API_KEY"),
-    "xai": ("https://api.x.ai/v1", "XAI_API_KEY"),
-    "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
-    "ollama": ("http://localhost:11434/v1", None),
+# Known providers and their default base URLs.
+# API keys come from connection_params at call time (llm.connection config),
+# not from environment variables. Providers that require connection_params
+# for their base URL (Bedrock, Vertex, Databricks) have None here.
+PROVIDER_CONFIGS: dict[str, str | None] = {
+    "openai": "https://api.openai.com/v1",
+    "anthropic": "https://api.anthropic.com/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta",
+    "bedrock": None,
+    "vertex": None,
+    "databricks": None,
+    "groq": "https://api.groq.com/openai/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "xai": "https://api.x.ai/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "ollama": "http://localhost:11434/v1",
 }
 
 _DEFAULT_PROVIDER = "openai"
