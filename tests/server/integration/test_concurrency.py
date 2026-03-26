@@ -282,6 +282,15 @@ async def test_cancel_during_llm_call(
     assert cancel_resp.json()["status"] == "cancelled"
     assert cancel_resp.json()["output"] == []
 
+    # Release: workflow must terminate (not hang)
+    call_1.release()
+
+    for _ in range(50):
+        resp = await client.get(f"/v1/responses/{response_id}")
+        if resp.json()["status"] in ("completed", "cancelled"):
+            break
+    assert resp.json()["status"] == "cancelled"
+
 
 async def test_cancel_idempotent_while_blocked(
     client: httpx.AsyncClient,
