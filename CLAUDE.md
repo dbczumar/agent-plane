@@ -2,7 +2,7 @@
 
 ## Mandatory Post-Change Review
 
-**After completing ANY set of code changes (before committing), you MUST spawn a review subagent.** This is non-negotiable.
+**🚨 EXTREMELY IMPORTANT: After completing ANY set of code changes (before committing), you MUST spawn a review subagent. This is the SINGLE MOST IMPORTANT step in the development workflow. NEVER skip it. NEVER forget it. Run it after EVERY code change, no matter how small. Failure to run the review subagent is a BLOCKING issue.**
 
 ### How to run the review
 
@@ -166,6 +166,16 @@ Check each file against this checklist:
     `assert x[0]["role"] == "assistant"` pass even when the payload
     is None/empty. Always assert on the value that proves the mock
     data traversed the full pipeline.
+
+28. NO RANDOM/INVENTED ENV VAR DEFAULTS: Never use
+    `os.environ.get("REQUIRED_VAR", "some-default")` where the
+    default is an invented value like `""`, `"us-central1"`, or
+    `"localhost"`. Required env vars must use
+    `os.environ.get("VAR")` + explicit `if var is None: raise
+    ValueError(...)`. Invented defaults mask missing configuration
+    and cause silent, hard-to-debug failures in production. If a
+    genuine default exists (documented in provider docs), it must
+    have a comment citing the source.
 
 Report each finding as:
   [FILE:LINE] ISSUE — description of the problem and suggested fix

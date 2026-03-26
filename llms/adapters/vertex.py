@@ -4,11 +4,14 @@ Google Vertex AI adapter.
 Uses the same Gemini payload format but with GCP auth (Application
 Default Credentials or service account) and Vertex AI endpoints.
 Ported from MLflow AI Gateway's VertexAIProvider.
+
+Connection config (``project``, ``location``) must be provided via
+``connection_params`` at call time — typically from the
+``connection:`` block in the agent spec's ``llm:`` config.
 """
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 from typing import Any
 
@@ -24,14 +27,14 @@ class VertexAdapter(GeminiAdapter):
     Inherits Gemini translation logic but uses Vertex AI endpoints
     and GCP OAuth authentication.
 
-    Config from environment (used as defaults):
-    - ``VERTEX_PROJECT``: GCP project ID (required).
-    - ``VERTEX_LOCATION``: GCP region, defaults to ``"us-central1"``.
-    - ``GOOGLE_APPLICATION_CREDENTIALS``: Path to service account
-      JSON (optional, uses ADC if not set).
+    Requires ``connection_params`` with:
+    - ``"project"``: GCP project ID, e.g. ``"my-gcp-project"``.
+    - ``"location"``: GCP region, e.g. ``"us-central1"``.
 
-    Per-call ``connection_params`` keys: ``"project"``,
-    ``"location"``, or a full ``"base_url"`` override.
+    Or alternatively a full ``"base_url"`` override.
+
+    These come from the ``connection:`` block in the agent spec's
+    ``llm:`` config — not from environment variables.
     """
 
     def __init__(self) -> None:
@@ -76,14 +79,16 @@ class VertexAdapter(GeminiAdapter):
 
     def _get_base_url(self) -> str:
         """
-        Build the Vertex AI endpoint URL from environment variables.
+        Not used — Vertex AI requires ``connection_params``.
 
-        :returns: The Vertex AI base URL for the configured
-            project and location.
+        :returns: Never returns.
+        :raises ValueError: Always — Vertex requires connection_params
+            with ``"project"`` and ``"location"``.
         """
-        project = os.environ.get("VERTEX_PROJECT", "")
-        location = os.environ.get("VERTEX_LOCATION", "us-central1")
-        return _build_vertex_url(project, location)
+        raise ValueError(
+            "Vertex AI requires 'project' and 'location' in"
+            " connection_params (from llm.connection config)"
+        )
 
     def chat_completions(
         self,
@@ -103,10 +108,11 @@ class VertexAdapter(GeminiAdapter):
         :param tools: Tool schemas or ``None``.
         :param stream: Enable streaming.
         :param extra: Additional kwargs.
-        :param connection_params: Per-call overrides. Supported keys:
-            ``"project"``, ``"location"`` (builds Vertex URL), or
-            ``"base_url"`` (used directly).
+        :param connection_params: Required. Must contain
+            ``"project"`` + ``"location"`` or ``"base_url"``.
         :returns: Chat Completions response dict or chunk iterator.
+        :raises ValueError: If ``connection_params`` is missing or
+            lacks required keys.
         """
         resolved_params = _resolve_vertex_params(connection_params)
         return super().chat_completions(
@@ -121,20 +127,24 @@ class VertexAdapter(GeminiAdapter):
 
 def _resolve_vertex_params(
     connection_params: dict[str, str] | None,
-) -> dict[str, str] | None:
+) -> dict[str, str]:
     """
     Convert Vertex-specific ``"project"``/``"location"`` keys into
     a ``"base_url"`` that the parent Gemini adapter understands.
 
-    If ``connection_params`` already contains ``"base_url"``, it is
-    passed through unchanged. If it contains ``"project"`` and/or
-    ``"location"``, a Vertex URL is built from them.
+    All connection info must come from ``connection_params`` — no
+    environment variable fallbacks.
 
     :param connection_params: Raw connection params from the caller.
-    :returns: Params with ``"base_url"`` resolved, or ``None``.
+        Must contain ``"project"`` + ``"location"`` or ``"base_url"``.
+    :returns: Params with ``"base_url"`` resolved.
+    :raises ValueError: If params are missing or incomplete.
     """
     if not connection_params:
-        return None
+        raise ValueError(
+            "Vertex AI requires connection_params with"
+            " 'project' and 'location' (from llm.connection config)"
+        )
 
     # If caller provided a full base_url, pass through as-is.
     if "base_url" in connection_params:
@@ -142,17 +152,18 @@ def _resolve_vertex_params(
 
     project = connection_params.get("project")
     location = connection_params.get("location")
-    if project or location:
-        resolved_project = project if project else os.environ.get("VERTEX_PROJECT", "")
-        resolved_location = (
-            location if location else os.environ.get("VERTEX_LOCATION", "us-central1")
+    if not project:
+        raise ValueError(
+            "Vertex AI requires 'project' in connection_params (from llm.connection config)"
         )
-        return {
-            **connection_params,
-            "base_url": _build_vertex_url(resolved_project, resolved_location),
-        }
-
-    return connection_params
+    if not location:
+        raise ValueError(
+            "Vertex AI requires 'location' in connection_params (from llm.connection config)"
+        )
+    return {
+        **connection_params,
+        "base_url": _build_vertex_url(project, location),
+    }
 
 
 def _build_vertex_url(project: str, location: str) -> str:
