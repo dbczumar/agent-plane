@@ -433,7 +433,7 @@ def _gemini_stream_chunk_to_chat(
             "id": f"gemini-{int(time.time())}",
             "object": "chat.completion.chunk",
             "created": int(time.time()),
-            "model": "",
+            "model": None,
             "choices": [
                 {
                     "index": 0,
