@@ -278,7 +278,8 @@ def _anthropic_to_chat(resp: dict[str, Any]) -> dict[str, Any]:
                 }
             )
 
-    stop_reason = resp.get("stop_reason", "end_turn")
+    # Anthropic API always returns stop_reason; fail loud if missing.
+    stop_reason = resp["stop_reason"]
     finish_reason = "length" if stop_reason == "max_tokens" else "stop"
     if tool_calls:
         finish_reason = "tool_calls"

@@ -246,8 +246,11 @@ def _to_responses_tools(
             # Chat Completions format — flatten
             fn = tool["function"]
             entry: dict[str, Any] = {
+                # Chat Completions tools always have type "function"
+                # per the OpenAI spec; default is spec-mandated.
                 "type": tool.get("type", "function"),
                 "name": fn["name"],
+                # Empty dict is valid JSON Schema for "no parameters".
                 "parameters": fn.get("parameters", {}),
             }
             if desc := fn.get("description"):

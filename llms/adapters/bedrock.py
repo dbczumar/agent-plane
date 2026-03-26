@@ -160,7 +160,7 @@ def _messages_to_converse(
     converse_messages: list[dict[str, Any]] = []
 
     for msg in messages:
-        role = msg.get("role", "user")
+        role = msg["role"]
 
         if role == "system":
             system_prompts.append({"text": msg["content"]})
@@ -269,7 +269,8 @@ def _converse_to_chat(
                 }
             )
 
-    stop_reason = response.get("stopReason", "end_turn")
+    # Bedrock Converse API always returns stopReason; fail loud if missing.
+    stop_reason = response["stopReason"]
     finish_reason = "tool_calls" if stop_reason == "tool_use" else "stop"
 
     usage = response.get("usage", {})
@@ -349,7 +350,8 @@ def _stream_converse(
                     ],
                 }
         elif "messageStop" in event:
-            stop_reason = event["messageStop"].get("stopReason", "end_turn")
+            # Bedrock always includes stopReason in messageStop; fail loud if missing.
+            stop_reason = event["messageStop"]["stopReason"]
             finish = "tool_calls" if stop_reason == "tool_use" else "stop"
             yield {
                 "id": f"bedrock-{int(time.time())}",

@@ -8,7 +8,7 @@ from llms.adapters.vertex import _build_vertex_url, _resolve_vertex_params
 
 def test_resolve_raises_when_no_params() -> None:
     """
-    ``None`` input raises ``ValueError`` — Vertex requires
+    ``None`` input raises ``AgentPlaneError`` — Vertex requires
     connection_params.
     """
     with pytest.raises(AgentPlaneError, match="requires connection_params"):
@@ -17,7 +17,7 @@ def test_resolve_raises_when_no_params() -> None:
 
 def test_resolve_raises_when_empty_params() -> None:
     """
-    Empty dict raises ``ValueError`` — Vertex requires
+    Empty dict raises ``AgentPlaneError`` — Vertex requires
     connection_params with project/location or base_url.
     """
     with pytest.raises(AgentPlaneError, match="requires connection_params"):
@@ -47,7 +47,7 @@ def test_resolve_builds_url_from_project_and_location() -> None:
 
 def test_resolve_raises_when_project_missing() -> None:
     """
-    ValueError when ``"location"`` is provided but ``"project"`` is not.
+    AgentPlaneError when ``"location"`` is provided but ``"project"`` is not.
     No env var fallback.
     """
     params = {"location": "us-east1"}
@@ -57,7 +57,7 @@ def test_resolve_raises_when_project_missing() -> None:
 
 def test_resolve_raises_when_location_missing() -> None:
     """
-    ValueError when ``"project"`` is provided but ``"location"`` is not.
+    AgentPlaneError when ``"project"`` is provided but ``"location"`` is not.
     No env var fallback.
     """
     params = {"project": "my-proj"}
@@ -68,7 +68,7 @@ def test_resolve_raises_when_location_missing() -> None:
 def test_resolve_raises_when_no_recognized_keys() -> None:
     """
     Params without ``"project"``, ``"location"``, or ``"base_url"``
-    raise ValueError — Vertex needs at least one of these.
+    raise AgentPlaneError — Vertex needs at least one of these.
     """
     params = {"some_other_key": "value"}
     with pytest.raises(AgentPlaneError, match="requires 'project'"):
