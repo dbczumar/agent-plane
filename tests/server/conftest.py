@@ -32,6 +32,7 @@ from agent_plane.stores.conversation_store.sqlalchemy_store import (
 from agent_plane.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from agent_plane.stores.task_store.sqlalchemy_store import SqlAlchemyTaskStore
 from llms.types import (
+    FunctionCallOutput,
     MessageOutput,
     OutputText,
     Response,
@@ -50,7 +51,11 @@ class MockCall:
     gates.
 
     :param text: The assistant response text, e.g.
-        ``"Hello from mock"``.
+        ``"Hello from mock"``. Ignored when ``tool_calls`` is set.
+    :param tool_calls: If set, the response contains function calls
+        instead of text. Each dict must have ``"call_id"``,
+        ``"name"``, and ``"arguments"`` keys, e.g.
+        ``[{"call_id": "c1", "name": "grep", "arguments": "{}"}]``.
     :param block_before_response: If set, the mock blocks on this
         event before producing any output. Call ``release()`` from
         the test to unblock.
@@ -62,6 +67,7 @@ class MockCall:
     """
 
     text: str = "Hello from the test agent."
+    tool_calls: list[dict[str, str]] | None = None
     block_before_response: threading.Event | None = None
     call_event: threading.Event = field(default_factory=threading.Event)
     stream_tokens: bool = False
@@ -74,18 +80,35 @@ class MockCall:
             self.block_before_response.set()
 
 
-def _build_completed_event(text: str) -> ResponseCompletedEvent:
+def _build_completed_event(
+    text: str,
+    tool_calls: list[dict[str, str]] | None = None,
+) -> ResponseCompletedEvent:
     """
-    Build a ``ResponseCompletedEvent`` with a single text output.
+    Build a ``ResponseCompletedEvent`` with text and/or tool calls.
 
     :param text: The assistant response text.
+    :param tool_calls: Optional list of tool call dicts, each with
+        ``"call_id"``, ``"name"``, and ``"arguments"`` keys, e.g.
+        ``[{"call_id": "c1", "name": "grep", "arguments": "{}"}]``.
+        When provided, function call outputs are included in the
+        response alongside any text.
     :returns: A completed event with real ``llms.types`` dataclasses.
     """
+    output: list[MessageOutput | FunctionCallOutput] = []
+    if tool_calls:
+        for tc in tool_calls:
+            output.append(
+                FunctionCallOutput(
+                    call_id=tc["call_id"],
+                    name=tc["name"],
+                    arguments=tc["arguments"],
+                )
+            )
+    else:
+        output.append(MessageOutput(content=[OutputText(text=text)]))
     return ResponseCompletedEvent(
-        response=Response(
-            output=[MessageOutput(content=[OutputText(text=text)])],
-            model="test-model",
-        ),
+        response=Response(output=output, model="test-model"),
     )
 
 
@@ -124,19 +147,25 @@ class ControllableMockClient:
         text: str | None = None,
         block: bool = False,
         stream_tokens: bool = False,
+        tool_calls: list[dict[str, str]] | None = None,
     ) -> MockCall:
         """
         Enqueue a configured call.
 
         :param text: Response text. Defaults to ``default_text``.
+            Ignored when ``tool_calls`` is provided.
         :param block: If ``True``, the call blocks until
             ``MockCall.release()`` is called.
         :param stream_tokens: If ``True``, emit text delta events
             before the completed event.
+        :param tool_calls: If provided, the response contains
+            function calls instead of text. Each dict must have
+            ``"call_id"``, ``"name"``, and ``"arguments"`` keys.
         :returns: The ``MockCall`` for synchronization.
         """
         call = MockCall(
             text=text or self._default_text,
+            tool_calls=tool_calls,
             block_before_response=threading.Event() if block else None,
             stream_tokens=stream_tokens,
         )
@@ -208,7 +237,10 @@ class _MockResponsesNamespace:
         stream = kwargs.get("stream", False)
         if stream:
             return self._stream(call)
-        return _build_completed_event(call.text).response
+        return _build_completed_event(
+            call.text,
+            tool_calls=call.tool_calls,
+        ).response
 
     def _stream(self, call: MockCall) -> Iterator[ResponseStreamEvent]:
         """
@@ -217,11 +249,14 @@ class _MockResponsesNamespace:
         :param call: The ``MockCall`` controlling this stream.
         :returns: An iterator of ``ResponseStreamEvent``.
         """
-        if call.stream_tokens:
+        if call.stream_tokens and not call.tool_calls:
             # Yield individual word tokens as deltas
             for word in call.text.split():
                 yield ResponseTextDeltaEvent(delta=word + " ")
-        yield _build_completed_event(call.text)
+        yield _build_completed_event(
+            call.text,
+            tool_calls=call.tool_calls,
+        )
 
 
 # ── Fixtures ──────────────────────────────────────────

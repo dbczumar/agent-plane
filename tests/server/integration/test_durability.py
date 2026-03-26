@@ -18,33 +18,29 @@ different hash and silently skips recovery.
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
-import httpx
 import pytest
 
-from agent_plane.runtime import init as init_runtime
-from agent_plane.runtime.agent_cache import AgentCache
 from agent_plane.runtime.durability import destroy_dbos, ensure_dbos
-from agent_plane.server.app import create_app
-from agent_plane.stores.agent_store.sqlalchemy_store import (
-    SqlAlchemyAgentStore,
-)
-from agent_plane.stores.artifact_store.local import LocalArtifactStore
-from agent_plane.stores.conversation_store.sqlalchemy_store import (
-    SqlAlchemyConversationStore,
-)
-from agent_plane.stores.file_store.sqlalchemy_store import (
-    SqlAlchemyFileStore,
-)
-from agent_plane.stores.task_store.sqlalchemy_store import (
-    SqlAlchemyTaskStore,
-)
 from tests.server.conftest import ControllableMockClient
-from tests.server.helpers import create_test_agent, create_test_response
+from tests.server.integration.durability_helpers import (
+    ToolGate,
+    assert_conversation_persisted,
+    assert_incomplete_step_reexecuted,
+    assert_recovery_output,
+    assert_steering_persisted,
+    assert_step_cache_replay,
+    run_server_1,
+    run_server_1_crash_mid_tool,
+    run_server_1_with_steering,
+    run_server_2,
+    run_server_2_after_steering_crash,
+    run_server_2_after_tool_crash,
+    setup_tool_tracking,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -92,62 +88,6 @@ def pinned_dbos_version() -> Iterator[None]:
             yield
 
 
-def _build_server(
-    db_uri: str,
-    tmp_path: Path,
-    mock_llm: ControllableMockClient,
-) -> httpx.AsyncClient:
-    """
-    Build a complete server stack (stores + runtime + app +
-    HTTP client) on the given database.
-
-    Mirrors the fixture chain in ``conftest.py`` but is callable
-    multiple times in a single test to simulate server restarts.
-
-    :param db_uri: SQLite database URI, e.g.
-        ``"sqlite:///path/to/test.db"``.
-    :param tmp_path: Temp directory for artifact and cache storage.
-    :param mock_llm: The mock LLM client to patch into the
-        workflow.
-    :returns: An ``httpx.AsyncClient`` wired to the new app.
-    """
-    agent_store = SqlAlchemyAgentStore(db_uri)
-    conversation_store = SqlAlchemyConversationStore(db_uri)
-    artifact_store = LocalArtifactStore(
-        str(tmp_path / "artifacts"),
-    )
-    agent_cache = AgentCache(
-        artifact_store=artifact_store,
-        cache_dir=tmp_path / ".cache",
-    )
-    task_store = SqlAlchemyTaskStore(db_uri)
-    init_runtime(
-        conversation_store=conversation_store,
-        task_store=task_store,
-        agent_store=agent_store,
-        agent_cache=agent_cache,
-    )
-
-    # Patch the LLM client at the module level so the real
-    # workflow uses our mock (same as the conftest fixture)
-    import agent_plane.runtime.workflow as wf_mod
-
-    wf_mod._get_llm_client = lambda: mock_llm  # type: ignore[assignment]
-
-    app = create_app(
-        agent_store=agent_store,
-        file_store=SqlAlchemyFileStore(db_uri),
-        task_store=task_store,
-        conversation_store=conversation_store,
-        artifact_store=artifact_store,
-    )
-    transport = httpx.ASGITransport(app=app)
-    return httpx.AsyncClient(
-        transport=transport,
-        base_url="http://test",
-    )
-
-
 async def test_workflow_recovers_after_server_restart(
     mock_llm: ControllableMockClient,
     db_uri: str,
@@ -155,19 +95,25 @@ async def test_workflow_recovers_after_server_restart(
 ) -> None:
     """
     A workflow interrupted mid-LLM-call completes after a full
-    server restart on the same database.
+    server restart on the same database — and DBOS replays
+    completed ``@step`` functions from cache instead of
+    re-executing them (partial replay).
 
     Lifecycle:
     1. Build server instance 1 (stores + app + DBOS)
-    2. Create agent + response, block workflow in LLM call
-    3. Tear down the ENTIRE server (client, app, DBOS)
-    4. Build server instance 2 on the same DB
-    5. Poll the new server until the response completes
-    6. Assert recovery-era text in output and conversation
-
-    This is more realistic than only restarting DBOS — it
-    rebuilds all stores and the FastAPI app from scratch,
-    just like a real process restart.
+    2. LLM call 1 (``@step``) returns a tool call ->
+       ``_call_tool`` (also ``@step``) executes. Both are
+       checkpointed by DBOS.
+    3. LLM call 2 (``@step``) blocks (simulating crash
+       mid-LLM — this step never completes, so no checkpoint)
+    4. Tear down the ENTIRE server (client, app, DBOS)
+    5. Build server instance 2 on the same DB
+    6. DBOS recovers: LLM call 1 and ``_call_tool`` both
+       replay from cache (bodies NOT called). LLM call 2
+       re-executes (no checkpoint existed) with recovery text.
+    7. Assert recovery text in output and conversation
+    8. Assert tool body ran exactly once (proves partial
+       replay from cache, not full re-execution)
 
     Breakage this catches:
     - Workflow silently disappears after crash (no recovery)
@@ -175,83 +121,154 @@ async def test_workflow_recovers_after_server_restart(
     - Task status stuck in in_progress forever
     - Conversation items not persisted by recovered workflow
     - Store reconstruction loses data
+    - DBOS step cache not persisted across restart (LLM or
+      tool re-executes instead of replaying from cache)
     """
-    # ── Server instance 1 ─────────────────────────────
-    client_1 = _build_server(db_uri, tmp_path, mock_llm)
+    tracking = setup_tool_tracking()
 
-    await create_test_agent(client_1)
+    with tracking.patch_ctx:
+        ids = await run_server_1(
+            mock_llm,
+            db_uri,
+            tmp_path,
+            tracking,
+        )
+        result = await run_server_2(
+            mock_llm,
+            db_uri,
+            tmp_path,
+            ids.response_id,
+        )
 
-    call_1 = mock_llm.add_call(
-        text="This text should never appear",
-        block=True,
+    recovery_text = "Recovered after server restart"
+    await assert_recovery_output(result.terminal_body, recovery_text)
+    await assert_conversation_persisted(
+        result.client,
+        ids.conversation_id,
+        "Durable request",
+        recovery_text,
     )
-    created = await create_test_response(
-        client_1,
-        input_text="Durable request",
-    )
-    response_id = created.body["id"]
-    conv_id = created.body["conversation"]["id"]
-    assert created.body["status"] == "queued"
+    assert_step_cache_replay(tracking, mock_llm)
 
-    # Gate: workflow has entered the LLM call
-    call_1.call_event.wait(timeout=10)
-
-    # ── Crash: tear down everything ───────────────────
-    # Do NOT release the mock call — the thread stays blocked,
-    # simulating a real crash where the process dies mid-LLM.
-    # mock_llm.release_all() in fixture teardown frees the
-    # orphaned thread so the test runner doesn't hang.
-    await client_1.aclose()
+    await result.client.aclose()
     destroy_dbos()
 
-    # ── Server instance 2 ─────────────────────────────
-    # Queue a recovery mock response. The original call
-    # (index 0) was consumed by server 1's workflow thread.
-    # The recovered workflow re-executes the uncheckpointed
-    # LLM step and gets this one (index 1).
-    recovery_text = "Recovered after server restart"
-    mock_llm.add_call(text=recovery_text)
 
-    client_2 = _build_server(db_uri, tmp_path, mock_llm)
+async def test_incomplete_step_reexecutes_after_crash(
+    mock_llm: ControllableMockClient,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """
+    A ``_call_tool`` step interrupted mid-execution has no
+    DBOS checkpoint and re-executes on recovery — proving
+    that incomplete steps are not skipped.
 
-    # Poll the NEW server until the workflow completes
-    terminal_body: dict | None = None
-    for _ in range(200):
-        resp = await client_2.get(
-            f"/v1/responses/{response_id}",
+    This is the complement of
+    ``test_workflow_recovers_after_server_restart``: that test
+    proves completed steps replay from cache; this test proves
+    incomplete steps re-run from scratch.
+
+    Lifecycle:
+    1. LLM call 1 returns tool call (checkpointed by DBOS)
+    2. ``_call_tool`` @step starts, blocks via gate (never
+       completes, no checkpoint written)
+    3. Crash (tear down server + DBOS)
+    4. Recovery: LLM call 1 replays from cache,
+       ``_call_tool`` re-executes (no cache), LLM call 2
+       runs fresh
+    5. Assert tool ran twice (once pre-crash, once recovery)
+    6. Assert LLM call 1 replayed from cache (2 total mock
+       calls, not 3)
+    """
+    gate = ToolGate(should_block=True)
+    tracking = setup_tool_tracking(gate=gate)
+
+    try:
+        with tracking.patch_ctx:
+            ids = await run_server_1_crash_mid_tool(
+                mock_llm,
+                db_uri,
+                tmp_path,
+                gate,
+            )
+            # Do NOT release gate here. Releasing between
+            # server 1 destroy and server 2 create lets the
+            # pre-crash thread's finally block record
+            # close_stream via server 2's DBOS, corrupting
+            # the step sequence for recovery.
+            gate.should_block = False
+
+            result = await run_server_2_after_tool_crash(
+                mock_llm,
+                db_uri,
+                tmp_path,
+                ids.response_id,
+            )
+
+        await assert_recovery_output(
+            result.terminal_body,
+            "Recovered after tool crash",
         )
-        body = resp.json()
-        if body["status"] in ("completed", "failed"):
-            terminal_body = body
-            break
-        await asyncio.sleep(0.1)
+        assert_incomplete_step_reexecuted(tracking, mock_llm)
 
-    assert terminal_body is not None, f"Response {response_id} never reached terminal state"
-    assert terminal_body["status"] == "completed", (
-        f"Expected completed, got {terminal_body['status']}: {terminal_body.get('error')}"
+        await result.client.aclose()
+        destroy_dbos()
+    finally:
+        # Release gate after BOTH DBOS instances are destroyed
+        # so the pre-crash thread's close_stream fails cleanly
+        # ("System database accessed before DBOS was launched").
+        gate.release.set()
+
+
+async def test_steered_messages_survive_crash(
+    mock_llm: ControllableMockClient,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """
+    A message injected via ``try_deliver`` (which writes in
+    its own SQLAlchemy transaction, independent of the DBOS
+    workflow) survives a crash and is visible after recovery.
+
+    ``try_deliver`` is the server-side half of the steering
+    handshake. It inserts the steered message into
+    ``conversation_items`` in its own session — NOT inside
+    the DBOS workflow transaction. This means steered messages
+    are durable even if the workflow crashes.
+
+    Lifecycle:
+    1. Start workflow, LLM call blocks (mid-execution)
+    2. POST with ``previous_response_id`` triggers
+       ``try_deliver`` which writes steered message to DB
+       in its own transaction
+    3. Crash (tear down server + DBOS)
+    4. Recovery: LLM call re-executes, ``_sync_history``
+       discovers the steered message in the conversation
+       store, workflow completes
+    5. Assert steered message and original user message both
+       appear in conversation items
+    """
+    ids = await run_server_1_with_steering(
+        mock_llm,
+        db_uri,
+        tmp_path,
+    )
+    result = await run_server_2_after_steering_crash(
+        mock_llm,
+        db_uri,
+        tmp_path,
+        ids.response_id,
     )
 
-    # Verify output contains recovery-era text
-    output = terminal_body["output"]
-    assert len(output) >= 1, "No output items after recovery"
-    assert output[0]["role"] == "assistant"
-    assert output[0]["content"][0]["text"] == recovery_text
-
-    # Verify conversation items persisted through the crash
-    items_resp = await client_2.get(
-        f"/v1/conversations/{conv_id}/items",
-        params={"limit": 100},
+    await assert_recovery_output(
+        result.terminal_body,
+        "Recovery after steering",
     )
-    items = items_resp.json()["data"]
+    await assert_steering_persisted(
+        result.client,
+        ids.conversation_id,
+    )
 
-    user_items = [i for i in items if i["role"] == "user"]
-    assistant_items = [i for i in items if i["role"] == "assistant"]
-
-    assert len(user_items) >= 1, "User message not persisted"
-    assert user_items[0]["content"][0]["text"] == "Durable request"
-
-    assert len(assistant_items) >= 1, "Assistant response not persisted after recovery"
-    assert assistant_items[0]["content"][0]["text"] == recovery_text
-
-    await client_2.aclose()
+    await result.client.aclose()
     destroy_dbos()
