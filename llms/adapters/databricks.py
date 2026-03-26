@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any
 
+from agent_plane.errors import AgentPlaneError, ErrorCode
 from llms.adapters.openai import OpenAICompatibleAdapter
 
 
@@ -55,13 +56,14 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
         :param connection_params: Required. Must contain
             ``"base_url"`` and ``"api_key"``.
         :returns: Response dict or iterator of chunk dicts.
-        :raises ValueError: If ``connection_params`` is missing or
+        :raises AgentPlaneError: If ``connection_params`` is missing or
             lacks ``"base_url"``.
         """
         if not connection_params or "base_url" not in connection_params:
-            raise ValueError(
+            raise AgentPlaneError(
                 "Databricks adapter requires 'base_url' in"
-                " connection_params (from llm.connection config)"
+                " connection_params (from llm.connection config)",
+                code=ErrorCode.INVALID_INPUT,
             )
         return super().chat_completions(
             messages,

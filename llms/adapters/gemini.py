@@ -15,6 +15,7 @@ from typing import Any
 
 import httpx
 
+from agent_plane.errors import AgentPlaneError, ErrorCode
 from llms.adapters.base import BaseAdapter
 
 _BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
@@ -70,12 +71,13 @@ class GeminiAdapter(BaseAdapter):
 
         :param api_key_override: API key from ``connection_params``.
         :returns: Headers dict with API key.
-        :raises ValueError: If no API key is provided.
+        :raises AgentPlaneError: If no API key is provided.
         """
         if not api_key_override:
-            raise ValueError(
+            raise AgentPlaneError(
                 "Gemini adapter requires 'api_key' in"
-                " connection_params (from llm.connection config)"
+                " connection_params (from llm.connection config)",
+                code=ErrorCode.INVALID_INPUT,
             )
         return {
             "Content-Type": "application/json",

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from agent_plane.errors import AgentPlaneError, ErrorCode
+
 # Known providers and their default base URLs.
 # API keys come from connection_params at call time (llm.connection config),
 # not from environment variables. Providers that require connection_params
@@ -55,7 +57,7 @@ def parse_model_string(model: str) -> RoutedModel:
     :param model: The model string, e.g.
         ``"anthropic/claude-sonnet-4-20250514"`` or ``"gpt-5.4"``.
     :returns: A :class:`RoutedModel` with ``provider`` and ``model``.
-    :raises ValueError: If the provider prefix is not recognized.
+    :raises AgentPlaneError: If the provider prefix is not recognized.
     """
     if "/" in model:
         provider, model_name = model.split("/", 1)
@@ -64,8 +66,9 @@ def parse_model_string(model: str) -> RoutedModel:
         model_name = model
 
     if provider not in PROVIDER_CONFIGS:
-        raise ValueError(
-            f"Unknown provider {provider!r}. Known providers: {sorted(PROVIDER_CONFIGS)}"
+        raise AgentPlaneError(
+            f"Unknown provider {provider!r}. Known providers: {sorted(PROVIDER_CONFIGS)}",
+            code=ErrorCode.INVALID_INPUT,
         )
 
     return RoutedModel(provider=provider, model=model_name)

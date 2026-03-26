@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 
+from agent_plane.errors import AgentPlaneError, ErrorCode
 from llms.adapters.base import BaseAdapter
 
 _BASE_URL = "https://api.anthropic.com/v1"
@@ -449,12 +450,13 @@ def _build_headers(
 
     :param api_key_override: API key from ``connection_params``.
     :returns: Headers dict with API key and version.
-    :raises ValueError: If no API key is provided.
+    :raises AgentPlaneError: If no API key is provided.
     """
     if not api_key_override:
-        raise ValueError(
+        raise AgentPlaneError(
             "Anthropic adapter requires 'api_key' in"
-            " connection_params (from llm.connection config)"
+            " connection_params (from llm.connection config)",
+            code=ErrorCode.INVALID_INPUT,
         )
     return {
         "Content-Type": "application/json",

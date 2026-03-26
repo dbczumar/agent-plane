@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent_plane.errors import AgentPlaneError, ErrorCode
 from llms.adapters.base import BaseAdapter
 
 # Lazy-initialized adapter cache. Each provider gets at most one
@@ -24,7 +25,7 @@ def get_adapter(provider: str, **kwargs: Any) -> BaseAdapter:
     :param kwargs: Extra keyword arguments forwarded to the adapter
         constructor (used by tests to override config).
     :returns: A :class:`BaseAdapter` subclass instance.
-    :raises ValueError: If the provider is not supported.
+    :raises AgentPlaneError: If the provider is not supported.
     """
     if provider in _adapter_cache and not kwargs:
         return _adapter_cache[provider]
@@ -99,7 +100,10 @@ def _create_adapter(provider: str, **kwargs: Any) -> BaseAdapter:
     all_providers = sorted(
         openai_compat_providers.keys() | {"anthropic", "gemini", "bedrock", "vertex", "databricks"}
     )
-    raise ValueError(f"Unknown provider {provider!r}. Supported: {all_providers}")
+    raise AgentPlaneError(
+        f"Unknown provider {provider!r}. Supported: {all_providers}",
+        code=ErrorCode.INVALID_INPUT,
+    )
 
 
 def clear_cache() -> None:

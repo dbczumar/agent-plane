@@ -2,6 +2,7 @@
 
 import pytest
 
+from agent_plane.errors import AgentPlaneError
 from llms.routing import RoutedModel, parse_model_string
 
 
@@ -70,5 +71,5 @@ def test_parse_without_prefix_defaults_to_openai() -> None:
 
 
 def test_unknown_provider_raises() -> None:
-    with pytest.raises(ValueError, match="Unknown provider 'foobar'"):
+    with pytest.raises(AgentPlaneError, match="Unknown provider 'foobar'"):
         parse_model_string("foobar/some-model")

@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any
 
+from agent_plane.errors import AgentPlaneError, ErrorCode
 from llms.adapters.gemini import GeminiAdapter
 
 _DEFAULT_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
@@ -82,12 +83,13 @@ class VertexAdapter(GeminiAdapter):
         Not used — Vertex AI requires ``connection_params``.
 
         :returns: Never returns.
-        :raises ValueError: Always — Vertex requires connection_params
+        :raises AgentPlaneError: Always — Vertex requires connection_params
             with ``"project"`` and ``"location"``.
         """
-        raise ValueError(
+        raise AgentPlaneError(
             "Vertex AI requires 'project' and 'location' in"
-            " connection_params (from llm.connection config)"
+            " connection_params (from llm.connection config)",
+            code=ErrorCode.INVALID_INPUT,
         )
 
     def chat_completions(
@@ -111,7 +113,7 @@ class VertexAdapter(GeminiAdapter):
         :param connection_params: Required. Must contain
             ``"project"`` + ``"location"`` or ``"base_url"``.
         :returns: Chat Completions response dict or chunk iterator.
-        :raises ValueError: If ``connection_params`` is missing or
+        :raises AgentPlaneError: If ``connection_params`` is missing or
             lacks required keys.
         """
         resolved_params = _resolve_vertex_params(connection_params)
@@ -138,12 +140,13 @@ def _resolve_vertex_params(
     :param connection_params: Raw connection params from the caller.
         Must contain ``"project"`` + ``"location"`` or ``"base_url"``.
     :returns: Params with ``"base_url"`` resolved.
-    :raises ValueError: If params are missing or incomplete.
+    :raises AgentPlaneError: If params are missing or incomplete.
     """
     if not connection_params:
-        raise ValueError(
+        raise AgentPlaneError(
             "Vertex AI requires connection_params with"
-            " 'project' and 'location' (from llm.connection config)"
+            " 'project' and 'location' (from llm.connection config)",
+            code=ErrorCode.INVALID_INPUT,
         )
 
     # If caller provided a full base_url, pass through as-is.
@@ -153,12 +156,14 @@ def _resolve_vertex_params(
     project = connection_params.get("project")
     location = connection_params.get("location")
     if not project:
-        raise ValueError(
-            "Vertex AI requires 'project' in connection_params (from llm.connection config)"
+        raise AgentPlaneError(
+            "Vertex AI requires 'project' in connection_params (from llm.connection config)",
+            code=ErrorCode.INVALID_INPUT,
         )
     if not location:
-        raise ValueError(
-            "Vertex AI requires 'location' in connection_params (from llm.connection config)"
+        raise AgentPlaneError(
+            "Vertex AI requires 'location' in connection_params (from llm.connection config)",
+            code=ErrorCode.INVALID_INPUT,
         )
     return {
         **connection_params,
