@@ -43,17 +43,17 @@ class OpenAICompatibleAdapter(BaseAdapter):
     at call time (from the ``connection:`` block in agent spec).
 
     :param base_url: The provider's default API base URL, e.g.
-        ``"https://api.openai.com/v1"``.
+        ``"https://api.openai.com/v1"``. ``None`` for providers
+        that always require ``connection_params["base_url"]``.
     """
 
     def __init__(
         self,
-        base_url: str,
+        base_url: str | None = None,
         # Kept for backward compat with tests; no longer used at runtime.
         api_key_env: str | None = None,
     ) -> None:
-        # Normalize so f"{base_url}/chat/completions" never double-slashes
-        self._base_url = base_url.rstrip("/")
+        self._base_url = base_url.rstrip("/") if base_url else None
 
     def _build_headers(
         self,
@@ -126,8 +126,7 @@ class OpenAICompatibleAdapter(BaseAdapter):
         """
         params = connection_params or {}
         payload = self._build_payload(messages, model, tools, stream, extra)
-        override_base = params.get("base_url")
-        effective_base = override_base.rstrip("/") if override_base else self._base_url
+        effective_base = _resolve_base_url(params.get("base_url"), self._base_url)
         url = f"{effective_base}/chat/completions"
         headers = self._build_headers(api_key_override=params.get("api_key"))
 
@@ -197,6 +196,29 @@ def _parse_sse_line(line: str) -> dict[str, Any] | None:
         return None
     result: dict[str, Any] = json.loads(data)
     return result
+
+
+def _resolve_base_url(
+    override: str | None,
+    default: str | None,
+) -> str:
+    """
+    Resolve the effective base URL from override or default.
+
+    :param override: Per-call base URL from ``connection_params``.
+    :param default: Adapter's default base URL (``None`` for providers
+        that always require ``connection_params``).
+    :returns: The resolved base URL, stripped of trailing slashes.
+    :raises ValueError: If neither override nor default is available.
+    """
+    if override:
+        return override.rstrip("/")
+    if default:
+        return default
+    raise ValueError(
+        "No base_url available — provide 'base_url' in"
+        " connection_params (from llm.connection config)"
+    )
 
 
 def _to_responses_tools(
@@ -384,8 +406,7 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         if stream:
             payload["stream"] = True
 
-        override_base = params.get("base_url")
-        effective_base = override_base.rstrip("/") if override_base else self._base_url
+        effective_base = _resolve_base_url(params.get("base_url"), self._base_url)
         url = f"{effective_base}/responses"
         headers = self._build_headers(api_key_override=params.get("api_key"))
 

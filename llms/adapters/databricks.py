@@ -32,9 +32,7 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
     """
 
     def __init__(self) -> None:
-        # Placeholder base_url — always overridden by connection_params
-        # at call time. chat_completions() validates this.
-        super().__init__(base_url="https://placeholder.invalid")
+        super().__init__()
 
     def chat_completions(
         self,
