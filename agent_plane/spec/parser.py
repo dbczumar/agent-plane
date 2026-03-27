@@ -97,7 +97,7 @@ def _parse_llm(raw: dict[str, Any] | None) -> LLMConfig | None:
         ``{"model": "openai/gpt-4o", "temperature": 0.7}``.
     :returns: A populated :class:`LLMConfig`, or ``None`` when
         the ``llm:`` block is absent.
-    :raises ValueError: If the ``llm:`` block is present but
+    :raises AgentPlaneError: If the ``llm:`` block is present but
         missing the required ``model`` field.
     """
     if raw is None:
@@ -389,14 +389,14 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     )
 
 
-def _expand_env_vars(
+def expand_env_vars(
     mapping: dict[str, str],
 ) -> dict[str, str]:
     """
     Expand ``${VAR}`` and ``$VAR`` references in dict values
     against the current process environment.
 
-    Raises :class:`ValueError` if any value still contains an
+    Raises :class:`AgentPlaneError` if any value still contains an
     unresolved ``$VAR`` or ``${VAR}`` reference after expansion.
     This catches typos and missing environment variables at parse
     time rather than silently passing literal ``${MISSING}`` to
@@ -405,13 +405,13 @@ def _expand_env_vars(
     :param mapping: A string-to-string dict, e.g.
         ``{"TOKEN": "${GITHUB_TOKEN}"}``.
     :returns: A new dict with expanded values.
-    :raises ValueError: If a value contains an unresolved
+    :raises AgentPlaneError: If a value contains an unresolved
         environment variable reference after expansion.
     """
     result: dict[str, str] = {}
     for key, value in mapping.items():
         expanded = os.path.expandvars(value)
-        _check_unresolved_env_vars(key, expanded)
+        check_unresolved_env_vars(key, expanded)
         result[key] = expanded
     return result
 
@@ -421,7 +421,7 @@ def _expand_env_vars(
 _UNRESOLVED_VAR_RE = re.compile(r"\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*")
 
 
-def _check_unresolved_env_vars(key: str, value: str) -> None:
+def check_unresolved_env_vars(key: str, value: str) -> None:
     """
     Raise if *value* contains unresolved environment variable
     references.

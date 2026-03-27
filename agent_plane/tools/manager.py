@@ -294,7 +294,8 @@ class ToolManager:
         :param tools: List of MCP tool definitions from
             ``tools/list``.
         """
-        assert self._loop_thread is not None
+        if self._loop_thread is None:
+            raise RuntimeError("EventLoopThread not initialized — call start() first")
         for tool_def in tools:
             if not is_valid_tool_name(tool_def.name):
                 _logger.warning(
