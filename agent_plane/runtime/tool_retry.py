@@ -81,9 +81,7 @@ def call_tool_with_timeout(
         try:
             return future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
-            raise TimeoutError(
-                f"Tool execution timed out after {timeout}s"
-            ) from None
+            raise TimeoutError(f"Tool execution timed out after {timeout}s") from None
 
 
 def execute_tool_with_retry(
@@ -120,17 +118,19 @@ def execute_tool_with_retry(
             last_error = str(exc)
             if attempt + 1 < retry_config.max_attempts:
                 _emit_tool_retry(
-                    tool_name, attempt, retry_config,
-                    "timeout", last_error, on_event,
+                    tool_name,
+                    attempt,
+                    retry_config,
+                    "timeout",
+                    last_error,
+                    on_event,
                 )
         except Exception as exc:
             last_error = f"Tool '{tool_name}' raised {type(exc).__name__}: {exc}"
             # Non-timeout exceptions are not retried.
             break
 
-    _emit_tool_error(
-        tool_name, retry_config.max_attempts, last_error, on_event
-    )
+    _emit_tool_error(tool_name, retry_config.max_attempts, last_error, on_event)
     return f"Error: {last_error} ({retry_config.max_attempts} attempts)"
 
 
@@ -173,8 +173,11 @@ def _emit_tool_retry(
     on_event(event)
     _logger.info(
         "Tool %r retry %d/%d after %.1fs: %s",
-        tool_name, attempt + 2, retry_config.max_attempts,
-        delay, error_code,
+        tool_name,
+        attempt + 2,
+        retry_config.max_attempts,
+        delay,
+        error_code,
     )
     time.sleep(delay)
 
@@ -196,13 +199,15 @@ def _emit_tool_error(
     # Defensive fallback — error_message should always be set by the
     # retry loop, but "Unknown error" is safe if somehow None.
     msg = error_message or "Unknown error"
-    on_event({
-        "type": "response.error",
-        "source": "tool",
-        "tool_name": tool_name,
-        "error": {
-            "code": "timeout",
-            "message": f"{msg} ({max_attempts} attempts exhausted)",
-            "detail": None,
-        },
-    })
+    on_event(
+        {
+            "type": "response.error",
+            "source": "tool",
+            "tool_name": tool_name,
+            "error": {
+                "code": "timeout",
+                "message": f"{msg} ({max_attempts} attempts exhausted)",
+                "detail": None,
+            },
+        }
+    )

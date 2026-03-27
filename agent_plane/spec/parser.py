@@ -9,6 +9,7 @@ from typing import Any
 
 import yaml
 
+from agent_plane.errors import AgentPlaneError, ErrorCode
 from agent_plane.spec.types import (
     AgentSpec,
     ExecutionConfig,
@@ -34,9 +35,9 @@ def parse(root: Path) -> AgentSpec:
         ``config.yaml``.
     :returns: A fully populated :class:`AgentSpec` (not yet
         validated).
+    :raises AgentPlaneError: If ``config.yaml`` is not valid YAML,
+        has structural issues, or contains unresolved env vars.
     :raises FileNotFoundError: If ``config.yaml`` is missing.
-    :raises ValueError: If ``config.yaml`` is not valid YAML or has
-        structural issues.
     """
     config_path = root / "config.yaml"
     if not config_path.exists():
@@ -44,11 +45,17 @@ def parse(root: Path) -> AgentSpec:
 
     raw = yaml.safe_load(config_path.read_text())
     if not isinstance(raw, dict):
-        raise ValueError(f"config.yaml must be a YAML mapping, got {type(raw).__name__}")
+        raise AgentPlaneError(
+            f"config.yaml must be a YAML mapping, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
     spec_version = raw.get("spec_version")
     if spec_version is None:
-        raise ValueError("config.yaml missing required field: spec_version")
+        raise AgentPlaneError(
+            "config.yaml missing required field: spec_version",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
     llm = _parse_llm(raw.get("llm"))
     interaction = _parse_interaction(raw.get("interaction"))
@@ -96,7 +103,10 @@ def _parse_llm(raw: dict[str, Any] | None) -> LLMConfig | None:
         return None
     model = raw.get("model")
     if model is None:
-        raise ValueError("llm block present but missing required field: model")
+        raise AgentPlaneError(
+            "llm block present but missing required field: model",
+            code=ErrorCode.INVALID_INPUT,
+        )
     # ``connection``, ``timeout``, and ``retry`` are separated into
     # their own typed fields; everything else is passed through to
     # the LLM SDK as extra kwargs.
@@ -292,23 +302,35 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     :param skill_md: Path to the ``SKILL.md`` file, e.g.
         ``skills/code-review/SKILL.md``.
     :returns: A populated :class:`SkillSpec`.
-    :raises ValueError: If the frontmatter is missing, malformed,
-        or lacks required fields.
+    :raises AgentPlaneError: If the frontmatter is missing,
+        malformed, or lacks required fields.
     """
     text = skill_md.read_text()
     match = _FRONTMATTER_RE.match(text)
     if not match:
-        raise ValueError(f"SKILL.md missing YAML frontmatter: {skill_md}")
+        raise AgentPlaneError(
+            f"SKILL.md missing YAML frontmatter: {skill_md}",
+            code=ErrorCode.INVALID_INPUT,
+        )
     frontmatter_str, content = match.groups()
     frontmatter = yaml.safe_load(frontmatter_str)
     if not isinstance(frontmatter, dict):
-        raise ValueError(f"SKILL.md frontmatter must be a YAML mapping: {skill_md}")
+        raise AgentPlaneError(
+            f"SKILL.md frontmatter must be a YAML mapping: {skill_md}",
+            code=ErrorCode.INVALID_INPUT,
+        )
     name = frontmatter.get("name")
     if name is None:
-        raise ValueError(f"SKILL.md frontmatter missing required field 'name': {skill_md}")
+        raise AgentPlaneError(
+            f"SKILL.md frontmatter missing required field 'name': {skill_md}",
+            code=ErrorCode.INVALID_INPUT,
+        )
     description = frontmatter.get("description")
     if description is None:
-        raise ValueError(f"SKILL.md frontmatter missing required field 'description': {skill_md}")
+        raise AgentPlaneError(
+            f"SKILL.md frontmatter missing required field 'description': {skill_md}",
+            code=ErrorCode.INVALID_INPUT,
+        )
     return SkillSpec(
         name=str(name),
         description=str(description),
@@ -324,15 +346,58 @@ def _expand_env_vars(
     Expand ``${VAR}`` and ``$VAR`` references in dict values
     against the current process environment.
 
-    Uses :func:`os.path.expandvars`, which leaves unresolved
-    references as-is (e.g. ``${MISSING}`` stays literal if
-    the variable is not set).
+    Raises :class:`ValueError` if any value still contains an
+    unresolved ``$VAR`` or ``${VAR}`` reference after expansion.
+    This catches typos and missing environment variables at parse
+    time rather than silently passing literal ``${MISSING}`` to
+    MCP servers or LLM clients.
 
     :param mapping: A string-to-string dict, e.g.
         ``{"TOKEN": "${GITHUB_TOKEN}"}``.
     :returns: A new dict with expanded values.
+    :raises ValueError: If a value contains an unresolved
+        environment variable reference after expansion.
     """
-    return {key: os.path.expandvars(value) for key, value in mapping.items()}
+    result: dict[str, str] = {}
+    for key, value in mapping.items():
+        expanded = os.path.expandvars(value)
+        _check_unresolved_env_vars(key, expanded)
+        result[key] = expanded
+    return result
+
+
+# Matches $VAR or ${VAR} patterns that survived expansion.
+# Excludes $$ (escaped dollar sign).
+_UNRESOLVED_VAR_RE = re.compile(r"\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _check_unresolved_env_vars(key: str, value: str) -> None:
+    """
+    Raise if *value* contains unresolved environment variable
+    references.
+
+    Called after :func:`os.path.expandvars` to catch variables
+    that were not set in the environment. Without this check,
+    ``os.path.expandvars`` silently passes through the literal
+    ``${VAR}`` string, which causes hard-to-debug failures
+    downstream (e.g. an MCP server receiving ``$GITHUB_TOKEN``
+    as a literal auth token).
+
+    :param key: The dict key (for error messages), e.g.
+        ``"GITHUB_TOKEN"``.
+    :param value: The expanded value to check, e.g.
+        ``"Bearer ${MISSING}"``.
+    :raises AgentPlaneError: If *value* contains an unresolved
+        ``$VAR`` or ``${VAR}`` reference.
+    """
+    match = _UNRESOLVED_VAR_RE.search(value)
+    if match is not None:
+        raise AgentPlaneError(
+            f"Unresolved environment variable {match.group()!r} "
+            f"in config key {key!r}. Set the variable in the "
+            f"environment or remove the reference.",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _discover_mcp_servers(
@@ -350,8 +415,8 @@ def _discover_mcp_servers(
     :returns: A sorted list of parsed :class:`MCPServerConfig`
         objects. Returns an empty list if *mcp_dir* does not
         exist.
-    :raises ValueError: If any YAML file is malformed or missing
-        required fields (``name``, ``transport``).
+    :raises AgentPlaneError: If any YAML file is malformed or
+        missing required fields (``name``, ``transport``).
     """
     if not mcp_dir.is_dir():
         return []
@@ -359,13 +424,22 @@ def _discover_mcp_servers(
     for yaml_file in sorted(mcp_dir.glob("*.yaml")):
         raw = yaml.safe_load(yaml_file.read_text())
         if not isinstance(raw, dict):
-            raise ValueError(f"MCP config must be a YAML mapping: {yaml_file}")
+            raise AgentPlaneError(
+                f"MCP config must be a YAML mapping: {yaml_file}",
+                code=ErrorCode.INVALID_INPUT,
+            )
         name = raw.get("name")
         if name is None:
-            raise ValueError(f"MCP config missing required field 'name': {yaml_file}")
+            raise AgentPlaneError(
+                f"MCP config missing required field 'name': {yaml_file}",
+                code=ErrorCode.INVALID_INPUT,
+            )
         transport = raw.get("transport")
         if transport is None:
-            raise ValueError(f"MCP config missing required field 'transport': {yaml_file}")
+            raise AgentPlaneError(
+                f"MCP config missing required field 'transport': {yaml_file}",
+                code=ErrorCode.INVALID_INPUT,
+            )
         servers.append(
             MCPServerConfig(
                 name=str(name),

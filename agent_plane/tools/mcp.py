@@ -18,23 +18,24 @@ import concurrent.futures
 import json
 import logging
 import threading
-import time
 from collections.abc import Callable, Coroutine
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, TypeVar
 
 from anyio.streams.memory import (
     MemoryObjectReceiveStream,
     MemoryObjectSendStream,
 )
+from cachetools import TTLCache
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.shared.exceptions import McpError
 from mcp.shared.message import SessionMessage
-from mcp.types import CONNECTION_CLOSED, CallToolResult, ContentBlock
+from mcp.types import CONNECTION_CLOSED, CallToolResult, ContentBlock, TextContent
 from mcp.types import Tool as McpToolDef
 
 from agent_plane.spec.types import MCPServerConfig
@@ -170,26 +171,20 @@ def _run_in_thread(coro: Coroutine[Any, Any, _T]) -> _T:
 # Default discovery cache TTL in seconds (5 minutes).
 _DEFAULT_CACHE_TTL_SECONDS = 300
 
+# Maximum number of MCP server discovery results to cache.
+# Each entry is lightweight (a list of tool definitions), so 64
+# is generous for any realistic deployment.
+_DEFAULT_CACHE_MAX_SIZE = 64
 
-@dataclass
-class _CachedDiscovery:
-    """
-    Cached result of an MCP ``tools/list`` call.
-
-    :param tools: The discovered MCP tool definitions.
-    :param fetched_at: Monotonic timestamp when the discovery
-        was performed, from ``time.monotonic()``.
-    """
-
-    tools: list[McpToolDef]
-    fetched_at: float
-
-
-# Module-level discovery cache keyed by a stable server identity
-# string. Survives across ToolManager instances so that sequential
-# workflow executions against the same agent don't re-discover
-# tools if the cache is still fresh.
-_discovery_cache: dict[str, _CachedDiscovery] = {}
+# Module-level discovery cache: bounded LRU with TTL expiration
+# (via cachetools.TTLCache). Keyed by a stable server identity
+# string (see _cache_key). Survives across ToolManager instances
+# so sequential workflow executions against the same agent avoid
+# redundant tools/list round-trips.
+_discovery_cache: TTLCache[str, list[McpToolDef]] = TTLCache(
+    maxsize=_DEFAULT_CACHE_MAX_SIZE,
+    ttl=_DEFAULT_CACHE_TTL_SECONDS,
+)
 
 
 def _cache_key(config: MCPServerConfig) -> str:
@@ -232,12 +227,15 @@ class McpServerConnection:
     :param config: The MCP server configuration from the agent
         spec, e.g. ``MCPServerConfig(name="github",
         transport="stdio", command="npx", ...)``.
-    :param cache_ttl_seconds: How long discovery results are
-        considered fresh, in seconds. Defaults to 300 (5 minutes).
+    :param work_dir: Working directory for stdio subprocess
+        execution. When set, the subprocess ``cwd`` is set to
+        this path so that relative command paths (e.g.
+        ``"tools/mcp/server.py"``) resolve correctly. ``None``
+        inherits the parent process CWD.
     """
 
     config: MCPServerConfig
-    cache_ttl_seconds: float = _DEFAULT_CACHE_TTL_SECONDS
+    work_dir: Path | None = None
     _session: ClientSession | None = field(default=None, init=False, repr=False)
     _exit_stack: AsyncExitStack | None = field(default=None, init=False, repr=False)
     _discovered_tools: list[McpToolDef] = field(default_factory=list, init=False, repr=False)
@@ -420,30 +418,28 @@ class McpServerConnection:
         """
         Return cached discovery if still fresh, else ``None``.
 
+        TTLCache handles expiry internally — ``get()`` returns
+        ``None`` for expired or absent entries.
+
         :returns: Cached tool list or ``None`` if expired or
             absent.
         """
         key = _cache_key(self.config)
-        cached = _discovery_cache.get(key)
-        if cached is None:
-            return None
-        age = time.monotonic() - cached.fetched_at
-        if age > self.cache_ttl_seconds:
-            del _discovery_cache[key]
-            return None
-        return cached.tools
+        # TTLCache lacks type stubs, so .get() returns Any.
+        result: list[McpToolDef] | None = _discovery_cache.get(key)
+        return result
 
     def _update_cache(self, tools: list[McpToolDef]) -> None:
         """
         Store discovery results in the module-level cache.
 
+        TTLCache tracks insertion time internally and evicts
+        entries after the configured TTL.
+
         :param tools: The freshly discovered tool definitions.
         """
         key = _cache_key(self.config)
-        _discovery_cache[key] = _CachedDiscovery(
-            tools=tools,
-            fetched_at=time.monotonic(),
-        )
+        _discovery_cache[key] = tools
 
     async def _open_transport(
         self,
@@ -480,6 +476,10 @@ class McpServerConnection:
             command=self.config.command,
             args=self.config.args,
             env=self.config.env or None,
+            # Set cwd so relative command paths (e.g.
+            # "tools/mcp/server.py") resolve from the agent's
+            # extracted working directory.
+            cwd=self.work_dir,
         )
         read_stream, write_stream = await self._exit_stack.enter_async_context(
             stdio_client(params)
@@ -658,23 +658,16 @@ def _format_content_block(block: ContentBlock) -> str:
     """
     Convert a single MCP content block to a string.
 
-    Prefers the ``.text`` attribute (present on ``TextContent``).
-    Falls back to Pydantic ``model_dump()`` for structured types
-    (``ImageContent``, ``AudioContent``, ``EmbeddedResource``,
-    ``ResourceLink``). Uses ``str()`` as a last resort if a future
-    SDK version adds a non-Pydantic content type.
+    Returns ``.text`` for ``TextContent`` (the most common case).
+    For non-text types (``ImageContent``, ``AudioContent``,
+    ``EmbeddedResource``, ``ResourceLink``), serializes the full
+    Pydantic model to JSON.
 
     :param block: A content block from ``CallToolResult.content``,
         e.g. ``TextContent(type="text", text="hello")``.
     :returns: A string representation of the block.
     """
-    # TextContent has a .text attribute — the most common case.
-    text = getattr(block, "text", None)
-    if text is not None:
-        return str(text)
-    # All current MCP SDK content types are Pydantic BaseModels.
-    model_dump = getattr(block, "model_dump", None)
-    if model_dump is not None:
-        return json.dumps(model_dump())
-    # Defensive fallback for unknown future content types.
-    return str(block)
+    if isinstance(block, TextContent):
+        return block.text
+    # All ContentBlock variants are Pydantic BaseModels.
+    return json.dumps(block.model_dump())

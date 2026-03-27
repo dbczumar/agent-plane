@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from agent_plane.errors import AgentPlaneError
 from agent_plane.spec.parser import parse
 
 
@@ -43,13 +44,13 @@ def test_parse_missing_config_yaml(tmp_path: Path) -> None:
 
 def test_parse_non_mapping_config(tmp_path: Path) -> None:
     (tmp_path / "config.yaml").write_text("- just a list")
-    with pytest.raises(ValueError, match="must be a YAML mapping"):
+    with pytest.raises(AgentPlaneError, match="must be a YAML mapping"):
         parse(tmp_path)
 
 
 def test_parse_missing_spec_version(tmp_path: Path) -> None:
     (tmp_path / "config.yaml").write_text(yaml.dump({"name": "no-version"}))
-    with pytest.raises(ValueError, match="missing required field: spec_version"):
+    with pytest.raises(AgentPlaneError, match="missing required field: spec_version"):
         parse(tmp_path)
 
 
@@ -94,7 +95,7 @@ def test_parse_full_config(tmp_path: Path) -> None:
 def test_parse_llm_missing_model(tmp_path: Path) -> None:
     config = {"spec_version": 1, "llm": {"max_completion_tokens": 100}}
     (tmp_path / "config.yaml").write_text(yaml.dump(config))
-    with pytest.raises(ValueError, match="missing required field: model"):
+    with pytest.raises(AgentPlaneError, match="missing required field: model"):
         parse(tmp_path)
 
 
@@ -176,6 +177,29 @@ def test_parse_llm_connection_expands_env_vars(
     assert spec.llm.connection == {"api_key": "sk-secret-123"}
 
 
+def test_parse_llm_connection_unresolved_var_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Unresolved ``${VAR}`` in LLM connection raises ValueError.
+
+    :param tmp_path: Temporary directory for config files.
+    :param monkeypatch: Pytest monkeypatch for env vars.
+    """
+    monkeypatch.delenv("MY_API_KEY", raising=False)
+    config = {
+        "spec_version": 1,
+        "llm": {
+            "model": "openai/gpt-4o",
+            "connection": {"api_key": "${MY_API_KEY}"},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(AgentPlaneError, match="Unresolved environment variable"):
+        parse(tmp_path)
+
+
 def test_parse_instructions_multiline_inline(tmp_path: Path) -> None:
     """Multiline inline instructions are not treated as file paths."""
     config = {
@@ -253,7 +277,7 @@ def test_parse_skill_missing_frontmatter(agent_dir: Path) -> None:
     skill_dir = agent_dir / "skills" / "bad"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("No frontmatter here.")
-    with pytest.raises(ValueError, match="missing YAML frontmatter"):
+    with pytest.raises(AgentPlaneError, match="missing YAML frontmatter"):
         parse(agent_dir)
 
 
@@ -261,7 +285,7 @@ def test_parse_skill_missing_name(agent_dir: Path) -> None:
     skill_dir = agent_dir / "skills" / "no-name"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("---\ndescription: Missing name.\n---\nContent.")
-    with pytest.raises(ValueError, match="missing required field 'name'"):
+    with pytest.raises(AgentPlaneError, match="missing required field 'name'"):
         parse(agent_dir)
 
 
@@ -269,7 +293,7 @@ def test_parse_skill_missing_description(agent_dir: Path) -> None:
     skill_dir = agent_dir / "skills" / "no-desc"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("---\nname: no-desc\n---\nContent.")
-    with pytest.raises(ValueError, match="missing required field 'description'"):
+    with pytest.raises(AgentPlaneError, match="missing required field 'description'"):
         parse(agent_dir)
 
 
@@ -277,8 +301,13 @@ def test_parse_mcp_stdio(
     agent_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Ensure the env var is NOT set so ${VAR} stays literal.
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    """
+    Parse a stdio MCP server config with env var expansion.
+
+    :param agent_dir: Temporary agent directory fixture.
+    :param monkeypatch: Pytest monkeypatch for env vars.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test123")
     mcp_dir = agent_dir / "tools" / "mcp"
     mcp_dir.mkdir(parents=True)
     mcp_config = {
@@ -297,16 +326,21 @@ def test_parse_mcp_stdio(
     assert mcp.transport == "stdio"
     assert mcp.command == "npx"
     assert mcp.args == ["-y", "@modelcontextprotocol/server-github"]
-    # Unset vars are left as literal ${VAR} by os.path.expandvars.
-    assert mcp.env == {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}
+    # ${GITHUB_TOKEN} expanded to the value set via monkeypatch.
+    assert mcp.env == {"GITHUB_TOKEN": "ghp_test123"}
 
 
 def test_parse_mcp_http(
     agent_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Ensure the env var is NOT set so ${VAR} stays literal.
-    monkeypatch.delenv("API_KEY", raising=False)
+    """
+    Parse an HTTP MCP server config with env var expansion.
+
+    :param agent_dir: Temporary agent directory fixture.
+    :param monkeypatch: Pytest monkeypatch for env vars.
+    """
+    monkeypatch.setenv("API_KEY", "sk-test-key")
     mcp_dir = agent_dir / "tools" / "mcp"
     mcp_dir.mkdir(parents=True)
     mcp_config = {
@@ -320,15 +354,90 @@ def test_parse_mcp_http(
     mcp = spec.mcp_servers[0]
     assert mcp.transport == "http"
     assert mcp.url == "http://localhost:9000/mcp"
-    # Unset vars are left as literal ${VAR} by os.path.expandvars.
-    assert mcp.headers == {"Authorization": "Bearer ${API_KEY}"}
+    # ${API_KEY} expanded to the value set via monkeypatch.
+    assert mcp.headers == {"Authorization": "Bearer sk-test-key"}
+
+
+def test_parse_mcp_env_unresolved_var_raises(
+    agent_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Unresolved ``${VAR}`` in MCP env raises ``AgentPlaneError``
+    at parse time instead of silently passing the literal to the
+    server.
+
+    :param agent_dir: Temporary agent directory fixture.
+    :param monkeypatch: Pytest monkeypatch for env vars.
+    """
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "github",
+        "transport": "stdio",
+        "command": "npx",
+        "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"},
+    }
+    (mcp_dir / "github.yaml").write_text(yaml.dump(mcp_config))
+    with pytest.raises(AgentPlaneError, match="Unresolved environment variable"):
+        parse(agent_dir)
+
+
+def test_parse_mcp_headers_unresolved_var_raises(
+    agent_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Unresolved ``${VAR}`` in MCP headers raises ValueError at
+    parse time.
+
+    :param agent_dir: Temporary agent directory fixture.
+    :param monkeypatch: Pytest monkeypatch for env vars.
+    """
+    monkeypatch.delenv("API_KEY", raising=False)
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "my-service",
+        "transport": "http",
+        "url": "http://localhost:9000/mcp",
+        "headers": {"Authorization": "Bearer ${API_KEY}"},
+    }
+    (mcp_dir / "service.yaml").write_text(yaml.dump(mcp_config))
+    with pytest.raises(AgentPlaneError, match="Unresolved environment variable"):
+        parse(agent_dir)
+
+
+def test_parse_mcp_env_dollar_without_braces_raises(
+    agent_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Unresolved ``$VAR`` (without braces) also raises ValueError.
+
+    :param agent_dir: Temporary agent directory fixture.
+    :param monkeypatch: Pytest monkeypatch for env vars.
+    """
+    monkeypatch.delenv("MY_SECRET", raising=False)
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "test",
+        "transport": "stdio",
+        "command": "echo",
+        "env": {"SECRET": "$MY_SECRET"},
+    }
+    (mcp_dir / "test.yaml").write_text(yaml.dump(mcp_config))
+    with pytest.raises(AgentPlaneError, match="Unresolved environment variable"):
+        parse(agent_dir)
 
 
 def test_parse_mcp_missing_name(agent_dir: Path) -> None:
     mcp_dir = agent_dir / "tools" / "mcp"
     mcp_dir.mkdir(parents=True)
     (mcp_dir / "bad.yaml").write_text(yaml.dump({"transport": "stdio"}))
-    with pytest.raises(ValueError, match="missing required field 'name'"):
+    with pytest.raises(AgentPlaneError, match="missing required field 'name'"):
         parse(agent_dir)
 
 
@@ -336,7 +445,7 @@ def test_parse_mcp_missing_transport(agent_dir: Path) -> None:
     mcp_dir = agent_dir / "tools" / "mcp"
     mcp_dir.mkdir(parents=True)
     (mcp_dir / "bad.yaml").write_text(yaml.dump({"name": "bad"}))
-    with pytest.raises(ValueError, match="missing required field 'transport'"):
+    with pytest.raises(AgentPlaneError, match="missing required field 'transport'"):
         parse(agent_dir)
 
 
@@ -479,12 +588,16 @@ def test_mcp_headers_expanded_from_environment(
     }
 
 
-def test_mcp_env_expansion_mixed_set_and_unset(
+def test_mcp_env_expansion_mixed_set_and_unset_raises(
     agent_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Set vars are expanded; unset vars stay as literal ``${VAR}``.
+    If any env value contains an unresolved ``${VAR}``, parsing
+    raises ValueError even when other vars are set.
+
+    :param agent_dir: Temporary agent directory fixture.
+    :param monkeypatch: Pytest monkeypatch for env vars.
     """
     monkeypatch.setenv("SET_VAR", "expanded")
     monkeypatch.delenv("UNSET_VAR", raising=False)
@@ -501,11 +614,8 @@ def test_mcp_env_expansion_mixed_set_and_unset(
         },
     }
     (mcp_dir / "mixed.yaml").write_text(yaml.dump(mcp_config))
-    spec = parse(agent_dir)
-    env = spec.mcp_servers[0].env
-    assert env["A"] == "expanded"
-    assert env["B"] == "${UNSET_VAR}"
-    assert env["C"] == "plain-value"
+    with pytest.raises(AgentPlaneError, match="Unresolved environment variable"):
+        parse(agent_dir)
 
 
 # ── Timeout / retry / execution parsing ────────────────

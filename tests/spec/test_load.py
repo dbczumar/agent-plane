@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from agent_plane.errors import AgentPlaneError
 from agent_plane.spec import load
 
 
@@ -54,7 +55,7 @@ def test_load_tarball_without_dest_raises(tmp_path: Path) -> None:
     config = yaml.dump({"spec_version": 1, "name": "x"})
     tar_path = _make_tarball(tmp_path, {"config.yaml": config})
 
-    with pytest.raises(ValueError, match="dest is required"):
+    with pytest.raises(AgentPlaneError, match="dest is required"):
         load(tar_path)
 
 
@@ -62,7 +63,7 @@ def test_load_invalid_spec_raises(tmp_path: Path) -> None:
     config = {"spec_version": 99, "name": "bad"}
     (tmp_path / "config.yaml").write_text(yaml.dump(config))
 
-    with pytest.raises(ValueError, match="invalid agent spec"):
+    with pytest.raises(AgentPlaneError, match="invalid agent spec"):
         load(tmp_path)
 
 
@@ -83,5 +84,5 @@ def test_load_from_bytes(tmp_path: Path) -> None:
 
 
 def test_load_bytes_without_dest_raises() -> None:
-    with pytest.raises(ValueError, match="dest is required"):
+    with pytest.raises(AgentPlaneError, match="dest is required"):
         load(b"fake-tarball-bytes")

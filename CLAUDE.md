@@ -154,12 +154,16 @@ Check each file against this checklist:
     docstring with `:param:` entries. Missing or incomplete
     docstrings are a blocking issue.
 
-26. MOCK INTEGRITY: Test mocks must use real types (dataclasses,
-    Pydantic models) from the same module the production code imports —
-    never MagicMock for objects checked with isinstance. After any
-    import-path refactor, grep tests for stale type references. Stale
-    mock *targets* (monkeypatch of renamed function) raise errors;
-    stale mock *types* silently degrade.
+26. MOCK INTEGRITY: MagicMock must NEVER be used when a real type
+    exists (SDK types, Pydantic models, dataclasses). MagicMock
+    silently returns MagicMock for any attribute access, making
+    broken code pass green. Use real types from the same module
+    the production code imports. MagicMock is ONLY acceptable for
+    client/interface stubs where production calls methods but never
+    checks types or accesses nested attributes. After any
+    import-path refactor, grep tests for stale type references.
+    Stale mock *targets* (monkeypatch of renamed function) raise
+    errors; stale mock *types* silently degrade.
 
 27. ASSERTION DEPTH: Test assertions must verify actual content values,
     not just structural properties. `assert len(x) >= 1` and
@@ -176,6 +180,17 @@ Check each file against this checklist:
     and cause silent, hard-to-debug failures in production. If a
     genuine default exists (documented in provider docs), it must
     have a comment citing the source.
+
+29. NO REINVENTING PRIMITIVES: Never hand-roll complex data structures
+    or algorithms that have well-known, battle-tested implementations
+    in the standard library or popular packages (e.g. custom LRU
+    caches, TTL caches, retry logic, rate limiters, thread pools,
+    connection pools). Custom implementations are a stability risk —
+    they lack the edge-case coverage, testing, and maintenance of
+    established libraries. Use `cachetools`, `tenacity`, `stdlib
+    collections`, etc. If a custom implementation is truly needed
+    (e.g. domain-specific invariants that no library enforces), add
+    a comment explaining why no existing library suffices.
 
 Report each finding as:
   [FILE:LINE] ISSUE — description of the problem and suggested fix

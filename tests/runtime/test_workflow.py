@@ -1,4 +1,7 @@
-"""Tests for agent_plane.runtime.workflow helpers: pagination, execution timeout, tool call splitting."""
+"""Tests for agent_plane.runtime.workflow helpers.
+
+Covers pagination, execution timeout, and tool call splitting.
+"""
 
 from __future__ import annotations
 

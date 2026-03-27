@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from agent_plane.errors import AgentPlaneError
 from agent_plane.runtime.agent_cache import AgentCache
 from agent_plane.stores.artifact_store.local import LocalArtifactStore
 
@@ -132,16 +133,22 @@ def test_load_missing_agent_raises_key_error(
         agent_cache.load("nonexistent")
 
 
-def test_load_invalid_spec_raises_value_error(
+def test_load_invalid_spec_raises_agent_plane_error(
     agent_cache: AgentCache,
     artifact_store: LocalArtifactStore,
 ) -> None:
-    """load() raises ValueError when the extracted spec is invalid."""
+    """
+    ``load()`` raises ``AgentPlaneError`` when the extracted spec
+    is invalid.
+
+    :param agent_cache: The cache under test.
+    :param artifact_store: Store for uploading test bundles.
+    """
     # spec_version=99 is invalid (must be 1)
     bad_config = yaml.dump({"spec_version": 99, "name": "bad"})
     _store_bundle(artifact_store, "bad-agent", {"config.yaml": bad_config})
 
-    with pytest.raises(ValueError, match="invalid agent spec"):
+    with pytest.raises(AgentPlaneError, match="invalid agent spec"):
         agent_cache.load("bad-agent")
 
 

@@ -72,7 +72,9 @@ def create_agents_router(
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 spec = load(bundle_bytes, dest=Path(tmpdir) / "agent")
-        except (ValueError, ExtractionError) as exc:
+        except AgentPlaneError:
+            raise
+        except ExtractionError as exc:
             raise AgentPlaneError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
         if spec.name is None:

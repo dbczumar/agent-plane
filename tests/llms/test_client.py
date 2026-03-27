@@ -24,7 +24,6 @@ from llms.types import (
     RetryConfig,
 )
 
-
 # ── Helpers ──────────────────────────────────────────────────
 
 
@@ -293,9 +292,7 @@ def test_create_with_retry_exhausted_raises(
     """
     mock_adapter = MagicMock()
     # All 3 attempts time out
-    mock_adapter.chat_completions.side_effect = httpx.TimeoutException(
-        "timeout"
-    )
+    mock_adapter.chat_completions.side_effect = httpx.TimeoutException("timeout")
     tracker = _patch_client_deps(monkeypatch, mock_adapter)
 
     with pytest.raises(RetryableLLMError) as exc_info:
@@ -396,9 +393,7 @@ def test_create_with_retry_connection_error_is_permanent(
     PermanentLLMError with no retry.
     """
     mock_adapter = MagicMock()
-    mock_adapter.chat_completions.side_effect = ConnectionError(
-        "connection refused"
-    )
+    mock_adapter.chat_completions.side_effect = ConnectionError("connection refused")
     tracker = _patch_client_deps(monkeypatch, mock_adapter)
 
     with pytest.raises(PermanentLLMError) as exc_info:

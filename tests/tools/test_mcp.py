@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from cachetools import TTLCache
 from mcp.shared.exceptions import McpError
-from mcp.types import CONNECTION_CLOSED, ErrorData
+from mcp.types import CONNECTION_CLOSED, ErrorData, ImageContent, TextContent
 
 from agent_plane.spec.types import MCPServerConfig
 from agent_plane.tools.mcp import (
@@ -21,7 +21,6 @@ from agent_plane.tools.mcp import (
     _cache_key,
     _discovery_cache,
     _format_call_result,
-    _format_content_block,
     _is_connection_error,
     _run_async,
     clear_discovery_cache,
@@ -211,7 +210,7 @@ async def test_cached_connect_has_live_session() -> None:
     with _mock_mcp_transport() as mock_session:
         # Set up call_tool to return a mock result.
         mock_result = MagicMock()
-        mock_result.content = [MagicMock(text="cached ok")]
+        mock_result.content = [TextContent(type="text", text="cached ok")]
         mock_result.isError = False
         mock_session.call_tool.return_value = mock_result
 
@@ -375,8 +374,7 @@ def test_format_call_result_text_content() -> None:
     """
     Text content blocks are extracted and joined.
     """
-    block = MagicMock()
-    block.text = "Hello world"
+    block = TextContent(type="text", text="Hello world")
     result = MagicMock()
     result.content = [block]
     result.isError = False
@@ -388,10 +386,8 @@ def test_format_call_result_multiple_blocks() -> None:
     """
     Multiple text blocks are joined with newlines.
     """
-    block1 = MagicMock()
-    block1.text = "Line 1"
-    block2 = MagicMock()
-    block2.text = "Line 2"
+    block1 = TextContent(type="text", text="Line 1")
+    block2 = TextContent(type="text", text="Line 2")
     result = MagicMock()
     result.content = [block1, block2]
     result.isError = False
@@ -403,8 +399,7 @@ def test_format_call_result_error_prefix() -> None:
     """
     Error results are prefixed with "Error: ".
     """
-    block = MagicMock()
-    block.text = "something went wrong"
+    block = TextContent(type="text", text="something went wrong")
     result = MagicMock()
     result.content = [block]
     result.isError = True
@@ -416,12 +411,10 @@ def test_format_call_result_error_prefix() -> None:
 
 def test_format_call_result_non_text_content() -> None:
     """
-    Non-text content (e.g. images) is serialized as JSON.
+    Non-text content (e.g. images) is serialized as JSON via
+    ``model_dump()``.
     """
-    # spec=[] disables auto-attribute creation so getattr(.text)
-    # returns None, simulating non-text content (e.g. ImageContent).
-    block = MagicMock(spec=[])
-    block.model_dump = MagicMock(return_value={"type": "image", "data": "base64..."})
+    block = ImageContent(type="image", data="base64data", mimeType="image/png")
     result = MagicMock()
     result.content = [block]
     result.isError = False
@@ -429,6 +422,7 @@ def test_format_call_result_non_text_content() -> None:
     formatted = _format_call_result(result)
     parsed = json.loads(formatted)
     assert parsed["type"] == "image"
+    assert parsed["data"] == "base64data"
 
 
 def test_format_call_result_empty_content() -> None:
@@ -453,24 +447,6 @@ def test_format_call_result_empty_content_with_error() -> None:
     result.isError = True
 
     assert _format_call_result(result) == "Error: (empty response)"
-
-
-def test_format_content_block_unknown_type_falls_back_to_str() -> None:
-    """
-    A content block with no ``.text`` and no ``.model_dump()``
-    falls back to ``str(block)``.
-    """
-
-    class _UnknownBlock:
-        """
-        Simulates a hypothetical future MCP content type that
-        is neither TextContent nor a Pydantic BaseModel.
-        """
-
-        def __str__(self) -> str:
-            return "CustomBlock(data=42)"
-
-    assert _format_content_block(_UnknownBlock()) == "CustomBlock(data=42)"
 
 
 # ── clear_discovery_cache ────────────────────────────────
@@ -652,7 +628,7 @@ async def test_call_tool_reconnects_on_connection_error() -> None:
         # First call_tool raises a connection error (server died).
         # Second call_tool (after reconnect) succeeds.
         ok_result = MagicMock()
-        ok_result.content = [MagicMock(text="recovered")]
+        ok_result.content = [TextContent(type="text", text="recovered")]
         ok_result.isError = False
 
         mock_session.call_tool.side_effect = [

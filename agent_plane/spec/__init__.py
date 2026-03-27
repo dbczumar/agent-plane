@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from agent_plane.errors import AgentPlaneError, ErrorCode
 from agent_plane.spec.parser import parse
 from agent_plane.spec.tar_utils import ExtractionError, extract_safe
 from agent_plane.spec.types import (
@@ -55,7 +56,7 @@ def load(source: Path | bytes, *, dest: Path | None = None) -> AgentSpec:
         is a tarball or bytes, ignored when *source* is a
         directory.
     :returns: A validated :class:`AgentSpec`.
-    :raises ValueError: If the spec fails validation, or if
+    :raises AgentPlaneError: If the spec fails validation, or if
         *source* is a tarball/bytes and *dest* is not provided.
     :raises FileNotFoundError: If *source* is a :class:`Path` that
         does not exist, or if the extracted directory is missing
@@ -64,14 +65,20 @@ def load(source: Path | bytes, *, dest: Path | None = None) -> AgentSpec:
     """
     if isinstance(source, bytes):
         if dest is None:
-            raise ValueError("dest is required when loading from bytes")
+            raise AgentPlaneError(
+                "dest is required when loading from bytes",
+                code=ErrorCode.INVALID_INPUT,
+            )
         extract_safe(source, dest)
         root = dest
     elif source.is_dir():
         root = source
     elif source.is_file():
         if dest is None:
-            raise ValueError("dest is required when loading from a tarball")
+            raise AgentPlaneError(
+                "dest is required when loading from a tarball",
+                code=ErrorCode.INVALID_INPUT,
+            )
         extract_safe(source, dest)
         root = dest
     else:
@@ -81,5 +88,8 @@ def load(source: Path | bytes, *, dest: Path | None = None) -> AgentSpec:
     result = validate(spec)
     if not result.valid:
         errors = "; ".join(f"{e.path}: {e.message}" for e in result.errors)
-        raise ValueError(f"invalid agent spec: {errors}")
+        raise AgentPlaneError(
+            f"invalid agent spec: {errors}",
+            code=ErrorCode.INVALID_INPUT,
+        )
     return spec

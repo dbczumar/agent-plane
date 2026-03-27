@@ -164,17 +164,13 @@ def execute_with_retry(
         try:
             return call_fn()
         except Exception as exc:
-            classified = classify_llm_error(
-                exc, retry_config.status_codes
-            )
+            classified = classify_llm_error(exc, retry_config.status_codes)
             if isinstance(classified, PermanentLLMError):
                 raise classified from exc
 
             last_error = classified
             if attempt + 1 < retry_config.max_attempts:
-                _emit_retry_and_sleep(
-                    attempt, retry_config, classified, on_retry
-                )
+                _emit_retry_and_sleep(attempt, retry_config, classified, on_retry)
 
     # All retries exhausted.
     assert last_error is not None
