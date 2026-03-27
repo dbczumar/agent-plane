@@ -649,6 +649,112 @@ async def test_client_side_tool_completes_with_function_call(
     )
 
 
+async def test_mixed_batch_executes_server_tools_returns_client_tools(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    When the LLM returns both a server-side tool and a client-side
+    tool in one batch, the server-side tool is executed (producing
+    a ``function_call_output``) and the client-side tool is returned
+    as a ``function_call`` without execution.
+
+    This is the critical mixed-batch scenario. The old code used an
+    ``any()`` check that skipped ALL tools when any client tool was
+    present — server-side tools would never execute.
+    """
+    await create_test_agent(client)
+
+    # LLM returns two tool calls in one batch:
+    # - load_skill: not registered on the minimal test agent,
+    #   so call_tool returns an error string — but it IS
+    #   executed server-side (produces function_call_output).
+    # - get_weather: client-side tool, must NOT be executed.
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_server_1",
+                "name": "load_skill",
+                "arguments": '{"name": "nonexistent"}',
+            },
+            {
+                "call_id": "call_client_1",
+                "name": "get_weather",
+                "arguments": '{"city": "NYC"}',
+            },
+        ],
+    )
+
+    result = await create_test_response(
+        client,
+        input_text="Use both tools",
+        tools=[_WEATHER_TOOL],
+    )
+    response_id = result.body["id"]
+    conv_id = result.body["conversation"]["id"]
+
+    body = await _wait_for_completion(client, response_id)
+    assert body["status"] == "completed", (
+        f"Expected 'completed'; got '{body['status']}'. "
+        f"If 'failed', a client-side tool was invoked server-side."
+    )
+
+    items = await _get_items(client, conv_id)
+    types = [i["type"] for i in items]
+
+    # Expected: [user, fc(load_skill), fc(get_weather),
+    #            fco(load_skill)]
+    # function_call items are persisted first (both tools),
+    # then server-side tools are executed (only load_skill).
+    # No function_call_output for get_weather.
+    assert types.count("function_call") == 2, (
+        f"Expected 2 function_call items (one per tool in the "
+        f"batch); got {types.count('function_call')}. Types: {types}"
+    )
+    assert types.count("function_call_output") == 1, (
+        f"Expected 1 function_call_output (only load_skill "
+        f"executed server-side); got "
+        f"{types.count('function_call_output')}. If 0, "
+        f"server-side tool was skipped (the old any() bug). "
+        f"If 2, client-side tool was executed server-side. "
+        f"Types: {types}"
+    )
+
+    # Verify the function_call_output belongs to load_skill
+    fco_items = [i for i in items if i["type"] == "function_call_output"]
+    assert fco_items[0]["call_id"] == "call_server_1", (
+        f"function_call_output should be for load_skill "
+        f"(call_server_1); got call_id={fco_items[0]['call_id']}"
+    )
+    # load_skill returns an error string for nonexistent skills
+    assert "not found" in fco_items[0]["output"].lower(), (
+        "load_skill output should contain an error for the "
+        "nonexistent skill, proving it was actually executed"
+    )
+
+    # Verify each function_call has the correct name↔call_id
+    fc_items = [i for i in items if i["type"] == "function_call"]
+    fc_by_name = {i["name"]: i for i in fc_items}
+    assert fc_by_name["load_skill"]["call_id"] == "call_server_1", (
+        "load_skill function_call must have the correct call_id"
+    )
+    assert fc_by_name["get_weather"]["call_id"] == "call_client_1", (
+        "get_weather function_call must have the correct call_id"
+    )
+
+    # Verify NO function_call_output for get_weather
+    fco_call_ids = {i["call_id"] for i in fco_items}
+    assert "call_client_1" not in fco_call_ids, (
+        "get_weather must not have a function_call_output — it is a client-side tool"
+    )
+
+    # 1 LLM call only — response completed after mixed batch
+    assert mock_llm.call_count == 1, (
+        f"Expected 1 LLM call; got {mock_llm.call_count}. "
+        f"The loop should not continue after a mixed batch."
+    )
+
+
 async def test_steering_during_llm_with_client_tool_persists_steered_message(
     client: httpx.AsyncClient,
     mock_llm: ControllableMockClient,
