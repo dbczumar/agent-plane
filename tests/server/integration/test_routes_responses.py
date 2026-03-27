@@ -728,14 +728,18 @@ async def test_multimodal_image_file_id_resolves_to_llm(
     received = mock_llm.get_call(0).received_kwargs
     assert received is not None
     llm_input = received.get("input", [])
+
+    # Find the resolved image block in the LLM input.
+    image_block = _find_content_block(llm_input, "input_image")
+    assert image_block is not None, "LLM input must contain an input_image block"
+    # file_id must be gone — replaced by image_url with a data: URI.
+    assert "file_id" not in image_block, "file_id must be resolved before reaching the LLM"
+    assert "image_url" in image_block, "Resolved image must have image_url field"
+    # image_url must be a well-formed data: URI with the correct
+    # media type and base64 payload. A wrong format (e.g. raw base64
+    # without the data: prefix) causes HTTP 400 from providers.
     expected_b64 = base64.b64encode(png_bytes).decode("ascii")
-    input_str = json.dumps(llm_input)
-    # file_id must NOT appear — it should have been resolved.
-    assert file_id not in input_str, (
-        "file_id must be resolved to inline content before reaching the LLM"
-    )
-    # The base64 content must appear in the input.
-    assert expected_b64 in input_str, "Base64-encoded image content must appear in the LLM input"
+    assert image_block["image_url"] == f"data:image/png;base64,{expected_b64}"
 
 
 async def test_multimodal_file_id_resolves_to_llm(
@@ -789,12 +793,18 @@ async def test_multimodal_file_id_resolves_to_llm(
     received = mock_llm.get_call(0).received_kwargs
     assert received is not None
     llm_input = received.get("input", [])
+
+    # Find the resolved file block in the LLM input.
+    file_block = _find_content_block(llm_input, "input_file")
+    assert file_block is not None, "LLM input must contain an input_file block"
+    # file_id must be gone — replaced by file_data with a data: URI.
+    assert "file_id" not in file_block, "file_id must be resolved before reaching the LLM"
+    assert "file_data" in file_block, "Resolved file must have file_data field"
+    # file_data must be a well-formed data: URI with the correct
+    # media type and base64 payload. Raw base64 without the data:
+    # prefix causes HTTP 400 from providers like OpenAI.
     expected_b64 = base64.b64encode(pdf_bytes).decode("ascii")
-    input_str = json.dumps(llm_input)
-    assert file_id not in input_str, (
-        "file_id must be resolved to inline content before reaching the LLM"
-    )
-    assert expected_b64 in input_str, "Base64-encoded file content must appear in the LLM input"
+    assert file_block["file_data"] == f"data:application/pdf;base64,{expected_b64}"
 
 
 async def test_multimodal_mixed_image_and_file(
@@ -852,6 +862,55 @@ async def test_multimodal_mixed_image_and_file(
     # Verify conversation was created.
     assert body["conversation"] is not None
     assert isinstance(body["conversation"]["id"], str)
+
+    # Verify both file references were resolved to proper data: URIs.
+    # call_count == 1: one LLM turn for the non-tool mock response.
+    assert mock_llm.call_count == 1
+    received = mock_llm.get_call(0).received_kwargs
+    assert received is not None
+    llm_input = received.get("input", [])
+
+    image_block = _find_content_block(llm_input, "input_image")
+    assert image_block is not None, "LLM input must contain an input_image block"
+    assert "file_id" not in image_block
+    img_b64 = base64.b64encode(png_bytes).decode("ascii")
+    assert image_block["image_url"] == f"data:image/png;base64,{img_b64}"
+
+    file_block = _find_content_block(llm_input, "input_file")
+    assert file_block is not None, "LLM input must contain an input_file block"
+    assert "file_id" not in file_block
+    pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
+    assert file_block["file_data"] == f"data:application/pdf;base64,{pdf_b64}"
+
+
+def _find_content_block(
+    llm_input: list[dict[str, Any]],
+    block_type: str,
+) -> dict[str, Any] | None:
+    """
+    Find a content block by type in the LLM input list.
+
+    Searches through Responses API input items for a content block
+    with the given type. Handles both top-level content blocks and
+    blocks nested inside message items.
+
+    :param llm_input: The ``input`` list passed to the LLM, e.g.
+        ``[{"role": "user", "content": [...]}]``.
+    :param block_type: The block type to find, e.g.
+        ``"input_image"`` or ``"input_file"``.
+    :returns: The first matching content block dict, or ``None``.
+    """
+    for item in llm_input:
+        # Top-level content block (flat Responses API input).
+        if item.get("type") == block_type:
+            return item
+        # Nested inside a message's content list.
+        content = item.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == block_type:
+                    return block
+    return None
 
 
 def _make_tiny_png() -> bytes:
