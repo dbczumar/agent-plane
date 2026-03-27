@@ -13,27 +13,6 @@ from agent_plane.entities import (
 from agent_plane.spec import AgentSpec
 
 
-def _extract_text(content_blocks: list[dict[str, Any]]) -> str:
-    """
-    Extract plain text from heterogeneous content blocks.
-    Handles ``input_text``, ``output_text``, and bare ``text``
-    block types.
-
-    :param content_blocks: List of content block dicts, e.g.
-        ``[{"type": "input_text", "text": "Hello"}]``.
-    :returns: Joined text from all recognized blocks, or
-        empty string if none contain text.
-    """
-    parts: list[str] = []
-    for block in content_blocks:
-        block_type = block.get("type")
-        if block_type in ("input_text", "output_text", "text"):
-            text = block.get("text")
-            if text:
-                parts.append(text)
-    return "\n".join(parts) if parts else ""
-
-
 def build_instructions(
     spec: AgentSpec,
     per_request_instructions: str | None,
