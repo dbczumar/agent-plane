@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
-
-import pytest
 
 from agent_plane.spec.types import LocalToolInfo
 from agent_plane.tools.local import (
@@ -99,9 +96,7 @@ def test_load_skips_missing_file(tmp_path: Path) -> None:
     )
     tools = load_local_python_tools([info], tmp_path)
     # Missing file is skipped, not an error.
-    assert tools == [], (
-        f"Expected empty list for missing file, got {len(tools)} tool(s)."
-    )
+    assert tools == [], f"Expected empty list for missing file, got {len(tools)} tool(s)."
 
 
 def test_load_skips_missing_schema(tmp_path: Path) -> None:
@@ -110,18 +105,14 @@ def test_load_skips_missing_schema(tmp_path: Path) -> None:
     """
     py_dir = tmp_path / "tools" / "python"
     py_dir.mkdir(parents=True)
-    (py_dir / "no_schema.py").write_text(
-        'def run(args):\n    return "ok"\n'
-    )
+    (py_dir / "no_schema.py").write_text('def run(args):\n    return "ok"\n')
     info = LocalToolInfo(
         name="no.schema",
         path="tools/python/no_schema.py",
         language="python",
     )
     tools = load_local_python_tools([info], tmp_path)
-    assert tools == [], (
-        "Tool without SCHEMA should be skipped."
-    )
+    assert tools == [], "Tool without SCHEMA should be skipped."
 
 
 def test_load_skips_missing_run(tmp_path: Path) -> None:
@@ -130,18 +121,14 @@ def test_load_skips_missing_run(tmp_path: Path) -> None:
     """
     py_dir = tmp_path / "tools" / "python"
     py_dir.mkdir(parents=True)
-    (py_dir / "no_run.py").write_text(
-        'SCHEMA = {"type": "function", "function": {"name": "x"}}\n'
-    )
+    (py_dir / "no_run.py").write_text('SCHEMA = {"type": "function", "function": {"name": "x"}}\n')
     info = LocalToolInfo(
         name="no.run",
         path="tools/python/no_run.py",
         language="python",
     )
     tools = load_local_python_tools([info], tmp_path)
-    assert tools == [], (
-        "Tool without run() should be skipped."
-    )
+    assert tools == [], "Tool without run() should be skipped."
 
 
 def test_load_skips_import_error(tmp_path: Path) -> None:
@@ -150,18 +137,14 @@ def test_load_skips_import_error(tmp_path: Path) -> None:
     """
     py_dir = tmp_path / "tools" / "python"
     py_dir.mkdir(parents=True)
-    (py_dir / "broken.py").write_text(
-        'raise RuntimeError("broken on import")\n'
-    )
+    (py_dir / "broken.py").write_text('raise RuntimeError("broken on import")\n')
     info = LocalToolInfo(
         name="broken",
         path="tools/python/broken.py",
         language="python",
     )
     tools = load_local_python_tools([info], tmp_path)
-    assert tools == [], (
-        "Tool with import error should be skipped."
-    )
+    assert tools == [], "Tool with import error should be skipped."
 
 
 def test_load_skips_typescript(tmp_path: Path) -> None:
@@ -174,9 +157,7 @@ def test_load_skips_typescript(tmp_path: Path) -> None:
         language="typescript",
     )
     tools = load_local_python_tools([info], tmp_path)
-    assert tools == [], (
-        "TypeScript tools should be skipped by Python loader."
-    )
+    assert tools == [], "TypeScript tools should be skipped by Python loader."
 
 
 def test_load_multiple_tools(tmp_path: Path) -> None:
@@ -191,9 +172,7 @@ def test_load_multiple_tools(tmp_path: Path) -> None:
         LocalToolInfo(name="tool.b", path="tools/python/tool_b.py", language="python"),
     ]
     tools = load_local_python_tools(infos, tmp_path)
-    assert len(tools) == 2, (
-        f"Expected 2 tools loaded, got {len(tools)}."
-    )
+    assert len(tools) == 2, f"Expected 2 tools loaded, got {len(tools)}."
     names = {t.name for t in tools}
     assert names == {"tool.a", "tool.b"}
 

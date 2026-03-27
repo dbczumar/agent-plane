@@ -456,6 +456,7 @@ def test_execution_timeout_preserves_prior_output(
         history: list[Any],
         instructions: str | None,
         tool_schemas: list[Any],
+        content_cache: dict[str, str] | None = None,
     ) -> MagicMock:
         """
         Fake LLM call that simulates a tool-call response.
@@ -471,6 +472,7 @@ def test_execution_timeout_preserves_prior_output(
         :param history: Conversation history (unused).
         :param instructions: Instructions (unused).
         :param tool_schemas: Tool schemas (unused).
+        :param content_cache: Per-task content cache (unused).
         :returns: A MagicMock LLM response with tool calls.
         """
         resp = MagicMock()

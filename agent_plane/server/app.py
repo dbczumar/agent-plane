@@ -91,7 +91,7 @@ def create_app(
         tags=["agents"],
     )
     app.include_router(
-        create_responses_router(task_store, conversation_store, agent_store),
+        create_responses_router(task_store, conversation_store, agent_store, file_store),
         prefix="/v1",
         tags=["responses"],
     )

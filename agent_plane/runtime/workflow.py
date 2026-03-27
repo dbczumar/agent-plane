@@ -1193,6 +1193,7 @@ def _call_llm_for_iteration(
     tool_schemas: list[dict[str, Any]],
     *,
     stream: bool = False,
+    content_cache: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     Build prompt messages and call the LLM for one iteration.
@@ -1216,6 +1217,9 @@ def _call_llm_for_iteration(
         agent's available tools.
     :param stream: If ``True``, stream tokens via SSE.
         If ``False``, use DBOS-checkpointed non-streaming.
+    :param content_cache: Per-task cache mapping ``file_id``
+        to base64-encoded content, avoiding redundant
+        artifact store fetches across iterations.
     :returns: The LLM response dict.
     """
     sys_instructions = build_instructions(spec, instructions, tool_schemas)
@@ -1224,7 +1228,7 @@ def _call_llm_for_iteration(
     file_store = get_file_store()
     artifact_store = get_artifact_store()
     if file_store is not None and artifact_store is not None:
-        history = resolve_content_references(history, file_store, artifact_store)
+        history = resolve_content_references(history, file_store, artifact_store, content_cache)
     input_items = history_to_input_items(history)
     if stream:
         return _call_llm_streaming(
@@ -1258,6 +1262,7 @@ def _call_llm_for_iteration_with_error_handling(
     history: list[ConversationItem],
     instructions: str | None,
     tool_schemas: list[dict[str, Any]],
+    content_cache: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     Call the LLM for one iteration with error handling and SSE
@@ -1273,6 +1278,9 @@ def _call_llm_for_iteration_with_error_handling(
     :param history: Conversation history as persisted items.
     :param instructions: Optional per-request instructions.
     :param tool_schemas: OpenAI-format tool schemas.
+    :param content_cache: Per-task cache mapping ``file_id``
+        to base64-encoded content (see
+        :func:`_call_llm_for_iteration`).
     :returns: The LLM response dict.
     :raises PermanentLLMError: On non-retryable LLM errors.
     :raises RetryableLLMError: When all retries are exhausted.
@@ -1286,6 +1294,7 @@ def _call_llm_for_iteration_with_error_handling(
             instructions,
             tool_schemas,
             stream=True,
+            content_cache=content_cache,
         )
     except (RetryableLLMError, PermanentLLMError) as exc:
         _emit_llm_error_event(task_id, exc)
@@ -1392,6 +1401,10 @@ def _run_agent_loop(
     assert spec.llm is not None
     llm_config = spec.llm
     tools_config = spec.tools
+    # Per-task cache for resolved file_id → base64 content.
+    # Shared across iterations so the same file is fetched and
+    # encoded only once per task execution.
+    content_cache: dict[str, str] = {}
     # Resolve execution timeout: min(spec, runtime cap)
     caps = get_caps()
     execution_timeout = min(spec.execution.timeout, caps.execution_timeout)
@@ -1422,6 +1435,7 @@ def _run_agent_loop(
             history,
             instructions,
             tool_schemas,
+            content_cache,
         )
 
         if not _has_tool_calls(llm_resp):

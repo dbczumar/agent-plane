@@ -14,8 +14,6 @@ from agent_plane.entities.conversation import (
     MessageData,
 )
 from agent_plane.runtime.content_resolver import resolve_content_references
-from agent_plane.stores import ArtifactStore, FileStore
-
 
 # ── Fake stores ──────────────────────────────────────────────────────
 
@@ -184,11 +182,11 @@ def test_text_only_message_passes_through(
     Messages with only text blocks should pass through unchanged
     (no copy, no modification).
     """
-    item = _make_conversation_item(
-        [{"type": "input_text", "text": "Hello"}]
-    )
+    item = _make_conversation_item([{"type": "input_text", "text": "Hello"}])
     result = resolve_content_references(
-        [item], file_store, artifact_store  # type: ignore[arg-type]
+        [item],
+        file_store,
+        artifact_store,  # type: ignore[arg-type]
     )
 
     # Exactly one item returned, same object (no copy needed).
@@ -205,16 +203,20 @@ def test_input_image_file_id_resolved_to_data_uri(
     input_image with file_id must be resolved to a data: URI in
     image_url, with file_id removed from the block.
     """
-    item = _make_conversation_item([
-        {"type": "input_text", "text": "What's in this image?"},
-        {
-            "type": "input_image",
-            "file_id": "file_img",
-            "detail": "auto",
-        },
-    ])
+    item = _make_conversation_item(
+        [
+            {"type": "input_text", "text": "What's in this image?"},
+            {
+                "type": "input_image",
+                "file_id": "file_img",
+                "detail": "auto",
+            },
+        ]
+    )
     result = resolve_content_references(
-        [item], file_store, artifact_store  # type: ignore[arg-type]
+        [item],
+        file_store,
+        artifact_store,  # type: ignore[arg-type]
     )
 
     # Result is a copy — original must not be modified.
@@ -234,9 +236,7 @@ def test_input_image_file_id_resolved_to_data_uri(
     assert "file_id" not in img_block
     # image_url must be a data: URI with the correct content type.
     # Failure would mean the LLM receives an invalid image reference.
-    assert img_block["image_url"] == (
-        f"data:image/png;base64,{expected_b64}"
-    )
+    assert img_block["image_url"] == (f"data:image/png;base64,{expected_b64}")
     # detail field must be preserved — it controls provider image resolution.
     # Failure would mean the client's detail preference is lost.
     assert img_block["detail"] == "auto"
@@ -252,16 +252,20 @@ def test_input_file_file_id_resolved_to_file_data(
     input_file with file_id must be resolved to file_data (base64),
     with content_type from file store metadata.
     """
-    item = _make_conversation_item([
-        {"type": "input_text", "text": "Summarize"},
-        {
-            "type": "input_file",
-            "file_id": "file_pdf",
-            "filename": "report.pdf",
-        },
-    ])
+    item = _make_conversation_item(
+        [
+            {"type": "input_text", "text": "Summarize"},
+            {
+                "type": "input_file",
+                "file_id": "file_pdf",
+                "filename": "report.pdf",
+            },
+        ]
+    )
     result = resolve_content_references(
-        [item], file_store, artifact_store  # type: ignore[arg-type]
+        [item],
+        file_store,
+        artifact_store,  # type: ignore[arg-type]
     )
 
     assert result[0] is not item
@@ -290,15 +294,19 @@ def test_image_url_passes_through_unchanged(
     input_image with image_url (no file_id) must pass through
     unchanged — URLs are never fetched server-side (SSRF protection).
     """
-    item = _make_conversation_item([
-        {
-            "type": "input_image",
-            "image_url": "https://example.com/photo.png",
-            "detail": "high",
-        },
-    ])
+    item = _make_conversation_item(
+        [
+            {
+                "type": "input_image",
+                "image_url": "https://example.com/photo.png",
+                "detail": "high",
+            },
+        ]
+    )
     result = resolve_content_references(
-        [item], file_store, artifact_store  # type: ignore[arg-type]
+        [item],
+        file_store,
+        artifact_store,  # type: ignore[arg-type]
     )
 
     # No file_id in any block — original item returned as-is.
@@ -314,15 +322,19 @@ def test_inline_file_data_passes_through_unchanged(
     input_file with file_data (no file_id) must pass through
     unchanged — content is already inline.
     """
-    item = _make_conversation_item([
-        {
-            "type": "input_file",
-            "file_data": "JVBERi0xLjQK",
-            "filename": "report.pdf",
-        },
-    ])
+    item = _make_conversation_item(
+        [
+            {
+                "type": "input_file",
+                "file_data": "JVBERi0xLjQK",
+                "filename": "report.pdf",
+            },
+        ]
+    )
     result = resolve_content_references(
-        [item], file_store, artifact_store  # type: ignore[arg-type]
+        [item],
+        file_store,
+        artifact_store,  # type: ignore[arg-type]
     )
 
     # No file_id — original item returned.
@@ -339,7 +351,9 @@ def test_non_message_items_pass_through(
     """
     fc_item = _make_function_call_item()
     result = resolve_content_references(
-        [fc_item], file_store, artifact_store  # type: ignore[arg-type]
+        [fc_item],
+        file_store,
+        artifact_store,  # type: ignore[arg-type]
     )
 
     # function_call items have no content blocks to resolve.
@@ -356,16 +370,20 @@ def test_missing_file_id_raises_value_error(
     Referencing a file_id that doesn't exist in the file store
     must raise ValueError — fail loud, no silent dropping.
     """
-    item = _make_conversation_item([
-        {
-            "type": "input_image",
-            "file_id": "file_nonexistent",
-        },
-    ])
+    item = _make_conversation_item(
+        [
+            {
+                "type": "input_image",
+                "file_id": "file_nonexistent",
+            },
+        ]
+    )
 
     with pytest.raises(ValueError, match="file_nonexistent"):
         resolve_content_references(
-            [item], file_store, artifact_store  # type: ignore[arg-type]
+            [item],
+            file_store,
+            artifact_store,  # type: ignore[arg-type]
         )
 
 
@@ -383,7 +401,9 @@ def test_original_item_not_mutated(
     item = _make_conversation_item(original_content)
 
     resolve_content_references(
-        [item], file_store, artifact_store  # type: ignore[arg-type]
+        [item],
+        file_store,
+        artifact_store,  # type: ignore[arg-type]
     )
 
     # Original content must still contain file_id — not mutated.
@@ -402,14 +422,18 @@ def test_unknown_block_type_with_file_id_resolved(
     still have its file_id resolved — the resolver resolves file_id
     on any block type, not just known ones.
     """
-    item = _make_conversation_item([
-        {
-            "type": "input_audio",
-            "file_id": "file_img",
-        },
-    ])
+    item = _make_conversation_item(
+        [
+            {
+                "type": "input_audio",
+                "file_id": "file_img",
+            },
+        ]
+    )
     result = resolve_content_references(
-        [item], file_store, artifact_store  # type: ignore[arg-type]
+        [item],
+        file_store,
+        artifact_store,  # type: ignore[arg-type]
     )
 
     assert isinstance(result[0].data, MessageData)
@@ -447,7 +471,9 @@ def test_mixed_items_preserves_order(
         ),
     ]
     result = resolve_content_references(
-        items, file_store, artifact_store  # type: ignore[arg-type]
+        items,
+        file_store,
+        artifact_store,  # type: ignore[arg-type]
     )
 
     # Order must be preserved: msg, msg(resolved), fc, msg.
@@ -491,11 +517,15 @@ def test_resolution_field_varies_by_block_type(
     blocks get file_data (raw base64). The resolution target field
     depends on block type.
     """
-    item = _make_conversation_item([
-        {"type": block_type, "file_id": "file_img"},
-    ])
+    item = _make_conversation_item(
+        [
+            {"type": block_type, "file_id": "file_img"},
+        ]
+    )
     result = resolve_content_references(
-        [item], file_store, artifact_store  # type: ignore[arg-type]
+        [item],
+        file_store,
+        artifact_store,  # type: ignore[arg-type]
     )
 
     assert isinstance(result[0].data, MessageData)
@@ -504,3 +534,95 @@ def test_resolution_field_varies_by_block_type(
     # Failure would mean the wrong inline format is used for this type.
     assert expected_field in block
     assert "file_id" not in block
+
+
+# ── Cache tests ─────────────────────────────────────────────────────
+
+
+def test_cache_avoids_redundant_artifact_fetch(
+    file_store: FakeFileStore,
+    artifact_store: FakeArtifactStore,
+) -> None:
+    """
+    When a cache dict is provided, the second resolution of the same
+    file_id must use the cached base64 instead of re-fetching from
+    the artifact store.
+    """
+    cache: dict[str, str] = {}
+    item = _make_conversation_item([{"type": "input_image", "file_id": "file_img"}])
+
+    # First call — populates cache.
+    resolve_content_references(
+        [item],
+        file_store,
+        artifact_store,  # type: ignore[arg-type]
+        cache,
+    )
+
+    # Cache should now contain the file_id.
+    assert "file_img" in cache
+    expected_b64 = base64.b64encode(PNG_BYTES).decode("ascii")
+    # Cached value is the raw base64, not a data: URI.
+    assert cache["file_img"] == expected_b64
+
+    # Sabotage the artifact store — if the cache is working, the
+    # resolver won't call artifact_store.get() again.
+    artifact_store.blobs = {}
+
+    result2 = resolve_content_references(
+        [item],
+        file_store,
+        artifact_store,  # type: ignore[arg-type]
+        cache,
+    )
+
+    # Second call should still succeed using cached value.
+    assert isinstance(result2[0].data, MessageData)
+    img_block = result2[0].data.content[0]
+    assert img_block["image_url"] == f"data:image/png;base64,{expected_b64}"
+
+
+def test_cache_none_disables_caching(
+    file_store: FakeFileStore,
+    artifact_store: FakeArtifactStore,
+) -> None:
+    """
+    Passing ``cache=None`` (the default) must still resolve
+    correctly — caching is optional.
+    """
+    item = _make_conversation_item([{"type": "input_image", "file_id": "file_img"}])
+
+    result = resolve_content_references(
+        [item],
+        file_store,
+        artifact_store,  # type: ignore[arg-type]
+        # Explicit None — no cache.
+        None,
+    )
+
+    assert isinstance(result[0].data, MessageData)
+    img_block = result[0].data.content[0]
+    expected_b64 = base64.b64encode(PNG_BYTES).decode("ascii")
+    assert img_block["image_url"] == f"data:image/png;base64,{expected_b64}"
+
+
+# ── Error handling tests ────────────────────────────────────────────
+
+
+def test_deleted_file_raises_clear_error(
+    file_store: FakeFileStore,
+    artifact_store: FakeArtifactStore,
+) -> None:
+    """
+    When a file is deleted between request validation and agent loop
+    execution, the error message must clearly indicate the file was
+    deleted — not a generic "not found".
+    """
+    item = _make_conversation_item([{"type": "input_image", "file_id": "file_nonexistent"}])
+
+    with pytest.raises(ValueError, match="no longer exists"):
+        resolve_content_references(
+            [item],
+            file_store,
+            artifact_store,  # type: ignore[arg-type]
+        )

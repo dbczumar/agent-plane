@@ -25,6 +25,7 @@ def resolve_content_references(
     items: list[ConversationItem],
     file_store: FileStore,
     artifact_store: ArtifactStore,
+    cache: dict[str, str] | None = None,
 ) -> list[ConversationItem]:
     """
     Resolve ``file_id`` references in content blocks to inline content.
@@ -43,6 +44,10 @@ def resolve_content_references(
     :param file_store: Store for looking up file metadata
         (``content_type``, ``filename``).
     :param artifact_store: Store for fetching file binary content.
+    :param cache: Optional per-task cache mapping ``file_id`` to
+        its base64-encoded content. Avoids re-fetching and
+        re-encoding the same file across agent loop iterations.
+        Pass ``None`` to disable caching.
     :returns: A list of conversation items with all ``file_id``
         references replaced by inline base64 content.
     :raises ValueError: If a referenced ``file_id`` does not exist
@@ -55,7 +60,7 @@ def resolve_content_references(
     for item in items:
         if item.type == "message" and isinstance(item.data, MessageData):
             resolved_content = _resolve_message_content(
-                item.data.content, file_store, artifact_store
+                item.data.content, file_store, artifact_store, cache
             )
             if resolved_content is item.data.content:
                 # No file_id references found — reuse original.
@@ -75,6 +80,7 @@ def _resolve_message_content(
     content: list[dict[str, Any]],
     file_store: FileStore,
     artifact_store: ArtifactStore,
+    cache: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Resolve ``file_id`` references in a list of content blocks.
@@ -86,6 +92,8 @@ def _resolve_message_content(
     :param content: Content block dicts from ``MessageData.content``.
     :param file_store: Store for file metadata lookups.
     :param artifact_store: Store for binary content fetches.
+    :param cache: Optional per-task base64 cache (see
+        :func:`resolve_content_references`).
     :returns: The original list (unchanged) or a new list with
         ``file_id`` references resolved to inline content.
     """
@@ -93,9 +101,7 @@ def _resolve_message_content(
     changed = False
     for block in content:
         if "file_id" in block:
-            resolved.append(
-                _resolve_file_id_block(block, file_store, artifact_store)
-            )
+            resolved.append(_resolve_file_id_block(block, file_store, artifact_store, cache))
             changed = True
         else:
             resolved.append(block)
@@ -108,6 +114,7 @@ def _resolve_file_id_block(
     block: dict[str, Any],
     file_store: FileStore,
     artifact_store: ArtifactStore,
+    cache: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     Resolve a single content block's ``file_id`` to inline content.
@@ -122,35 +129,39 @@ def _resolve_file_id_block(
         e.g. ``{"type": "input_image", "file_id": "file_abc123"}``.
     :param file_store: Store for file metadata lookups.
     :param artifact_store: Store for binary content fetches.
+    :param cache: Optional per-task base64 cache (see
+        :func:`resolve_content_references`).
     :returns: A new dict with ``file_id`` replaced by inline
         content. All other fields are preserved.
     :raises ValueError: If ``file_id`` is not found in the file
-        store.
+        store — the file was deleted between request validation
+        and agent loop execution.
     """
     file_id = block["file_id"]
     file_meta = file_store.get(file_id)
     if file_meta is None:
         raise ValueError(
-            f"file_id '{file_id}' not found in file store"
+            f"Referenced file '{file_id}' no longer exists — "
+            f"it may have been deleted after the request was accepted"
         )
 
-    content_bytes = artifact_store.get(file_id)
-    encoded = base64.b64encode(content_bytes).decode("ascii")
+    # Use cached base64 if available; otherwise fetch, encode, and cache.
+    if cache is not None and file_id in cache:
+        encoded = cache[file_id]
+    else:
+        content_bytes = artifact_store.get(file_id)
+        encoded = base64.b64encode(content_bytes).decode("ascii")
+        if cache is not None:
+            cache[file_id] = encoded
 
     # Copy all fields except file_id.
-    resolved: dict[str, Any] = {
-        k: v for k, v in block.items() if k != "file_id"
-    }
+    resolved: dict[str, Any] = {k: v for k, v in block.items() if k != "file_id"}
 
     block_type = block.get("type")
     if block_type == "input_image":
         # Image blocks use a data: URI in the image_url field.
-        content_type = (
-            file_meta.content_type or "application/octet-stream"
-        )
-        resolved["image_url"] = (
-            f"data:{content_type};base64,{encoded}"
-        )
+        content_type = file_meta.content_type or "application/octet-stream"
+        resolved["image_url"] = f"data:{content_type};base64,{encoded}"
     else:
         # input_file and any future type: inline as file_data.
         resolved["file_data"] = encoded

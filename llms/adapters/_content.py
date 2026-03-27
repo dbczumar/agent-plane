@@ -41,12 +41,12 @@ def parse_data_uri(uri: str) -> DataUriParts | None:
         return None
 
     # Format: data:<media_type>;base64,<data>
-    rest = uri[len("data:"):]
+    rest = uri[len("data:") :]
     separator = ";base64,"
     sep_idx = rest.find(separator)
     if sep_idx == -1:
         return None
 
     media_type = rest[:sep_idx]
-    data = rest[sep_idx + len(separator):]
+    data = rest[sep_idx + len(separator) :]
     return DataUriParts(media_type=media_type, data=data)

@@ -587,3 +587,83 @@ def test_split_input_multiple_fco_no_text() -> None:
         f"If 3, an empty user message was created."
     )
     assert all(i.type == "function_call_output" for i in items)
+
+
+# ── file_id validation tests ────────────────────────────────────────
+
+
+async def test_create_response_rejects_nonexistent_file_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Posting a request with a file_id that does not exist in the file
+    store must return 400 immediately — not a deferred workflow error.
+    """
+    await create_test_agent(client)
+    resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": [
+                {"type": "input_image", "file_id": "file_nonexistent"},
+            ],
+        },
+    )
+    # 400 with INVALID_INPUT — file_id validated at request time.
+    assert resp.status_code == 400
+    body = resp.json()
+    assert "file_nonexistent" in body["error"]["message"]
+
+
+async def test_create_response_accepts_valid_file_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Posting a request with a file_id that exists in the file store
+    must succeed (not rejected by validation).
+    """
+    await create_test_agent(client)
+
+    # Upload a file first via the files API.
+    upload_resp = await client.post(
+        "/v1/files",
+        files={"file": ("test.txt", b"hello world", "text/plain")},
+    )
+    # File upload returns 201 Created per the OpenResponses spec.
+    assert upload_resp.status_code == 201
+    file_id = upload_resp.json()["id"]
+
+    # Now reference that file_id in a response request.
+    resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": [
+                {"type": "input_file", "file_id": file_id},
+            ],
+            "background": True,
+            "stream": False,
+        },
+    )
+    # Should succeed — file_id is valid.
+    assert resp.status_code == 200
+
+
+async def test_create_response_no_file_id_skips_validation(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Requests without file_id references must skip validation
+    entirely — no error even if file store has no files.
+    """
+    await create_test_agent(client)
+    resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": "Hello, no file references here",
+            "background": True,
+            "stream": False,
+        },
+    )
+    assert resp.status_code == 200

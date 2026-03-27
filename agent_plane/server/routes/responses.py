@@ -34,7 +34,7 @@ from agent_plane.server.schemas import (
     ResponseObject,
     Usage,
 )
-from agent_plane.stores import AgentStore, ConversationStore, TaskStore
+from agent_plane.stores import AgentStore, ConversationStore, FileStore, TaskStore
 from agent_plane.tools.client_specified import parse_client_side_tool_specs
 
 
@@ -88,6 +88,41 @@ def _normalize_input(
     if isinstance(raw_input, str):
         return [{"type": "input_text", "text": raw_input}]
     return raw_input
+
+
+def _validate_file_references(
+    content: list[dict[str, Any]],
+    file_store: FileStore | None,
+) -> None:
+    """
+    Validate that all ``file_id`` references in content blocks
+    exist in the file store.
+
+    Called at request time so the client gets an immediate 400
+    instead of a deferred workflow failure.
+
+    :param content: Normalized content blocks from the request,
+        e.g. ``[{"type": "input_image", "file_id": "file_abc"}]``.
+    :param file_store: Store for file metadata lookups, or
+        ``None`` when the server has no file store configured.
+    :raises AgentPlaneError: If any ``file_id`` is not found.
+    """
+    file_ids = [block["file_id"] for block in content if "file_id" in block]
+    if not file_ids:
+        return
+
+    if file_store is None:
+        raise AgentPlaneError(
+            "file_id references require a configured file store",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+    for file_id in file_ids:
+        if file_store.get(file_id) is None:
+            raise AgentPlaneError(
+                f"file_id '{file_id}' not found",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
 
 def _format_sse(event_type: str, data: dict[str, Any] | str) -> str:
@@ -648,6 +683,7 @@ def create_responses_router(
     task_store: TaskStore,
     conversation_store: ConversationStore,
     agent_store: AgentStore,
+    file_store: FileStore | None = None,
 ) -> APIRouter:
     """
     Factory that builds the responses router.
@@ -659,6 +695,9 @@ def create_responses_router(
         persistence.
     :param agent_store: Store for agent lookups (model
         resolution).
+    :param file_store: Store for file metadata lookups, used
+        to validate ``file_id`` references at request time.
+        ``None`` when the server has no file store configured.
     :returns: A configured :class:`APIRouter` with all
         ``/responses`` endpoints.
     """
@@ -720,6 +759,10 @@ def create_responses_router(
             client_tools = req.tools
 
         content = _normalize_input(req.input)
+
+        # Validate file_id references exist before creating the task.
+        # Fails fast with 400 instead of a deferred workflow error.
+        _validate_file_references(content, file_store)
 
         result = await _resolve_conversation(req, content, task_store, conversation_store)
         # Steering succeeded — return the existing response
