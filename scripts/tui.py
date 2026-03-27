@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import pathlib
 import signal
@@ -197,6 +198,10 @@ class _StreamAccumulator:
     in_reasoning: bool = False
     in_summary: bool = False
     had_text: bool = False
+    # Separate widget for streaming text, mounted at the bottom
+    # (below tool calls). The main live widget at the top only
+    # shows status like "thinking…".
+    text_widget: AssistantMessage | None = None
 
 
 # ── Message widgets ───────────────────────────────────
@@ -307,15 +312,21 @@ class ChatApp(App[None]):
         self,
         server_proc: subprocess.Popen[bytes],
         agent_id: str,
+        auto_send: str | None = None,
     ) -> None:
         """
         :param server_proc: The running server subprocess.
             Terminated on app exit.
         :param agent_id: The deployed agent's ID.
+        :param auto_send: If set, auto-submit this message on
+            startup (for automated testing).
         """
         super().__init__()
         self._server_proc = server_proc
         self._agent_id = agent_id
+        self._auto_send = auto_send
+        # Set after auto-send response completes, triggers screenshot + exit
+        self._auto_send_done = False
         self._previous_response_id: str | None = None
         self._current_response_id: str | None = None
         self._streaming = False
@@ -343,7 +354,19 @@ class ChatApp(App[None]):
                 )
             )
         )
-        self.query_one("#user-input", Input).focus()
+        inp = self.query_one("#user-input", Input)
+        inp.focus()
+        # Auto-send for automated testing — send message and
+        # screenshot + exit after the response completes.
+        if self._auto_send is not None:
+            msg = self._auto_send
+            self._auto_send = None
+            self._auto_send_done = True
+            scroll.mount(
+                UserMessage(Text.from_markup(f"[bold cyan]you>[/bold cyan] {escape(msg)}"))
+            )
+            scroll.scroll_end()
+            self._start_stream(msg)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """
@@ -393,12 +416,17 @@ class ChatApp(App[None]):
         scroll = self.query_one("#chat-scroll", VerticalScroll)
         acc = _StreamAccumulator()
 
-        # Mount the live assistant widget for streaming output.
+        # Live widget created eagerly — shows status ("thinking…")
+        # while tool calls mount below it. On finalization the live
+        # widget is removed and the final text is mounted at the
+        # bottom, below all tool calls and reasoning.
+        _open_widget_log()
         live = AssistantMessage(
             Text.from_markup("[bold green]assistant>[/bold green] [dim]…[/dim]")
         )
         self._live_widget = live
         await scroll.mount(live)
+        _wlog("MOUNT", "AssistantMessage", "status: assistant> …")
         scroll.scroll_end()
 
         body: dict[str, object] = {
@@ -412,27 +440,56 @@ class ChatApp(App[None]):
         try:
             await _run_sse_stream(self, scroll, live, acc, body)
         except httpx.HTTPStatusError as exc:
-            current = self._live_widget or live
-            current.update(
+            error_widget = _ensure_live(self, scroll, self._live_widget)
+            error_widget.update(
                 Text.from_markup(
                     f"[bold red]Error {exc.response.status_code}:"
                     f"[/bold red] {escape(exc.response.text[:200])}"
                 )
             )
         except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
-            current = self._live_widget or live
-            current.update(
+            error_widget = _ensure_live(self, scroll, self._live_widget)
+            error_widget.update(
                 Text.from_markup(f"[bold red]Connection error:[/bold red] {escape(str(exc))}")
+            )
+        except httpx.TimeoutException as exc:
+            error_widget = _ensure_live(self, scroll, self._live_widget)
+            error_widget.update(
+                Text.from_markup(f"[bold red]Timeout:[/bold red] {escape(str(exc))}")
+            )
+        except Exception as exc:
+            _logger.exception("unexpected error in SSE stream")
+            error_widget = _ensure_live(self, scroll, self._live_widget)
+            error_widget.update(
+                Text.from_markup(f"[bold red]Error:[/bold red] {escape(str(exc))}")
             )
         finally:
             self._streaming = False
-            # Remove trailing placeholder widget if it never got content
-            final = self._live_widget
-            if final is not None and not acc.had_text:
-                final.remove()
+            # Finalize the status widget: on success it was already
+            # updated to "assistant>" by _finalize_message. On error
+            # or empty turns it may still show "thinking…" — remove
+            # it to avoid a stale indicator.
+            try:
+                status = self._live_widget
+                if status is not None and not acc.had_text:
+                    # No text was produced — remove the stale status
+                    status.remove()
+            except Exception:
+                _logger.exception("error cleaning up status widget")
             self._live_widget = None
             if self._current_response_id is not None:
                 self._previous_response_id = self._current_response_id
+            # Auto-screenshot after auto-send completes
+            if self._auto_send_done:
+                self._save_and_exit()
+
+    def _save_and_exit(self) -> None:
+        """
+        Save a Textual screenshot to ``/tmp/tui-textual.svg``
+        and exit. Used by auto-send mode for headless verification.
+        """
+        self.save_screenshot("/tmp/tui-textual.svg")
+        self.exit()
 
     @work(thread=True, group="steer")
     def _send_steering(self, text: str) -> None:
@@ -556,10 +613,47 @@ def _index_of(
     return 0
 
 
+# ── Widget audit log ──────────────────────────────────
+#
+# Writes a structured trace of every widget operation to
+# /tmp/tui-widgets.log so layout issues can be debugged
+# without screenshots.
+
+_widget_log: io.TextIOWrapper | None = None
+
+
+def _open_widget_log() -> None:
+    """
+    Open the widget audit log (cleared per stream).
+    """
+    global _widget_log
+    _widget_log = open("/tmp/tui-widgets.log", "w")  # noqa: SIM115
+
+
+def _wlog(op: str, widget_type: str, content: str, before: str | None = None) -> None:
+    """
+    Write a widget operation to the audit log.
+
+    :param op: Operation name, e.g. ``"MOUNT"``, ``"UPDATE"``,
+        ``"REMOVE"``.
+    :param widget_type: Widget class name, e.g.
+        ``"AssistantMessage"``.
+    :param content: First 120 chars of the widget's content.
+    :param before: If the mount used ``before=``, the type/content
+        of the reference widget.
+    """
+    if _widget_log is None:
+        return
+    before_str = f" before={before}" if before else ""
+    _widget_log.write(f"{op} {widget_type}{before_str}: {content[:120]}\n")
+    _widget_log.flush()
+
+
 # ── SSE streaming ─────────────────────────────────────
 
 
 _DEBUG_SSE = os.environ.get("DEBUG_SSE") == "1"
+_logger = logging.getLogger("tui")
 
 
 async def _run_sse_stream(
@@ -582,8 +676,11 @@ async def _run_sse_stream(
     :param acc: The stream accumulator.
     :param body: The request body for ``/v1/responses``.
     """
-    debug_file = open("/tmp/tui-sse.log", "a") if _DEBUG_SSE else None  # noqa: SIM115
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    # Always log SSE events to help debug issues.
+    debug_file = open("/tmp/tui-sse.log", "w")  # noqa: SIM115
+    # Long read timeout: tool execution can pause SSE for minutes
+    timeout = httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream(
             "POST",
             f"{BASE_URL}/v1/responses",
@@ -610,7 +707,22 @@ async def _run_sse_stream(
                             debug_file.flush()
                         # Rebind: _handle_sse mounts a new widget after
                         # each finalized message (e.g. steering follow-up).
-                        live = _handle_sse(app, scroll, live, current_event, data, acc)
+                        try:
+                            live = _handle_sse(
+                                app,
+                                scroll,
+                                live,
+                                current_event,
+                                data,
+                                acc,
+                            )
+                        except Exception:
+                            _logger.exception("error handling SSE event %s", current_event)
+                            if debug_file is not None:
+                                import traceback
+
+                                debug_file.write(f"ERROR: {traceback.format_exc()}\n")
+                                debug_file.flush()
                         current_event = None
                     elif line == "":
                         current_event = None
@@ -619,35 +731,38 @@ async def _run_sse_stream(
 def _handle_sse(
     app: ChatApp,
     scroll: VerticalScroll,
-    live: AssistantMessage,
+    live: AssistantMessage | None,
     event_type: str,
     data: dict[str, object],
     acc: _StreamAccumulator,
-) -> AssistantMessage:
+) -> AssistantMessage | None:
     """
     Dispatch a single SSE event.
 
-    Text deltas update the live widget in-place for real-time
-    streaming. Reasoning, tool calls, and completion events
-    mount new widgets or finalize the live widget.
+    Text and reasoning deltas update the live widget in-place.
+    Tool calls mount at the scroll end (below the live widget).
+    On finalization the live widget is removed and the final
+    text is mounted at the bottom, below all tool calls.
 
-    Returns the current live widget — may be a newly mounted
-    widget if the previous message was finalized (e.g. during
-    steering, where multiple messages arrive on one stream).
+    The *live* widget may become ``None`` after a message is
+    finalized — a fresh one is created via :func:`_ensure_live`
+    if a follow-up message starts (e.g. from steering).
 
     :param app: The ChatApp instance.
     :param scroll: The scrollable container.
-    :param live: The live assistant message widget.
+    :param live: The live assistant message widget, or ``None``
+        after a message was finalized.
     :param event_type: SSE event name.
     :param data: Parsed JSON payload.
     :param acc: The stream accumulator.
-    :returns: The active live widget (same or new).
+    :returns: The active live widget (same, new, or ``None``).
     """
     if event_type == "response.created":
         _extract_response_id(data, app)
 
     elif event_type == "response.reasoning.started":
         if not acc.in_reasoning:
+            live = _ensure_live(app, scroll, live)
             live.update(
                 Text.from_markup(
                     "[bold green]assistant>[/bold green] [dim cyan]thinking…[/dim cyan]"
@@ -658,9 +773,9 @@ def _handle_sse(
     elif event_type == "response.reasoning_text.delta":
         delta = data.get("delta")
         if isinstance(delta, str):
+            live = _ensure_live(app, scroll, live)
             acc.in_reasoning = True
             acc.reasoning += delta
-            # Show reasoning progress in the live widget
             live.update(
                 Text.from_markup(
                     "[bold green]assistant>[/bold green]"
@@ -673,6 +788,7 @@ def _handle_sse(
     elif event_type == "response.reasoning_summary_text.delta":
         delta = data.get("delta")
         if isinstance(delta, str):
+            live = _ensure_live(app, scroll, live)
             acc.in_summary = True
             acc.summary += delta
             # Stream summary tokens visibly — for models like o4-mini,
@@ -692,10 +808,15 @@ def _handle_sse(
         if isinstance(delta, str):
             acc.had_text = True
             acc.text += delta
-            # Update the live widget with accumulated text
-            live.update(
-                Text.from_markup(f"[bold green]assistant>[/bold green] {escape(acc.text)}")
-            )
+            # Stream text into a separate widget at the bottom
+            # (below tool calls). No "assistant>" prefix — the
+            # status widget above already shows the header.
+            if acc.text_widget is None:
+                acc.text_widget = AssistantMessage(Text.from_markup(escape(acc.text)))
+                scroll.mount(acc.text_widget)
+                _wlog("MOUNT", "AssistantMessage", f"text: {acc.text[:80]}")
+            else:
+                acc.text_widget.update(Text.from_markup(escape(acc.text)))
             scroll.scroll_end()
 
     elif event_type == "response.output_item.done":
@@ -705,6 +826,31 @@ def _handle_sse(
         _extract_response_id(data, app)
 
     return live
+
+
+def _ensure_live(
+    app: ChatApp,
+    scroll: VerticalScroll,
+    live: AssistantMessage | None,
+) -> AssistantMessage:
+    """Create the live assistant widget if it does not yet exist.
+
+    Called lazily on the first text or reasoning delta so that
+    tool calls mount at the scroll end (below the user message)
+    before any ``assistant>`` placeholder appears.
+
+    :param app: The ChatApp instance.
+    :param scroll: The scrollable container.
+    :param live: The existing live widget, or ``None``.
+    :returns: The existing or newly created live widget.
+    """
+    if live is not None:
+        return live
+    widget = AssistantMessage(Text.from_markup("[bold green]assistant>[/bold green] [dim]…[/dim]"))
+    app._live_widget = widget
+    scroll.mount(widget)
+    scroll.scroll_end()
+    return widget
 
 
 def _extract_response_id(
@@ -727,10 +873,10 @@ def _extract_response_id(
 def _handle_item_done(
     app: ChatApp,
     scroll: VerticalScroll,
-    live: AssistantMessage,
+    live: AssistantMessage | None,
     data: dict[str, object],
     acc: _StreamAccumulator,
-) -> AssistantMessage:
+) -> AssistantMessage | None:
     """
     Handle a completed output item.
 
@@ -738,14 +884,16 @@ def _handle_item_done(
     content including any reasoning sections, then mount a
     fresh widget for any subsequent message (e.g. from
     steering). For tool calls and results: mount new
-    SystemInfo widgets.
+    SystemInfo widgets before the live widget (if it exists)
+    or at the scroll end (if not yet created).
 
     :param app: The ChatApp instance.
     :param scroll: The scrollable container.
-    :param live: The live assistant message widget.
+    :param live: The live assistant message widget, or ``None``
+        if not yet created.
     :param data: The output_item.done payload.
     :param acc: The stream accumulator.
-    :returns: The active live widget (same or new).
+    :returns: The active live widget (same, new, or ``None``).
     """
     item = data.get("item")
     if not isinstance(item, dict):
@@ -753,19 +901,20 @@ def _handle_item_done(
 
     item_type = item.get("type")
     if item_type == "message":
-        _finalize_message(scroll, live, item, acc)
-        # Mount a fresh widget for any subsequent message on
-        # the same stream (e.g. steered follow-up).
-        new_live = AssistantMessage(
-            Text.from_markup("[bold green]assistant>[/bold green] [dim]…[/dim]")
-        )
-        scroll.mount(new_live)
-        app._live_widget = new_live
-        return new_live
+        if live is not None:
+            _finalize_message(scroll, live, item, acc)
+        # Reset live to None — a fresh widget will be created
+        # lazily by _ensure_live if a follow-up message starts
+        # (e.g. from steering). This avoids a visible flash of
+        # a placeholder "assistant> …" widget.
+        app._live_widget = None
+        return None
     elif item_type == "function_call":
-        _mount_tool_call(scroll, item, before=live)
+        # Mount at scroll end — below the live status widget,
+        # so tool calls appear as part of the assistant's turn.
+        _mount_tool_call(scroll, item)
     elif item_type == "function_call_output":
-        _mount_tool_result(scroll, item, before=live)
+        _mount_tool_result(scroll, item)
     return live
 
 
@@ -776,20 +925,42 @@ def _finalize_message(
     acc: _StreamAccumulator,
 ) -> None:
     """
-    Finalize the live assistant widget with completed content.
+    Finalize the assistant's turn.
 
-    Mounts reasoning/summary as collapsed ``Collapsible``
-    widgets above the answer, then updates the live widget
-    with the final text.
+    Keeps the status widget as the ``assistant>`` header so
+    tool calls and text appear grouped under it. Updates the
+    text widget (or creates one) with the final content, and
+    mounts reasoning collapsibles before the text.
+
+    Final layout::
+
+        assistant>
+          ▸ tool_call(...)
+          ▶ result: ...
+          ▶ reasoning summary   (collapsible)
+        Final text here...
 
     :param scroll: The scrollable container.
-    :param live: The live assistant message widget.
+    :param live: The live status widget (becomes the header).
     :param item: The message output item dict.
     :param acc: The stream accumulator.
     """
     from textual.widgets import Collapsible
 
-    # Mount collapsible sections before the live answer widget
+    # Keep the status widget as the "assistant>" header.
+    _wlog("UPDATE", "AssistantMessage", "status → assistant>")
+    live.update(Text.from_markup("[bold green]assistant>[/bold green]"))
+
+    final_text = _extract_final_text(acc, item)
+    # Determine the text widget — either already streaming
+    # or a fresh one we mount now.
+    text_widget = acc.text_widget
+    if text_widget is None:
+        text_widget = AssistantMessage(Text.from_markup(escape(final_text)))
+        scroll.mount(text_widget)
+        _wlog("MOUNT", "AssistantMessage", f"final_text(new): {final_text[:80]}")
+
+    # Mount reasoning/summary collapsibles BEFORE the text widget.
     if acc.reasoning:
         scroll.mount(
             Collapsible(
@@ -797,7 +968,7 @@ def _finalize_message(
                 title="reasoning",
                 collapsed=True,
             ),
-            before=live,
+            before=text_widget,
         )
     if acc.summary:
         scroll.mount(
@@ -810,11 +981,13 @@ def _finalize_message(
                 title="reasoning summary",
                 collapsed=True,
             ),
-            before=live,
+            before=text_widget,
         )
 
-    final_text = _extract_final_text(acc, item)
-    live.update(Text.from_markup(f"[bold green]assistant>[/bold green] {escape(final_text)}"))
+    # Update text widget with final content (no "assistant>" prefix —
+    # the status widget above already shows the header).
+    _wlog("UPDATE", "AssistantMessage", f"final_text: {final_text[:80]}")
+    text_widget.update(Text.from_markup(escape(final_text)))
     scroll.scroll_end()
 
     _reset_accumulator(acc)
@@ -859,6 +1032,7 @@ def _reset_accumulator(acc: _StreamAccumulator) -> None:
     acc.in_reasoning = False
     acc.in_summary = False
     acc.had_text = False
+    acc.text_widget = None
 
 
 def _mount_tool_call(
@@ -877,13 +1051,16 @@ def _mount_tool_call(
     """
     name = item.get("name", "?")
     args = item.get("arguments", "")
+    label = f"▸ {name}({str(args)[:80]})"
     widget = SystemInfo(
         Text.from_markup(f"[green]▸ {escape(str(name))}({escape(str(args)[:120])})[/green]")
     )
     if before is not None:
         scroll.mount(widget, before=before)
+        _wlog("MOUNT", "SystemInfo", f"tool_call: {label}", before="ref")
     else:
         scroll.mount(widget)
+        _wlog("MOUNT", "SystemInfo", f"tool_call: {label}")
     scroll.scroll_end()
 
 
@@ -913,8 +1090,10 @@ def _mount_tool_result(
     )
     if before is not None:
         scroll.mount(widget, before=before)
+        _wlog("MOUNT", "Collapsible", f"tool_result: {first_line}", before="ref")
     else:
         scroll.mount(widget)
+        _wlog("MOUNT", "Collapsible", f"tool_result: {first_line}")
     scroll.scroll_end()
 
 
@@ -924,21 +1103,39 @@ def _mount_tool_result(
 def main() -> None:
     """
     Start server, deploy agent from directory or tarball, launch TUI.
+
+    Accepts ``--auto-send "message"`` to auto-submit a message on
+    startup (for automated testing without user interaction).
     """
     global AGENT_NAME
-    if len(sys.argv) < 2:
-        print("Usage: python scripts/tui.py <agent-dir-or-tarball>")
+    # Parse --auto-send flag before normal arg parsing
+    auto_send: str | None = None
+    args = sys.argv[1:]
+    if "--auto-send" in args:
+        idx = args.index("--auto-send")
+        if idx + 1 < len(args):
+            auto_send = args[idx + 1]
+            args = args[:idx] + args[idx + 2 :]
+        else:
+            print("Error: --auto-send requires a message argument")
+            sys.exit(1)
+
+    if not args:
+        print("Usage: python scripts/tui.py <agent-dir-or-tarball> [--auto-send MSG]")
         print()
         print("  agent-dir-or-tarball  Path to an agent image directory")
         print("                        (containing config.yaml) or a")
         print("                        .tar.gz bundle.")
         print()
+        print("Options:")
+        print("  --auto-send MSG       Auto-submit MSG on startup (for testing)")
+        print()
         print("Examples:")
         print("  python scripts/tui.py ./my-agent/")
-        print("  python scripts/tui.py ./my-agent.tar.gz")
+        print("  python scripts/tui.py ./my-agent/ --auto-send 'say hello'")
         sys.exit(1)
 
-    agent_path = sys.argv[1]
+    agent_path = args[0]
     bundle = _load_agent_bundle(agent_path)
     AGENT_NAME = _extract_agent_name(bundle)
 
@@ -951,7 +1148,11 @@ def main() -> None:
         server_proc.kill()
         raise
 
-    app = ChatApp(server_proc=server_proc, agent_id=agent_id)
+    app = ChatApp(
+        server_proc=server_proc,
+        agent_id=agent_id,
+        auto_send=auto_send,
+    )
     app.run()
 
 
