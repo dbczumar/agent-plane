@@ -190,6 +190,13 @@ headers:                      # optional headers
 
 **Required fields:** `name`, `url`
 
+**Security note — SSRF risk:** The agent-plane server makes outbound HTTP
+requests to the configured `url`. There is currently no application-level
+URL validation (e.g. blocking private IPs or cloud metadata endpoints).
+In multi-tenant or untrusted-bundle environments, use network-level
+controls (egress proxy, network policies) to restrict which destinations
+the server process can reach.
+
 ---
 
 ## Local Tools — `tools/python/*.py` / `tools/typescript/*.ts`
