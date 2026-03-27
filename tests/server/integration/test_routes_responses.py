@@ -1044,6 +1044,283 @@ async def test_multimodal_file_without_content_type_uses_fallback(
     assert file_block["file_data"] == (f"data:application/octet-stream;base64,{expected_b64}")
 
 
+async def test_multimodal_multi_turn_resolves_file_from_history(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Turn 1 uploads a file. Turn 2 is plain text referencing the same
+    conversation. Verify the LLM receives the resolved file from
+    Turn 1's history — not the raw file_id.
+
+    Catches bugs where file_id resolution is skipped for historical
+    messages, causing the LLM to see unresolved references.
+    """
+    await create_test_agent(client)
+    # Turn 1 mock (file upload turn) and Turn 2 mock (follow-up).
+    mock_llm.add_call(text="I see a red pixel.")
+    turn2_call = mock_llm.add_call(text="It was a 1x1 PNG.")
+
+    png_bytes = _make_tiny_png()
+    upload_resp = await client.post(
+        "/v1/files",
+        files={"file": ("red.png", png_bytes, "image/png")},
+    )
+    assert upload_resp.status_code == 201
+    file_id = upload_resp.json()["id"]
+
+    # Turn 1: send image.
+    turn1_resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": [
+                {"type": "input_text", "text": "What is this?"},
+                {"type": "input_image", "file_id": file_id},
+            ],
+            "background": False,
+            "stream": False,
+        },
+    )
+    assert turn1_resp.status_code == 200
+    turn1_id = turn1_resp.json()["id"]
+
+    # Turn 2: plain text follow-up in the same conversation.
+    turn2_resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": "Can you describe the image dimensions?",
+            "previous_response_id": turn1_id,
+            "background": False,
+            "stream": False,
+        },
+    )
+    assert turn2_resp.status_code == 200
+    assert turn2_resp.json()["status"] == "completed"
+
+    # Verify Turn 2's LLM call contains the resolved image from
+    # Turn 1's history — not the raw file_id.
+    received = turn2_call.received_kwargs
+    assert received is not None
+    llm_input = received.get("input", [])
+    input_str = json.dumps(llm_input)
+    # file_id must NOT appear anywhere in the serialized input.
+    assert file_id not in input_str, "file_id from Turn 1 must be resolved in Turn 2's history"
+    # The resolved base64 content must appear (from Turn 1's image).
+    expected_b64 = base64.b64encode(png_bytes).decode("ascii")
+    assert expected_b64 in input_str, (
+        "Resolved image content from Turn 1 must appear in Turn 2's input"
+    )
+
+
+async def test_multimodal_streaming_resolves_file(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    stream=True with a file_id: verify the streaming path resolves
+    file references and completes successfully.
+
+    Catches bugs where streaming handlers bypass content resolution
+    or where resolution races with the SSE event emitter.
+    """
+    await create_test_agent(client)
+    mock_llm.add_call(text="The document is about testing.")
+
+    pdf_bytes = b"%PDF-1.4 streaming test"
+    upload_resp = await client.post(
+        "/v1/files",
+        files={"file": ("stream.pdf", pdf_bytes, "application/pdf")},
+    )
+    assert upload_resp.status_code == 201
+    file_id = upload_resp.json()["id"]
+
+    events: list[tuple[str, dict[str, Any] | str]] = []
+    async with aconnect_sse(
+        client,
+        "POST",
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": [
+                {"type": "input_text", "text": "Summarize"},
+                {
+                    "type": "input_file",
+                    "file_id": file_id,
+                    "filename": "stream.pdf",
+                },
+            ],
+            "stream": True,
+        },
+    ) as event_source:
+        async for sse in event_source.aiter_sse():
+            if sse.data == "[DONE]":
+                events.append(("done", "[DONE]"))
+            else:
+                parsed = json.loads(sse.data)
+                events.append((sse.event, parsed))
+
+    # Must complete — not fail due to unresolved file_id.
+    terminal = events[-2]
+    assert terminal[0] == "response.completed"
+    assert terminal[1]["response"]["status"] == "completed"
+    assert events[-1] == ("done", "[DONE]")
+
+    # Verify the LLM received the resolved file, not the raw file_id.
+    # call_count == 1: one LLM turn for the non-tool mock response.
+    assert mock_llm.call_count == 1
+    received = mock_llm.get_call(0).received_kwargs
+    assert received is not None
+    llm_input = received.get("input", [])
+    file_block = _find_content_block(llm_input, "input_file")
+    assert file_block is not None
+    assert "file_id" not in file_block
+    expected_b64 = base64.b64encode(pdf_bytes).decode("ascii")
+    assert file_block["file_data"] == (f"data:application/pdf;base64,{expected_b64}")
+
+
+async def test_multimodal_background_resolves_file(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    background=True with a file_id: verify the background task path
+    resolves file references and the task completes.
+
+    Catches bugs where file resolution state is lost between
+    queueing and execution, or where the background workflow
+    thread doesn't have access to the file/artifact stores.
+    """
+    await create_test_agent(client)
+    mock_llm.add_call(text="Background file processed.")
+
+    pdf_bytes = b"%PDF-1.4 background test"
+    upload_resp = await client.post(
+        "/v1/files",
+        files={"file": ("bg.pdf", pdf_bytes, "application/pdf")},
+    )
+    assert upload_resp.status_code == 201
+    file_id = upload_resp.json()["id"]
+
+    events: list[tuple[str, dict[str, Any] | str]] = []
+    async with aconnect_sse(
+        client,
+        "POST",
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": [
+                {
+                    "type": "input_file",
+                    "file_id": file_id,
+                    "filename": "bg.pdf",
+                },
+            ],
+            "stream": True,
+            "background": True,
+        },
+    ) as event_source:
+        async for sse in event_source.aiter_sse():
+            if sse.data == "[DONE]":
+                events.append(("done", "[DONE]"))
+            else:
+                parsed = json.loads(sse.data)
+                events.append((sse.event, parsed))
+
+    event_types = [e[0] for e in events]
+    # background=True adds response.queued between created and
+    # in_progress.
+    assert event_types[0] == "response.created"
+    assert event_types[1] == "response.queued"
+    assert event_types[2] == "response.in_progress"
+
+    # Must complete — not fail due to unresolved file_id.
+    terminal = events[-2]
+    assert terminal[0] == "response.completed"
+    assert terminal[1]["response"]["status"] == "completed"
+
+    # Verify the LLM received the resolved file.
+    assert mock_llm.call_count == 1
+    received = mock_llm.get_call(0).received_kwargs
+    assert received is not None
+    llm_input = received.get("input", [])
+    file_block = _find_content_block(llm_input, "input_file")
+    assert file_block is not None
+    assert "file_id" not in file_block
+    expected_b64 = base64.b64encode(pdf_bytes).decode("ascii")
+    assert file_block["file_data"] == (f"data:application/pdf;base64,{expected_b64}")
+
+
+async def test_multimodal_two_images_in_one_request(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Two images in a single request: verify both file_ids resolve
+    to distinct data: URIs with correct content.
+
+    Catches cache-collision bugs where two different files map to
+    the same cached content, causing the LLM to see the same
+    image twice.
+    """
+    await create_test_agent(client)
+    mock_llm.add_call(text="Two different images.")
+
+    png_bytes = _make_tiny_png()
+    # Second image: a minimal JPEG (different content from PNG).
+    jpeg_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
+
+    img1_resp = await client.post(
+        "/v1/files",
+        files={"file": ("red.png", png_bytes, "image/png")},
+    )
+    assert img1_resp.status_code == 201
+    img1_id = img1_resp.json()["id"]
+
+    img2_resp = await client.post(
+        "/v1/files",
+        files={"file": ("photo.jpg", jpeg_bytes, "image/jpeg")},
+    )
+    assert img2_resp.status_code == 201
+    img2_id = img2_resp.json()["id"]
+
+    resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": [
+                {"type": "input_text", "text": "Compare these two images"},
+                {"type": "input_image", "file_id": img1_id},
+                {"type": "input_image", "file_id": img2_id},
+            ],
+            "background": False,
+            "stream": False,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "completed"
+
+    # Verify the LLM received BOTH resolved images with distinct
+    # content — not the same image duplicated.
+    assert mock_llm.call_count == 1
+    received = mock_llm.get_call(0).received_kwargs
+    assert received is not None
+    llm_input = received.get("input", [])
+    input_str = json.dumps(llm_input)
+
+    # Neither file_id should appear.
+    assert img1_id not in input_str
+    assert img2_id not in input_str
+
+    # Both base64 payloads must appear — distinct content proves
+    # no cache collision.
+    png_b64 = base64.b64encode(png_bytes).decode("ascii")
+    jpeg_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+    assert f"data:image/png;base64,{png_b64}" in input_str
+    assert f"data:image/jpeg;base64,{jpeg_b64}" in input_str
+
+
 def _find_content_block(
     llm_input: list[dict[str, Any]],
     block_type: str,

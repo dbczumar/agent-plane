@@ -608,6 +608,46 @@ def test_cache_none_disables_caching(
 # ── Error handling tests ────────────────────────────────────────────
 
 
+def test_assistant_message_file_id_resolved(
+    file_store: FakeFileStore,
+    artifact_store: FakeArtifactStore,
+) -> None:
+    """
+    An assistant message in conversation history with file_id must
+    have that reference resolved — the content resolver scans all
+    message roles, not just user messages.
+
+    Catches bugs where role-based filtering causes assistant messages
+    (e.g. from a prior turn's multimodal output) to retain
+    unresolved file_id references.
+    """
+    item = _make_conversation_item(
+        [
+            {"type": "input_text", "text": "Here is the analysis"},
+            {"type": "input_file", "file_id": "file_pdf", "filename": "report.pdf"},
+        ],
+        role="assistant",
+    )
+    result = resolve_content_references(
+        [item],
+        file_store,
+        artifact_store,  # type: ignore[arg-type]
+    )
+
+    # Must be a copy — assistant message was modified.
+    assert result[0] is not item
+    assert isinstance(result[0].data, MessageData)
+    file_block = result[0].data.content[1]
+
+    expected_b64 = base64.b64encode(PDF_BYTES).decode("ascii")
+    # file_id must be removed.
+    assert "file_id" not in file_block
+    # file_data must be a data: URI.
+    assert file_block["file_data"] == f"data:application/pdf;base64,{expected_b64}"
+    assert file_block["filename"] == "report.pdf"
+    assert file_block["type"] == "input_file"
+
+
 def test_deleted_file_raises_clear_error(
     file_store: FakeFileStore,
     artifact_store: FakeArtifactStore,
