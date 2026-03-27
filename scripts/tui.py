@@ -5,10 +5,17 @@ Usage:
     python scripts/tui.py <agent-dir-or-tarball>
     python scripts/tui.py ./my-agent/
     python scripts/tui.py ./my-agent.tar.gz
+    python scripts/tui.py ./coder/ --tools coder
 
 Starts a temporary server, deploys the agent, and opens an
 interactive chat TUI with streaming responses, markdown
 rendering, and steering support.
+
+When ``--tools <name>`` is provided, loads a client-side tool
+set from ``scripts/tool_sets/<name>.py``. Tool schemas are
+passed to the server, and ``function_call`` items are executed
+locally by the TUI — results are sent back as
+``function_call_output`` items to continue the conversation.
 """
 
 from __future__ import annotations
@@ -24,7 +31,8 @@ import sys
 import tarfile
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import ModuleType
 
 import httpx
 from rich.markup import escape
@@ -190,6 +198,10 @@ class _StreamAccumulator:
     :param in_reasoning: Whether a reasoning block is open.
     :param in_summary: Whether a summary block is open.
     :param had_text: Whether any text deltas arrived.
+    :param finalized: Whether ``_finalize_message`` completed for this turn.
+    :param pending_tool_calls: Client-side ``function_call`` items
+        collected during streaming. After the stream completes,
+        the TUI executes these locally and sends results back.
     """
 
     text: str = ""
@@ -198,10 +210,17 @@ class _StreamAccumulator:
     in_reasoning: bool = False
     in_summary: bool = False
     had_text: bool = False
+    finalized: bool = False
     # Separate widget for streaming text, mounted at the bottom
     # (below tool calls). The main live widget at the top only
     # shows status like "thinking…".
     text_widget: AssistantMessage | None = None
+    # Client-side function_call items to execute after the
+    # stream completes. Each dict has "call_id", "name",
+    # "arguments" keys.
+    pending_tool_calls: list[dict[str, object]] = field(
+        default_factory=list,
+    )
 
 
 # ── Message widgets ───────────────────────────────────
@@ -313,6 +332,7 @@ class ChatApp(App[None]):
         server_proc: subprocess.Popen[bytes],
         agent_id: str,
         auto_send: str | None = None,
+        tool_set: ModuleType | None = None,
     ) -> None:
         """
         :param server_proc: The running server subprocess.
@@ -320,11 +340,17 @@ class ChatApp(App[None]):
         :param agent_id: The deployed agent's ID.
         :param auto_send: If set, auto-submit this message on
             startup (for automated testing).
+        :param tool_set: Optional client-side tool set module
+            with ``TOOLS`` (schemas) and ``execute_tool(name, args)``
+            attributes. When provided, tool schemas are sent with
+            each request and ``function_call`` items are executed
+            locally.
         """
         super().__init__()
         self._server_proc = server_proc
         self._agent_id = agent_id
         self._auto_send = auto_send
+        self._tool_set = tool_set
         # Set after auto-send response completes, triggers screenshot + exit
         self._auto_send_done = False
         self._previous_response_id: str | None = None
@@ -409,36 +435,24 @@ class ChatApp(App[None]):
         token-by-token as text deltas arrive. When the message
         completes, the widget stays as the final rendered message.
 
+        When a client-side tool set is active, ``function_call``
+        items are collected during streaming. After the stream
+        ends, tools are executed locally and results sent back
+        via a new request. This loops until the agent produces
+        a final text response with no pending tool calls.
+
         :param user_input: The user's message text.
         """
         self._streaming = True
         self._current_response_id = None
         scroll = self.query_one("#chat-scroll", VerticalScroll)
-        acc = _StreamAccumulator()
 
-        # Live widget created eagerly — shows status ("thinking…")
-        # while tool calls mount below it. On finalization the live
-        # widget is removed and the final text is mounted at the
-        # bottom, below all tool calls and reasoning.
-        _open_widget_log()
-        live = AssistantMessage(
-            Text.from_markup("[bold green]assistant>[/bold green] [dim]…[/dim]")
-        )
-        self._live_widget = live
-        await scroll.mount(live)
-        _wlog("MOUNT", "AssistantMessage", "status: assistant> …")
-        scroll.scroll_end()
-
-        body: dict[str, object] = {
-            "model": AGENT_NAME,
-            "input": user_input,
-            "stream": True,
-        }
-        if self._previous_response_id is not None:
-            body["previous_response_id"] = self._previous_response_id
+        # The input for the current iteration — starts as user
+        # text, becomes function_call_output list on tool loops.
+        current_input: str | list[dict[str, object]] = user_input
 
         try:
-            await _run_sse_stream(self, scroll, live, acc, body)
+            await self._stream_loop(scroll, current_input)
         except httpx.HTTPStatusError as exc:
             error_widget = _ensure_live(self, scroll, self._live_widget)
             error_widget.update(
@@ -465,23 +479,128 @@ class ChatApp(App[None]):
             )
         finally:
             self._streaming = False
-            # Finalize the status widget: on success it was already
-            # updated to "assistant>" by _finalize_message. On error
-            # or empty turns it may still show "thinking…" — remove
-            # it to avoid a stale indicator.
             try:
                 status = self._live_widget
-                if status is not None and not acc.had_text:
-                    # No text was produced — remove the stale status
+                if status is not None:
                     status.remove()
             except Exception:
                 _logger.exception("error cleaning up status widget")
             self._live_widget = None
             if self._current_response_id is not None:
                 self._previous_response_id = self._current_response_id
-            # Auto-screenshot after auto-send completes
             if self._auto_send_done:
                 self._save_and_exit()
+
+    async def _stream_loop(
+        self,
+        scroll: VerticalScroll,
+        current_input: str | list[dict[str, object]],
+    ) -> None:
+        """
+        Stream responses, executing client-side tools in a loop.
+
+        Each iteration streams one server response. If the response
+        contains ``function_call`` items and a tool set is active,
+        tools are executed locally and results sent back as the next
+        input. The loop exits when no pending tool calls remain.
+
+        :param scroll: The scrollable chat container.
+        :param current_input: Initial user text or tool results
+            from a previous iteration.
+        """
+        while True:
+            acc = _StreamAccumulator()
+            _open_widget_log()
+            live = AssistantMessage(
+                Text.from_markup(
+                    "[bold green]assistant>[/bold green] [dim]…[/dim]",
+                )
+            )
+            self._live_widget = live
+            await scroll.mount(live)
+            _wlog("MOUNT", "AssistantMessage", "status: assistant> …")
+            scroll.scroll_end()
+
+            body = self._build_request_body(current_input)
+            await _run_sse_stream(self, scroll, live, acc, body)
+
+            # Update previous_response_id for tool result continuations.
+            if self._current_response_id is not None:
+                self._previous_response_id = self._current_response_id
+
+            # If no client-side tool calls pending, we're done.
+            if not acc.pending_tool_calls or self._tool_set is None:
+                # Clean up the status widget if finalization ran.
+                if acc.finalized and self._live_widget is not None:
+                    self._live_widget = None
+                break
+
+            # Execute tools locally and send results back.
+            current_input = await self._execute_pending_tools(
+                scroll, acc.pending_tool_calls,
+            )
+
+    def _build_request_body(
+        self,
+        current_input: str | list[dict[str, object]],
+    ) -> dict[str, object]:
+        """
+        Build the request body for ``POST /v1/responses``.
+
+        :param current_input: User text or ``function_call_output``
+            items from local tool execution.
+        :returns: Request body dict with model, input, stream, and
+            optionally tools and previous_response_id.
+        """
+        body: dict[str, object] = {
+            "model": AGENT_NAME,
+            "input": current_input,
+            "stream": True,
+        }
+        if self._previous_response_id is not None:
+            body["previous_response_id"] = self._previous_response_id
+        if self._tool_set is not None:
+            body["tools"] = self._tool_set.TOOLS
+        return body
+
+    async def _execute_pending_tools(
+        self,
+        scroll: VerticalScroll,
+        tool_calls: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """
+        Execute client-side tool calls and return results.
+
+        Each tool is executed locally via the tool set's
+        ``execute_tool`` function. Results are displayed in the
+        TUI as collapsible widgets and returned as
+        ``function_call_output`` items for the next request.
+
+        :param scroll: The scrollable chat container.
+        :param tool_calls: List of ``function_call`` item dicts,
+            each with ``call_id``, ``name``, ``arguments``.
+        :returns: List of ``function_call_output`` dicts to send
+            as the next request's input.
+        """
+        assert self._tool_set is not None
+        results: list[dict[str, object]] = []
+        for fc in tool_calls:
+            name = str(fc.get("name", ""))
+            call_id = str(fc.get("call_id", ""))
+            args_str = str(fc.get("arguments", "{}"))
+            try:
+                arguments = json.loads(args_str)
+            except json.JSONDecodeError:
+                arguments = {}
+            output = self._tool_set.execute_tool(name, arguments)
+            # Display result in TUI.
+            _mount_tool_result(scroll, {"output": output})
+            results.append({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            })
+        return results
 
     def _save_and_exit(self) -> None:
         """
@@ -913,6 +1032,10 @@ def _handle_item_done(
         # Mount at scroll end — below the live status widget,
         # so tool calls appear as part of the assistant's turn.
         _mount_tool_call(scroll, item)
+        # If client-side tools are active, collect for local
+        # execution after the stream completes.
+        if app._tool_set is not None:
+            acc.pending_tool_calls.append(item)
     elif item_type == "function_call_output":
         _mount_tool_result(scroll, item)
     return live
@@ -990,6 +1113,9 @@ def _finalize_message(
     text_widget.update(Text.from_markup(escape(final_text)))
     scroll.scroll_end()
 
+    # Mark finalized BEFORE resetting other fields so the finally
+    # block knows not to remove the status widget.
+    acc.finalized = True
     _reset_accumulator(acc)
 
 
@@ -1106,11 +1232,14 @@ def main() -> None:
 
     Accepts ``--auto-send "message"`` to auto-submit a message on
     startup (for automated testing without user interaction).
+    Accepts ``--tools <name>`` to load a client-side tool set.
     """
     global AGENT_NAME
-    # Parse --auto-send flag before normal arg parsing
     auto_send: str | None = None
+    tool_set: ModuleType | None = None
     args = sys.argv[1:]
+
+    # Parse --auto-send flag.
     if "--auto-send" in args:
         idx = args.index("--auto-send")
         if idx + 1 < len(args):
@@ -1120,19 +1249,18 @@ def main() -> None:
             print("Error: --auto-send requires a message argument")
             sys.exit(1)
 
+    # Parse --tools flag.
+    if "--tools" in args:
+        idx = args.index("--tools")
+        if idx + 1 < len(args):
+            tool_set = _load_tool_set(args[idx + 1])
+            args = args[:idx] + args[idx + 2 :]
+        else:
+            print("Error: --tools requires a tool set name")
+            sys.exit(1)
+
     if not args:
-        print("Usage: python scripts/tui.py <agent-dir-or-tarball> [--auto-send MSG]")
-        print()
-        print("  agent-dir-or-tarball  Path to an agent image directory")
-        print("                        (containing config.yaml) or a")
-        print("                        .tar.gz bundle.")
-        print()
-        print("Options:")
-        print("  --auto-send MSG       Auto-submit MSG on startup (for testing)")
-        print()
-        print("Examples:")
-        print("  python scripts/tui.py ./my-agent/")
-        print("  python scripts/tui.py ./my-agent/ --auto-send 'say hello'")
+        _print_usage()
         sys.exit(1)
 
     agent_path = args[0]
@@ -1152,8 +1280,52 @@ def main() -> None:
         server_proc=server_proc,
         agent_id=agent_id,
         auto_send=auto_send,
+        tool_set=tool_set,
     )
     app.run()
+
+
+def _load_tool_set(name: str) -> ModuleType:
+    """
+    Load a client-side tool set by name.
+
+    Adds the ``scripts/`` directory to ``sys.path`` so that
+    ``tool_sets.<name>`` can be imported regardless of the
+    caller's working directory.
+
+    :param name: Tool set name, e.g. ``"coder"``.
+    :returns: The tool set module with ``TOOLS`` and
+        ``execute_tool`` attributes.
+    """
+    scripts_dir = str(pathlib.Path(__file__).resolve().parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    from tool_sets import get_tool_set
+
+    return get_tool_set(name)
+
+
+def _print_usage() -> None:
+    """
+    Print CLI usage information and exit.
+    """
+    print(
+        "Usage: python scripts/tui.py <agent-dir-or-tarball>"
+        " [--tools NAME] [--auto-send MSG]"
+    )
+    print()
+    print("  agent-dir-or-tarball  Path to an agent image directory")
+    print("                        (containing config.yaml) or a")
+    print("                        .tar.gz bundle.")
+    print()
+    print("Options:")
+    print("  --tools NAME          Load client-side tool set (e.g. 'coder')")
+    print("  --auto-send MSG       Auto-submit MSG on startup (for testing)")
+    print()
+    print("Examples:")
+    print("  python scripts/tui.py ./my-agent/")
+    print("  python scripts/tui.py examples/agents/coder/ --tools coder")
+    print("  python scripts/tui.py ./my-agent/ --auto-send 'say hello'")
 
 
 def _start_server() -> subprocess.Popen[bytes]:
