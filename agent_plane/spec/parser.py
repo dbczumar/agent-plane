@@ -179,6 +179,7 @@ def _parse_tools_config(
     retry = _parse_retry(raw.get("retry"))
     return ToolsConfig(
         agents=raw.get("agents", []),
+        builtins=raw.get("builtins", []),
         timeout=timeout,
         retry=retry,
     )

@@ -20,6 +20,7 @@ from agent_plane.tools.builtins import (
     LoadSkillTool,
     ReadSkillFileTool,
     any_skill_has_resources,
+    get_builtin_tool,
 )
 from agent_plane.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from agent_plane.tools.local import load_local_python_tools
@@ -50,8 +51,9 @@ class ToolManager:
     Registers at init:
     - ``load_skill`` (if the agent has skills)
     - ``read_skill_file`` (if any skill has bundled resources)
-    - One :class:`ClientSideTool` per entry in ``client_tool_specs``
+    - Built-in tools from ``tools.builtins`` (e.g. ``web_search_openai``)
     - One :class:`LocalPythonTool` per ``tools/python/*.py`` file
+    - One :class:`ClientSideTool` per entry in ``client_tool_specs``
 
     Registers at ``start()``:
     - MCP tools discovered from ``mcp_servers`` in the agent spec
@@ -86,6 +88,7 @@ class ToolManager:
         self._mcp_connections: list[McpServerConnection] = []
         self._loop_thread: EventLoopThread | None = None
         self._register_skill_tools()
+        self._register_builtin_tools()
         self._register_local_tools(workdir)
         self._register_client_tools(client_tool_specs or [])
 
@@ -103,6 +106,25 @@ class ToolManager:
         if any_skill_has_resources(self._spec.skills):
             read_tool = ReadSkillFileTool(self._spec.skills)
             self._tools[read_tool.name] = read_tool
+
+    def _register_builtin_tools(self) -> None:
+        """
+        Register built-in tools declared in ``tools.builtins``.
+
+        Each name in the list is looked up in the built-in registry.
+        Unrecognized names are logged as warnings and skipped.
+        """
+        for name in self._spec.tools.builtins:
+            tool = get_builtin_tool(name)
+            if tool is None:
+                _logger.warning(
+                    "Unknown built-in tool %r — skipping. "
+                    "Available: web_search_openai, web_search_google, "
+                    "web_search_perplexity",
+                    name,
+                )
+                continue
+            self._tools[tool.name] = tool
 
     def _register_local_tools(self, workdir: Path | None) -> None:
         """

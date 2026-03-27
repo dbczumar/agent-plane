@@ -155,6 +155,9 @@ class ToolsConfig:
     :param agents: Names of sub-agents this agent can delegate to,
         e.g. ``["summarizer", "code-reviewer"]``. Each name must
         match a directory under ``agents/``.
+    :param builtins: Names of built-in tools to enable, e.g.
+        ``["web_search_openai", "web_search_google"]``. Each name
+        must match a registered built-in tool in the runtime.
     :param timeout: Default timeout in seconds for all tool calls,
         e.g. ``60``. Individual tools can override this.
     :param retry: Default retry policy for all tool calls.
@@ -162,6 +165,7 @@ class ToolsConfig:
     """
 
     agents: list[str] = field(default_factory=list)
+    builtins: list[str] = field(default_factory=list)
     timeout: int = 60
     retry: RetryConfig = field(
         default_factory=lambda: RetryConfig(
@@ -204,21 +208,23 @@ class MCPServerConfig:
     local subprocess tools should use client-side tools instead.
 
     :param name: Unique server identifier, e.g. ``"github"``.
-    :param description: Optional human-readable summary of the
-        server's purpose.
     :param url: Endpoint URL for the HTTP (SSE) transport, e.g.
         ``"https://mcp.example.com/sse"``.
+    :param description: Optional human-readable summary of the
+        server's purpose.
     :param headers: HTTP headers to include with requests,
         e.g. ``{"Authorization": "Bearer tok_xyz"}``.
     :param timeout: Per-tool timeout in seconds. ``None`` inherits
-        ``tools.timeout``.
+        ``tools.timeout``. When ultimately ``None`` at runtime, the
+        MCP SDK defaults apply: 5 s for the initial HTTP connection
+        handshake and 300 s (5 min) for each SSE event read.
     :param retry: Per-tool retry policy. ``None`` inherits
         ``tools.retry``.
     """
 
     name: str
+    url: str
     description: str | None = None
-    url: str | None = None
     headers: dict[str, str] = field(default_factory=dict, repr=False)
     # Per-tool timeout/retry overrides. None = inherit from
     # tools.timeout / tools.retry.

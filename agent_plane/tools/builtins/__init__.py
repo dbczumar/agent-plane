@@ -1,4 +1,4 @@
-"""Built-in tools for agent-plane skills.
+"""Built-in tools for agent-plane.
 
 Public API:
 - ``LoadSkillTool``: Loads a skill's instructions by name.
@@ -8,11 +8,13 @@ Public API:
   register ReadSkillFileTool).
 - ``list_skill_resources``: Lists resource files in a skill's
   directory (used by LoadSkillTool to append file listings).
+- ``get_builtin_tool``: Instantiate a built-in tool by name.
 """
 
 from __future__ import annotations
 
 from agent_plane.spec.types import SkillSpec
+from agent_plane.tools.base import Tool
 from agent_plane.tools.builtins.load_skill import (
     LoadSkillTool,
     list_skill_resources,
@@ -20,13 +22,50 @@ from agent_plane.tools.builtins.load_skill import (
 from agent_plane.tools.builtins.read_skill_file import (
     ReadSkillFileTool,
 )
+from agent_plane.tools.builtins.web_search_google import (
+    WebSearchGoogleTool,
+)
+from agent_plane.tools.builtins.web_search_openai import (
+    WebSearchOpenAITool,
+)
+from agent_plane.tools.builtins.web_search_perplexity import (
+    WebSearchPerplexityTool,
+)
 
 __all__ = [
     "LoadSkillTool",
     "ReadSkillFileTool",
+    "WebSearchGoogleTool",
+    "WebSearchOpenAITool",
+    "WebSearchPerplexityTool",
     "any_skill_has_resources",
+    "get_builtin_tool",
     "list_skill_resources",
 ]
+
+# Registry of built-in tools that agents can enable via
+# ``tools.builtins`` in config.yaml. Keyed by the name string
+# users write in the spec.
+_BUILTIN_REGISTRY: dict[str, type[Tool]] = {
+    "web_search_openai": WebSearchOpenAITool,
+    "web_search_google": WebSearchGoogleTool,
+    "web_search_perplexity": WebSearchPerplexityTool,
+}
+
+
+def get_builtin_tool(name: str) -> Tool | None:
+    """
+    Instantiate a built-in tool by name.
+
+    :param name: The tool name from ``tools.builtins`` in
+        config.yaml, e.g. ``"web_search_openai"``.
+    :returns: A :class:`Tool` instance, or ``None`` if the
+        name is not recognized.
+    """
+    cls = _BUILTIN_REGISTRY.get(name)
+    if cls is None:
+        return None
+    return cls()
 
 
 def any_skill_has_resources(

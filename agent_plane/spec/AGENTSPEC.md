@@ -117,6 +117,32 @@ must have a corresponding directory under `agents/`. Listing an agent in
 `tools.agents` is sufficient to call it — no additional builtin declaration is
 needed.
 
+### `tools.builtins`
+
+Enables built-in tools provided by agent-plane. Each entry is a string matching
+a registered built-in tool name:
+
+```yaml
+tools:
+  builtins:
+    - web_search_openai      # OpenAI native web search (passthrough)
+    - web_search_google       # Google Custom Search API
+    - web_search_perplexity   # Perplexity AI search
+```
+
+**Available built-in tools:**
+
+| Name | Provider | Type | Env Vars Required |
+|---|---|---|---|
+| `web_search_openai` | OpenAI | Passthrough (provider-native) | None (uses LLM API key) |
+| `web_search_google` | Google | Function (server-executed) | `GOOGLE_SEARCH_API_KEY`, `GOOGLE_SEARCH_ENGINE_ID` |
+| `web_search_perplexity` | Perplexity | Function (server-executed) | `PERPLEXITY_API_KEY` |
+
+**Passthrough vs function tools**: `web_search_openai` sends
+`{"type": "web_search_preview"}` directly to the OpenAI Responses API — the LLM
+handles search server-side. The other tools are standard function tools that
+agent-plane executes and returns results to the LLM.
+
 ---
 
 ## Instructions
