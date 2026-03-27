@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from agent_plane.tools.base import Tool
+from agent_plane.tools.base import Tool, is_valid_tool_name
 
 
 @dataclass
@@ -134,6 +134,9 @@ def parse_client_side_tool_spec(raw: dict[str, Any]) -> ClientSideToolSpec:
     name = func.get("name")
     if not name:
         raise ValueError("client-specified tool missing function.name")
+
+    if not is_valid_tool_name(name):
+        raise ValueError(f"Invalid tool name {name!r}: must match [a-zA-Z0-9_-]{{1,64}}")
 
     return ClientSideToolSpec(name=name, schema=raw)
 

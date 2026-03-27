@@ -225,3 +225,75 @@ def test_invoke_raises_runtime_error(weather_spec: ClientSideToolSpec) -> None:
 
     with pytest.raises(RuntimeError, match="must not be invoked server-side"):
         tool.invoke('{"city": "San Francisco"}')
+
+
+# ── Tool name validation ─────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "tool with spaces",
+        "tool:colon",
+        "tool.dot",
+        "a" * 65,
+        "ns::method",
+    ],
+    ids=[
+        "spaces",
+        "colon",
+        "dot",
+        "too_long",
+        "double_colon",
+    ],
+)
+def test_parse_rejects_invalid_tool_name(name: str) -> None:
+    """
+    ``parse_client_side_tool_spec`` raises ``ValueError`` when the
+    tool name violates the OpenAI constraint
+    (``[a-zA-Z0-9_-]{1,64}``).
+    """
+    raw = {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "A tool.",
+            "parameters": {},
+        },
+    }
+    with pytest.raises(ValueError, match="Invalid tool name"):
+        parse_client_side_tool_spec(raw)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "simple",
+        "with_underscore",
+        "with-hyphen",
+        "CamelCase",
+        "a" * 64,
+    ],
+    ids=[
+        "simple",
+        "underscore",
+        "hyphen",
+        "camel_case",
+        "max_length",
+    ],
+)
+def test_parse_accepts_valid_tool_name(name: str) -> None:
+    """
+    ``parse_client_side_tool_spec`` accepts names that match the
+    OpenAI constraint (``[a-zA-Z0-9_-]{1,64}``).
+    """
+    raw = {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "A tool.",
+            "parameters": {},
+        },
+    }
+    spec = parse_client_side_tool_spec(raw)
+    assert spec.name == name

@@ -13,8 +13,9 @@ from typing import Any
 
 from mcp.types import Tool as McpToolDef
 
+from agent_plane.errors import AgentPlaneError, ErrorCode
 from agent_plane.spec import AgentSpec
-from agent_plane.tools.base import Tool
+from agent_plane.tools.base import Tool, is_valid_tool_name
 from agent_plane.tools.builtins import (
     LoadSkillTool,
     ReadSkillFileTool,
@@ -111,15 +112,23 @@ class ToolManager:
         """
         Register client-specified tools.
 
-        If a client tool name collides with an already-registered
-        tool (e.g. a built-in skill tool), the client tool wins
-        and a warning is logged.
+        Raises :class:`AgentPlaneError` if a tool name violates the
+        OpenAI function-calling constraint
+        (``^[a-zA-Z0-9_-]{1,64}$``). If a client tool name collides
+        with an already-registered tool (e.g. a built-in skill tool),
+        the client tool wins and a warning is logged.
 
         :param specs: List of :class:`ClientSideToolSpec` objects to
             register, e.g.
             ``[ClientSideToolSpec(name="get_weather", ...)]``.
+        :raises AgentPlaneError: If any tool name is invalid.
         """
         for spec in specs:
+            if not is_valid_tool_name(spec.name):
+                raise AgentPlaneError(
+                    f"Invalid client tool name {spec.name!r}: must match [a-zA-Z0-9_-]{{1,64}}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
             if spec.name in self._tools:
                 _logger.warning(
                     "Client-specified tool %r shadows existing tool — overwriting",
@@ -230,6 +239,11 @@ class ToolManager:
         """
         Register discovered MCP tools in the tool registry.
 
+        Tools with names that violate the OpenAI function-calling
+        constraint (``^[a-zA-Z0-9_-]{1,64}$``) are skipped with a
+        warning — MCP servers may expose tools whose names contain
+        characters that LLM providers reject.
+
         :param connection: The MCP server connection that
             owns these tools.
         :param tools: List of MCP tool definitions from
@@ -237,6 +251,14 @@ class ToolManager:
         """
         assert self._loop_thread is not None
         for tool_def in tools:
+            if not is_valid_tool_name(tool_def.name):
+                _logger.warning(
+                    "MCP tool %r from server %r has an invalid name "
+                    "(must match [a-zA-Z0-9_-]{1,64}) — skipping",
+                    tool_def.name,
+                    connection.config.name,
+                )
+                continue
             if tool_def.name in self._tools:
                 _logger.warning(
                     "MCP tool %r from server %r shadows existing tool — overwriting",

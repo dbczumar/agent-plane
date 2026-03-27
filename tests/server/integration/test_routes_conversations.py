@@ -675,8 +675,8 @@ async def test_steering_during_llm_with_client_tool_persists_steered_message(
         ],
         block=True,
     )
-    # Next turn: LLM sees the steered message and responds
-    mock_llm.add_call(text="Weather is sunny and also NYC is rainy")
+    # call_2 is enqueued later (after first turn completes) so
+    # we can capture received_kwargs on the named reference.
 
     first = await create_test_response(
         client,
@@ -738,6 +738,7 @@ async def test_steering_during_llm_with_client_tool_persists_steered_message(
     # plain text message. The LLM sees the full conversation
     # history — including the steered message from turn 1 —
     # in its prompt.
+    call_2 = mock_llm.add_call(text="Weather is sunny and also NYC is rainy")
     second = await create_test_response(
         client,
         input_text="The weather result was 72F sunny",
@@ -749,26 +750,34 @@ async def test_steering_during_llm_with_client_tool_persists_steered_message(
     body = await _wait_for_completion(client, second_id)
     assert body["status"] == "completed"
 
-    # Full conversation now includes the steered message
-    # from turn 1 alongside everything else
+    # Verify the LLM actually received the steered message
+    # in its input. This is the critical assertion — without
+    # it, the test would pass even if the steered message was
+    # silently dropped, because the mock returns a fixed string.
+    assert call_2.received_kwargs is not None, (
+        "Second LLM call was never made — the workflow did not continue to a second turn."
+    )
+    llm_input = call_2.received_kwargs["input"]
+    # Flatten all text content from the LLM input items into
+    # a single string for substring matching
+    llm_input_str = str(llm_input)
+    assert "Also check NYC" in llm_input_str, (
+        "Steered message must appear in the LLM prompt on "
+        "the second turn. If missing, the steered message "
+        "was persisted in the conversation store but not "
+        "included in the history sent to the LLM."
+    )
+
+    # Full conversation includes the steered message
     items = await _get_items(client, conv_id)
     user_texts = [
         i["content"][0]["text"]
         for i in items
         if i.get("role") == "user" and i["content"][0].get("type") == "input_text"
     ]
-    # Both original and steered messages visible
     assert "What is the weather in SF?" in user_texts
     assert "Also check NYC" in user_texts
     assert "The weather result was 72F sunny" in user_texts
-
-    # The LLM's second-turn response is in the conversation
-    assistant_texts = [i["content"][0]["text"] for i in items if i.get("role") == "assistant"]
-    assert "Weather is sunny and also NYC is rainy" in assistant_texts, (
-        "Second-turn LLM should see the steered message in its "
-        "prompt and respond to it. If missing, the steered "
-        "message was lost between turns."
-    )
 
 
 # ── Error Handling ───────────────────────────────────────

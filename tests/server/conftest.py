@@ -71,6 +71,14 @@ class MockCall:
     block_before_response: threading.Event | None = None
     call_event: threading.Event = field(default_factory=threading.Event)
     stream_tokens: bool = False
+    # Populated by the mock when this call is consumed. Contains
+    # the kwargs passed to responses.create() so tests can inspect
+    # what the LLM received (e.g. the input/history).
+    # Any: kwargs from responses.create() are heterogeneous.
+    received_kwargs: dict[str, Any] | None = field(
+        default=None,
+        repr=False,
+    )
 
     def release(self) -> None:
         """
@@ -223,11 +231,14 @@ class _MockResponsesNamespace:
         Mock ``responses.create()``. Consumes the next MockCall,
         optionally blocking, then returns a Response or stream.
 
-        :param kwargs: Ignored (accepts any Responses API kwargs).
+        :param kwargs: Responses API kwargs — captured on the
+            ``MockCall.received_kwargs`` for test inspection.
         :returns: A ``Response`` if ``stream`` is falsy, or an
             iterator of ``ResponseStreamEvent`` if ``stream=True``.
         """
         call = self._client._next_call()
+        # Capture kwargs so tests can inspect what the LLM received
+        call.received_kwargs = kwargs
         # Signal that this call has been entered
         call.call_event.set()
         # Optionally block until the test releases us

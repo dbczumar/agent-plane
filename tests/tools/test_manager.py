@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent_plane.errors import AgentPlaneError
 from agent_plane.spec.types import (
     AgentSpec,
     MCPServerConfig,
@@ -561,3 +562,149 @@ def test_mcp_duplicate_tool_name_last_wins(
     assert names.count("shared_tool") == 1
 
     mgr.shutdown()
+
+
+# ── Tool name validation ─────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "tool with spaces",
+        "tool:colon",
+        "tool.dot",
+        "",
+        "a" * 65,  # exceeds 64-char limit
+        "tool/slash",
+        "ns::tool",
+    ],
+    ids=[
+        "spaces",
+        "colon",
+        "dot",
+        "empty",
+        "too_long",
+        "slash",
+        "double_colon",
+    ],
+)
+def test_mcp_tool_invalid_name_skipped(
+    work_dir: Path,
+    name: str,
+) -> None:
+    """
+    MCP tools with names violating the OpenAI constraint
+    (``[a-zA-Z0-9_-]{1,64}``) are skipped at registration
+    and do not appear in ``get_tool_schemas()``.
+    """
+    mcp_config = MCPServerConfig(
+        name="test-mcp",
+        transport="stdio",
+        command="echo",
+    )
+    spec = _make_spec(mcp_servers=[mcp_config])
+    mgr = ToolManager(spec, work_dir)
+
+    tool_def = _make_mock_mcp_tool(name)
+
+    with _patch_mcp_connect([tool_def]):
+        mgr.start()
+
+    assert mgr.get_tool_schemas() == []
+
+    mgr.shutdown()
+
+
+def test_mcp_tool_valid_names_registered(
+    work_dir: Path,
+) -> None:
+    """
+    MCP tools with valid names (alphanumeric, underscore,
+    hyphen, up to 64 chars) are registered normally.
+    """
+    mcp_config = MCPServerConfig(
+        name="test-mcp",
+        transport="stdio",
+        command="echo",
+    )
+    spec = _make_spec(mcp_servers=[mcp_config])
+    mgr = ToolManager(spec, work_dir)
+
+    tools = [
+        _make_mock_mcp_tool("simple"),
+        _make_mock_mcp_tool("with_underscore"),
+        _make_mock_mcp_tool("with-hyphen"),
+        _make_mock_mcp_tool("MixedCase123"),
+    ]
+
+    with _patch_mcp_connect(tools):
+        mgr.start()
+
+    schemas = mgr.get_tool_schemas()
+    names = {s["function"]["name"] for s in schemas}
+    assert names == {"simple", "with_underscore", "with-hyphen", "MixedCase123"}
+
+    mgr.shutdown()
+
+
+def test_mcp_tool_mixed_valid_and_invalid(
+    work_dir: Path,
+) -> None:
+    """
+    When an MCP server returns a mix of valid and invalid tool
+    names, only valid tools are registered.
+    """
+    mcp_config = MCPServerConfig(
+        name="test-mcp",
+        transport="stdio",
+        command="echo",
+    )
+    spec = _make_spec(mcp_servers=[mcp_config])
+    mgr = ToolManager(spec, work_dir)
+
+    tools = [
+        _make_mock_mcp_tool("valid_tool"),
+        _make_mock_mcp_tool("invalid tool"),  # space
+        _make_mock_mcp_tool("also_valid"),
+    ]
+
+    with _patch_mcp_connect(tools):
+        mgr.start()
+
+    schemas = mgr.get_tool_schemas()
+    names = {s["function"]["name"] for s in schemas}
+    assert names == {"valid_tool", "also_valid"}
+
+    mgr.shutdown()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "tool with spaces",
+        "tool:colon",
+        "",
+        "a" * 65,
+    ],
+    ids=[
+        "spaces",
+        "colon",
+        "empty",
+        "too_long",
+    ],
+)
+def test_client_tool_invalid_name_raises(
+    work_dir: Path,
+    name: str,
+) -> None:
+    """
+    Client-specified tools with invalid names raise
+    ``AgentPlaneError`` at registration time.
+    """
+    spec = _make_spec()
+    with pytest.raises(AgentPlaneError, match="Invalid client tool name"):
+        ToolManager(
+            spec,
+            work_dir,
+            client_tool_specs=[_make_client_side_spec(name)],
+        )

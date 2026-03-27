@@ -3,7 +3,23 @@
 from __future__ import annotations
 
 import abc
+import re
 from typing import Any
+
+# OpenAI function-calling constraint: names must match this pattern.
+# MCP and client-specified tools must be validated before registration.
+TOOL_NAME_RE: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+def is_valid_tool_name(name: str) -> bool:
+    """
+    Check whether a tool name satisfies the OpenAI function-calling
+    constraint: 1–64 characters, alphanumeric plus ``_`` and ``-``.
+
+    :param name: The tool name to validate, e.g. ``"get_weather"``.
+    :returns: ``True`` if the name is valid, ``False`` otherwise.
+    """
+    return TOOL_NAME_RE.match(name) is not None
 
 
 class Tool(abc.ABC):
