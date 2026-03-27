@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
-import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import timedelta
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from cachetools import TTLCache
 from mcp.shared.exceptions import McpError
 from mcp.types import CONNECTION_CLOSED, ErrorData
 
@@ -17,7 +19,6 @@ from agent_plane.tools.mcp import (
     McpServerConnection,
     McpTool,
     _cache_key,
-    _CachedDiscovery,
     _discovery_cache,
     _format_call_result,
     _format_content_block,
@@ -181,11 +182,8 @@ async def test_connect_skips_list_tools_when_cache_fresh() -> None:
     config = _make_stdio_config()
     tool_def = _make_mcp_tool_def()
 
-    # Pre-populate the cache.
-    _discovery_cache[_cache_key(config)] = _CachedDiscovery(
-        tools=[tool_def],
-        fetched_at=time.monotonic(),
-    )
+    # Pre-populate the cache — TTLCache uses dict assignment.
+    _discovery_cache[_cache_key(config)] = [tool_def]
 
     with _mock_mcp_transport() as mock_session:
         conn = McpServerConnection(config=config)
@@ -208,10 +206,7 @@ async def test_cached_connect_has_live_session() -> None:
     has a live session that can invoke tools.
     """
     config = _make_stdio_config()
-    _discovery_cache[_cache_key(config)] = _CachedDiscovery(
-        tools=[_make_mcp_tool_def()],
-        fetched_at=time.monotonic(),
-    )
+    _discovery_cache[_cache_key(config)] = [_make_mcp_tool_def()]
 
     with _mock_mcp_transport() as mock_session:
         # Set up call_tool to return a mock result.
@@ -238,17 +233,24 @@ async def test_connect_skips_expired_cache() -> None:
     """
     config = _make_stdio_config()
 
-    # Pre-populate with an expired entry.
-    _discovery_cache[_cache_key(config)] = _CachedDiscovery(
-        tools=[_make_mcp_tool_def()],
-        # Expired: fetched 1000 seconds ago.
-        fetched_at=time.monotonic() - 1000,
+    # Use a TTLCache with a controllable timer so we can
+    # simulate expiry without sleeping. Start at t=0, insert
+    # the entry, then advance past the TTL.
+    current_time = [0.0]
+    expired_cache: TTLCache[str, list[MagicMock]] = TTLCache(
+        maxsize=64,
+        ttl=300,
+        timer=lambda: current_time[0],
     )
+    expired_cache[_cache_key(config)] = [_make_mcp_tool_def()]
+    # Advance time past the 300s TTL.
+    current_time[0] = 1000.0
 
     fresh_tool = _make_mcp_tool_def("fresh_tool")
     with _mock_mcp_transport([fresh_tool]) as mock_session:
-        conn = McpServerConnection(config=config)
-        tools = await conn.connect()
+        with patch("agent_plane.tools.mcp._discovery_cache", expired_cache):
+            conn = McpServerConnection(config=config)
+            tools = await conn.connect()
 
     assert len(tools) == 1
     assert tools[0].name == "fresh_tool"
@@ -273,8 +275,10 @@ async def test_connect_populates_cache() -> None:
 
     key = _cache_key(config)
     assert key in _discovery_cache
-    assert len(_discovery_cache[key].tools) == 1
-    assert _discovery_cache[key].tools[0].name == "cached_tool"
+    cached = _discovery_cache.get(key)
+    assert cached is not None
+    assert len(cached) == 1
+    assert cached[0].name == "cached_tool"
 
     await conn.close()
 
@@ -477,14 +481,35 @@ def test_clear_discovery_cache() -> None:
     ``clear_discovery_cache()`` empties the module-level cache.
     """
     config = _make_stdio_config()
-    _discovery_cache[_cache_key(config)] = _CachedDiscovery(
-        tools=[],
-        fetched_at=time.monotonic(),
-    )
+    _discovery_cache[_cache_key(config)] = []
     assert len(_discovery_cache) > 0
 
     clear_discovery_cache()
     assert len(_discovery_cache) == 0
+
+
+def test_discovery_cache_evicts_lru_when_full() -> None:
+    """
+    The discovery cache evicts the least-recently-used entry
+    when it reaches ``maxsize``.
+
+    Uses a small TTLCache (maxsize=2) to verify that inserting
+    a third entry evicts the oldest one.
+    """
+    small_cache: TTLCache[str, list[MagicMock]] = TTLCache(
+        maxsize=2,
+        ttl=300,
+    )
+    small_cache["server-a"] = [_make_mcp_tool_def("tool_a")]
+    small_cache["server-b"] = [_make_mcp_tool_def("tool_b")]
+
+    # Inserting a third entry should evict the LRU (server-a).
+    small_cache["server-c"] = [_make_mcp_tool_def("tool_c")]
+
+    assert "server-a" not in small_cache
+    assert "server-b" in small_cache
+    assert "server-c" in small_cache
+    assert len(small_cache) == 2
 
 
 # ── _open_transport validation ───────────────────────────
@@ -692,3 +717,285 @@ async def test_call_tool_propagates_if_retry_fails() -> None:
         with patch.object(conn, "_reconnect", new_callable=AsyncMock):
             with pytest.raises(EOFError, match="died again"):
                 await conn.call_tool("test_tool", {"query": "hi"})
+
+
+# ── Timeout propagation ──────────────────────────────────
+
+
+@pytest.mark.asyncio()
+async def test_connect_passes_timeout_to_client_session() -> None:
+    """
+    When ``MCPServerConfig.timeout`` is set, ``connect()`` must
+    pass ``read_timeout_seconds=timedelta(seconds=timeout)`` to
+    ``ClientSession``.
+    """
+    config = MCPServerConfig(
+        name="test-timeout",
+        transport="stdio",
+        command="echo",
+        args=["hello"],
+        timeout=60,
+    )
+
+    captured_kwargs: dict[str, Any] = {}
+
+    def _capturing_session(
+        *args: Any,
+        **kwargs: Any,
+    ) -> AsyncMock:
+        """
+        Fake ``ClientSession`` constructor that records kwargs.
+
+        :param args: Positional args (read_stream, write_stream).
+        :param kwargs: Keyword args including read_timeout_seconds.
+        :returns: A mock session with working initialize/list_tools.
+        """
+        captured_kwargs.update(kwargs)
+        mock_session = AsyncMock()
+        mock_session.initialize = AsyncMock()
+        mock_tools = MagicMock()
+        mock_tools.tools = []
+        mock_session.list_tools.return_value = mock_tools
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        return mock_session
+
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__ = AsyncMock(
+        return_value=(MagicMock(), MagicMock()),
+    )
+    mock_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "agent_plane.tools.mcp.ClientSession",
+        side_effect=_capturing_session,
+    ):
+        with patch(
+            "agent_plane.tools.mcp.stdio_client",
+            return_value=mock_ctx,
+        ):
+            conn = McpServerConnection(config=config)
+            await conn.connect()
+
+    # timeout=60 must be converted to timedelta(seconds=60) for the
+    # MCP SDK's ClientSession read_timeout_seconds parameter.
+    assert captured_kwargs.get("read_timeout_seconds") == timedelta(seconds=60), (
+        "ClientSession must receive read_timeout_seconds as a "
+        "timedelta matching the config timeout"
+    )
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_connect_passes_none_timeout_to_client_session() -> None:
+    """
+    When ``MCPServerConfig.timeout`` is ``None`` (default),
+    ``connect()`` must pass ``read_timeout_seconds=None`` so the
+    MCP SDK uses its built-in default.
+    """
+    config = MCPServerConfig(
+        name="test-no-timeout",
+        transport="stdio",
+        command="echo",
+        args=["hello"],
+        # timeout defaults to None
+    )
+
+    captured_kwargs: dict[str, Any] = {}
+
+    def _capturing_session(
+        *args: Any,
+        **kwargs: Any,
+    ) -> AsyncMock:
+        """
+        Fake ``ClientSession`` constructor that records kwargs.
+
+        :param args: Positional args (read_stream, write_stream).
+        :param kwargs: Keyword args including read_timeout_seconds.
+        :returns: A mock session with working initialize/list_tools.
+        """
+        captured_kwargs.update(kwargs)
+        mock_session = AsyncMock()
+        mock_session.initialize = AsyncMock()
+        mock_tools = MagicMock()
+        mock_tools.tools = []
+        mock_session.list_tools.return_value = mock_tools
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        return mock_session
+
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__ = AsyncMock(
+        return_value=(MagicMock(), MagicMock()),
+    )
+    mock_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "agent_plane.tools.mcp.ClientSession",
+        side_effect=_capturing_session,
+    ):
+        with patch(
+            "agent_plane.tools.mcp.stdio_client",
+            return_value=mock_ctx,
+        ):
+            conn = McpServerConnection(config=config)
+            await conn.connect()
+
+    # When timeout is None, read_timeout_seconds must be None so the
+    # MCP SDK falls back to its own default (no timeout).
+    assert captured_kwargs.get("read_timeout_seconds") is None, (
+        "ClientSession must receive read_timeout_seconds=None when config timeout is unset"
+    )
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_connect_http_passes_timeout_to_sse_client() -> None:
+    """
+    When ``MCPServerConfig(transport="http", timeout=60)``,
+    ``connect()`` must pass ``timeout=60.0`` and
+    ``sse_read_timeout=60.0`` to ``sse_client``.
+    """
+    config = MCPServerConfig(
+        name="test-http-timeout",
+        transport="http",
+        url="http://localhost:9000/mcp",
+        timeout=60,
+    )
+
+    captured_sse_kwargs: dict[str, Any] = {}
+
+    mock_sse_ctx = AsyncMock()
+    mock_sse_ctx.__aenter__ = AsyncMock(
+        return_value=(MagicMock(), MagicMock()),
+    )
+    mock_sse_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    def _capturing_sse_client(**kwargs: Any) -> AsyncMock:
+        """
+        Fake ``sse_client`` that records kwargs.
+
+        :param kwargs: Keyword args including timeout and
+            sse_read_timeout.
+        :returns: An async context manager yielding mock streams.
+        """
+        captured_sse_kwargs.update(kwargs)
+        return mock_sse_ctx
+
+    def _capturing_session(
+        *args: Any,
+        **kwargs: Any,
+    ) -> AsyncMock:
+        """
+        Fake ``ClientSession`` constructor for HTTP transport.
+
+        :param args: Positional args (read_stream, write_stream).
+        :param kwargs: Keyword args.
+        :returns: A mock session with working initialize/list_tools.
+        """
+        mock_session = AsyncMock()
+        mock_session.initialize = AsyncMock()
+        mock_tools = MagicMock()
+        mock_tools.tools = []
+        mock_session.list_tools.return_value = mock_tools
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        return mock_session
+
+    with patch(
+        "agent_plane.tools.mcp.sse_client",
+        side_effect=_capturing_sse_client,
+    ):
+        with patch(
+            "agent_plane.tools.mcp.ClientSession",
+            side_effect=_capturing_session,
+        ):
+            conn = McpServerConnection(config=config)
+            await conn.connect()
+
+    # Both timeout (HTTP handshake) and sse_read_timeout (SSE event
+    # wait) must be set to the config timeout as a float.
+    assert captured_sse_kwargs["timeout"] == 60.0, (
+        "sse_client timeout must equal the config timeout as float"
+    )
+    assert captured_sse_kwargs["sse_read_timeout"] == 60.0, (
+        "sse_client sse_read_timeout must equal the config timeout as float"
+    )
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_connect_http_uses_default_timeouts_when_none() -> None:
+    """
+    When ``MCPServerConfig(transport="http", timeout=None)``,
+    ``connect()`` must pass the MCP SDK defaults: ``timeout=5``
+    and ``sse_read_timeout=300``.
+    """
+    config = MCPServerConfig(
+        name="test-http-default",
+        transport="http",
+        url="http://localhost:9000/mcp",
+        # timeout defaults to None
+    )
+
+    captured_sse_kwargs: dict[str, Any] = {}
+
+    mock_sse_ctx = AsyncMock()
+    mock_sse_ctx.__aenter__ = AsyncMock(
+        return_value=(MagicMock(), MagicMock()),
+    )
+    mock_sse_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    def _capturing_sse_client(**kwargs: Any) -> AsyncMock:
+        """
+        Fake ``sse_client`` that records kwargs.
+
+        :param kwargs: Keyword args including timeout and
+            sse_read_timeout.
+        :returns: An async context manager yielding mock streams.
+        """
+        captured_sse_kwargs.update(kwargs)
+        return mock_sse_ctx
+
+    def _capturing_session(
+        *args: Any,
+        **kwargs: Any,
+    ) -> AsyncMock:
+        """
+        Fake ``ClientSession`` constructor for HTTP transport.
+
+        :param args: Positional args (read_stream, write_stream).
+        :param kwargs: Keyword args.
+        :returns: A mock session with working initialize/list_tools.
+        """
+        mock_session = AsyncMock()
+        mock_session.initialize = AsyncMock()
+        mock_tools = MagicMock()
+        mock_tools.tools = []
+        mock_session.list_tools.return_value = mock_tools
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        return mock_session
+
+    with patch(
+        "agent_plane.tools.mcp.sse_client",
+        side_effect=_capturing_sse_client,
+    ):
+        with patch(
+            "agent_plane.tools.mcp.ClientSession",
+            side_effect=_capturing_session,
+        ):
+            conn = McpServerConnection(config=config)
+            await conn.connect()
+
+    # SDK default: 5s for initial HTTP connection handshake.
+    assert captured_sse_kwargs["timeout"] == 5, (
+        "sse_client timeout must default to 5 when config timeout is None"
+    )
+    # SDK default: 300s (5 min) for SSE event read.
+    assert captured_sse_kwargs["sse_read_timeout"] == 300, (
+        "sse_client sse_read_timeout must default to 300 when config timeout is None"
+    )
