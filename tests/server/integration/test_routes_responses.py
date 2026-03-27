@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any
 
@@ -667,3 +668,215 @@ async def test_create_response_no_file_id_skips_validation(
         },
     )
     assert resp.status_code == 200
+
+
+# ── Multimodal integration tests ────────────────────────────────────
+
+
+async def test_multimodal_image_file_id_resolves_to_llm(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Upload an image via /v1/files, reference it via file_id in a
+    response request, and verify the task completes with output.
+
+    This is the full end-to-end path:
+    upload → file_id validation → task creation → workflow →
+    content resolver → prompt builder → LLM call.
+
+    The content resolver resolves file_id to a data: URI before
+    the LLM sees it. If resolution fails, the workflow errors out
+    and the task status would be 'failed', not 'completed'.
+    """
+    await create_test_agent(client)
+    mock_llm.add_call(text="It is red.")
+
+    # Upload a small PNG (1x1 red pixel).
+    png_bytes = _make_tiny_png()
+    upload_resp = await client.post(
+        "/v1/files",
+        files={"file": ("red.png", png_bytes, "image/png")},
+    )
+    assert upload_resp.status_code == 201
+    file_id = upload_resp.json()["id"]
+
+    # Send a response request with text + image file_id.
+    resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": [
+                {"type": "input_text", "text": "What color is this?"},
+                {"type": "input_image", "file_id": file_id},
+            ],
+            "background": False,
+            "stream": False,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    # Task completed — file_id was resolved and LLM responded.
+    # If the content resolver failed, status would be 'failed'.
+    assert body["status"] == "completed"
+    assert len(body["output"]) > 0
+
+    # Verify the LLM received the resolved image in its input.
+    # The mock captures received_kwargs on each call.
+    # call_count == 1: one LLM turn for the non-tool mock response.
+    assert mock_llm.call_count == 1
+    received = mock_llm.get_call(0).received_kwargs
+    assert received is not None
+    llm_input = received.get("input", [])
+    expected_b64 = base64.b64encode(png_bytes).decode("ascii")
+    input_str = json.dumps(llm_input)
+    # file_id must NOT appear — it should have been resolved.
+    assert file_id not in input_str, (
+        "file_id must be resolved to inline content before reaching the LLM"
+    )
+    # The base64 content must appear in the input.
+    assert expected_b64 in input_str, "Base64-encoded image content must appear in the LLM input"
+
+
+async def test_multimodal_file_id_resolves_to_llm(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Upload a PDF via /v1/files, reference it via file_id in a
+    response request, and verify the task completes with the
+    file_id resolved to inline base64 content.
+
+    Tests the input_file content block path end-to-end.
+    """
+    await create_test_agent(client)
+    mock_llm.add_call(text="The document discusses testing.")
+
+    # Upload a fake PDF.
+    pdf_bytes = b"%PDF-1.4 fake pdf for testing"
+    upload_resp = await client.post(
+        "/v1/files",
+        files={"file": ("report.pdf", pdf_bytes, "application/pdf")},
+    )
+    assert upload_resp.status_code == 201
+    file_id = upload_resp.json()["id"]
+
+    # Send a response with text + file.
+    resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": [
+                {"type": "input_text", "text": "Summarize this document"},
+                {
+                    "type": "input_file",
+                    "file_id": file_id,
+                    "filename": "report.pdf",
+                },
+            ],
+            "background": False,
+            "stream": False,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "completed"
+    assert len(body["output"]) > 0
+
+    # Verify the LLM received resolved file content.
+    # call_count == 1: one LLM turn for the non-tool mock response.
+    assert mock_llm.call_count == 1
+    received = mock_llm.get_call(0).received_kwargs
+    assert received is not None
+    llm_input = received.get("input", [])
+    expected_b64 = base64.b64encode(pdf_bytes).decode("ascii")
+    input_str = json.dumps(llm_input)
+    assert file_id not in input_str, (
+        "file_id must be resolved to inline content before reaching the LLM"
+    )
+    assert expected_b64 in input_str, "Base64-encoded file content must appear in the LLM input"
+
+
+async def test_multimodal_mixed_image_and_file(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Upload both an image and a PDF, then send a request
+    referencing both. Verifies the full pipeline handles
+    multiple file types in a single request.
+    """
+    await create_test_agent(client)
+    mock_llm.add_call(text="The image shows a red pixel and the doc is a test.")
+
+    # Upload image.
+    png_bytes = _make_tiny_png()
+    img_resp = await client.post(
+        "/v1/files",
+        files={"file": ("photo.png", png_bytes, "image/png")},
+    )
+    assert img_resp.status_code == 201
+    img_id = img_resp.json()["id"]
+
+    # Upload PDF.
+    pdf_bytes = b"%PDF-1.4 test document content"
+    pdf_resp = await client.post(
+        "/v1/files",
+        files={"file": ("doc.pdf", pdf_bytes, "application/pdf")},
+    )
+    assert pdf_resp.status_code == 201
+    pdf_id = pdf_resp.json()["id"]
+
+    # Send request with text + image + file.
+    resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": [
+                {"type": "input_text", "text": "Compare the image to the doc"},
+                {"type": "input_image", "file_id": img_id},
+                {
+                    "type": "input_file",
+                    "file_id": pdf_id,
+                    "filename": "doc.pdf",
+                },
+            ],
+            "background": False,
+            "stream": False,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "completed"
+    assert len(body["output"]) > 0
+    # Verify conversation was created.
+    assert body["conversation"] is not None
+    assert isinstance(body["conversation"]["id"], str)
+
+
+def _make_tiny_png() -> bytes:
+    """
+    Generate a minimal valid 1x1 red PNG.
+
+    :returns: PNG file bytes.
+    """
+    import struct
+    import zlib
+
+    # IHDR: 1x1, 8-bit RGB
+    ihdr_data = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    ihdr_crc = zlib.crc32(b"IHDR" + ihdr_data) & 0xFFFFFFFF
+    ihdr = struct.pack(">I", 13) + b"IHDR" + ihdr_data + struct.pack(">I", ihdr_crc)
+
+    # IDAT: single row, filter byte 0, then RGB (255, 0, 0)
+    raw_row = b"\x00\xff\x00\x00"
+    compressed = zlib.compress(raw_row)
+    idat_crc = zlib.crc32(b"IDAT" + compressed) & 0xFFFFFFFF
+    idat = struct.pack(">I", len(compressed)) + b"IDAT" + compressed + struct.pack(">I", idat_crc)
+
+    # IEND
+    iend_crc = zlib.crc32(b"IEND") & 0xFFFFFFFF
+    iend = struct.pack(">I", 0) + b"IEND" + struct.pack(">I", iend_crc)
+
+    # PNG signature + chunks
+    return b"\x89PNG\r\n\x1a\n" + ihdr + idat + iend

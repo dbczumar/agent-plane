@@ -23,6 +23,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import mimetypes
 import os
 import pathlib
 import signal
@@ -55,6 +56,102 @@ _MAX_SCROLL_WIDGETS: int = 200
 # Maximum characters to store in a tool-result Collapsible.
 # Even collapsed, large Static widgets slow the DOM.
 _MAX_TOOL_RESULT_DISPLAY: int = 4000
+# File extensions recognized as images for inline display.
+_IMAGE_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".bmp",
+        ".svg",
+    }
+)
+
+
+# ── File upload ───────────────────────────────────────
+
+
+@dataclass
+class _UploadedFile:
+    """
+    Metadata for a file uploaded to the server.
+
+    :param file_id: Server-assigned file identifier, e.g.
+        ``"file_abc123"``.
+    :param filename: Original filename, e.g. ``"photo.png"``.
+    :param content_type: MIME type, e.g. ``"image/png"``.
+    """
+
+    file_id: str
+    filename: str
+    content_type: str | None
+
+
+def _upload_file(file_path: pathlib.Path) -> _UploadedFile:
+    """
+    Upload a local file to the agent-plane server.
+
+    :param file_path: Path to the file on disk.
+    :returns: An :class:`_UploadedFile` with the server-assigned
+        ``file_id``.
+    :raises httpx.HTTPStatusError: If the upload fails.
+    """
+    content_type = mimetypes.guess_type(str(file_path))[0]
+    with open(file_path, "rb") as f:
+        resp = httpx.post(
+            f"{BASE_URL}/v1/files",
+            files={"file": (file_path.name, f, content_type)},
+            timeout=30.0,
+        )
+    resp.raise_for_status()
+    body = resp.json()
+    return _UploadedFile(
+        file_id=body["id"],
+        filename=file_path.name,
+        content_type=content_type,
+    )
+
+
+def _build_content_blocks(
+    text: str,
+    files: list[_UploadedFile],
+) -> str | list[dict[str, object]]:
+    """
+    Build the ``input`` payload from user text and attached files.
+
+    Returns a plain string when there are no file attachments
+    (backward compatible). Returns a list of content blocks when
+    files are present.
+
+    :param text: The user's message text.
+    :param files: Uploaded file references to attach.
+    :returns: A string or list of content block dicts.
+    """
+    if not files:
+        return text
+
+    blocks: list[dict[str, object]] = []
+    if text:
+        blocks.append({"type": "input_text", "text": text})
+    for f in files:
+        if f.content_type and f.content_type.startswith("image/"):
+            blocks.append(
+                {
+                    "type": "input_image",
+                    "file_id": f.file_id,
+                }
+            )
+        else:
+            blocks.append(
+                {
+                    "type": "input_file",
+                    "file_id": f.file_id,
+                    "filename": f.filename,
+                }
+            )
+    return blocks
 
 
 # ── Agent bundle ──────────────────────────────────────
@@ -330,6 +427,7 @@ class ChatApp(App[None]):
         Binding("ctrl+c", "quit", "Quit"),
         Binding("ctrl+l", "clear_log", "Clear"),
         Binding("ctrl+r", "toggle_reasoning", "Reasoning"),
+        Binding("ctrl+v", "paste_files", "Paste", show=False),
         Binding("escape", "toggle_browse", "Browse", show=False),
     ]
 
@@ -364,6 +462,8 @@ class ChatApp(App[None]):
         self._streaming = False
         # The live Static widget being updated during streaming.
         self._live_widget: Static | None = None
+        # Files attached to the next message (drag-and-drop or paste).
+        self._pending_files: list[_UploadedFile] = []
 
     def compose(self) -> ComposeResult:
         """Build the UI layout."""
@@ -406,10 +506,11 @@ class ChatApp(App[None]):
 
         If the assistant is currently streaming, deliver the
         message as a steering request. Otherwise, start a new
-        conversation turn.
+        conversation turn. Attached files (from drag-and-drop
+        or paste) are included as content blocks.
         """
         text = event.value.strip()
-        if not text:
+        if not text and not self._pending_files:
             return
         event.input.value = ""
 
@@ -428,12 +529,25 @@ class ChatApp(App[None]):
             scroll.scroll_end()
             return
 
-        scroll.mount(UserMessage(Text.from_markup(f"[bold cyan]you>[/bold cyan] {escape(text)}")))
+        # Collect any inline file paths (e.g. /path/to/image.png
+        # pasted by terminals that convert drag-and-drop to paths).
+        attached = list(self._pending_files)
+        self._pending_files.clear()
+        attached.extend(_extract_file_paths(text))
+
+        # Build display label.
+        display = _user_display_label(text, attached)
+        scroll.mount(UserMessage(Text.from_markup(display)))
         scroll.scroll_end()
-        self._start_stream(text)
+
+        content = _build_content_blocks(_strip_file_paths(text), attached)
+        self._start_stream(content)
 
     @work(exclusive=True, group="stream")
-    async def _start_stream(self, user_input: str) -> None:
+    async def _start_stream(
+        self,
+        user_input: str | list[dict[str, object]],
+    ) -> None:
         """
         Stream a response from the agent in a background worker.
 
@@ -447,7 +561,8 @@ class ChatApp(App[None]):
         via a new request. This loops until the agent produces
         a final text response with no pending tool calls.
 
-        :param user_input: The user's message text.
+        :param user_input: The user's message text, or a list
+            of content block dicts when files are attached.
         """
         self._streaming = True
         self._current_response_id = None
@@ -660,6 +775,43 @@ class ChatApp(App[None]):
         for c in self.query(Collapsible):
             c.collapsed = not c.collapsed
 
+    def action_paste_files(self) -> None:
+        """
+        Paste file paths from the system clipboard (Ctrl+V).
+
+        Inspects clipboard text for file paths (one per line).
+        Image and document files are uploaded to the server and
+        queued as attachments for the next message.
+        """
+        try:
+            import subprocess as _sp
+
+            result = _sp.run(["pbpaste"], capture_output=True, text=True, timeout=2)
+            clipboard = result.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            # pbpaste missing (non-macOS) or timed out — nothing to paste.
+            return
+
+        if not clipboard:
+            return
+
+        files = _parse_clipboard_paths(clipboard)
+        if not files:
+            # Not file paths — let Textual handle as normal text paste.
+            inp = self.query_one("#user-input", Input)
+            inp.insert_text_at_cursor(clipboard)
+            return
+
+        scroll = self.query_one("#chat-scroll", VerticalScroll)
+        for uploaded in files:
+            self._pending_files.append(uploaded)
+            scroll.mount(
+                SystemInfo(
+                    Text.from_markup(f"[dim]📎 attached: {escape(uploaded.filename)}[/dim]")
+                )
+            )
+        scroll.scroll_end()
+
     def action_toggle_browse(self) -> None:
         """
         Toggle between input mode and browse mode (Escape).
@@ -719,6 +871,35 @@ class ChatApp(App[None]):
             event.prevent_default()
             self.query_one("#user-input", Input).focus()
 
+    def on_paste(self, event: events.Paste) -> None:
+        """
+        Handle paste events — detect file paths from drag-and-drop.
+
+        Terminals like iTerm2 and kitty convert drag-and-drop into
+        a paste event containing file paths. If the pasted text
+        contains valid file paths, they are uploaded and attached
+        to the next message. Otherwise the paste is forwarded to
+        the input widget as normal text.
+
+        :param event: The paste event with the pasted text.
+        """
+        text = event.text.strip()
+        if not text:
+            return
+
+        files = _parse_clipboard_paths(text)
+        if files:
+            event.prevent_default()
+            scroll = self.query_one("#chat-scroll", VerticalScroll)
+            for uploaded in files:
+                self._pending_files.append(uploaded)
+                scroll.mount(
+                    SystemInfo(
+                        Text.from_markup(f"[dim]📎 attached: {escape(uploaded.filename)}[/dim]")
+                    )
+                )
+            scroll.scroll_end()
+
     def on_unmount(self) -> None:
         """Shut down the server on exit."""
         self._server_proc.send_signal(signal.SIGINT)
@@ -773,6 +954,133 @@ def _index_of(
         if w is target:
             return i
     return 0
+
+
+# ── File path helpers ─────────────────────────────────
+
+
+def _is_supported_file(path: pathlib.Path) -> bool:
+    """
+    Check if a file path points to an uploadable file.
+
+    :param path: The file path to check.
+    :returns: ``True`` if the file exists and has a recognized
+        extension (image or common document format).
+    """
+    if not path.is_file():
+        return False
+    suffix = path.suffix.lower()
+    return suffix in _IMAGE_EXTENSIONS or suffix in {
+        ".pdf",
+        ".txt",
+        ".csv",
+        ".json",
+        ".md",
+        ".py",
+        ".js",
+        ".ts",
+        ".html",
+        ".css",
+        ".xml",
+        ".yaml",
+        ".yml",
+        ".toml",
+    }
+
+
+def _upload_paths(paths: list[pathlib.Path]) -> list[_UploadedFile]:
+    """
+    Upload a list of file paths, skipping any that fail.
+
+    Each path is uploaded via ``_upload_file``. Network and I/O
+    errors are logged and the path is skipped — the user sees the
+    attachment confirmation only for successful uploads.
+
+    :param paths: Resolved file paths to upload, e.g.
+        ``[Path("/tmp/photo.png"), Path("report.pdf")]``.
+    :returns: Successfully uploaded file references.
+    """
+    uploaded: list[_UploadedFile] = []
+    for path in paths:
+        try:
+            uploaded.append(_upload_file(path))
+        except (httpx.HTTPError, OSError) as exc:
+            _logger.warning("failed to upload %s: %s", path, exc)
+    return uploaded
+
+
+def _parse_clipboard_paths(clipboard: str) -> list[_UploadedFile]:
+    """
+    Parse clipboard text for file paths and upload each one.
+
+    Lines that resolve to existing files with supported extensions
+    are uploaded. Non-file lines are ignored.
+
+    :param clipboard: Raw clipboard text, potentially containing
+        file paths separated by newlines.
+    :returns: List of uploaded file references.
+    """
+    paths: list[pathlib.Path] = []
+    for line in clipboard.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        path = pathlib.Path(line)
+        if _is_supported_file(path):
+            paths.append(path)
+    return _upload_paths(paths)
+
+
+def _extract_file_paths(text: str) -> list[_UploadedFile]:
+    """
+    Extract and upload file paths from user input text.
+
+    Recognizes absolute paths (starting with ``/``) and relative
+    paths with recognized file extensions. Tokens that resolve to
+    existing files are uploaded.
+
+    :param text: The raw user input text.
+    :returns: List of uploaded file references.
+    """
+    paths = [
+        pathlib.Path(token) for token in text.split() if _is_supported_file(pathlib.Path(token))
+    ]
+    return _upload_paths(paths)
+
+
+def _strip_file_paths(text: str) -> str:
+    """
+    Remove file path tokens from user input text.
+
+    Strips tokens that were recognized as uploadable files so
+    the text sent to the LLM is clean.
+
+    :param text: The raw user input text.
+    :returns: Text with file path tokens removed.
+    """
+    tokens = text.split()
+    kept = [t for t in tokens if not _is_supported_file(pathlib.Path(t))]
+    return " ".join(kept)
+
+
+def _user_display_label(
+    text: str,
+    files: list[_UploadedFile],
+) -> str:
+    """
+    Build the display label for a user message with attachments.
+
+    :param text: The user's message text (may contain file paths).
+    :param files: Uploaded file references.
+    :returns: Rich markup string for the user message widget.
+    """
+    clean_text = _strip_file_paths(text)
+    parts = ["[bold cyan]you>[/bold cyan]"]
+    if clean_text:
+        parts.append(f" {escape(clean_text)}")
+    for f in files:
+        parts.append(f" [dim]📎 {escape(f.filename)}[/dim]")
+    return "".join(parts)
 
 
 # ── Widget audit log ──────────────────────────────────

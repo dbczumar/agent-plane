@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import io
-import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -157,13 +155,16 @@ def test_resolve_bundle_expands_config_yaml(
     ``config.yaml`` content with expanded env vars.
     """
     monkeypatch.setenv("BUNDLE_TEST_KEY", "resolved-value")
-    _write_config(tmp_path, {
-        "spec_version": 1,
-        "llm": {
-            "model": "gpt-5.4",
-            "connection": {"api_key": "${BUNDLE_TEST_KEY}"},
+    _write_config(
+        tmp_path,
+        {
+            "spec_version": 1,
+            "llm": {
+                "model": "gpt-5.4",
+                "connection": {"api_key": "${BUNDLE_TEST_KEY}"},
+            },
         },
-    })
+    )
 
     resolved = _resolve_bundle_env_vars(tmp_path)
 
@@ -182,12 +183,16 @@ def test_resolve_bundle_expands_mcp_headers(
     YAML with expanded header env vars.
     """
     monkeypatch.setenv("MCP_TOKEN", "tok-abc")
-    _write_mcp_config(tmp_path, "github", {
-        "name": "github",
-        "transport": "http",
-        "url": "http://localhost:9000/mcp",
-        "headers": {"Authorization": "Bearer ${MCP_TOKEN}"},
-    })
+    _write_mcp_config(
+        tmp_path,
+        "github",
+        {
+            "name": "github",
+            "transport": "http",
+            "url": "http://localhost:9000/mcp",
+            "headers": {"Authorization": "Bearer ${MCP_TOKEN}"},
+        },
+    )
     # config.yaml must exist (even if empty) for a valid agent dir.
     _write_config(tmp_path, {"spec_version": 1})
 
@@ -206,10 +211,13 @@ def test_resolve_bundle_no_env_vars_returns_empty(
     ``_resolve_bundle_env_vars`` returns an empty dict when
     the config has no env var references.
     """
-    _write_config(tmp_path, {
-        "spec_version": 1,
-        "name": "plain-agent",
-    })
+    _write_config(
+        tmp_path,
+        {
+            "spec_version": 1,
+            "name": "plain-agent",
+        },
+    )
 
     resolved = _resolve_bundle_env_vars(tmp_path)
     assert resolved == {}
@@ -224,17 +232,20 @@ def test_resolve_bundle_missing_env_var_raises(
     when a config.yaml env var cannot be resolved.
     """
     monkeypatch.delenv("NONEXISTENT_DEPLOY_KEY", raising=False)
-    _write_config(tmp_path, {
-        "spec_version": 1,
-        "tools": {
-            "builtins": [
-                {
-                    "name": "web_search_google",
-                    "api_key": "${NONEXISTENT_DEPLOY_KEY}",
-                },
-            ],
+    _write_config(
+        tmp_path,
+        {
+            "spec_version": 1,
+            "tools": {
+                "builtins": [
+                    {
+                        "name": "web_search_google",
+                        "api_key": "${NONEXISTENT_DEPLOY_KEY}",
+                    },
+                ],
+            },
         },
-    })
+    )
 
     with pytest.raises(AgentPlaneError, match="NONEXISTENT_DEPLOY_KEY"):
         _resolve_bundle_env_vars(tmp_path)

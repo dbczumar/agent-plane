@@ -1,0 +1,17 @@
+spec_version: 1
+
+name: archer
+description: A sharp, pragmatic senior engineer who pairs with you to write better code.
+
+llm:
+  model: o4-mini
+  reasoning_effort: high
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+interaction:
+  modalities:
+    input: [text, image, file]
+    output: [text]
+
+instructions: AGENTS.md

@@ -204,6 +204,20 @@ class ControllableMockClient:
         for call in self._calls:
             call.release()
 
+    def get_call(self, index: int) -> MockCall:
+        """
+        Return a queued ``MockCall`` by index.
+
+        Use this instead of accessing ``_calls`` directly so tests
+        interact through a public interface.
+
+        :param index: Zero-based index into the queued calls list,
+            e.g. ``0`` for the first call.
+        :returns: The ``MockCall`` at the given index.
+        :raises IndexError: If *index* is out of range.
+        """
+        return self._calls[index]
+
     @property
     def call_count(self) -> int:
         """
@@ -303,9 +317,16 @@ def task_store(
     On teardown, releases all blocked mock calls and destroys the
     DBOS singleton so background threads exit before the event loop
     shuts down.
+
+    :param db_uri: SQLite connection URI from the ``db_uri`` fixture.
+    :param tmp_path: Pytest temp directory for artifacts and cache.
+    :param mock_llm: Controllable mock LLM client for the test.
+    :param monkeypatch: Pytest fixture for patching the LLM client
+        factory in the workflow module.
     """
     agent_store = SqlAlchemyAgentStore(db_uri)
     conversation_store = SqlAlchemyConversationStore(db_uri)
+    file_store = SqlAlchemyFileStore(db_uri)
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     agent_cache = AgentCache(
         artifact_store=artifact_store,
@@ -317,6 +338,8 @@ def task_store(
         task_store=ts,
         agent_store=agent_store,
         agent_cache=agent_cache,
+        file_store=file_store,
+        artifact_store=artifact_store,
     )
     # Patch the LLM client so the real workflow uses our mock
     monkeypatch.setattr(
