@@ -76,12 +76,17 @@ async def create_test_response(
     store: bool | None = None,
     conversation: dict[str, str] | None = None,
     reasoning: dict[str, str] | None = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> ApiResponse:
     """
     Create a response via the API and return an ApiResponse.
 
     Defaults to background=True so the endpoint returns immediately
     without blocking on task completion.
+
+    :param tools: Optional list of client-side tool schemas in
+        standard OpenAI function format, e.g.
+        ``[{"type": "function", "function": {"name": "get_weather", ...}}]``.
     """
     payload: dict[str, Any] = {
         "model": model,
@@ -99,5 +104,7 @@ async def create_test_response(
         payload["conversation"] = conversation
     if reasoning is not None:
         payload["reasoning"] = reasoning
+    if tools is not None:
+        payload["tools"] = tools
     resp = await client.post("/v1/responses", json=payload)
     return ApiResponse(status_code=resp.status_code, body=resp.json())

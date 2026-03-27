@@ -572,6 +572,198 @@ async def test_steering_position_among_tool_items(
     assert mock_llm.call_count == 3
 
 
+# ── Client-side tools + steering ─────────────────────────
+
+
+# OpenAI-format client-side tool schema used across
+# client-tool tests — avoids duplicating the dict literal.
+_WEATHER_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city.",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+}
+
+
+async def test_client_side_tool_completes_with_function_call(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    When the LLM invokes a client-side tool, the response
+    completes with the ``function_call`` item in the output
+    and no ``function_call_output`` (not executed server-side).
+    """
+    await create_test_agent(client)
+
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_weather_1",
+                "name": "get_weather",
+                "arguments": '{"city": "San Francisco"}',
+            },
+        ],
+    )
+
+    result = await create_test_response(
+        client,
+        input_text="What is the weather?",
+        tools=[_WEATHER_TOOL],
+    )
+    response_id = result.body["id"]
+    conv_id = result.body["conversation"]["id"]
+
+    body = await _wait_for_completion(client, response_id)
+
+    # Response completed — not failed or incomplete
+    assert body["status"] == "completed", (
+        f"Expected 'completed' for client-side tool path; "
+        f"got '{body['status']}'. If 'failed', the workflow "
+        f"tried to execute the client-side tool server-side."
+    )
+
+    items = await _get_items(client, conv_id)
+    types = [i["type"] for i in items]
+
+    # [user message, function_call] — no function_call_output
+    assert types == ["message", "function_call"], (
+        f"Expected [message, function_call] for client-side "
+        f"tool; got {types}. If function_call_output is "
+        f"present, the tool was executed server-side."
+    )
+    assert items[1]["name"] == "get_weather"
+    assert items[1]["call_id"] == "call_weather_1"
+    assert items[1]["arguments"] == '{"city": "San Francisco"}'
+
+    # 1 LLM call only — no tool execution loop
+    assert mock_llm.call_count == 1, (
+        f"Expected 1 LLM call; got {mock_llm.call_count}. "
+        f"If 2, the loop continued after client-side tool call."
+    )
+
+
+async def test_steering_during_llm_with_client_tool_persists_steered_message(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Steering a message while the LLM is streaming, followed by
+    the LLM returning a client-side tool call.
+
+    The steered message is persisted in the conversation but not
+    processed in this turn (known gap — the client-tool path
+    completes immediately). On the next request the steered
+    message appears in the prompt.
+    """
+    await create_test_agent(client)
+
+    # Block so we can steer while LLM is "streaming"
+    call_1 = mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_weather_steer",
+                "name": "get_weather",
+                "arguments": '{"city": "SF"}',
+            },
+        ],
+        block=True,
+    )
+    # Next turn: LLM sees the steered message and responds
+    mock_llm.add_call(text="Weather is sunny and also NYC is rainy")
+
+    first = await create_test_response(
+        client,
+        input_text="What is the weather in SF?",
+        tools=[_WEATHER_TOOL],
+    )
+    first_id = first.body["id"]
+    conv_id = first.body["conversation"]["id"]
+
+    # Wait for LLM to be called, then steer
+    call_1.call_event.wait(timeout=10)
+    steer_resp = await create_test_response(
+        client,
+        input_text="Also check NYC",
+        previous_response_id=first_id,
+    )
+    # Steering delivered to the running task
+    assert steer_resp.body["id"] == first_id, (
+        "Steering should return the same response ID, indicating try_deliver succeeded."
+    )
+
+    # Release the LLM — it returns client-side tool call,
+    # response completes immediately
+    call_1.release()
+
+    body = await _wait_for_completion(client, first_id)
+    assert body["status"] == "completed"
+
+    # Conversation items after first turn
+    items = await _get_items(client, conv_id)
+    types = [i["type"] for i in items]
+
+    # [user, steered-user, function_call]
+    # The steered message is persisted even though the agent
+    # didn't process it this turn.
+    assert "function_call" in types, f"Expected function_call in items; got {types}"
+    user_texts = [i["content"][0]["text"] for i in items if i.get("role") == "user"]
+    assert "What is the weather in SF?" in user_texts
+    # Steered message is persisted in the conversation
+    assert "Also check NYC" in user_texts, (
+        "Steered message must be persisted in the conversation "
+        "even though the client-tool path completes without "
+        "processing it. If missing, try_deliver failed."
+    )
+    # No function_call_output — client-side tool not executed
+    assert "function_call_output" not in types, (
+        "Client-side tool must not produce function_call_output"
+    )
+
+    # ── Next turn picks up steered message ──────────────
+    # Client continues with previous_response_id using a
+    # plain text message. The LLM sees the full conversation
+    # history — including the steered message from turn 1 —
+    # in its prompt.
+    second = await create_test_response(
+        client,
+        input_text="The weather result was 72F sunny",
+        previous_response_id=first_id,
+        tools=[_WEATHER_TOOL],
+    )
+    second_id = second.body["id"]
+
+    body = await _wait_for_completion(client, second_id)
+    assert body["status"] == "completed"
+
+    # Full conversation now includes the steered message
+    # from turn 1 alongside everything else
+    items = await _get_items(client, conv_id)
+    user_texts = [
+        i["content"][0]["text"]
+        for i in items
+        if i.get("role") == "user" and i["content"][0].get("type") == "input_text"
+    ]
+    # Both original and steered messages visible
+    assert "What is the weather in SF?" in user_texts
+    assert "Also check NYC" in user_texts
+    assert "The weather result was 72F sunny" in user_texts
+
+    # The LLM's second-turn response is in the conversation
+    assistant_texts = [i["content"][0]["text"] for i in items if i.get("role") == "assistant"]
+    assert "Weather is sunny and also NYC is rainy" in assistant_texts, (
+        "Second-turn LLM should see the steered message in its "
+        "prompt and respond to it. If missing, the steered "
+        "message was lost between turns."
+    )
+
+
 # ── Error Handling ───────────────────────────────────────
 
 
