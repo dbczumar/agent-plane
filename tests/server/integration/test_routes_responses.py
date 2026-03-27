@@ -883,6 +883,167 @@ async def test_multimodal_mixed_image_and_file(
     assert file_block["file_data"] == f"data:application/pdf;base64,{pdf_b64}"
 
 
+async def test_multimodal_jpeg_image_uses_correct_media_type(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Upload a JPEG via /v1/files and verify the resolved data: URI
+    uses image/jpeg, not a hardcoded image/png.
+
+    Catches regressions where the media type is derived from the
+    file metadata rather than hardcoded to a single image format.
+    """
+    await create_test_agent(client)
+    mock_llm.add_call(text="I see a photo.")
+
+    # Minimal JPEG: SOI + APP0 (JFIF header) + EOI markers.
+    jpeg_bytes = (
+        b"\xff\xd8"  # SOI
+        b"\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+        b"\xff\xd9"  # EOI
+    )
+    upload_resp = await client.post(
+        "/v1/files",
+        files={"file": ("photo.jpg", jpeg_bytes, "image/jpeg")},
+    )
+    assert upload_resp.status_code == 201
+    file_id = upload_resp.json()["id"]
+
+    resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": [
+                {"type": "input_image", "file_id": file_id},
+            ],
+            "background": False,
+            "stream": False,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "completed"
+
+    # call_count == 1: one LLM turn for the non-tool mock response.
+    assert mock_llm.call_count == 1
+    received = mock_llm.get_call(0).received_kwargs
+    assert received is not None
+    llm_input = received.get("input", [])
+    image_block = _find_content_block(llm_input, "input_image")
+    assert image_block is not None
+    expected_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+    # Must use image/jpeg, not image/png or application/octet-stream.
+    assert image_block["image_url"] == (f"data:image/jpeg;base64,{expected_b64}")
+
+
+async def test_multimodal_plain_text_file_resolves(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Upload a plain text file and verify it resolves to a data: URI
+    with text/plain media type.
+
+    Ensures the pipeline works for non-PDF document types — the
+    content resolver must use the actual content_type from the file
+    store, not assume application/pdf.
+    """
+    await create_test_agent(client)
+    mock_llm.add_call(text="The file contains a greeting.")
+
+    txt_bytes = b"Hello, world!"
+    upload_resp = await client.post(
+        "/v1/files",
+        files={"file": ("notes.txt", txt_bytes, "text/plain")},
+    )
+    assert upload_resp.status_code == 201
+    file_id = upload_resp.json()["id"]
+
+    resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": [
+                {"type": "input_text", "text": "What does this file say?"},
+                {
+                    "type": "input_file",
+                    "file_id": file_id,
+                    "filename": "notes.txt",
+                },
+            ],
+            "background": False,
+            "stream": False,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "completed"
+
+    # call_count == 1: one LLM turn for the non-tool mock response.
+    assert mock_llm.call_count == 1
+    received = mock_llm.get_call(0).received_kwargs
+    assert received is not None
+    llm_input = received.get("input", [])
+    file_block = _find_content_block(llm_input, "input_file")
+    assert file_block is not None
+    expected_b64 = base64.b64encode(txt_bytes).decode("ascii")
+    # Must use text/plain, not application/pdf.
+    assert file_block["file_data"] == (f"data:text/plain;base64,{expected_b64}")
+
+
+async def test_multimodal_file_without_content_type_uses_fallback(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Upload a file with no Content-Type header and verify the resolved
+    data: URI falls back to application/octet-stream.
+
+    Catches regressions where a missing content_type causes a crash
+    or produces a malformed data: URI (e.g. "data:None;base64,...").
+    """
+    await create_test_agent(client)
+    mock_llm.add_call(text="Binary data received.")
+
+    raw_bytes = b"\x00\x01\x02\x03binary"
+    upload_resp = await client.post(
+        "/v1/files",
+        # No content_type — server must handle gracefully.
+        files={"file": ("blob.bin", raw_bytes)},
+    )
+    assert upload_resp.status_code == 201
+    file_id = upload_resp.json()["id"]
+
+    resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": [
+                {
+                    "type": "input_file",
+                    "file_id": file_id,
+                    "filename": "blob.bin",
+                },
+            ],
+            "background": False,
+            "stream": False,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "completed"
+
+    # call_count == 1: one LLM turn for the non-tool mock response.
+    assert mock_llm.call_count == 1
+    received = mock_llm.get_call(0).received_kwargs
+    assert received is not None
+    llm_input = received.get("input", [])
+    file_block = _find_content_block(llm_input, "input_file")
+    assert file_block is not None
+    expected_b64 = base64.b64encode(raw_bytes).decode("ascii")
+    # Must fall back to application/octet-stream, not crash or
+    # produce "data:None;base64,...".
+    assert file_block["file_data"] == (f"data:application/octet-stream;base64,{expected_b64}")
+
+
 def _find_content_block(
     llm_input: list[dict[str, Any]],
     block_type: str,

@@ -9,6 +9,10 @@ llm:
   connection:
     api_key: ${OPENAI_API_KEY}
 
+tools:
+  builtins:
+    - web_search_openai
+
 interaction:
   modalities:
     input: [text, image, file]
