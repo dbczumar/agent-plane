@@ -713,6 +713,13 @@ async def test_steering_during_llm_with_client_tool_persists_steered_message(
     # The steered message is persisted even though the agent
     # didn't process it this turn.
     assert "function_call" in types, f"Expected function_call in items; got {types}"
+    # Verify the function_call item has the correct tool content
+    fc_item = next(i for i in items if i["type"] == "function_call")
+    assert fc_item["name"] == "get_weather", (
+        f"function_call should invoke get_weather; got {fc_item['name']}"
+    )
+    assert fc_item["call_id"] == "call_weather_steer"
+    assert fc_item["arguments"] == '{"city": "SF"}'
     user_texts = [i["content"][0]["text"] for i in items if i.get("role") == "user"]
     assert "What is the weather in SF?" in user_texts
     # Steered message is persisted in the conversation
