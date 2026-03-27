@@ -1,7 +1,8 @@
-"""Tests for agent_plane.runtime.workflow pagination helpers and execution timeout."""
+"""Tests for agent_plane.runtime.workflow helpers: pagination, execution timeout, tool call splitting."""
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -9,7 +10,12 @@ import pytest
 
 from agent_plane.entities import MessageData, NewConversationItem
 from agent_plane.runtime.caps import RuntimeCaps
-from agent_plane.runtime.workflow import _run_agent_loop, fetch_all_items
+from agent_plane.runtime.workflow import (
+    _run_agent_loop,
+    _split_tool_calls,
+    _ToolCall,
+    fetch_all_items,
+)
 from agent_plane.spec.types import (
     AgentSpec,
     ExecutionConfig,
@@ -20,6 +26,8 @@ from agent_plane.spec.types import (
 from agent_plane.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from agent_plane.tools.client_specified import ClientSideToolSpec
+from agent_plane.tools.manager import ToolManager
 
 
 @pytest.fixture()
@@ -543,4 +551,173 @@ def test_execution_timeout_preserves_prior_output(
     assert result.output[0] == prior_output_item, (
         "The preserved output item must match the item appended "
         "during the first iteration's tool handling"
+    )
+
+
+# ── _split_tool_calls ─────────────────────────────────
+
+
+def _make_tool_manager(
+    client_tool_names: list[str],
+) -> ToolManager:
+    """
+    Build a ToolManager with only client-side tools registered.
+
+    Uses a minimal AgentSpec with no skills or MCP servers, so
+    the only registered tools are the client-specified ones.
+
+    :param client_tool_names: Names for the client-side tools
+        to register, e.g. ``["get_weather", "search"]``.
+    :returns: A ToolManager with the specified client-side tools.
+    """
+    spec = AgentSpec(
+        spec_version=1,
+        name="split-test-agent",
+        llm=LLMConfig(
+            model="openai/gpt-4o",
+            timeout=300,
+            retry=RetryConfig(max_attempts=1),
+        ),
+        tools=ToolsConfig(),
+        execution=ExecutionConfig(timeout=60, max_iterations=100),
+    )
+    client_specs = [
+        ClientSideToolSpec(
+            name=name,
+            schema={
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"Client tool: {name}",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        )
+        for name in client_tool_names
+    ]
+    return ToolManager(
+        spec=spec,
+        work_dir=Path("/tmp/test"),
+        client_tool_specs=client_specs,
+    )
+
+
+def _make_tool_call(name: str) -> _ToolCall:
+    """
+    Build a minimal _ToolCall for testing.
+
+    :param name: The tool function name, e.g.
+        ``"load_skill"`` or ``"get_weather"``.
+    :returns: A _ToolCall with the given name and dummy
+        call_id / arguments.
+    """
+    return _ToolCall(
+        call_id=f"call_{name}",
+        name=name,
+        arguments="{}",
+    )
+
+
+def test_split_all_server_side() -> None:
+    """
+    When no tools are client-side, all calls land in
+    ``server`` and ``has_client`` is False.
+    """
+    tool_mgr = _make_tool_manager(client_tool_names=[])
+    tool_calls = [
+        _make_tool_call("load_skill"),
+        _make_tool_call("mcp_github"),
+    ]
+
+    split = _split_tool_calls(tool_calls, tool_mgr)
+
+    # All tools are server-side — none are registered as client tools
+    assert len(split.server) == 2, (
+        f"Expected 2 server-side tools, got {len(split.server)}. "
+        "If 0, is_client_side_tool is returning True for unregistered tools."
+    )
+    assert split.server[0].name == "load_skill"
+    assert split.server[1].name == "mcp_github"
+    # No client tools in the batch
+    assert split.has_client is False, "has_client should be False when no client-side tools exist"
+
+
+def test_split_all_client_side() -> None:
+    """
+    When all tools are client-side, ``server`` is empty
+    and ``has_client`` is True.
+    """
+    tool_mgr = _make_tool_manager(
+        client_tool_names=["get_weather", "search"],
+    )
+    tool_calls = [
+        _make_tool_call("get_weather"),
+        _make_tool_call("search"),
+    ]
+
+    split = _split_tool_calls(tool_calls, tool_mgr)
+
+    # No server-side tools — both are client-side
+    assert split.server == [], (
+        f"Expected empty server list, got {len(split.server)} tools. "
+        "If non-empty, is_client_side_tool failed to detect a registered client tool."
+    )
+    assert split.has_client is True, "has_client should be True when client-side tools are present"
+
+
+def test_split_mixed_batch() -> None:
+    """
+    When a batch contains both server-side and client-side tools,
+    only server-side tools appear in ``server`` and ``has_client``
+    is True.
+
+    This is the critical scenario: the old code used ``any()`` and
+    skipped ALL tools when any client tool was present. The fix
+    ensures server-side tools are separated for execution.
+    """
+    tool_mgr = _make_tool_manager(
+        client_tool_names=["get_weather"],
+    )
+    tool_calls = [
+        _make_tool_call("load_skill"),
+        _make_tool_call("get_weather"),
+        _make_tool_call("mcp_github"),
+    ]
+
+    split = _split_tool_calls(tool_calls, tool_mgr)
+
+    # 2 server-side tools (load_skill, mcp_github), 1 client (get_weather)
+    assert len(split.server) == 2, (
+        f"Expected 2 server-side tools, got {len(split.server)}. "
+        "If 0, the old any() bug is back — all tools are being skipped. "
+        "If 3, get_weather was not detected as client-side."
+    )
+    server_names = [tc.name for tc in split.server]
+    assert server_names == ["load_skill", "mcp_github"], (
+        f"Server tools should be load_skill and mcp_github in order; got {server_names}"
+    )
+    assert split.has_client is True, (
+        "has_client should be True — get_weather is a client-side tool"
+    )
+
+
+def test_split_preserves_tool_call_fields() -> None:
+    """
+    Server-side _ToolCall instances in the split preserve all
+    fields (call_id, name, arguments) from the original.
+    """
+    tool_mgr = _make_tool_manager(client_tool_names=["search"])
+    tc = _ToolCall(
+        call_id="call_xyz789",
+        name="load_skill",
+        arguments='{"name": "summarize"}',
+    )
+
+    split = _split_tool_calls([tc], tool_mgr)
+
+    # The server tool is the same object — fields intact
+    assert split.server[0].call_id == "call_xyz789", "call_id must survive the split unchanged"
+    assert split.server[0].name == "load_skill"
+    assert split.server[0].arguments == '{"name": "summarize"}', (
+        "arguments must survive the split unchanged"
     )
