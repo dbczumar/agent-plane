@@ -275,8 +275,7 @@ def test_user_message_with_file_data() -> None:
     """
     part = {
         "type": "input_file",
-        "file_data": "JVBERi0xLjQK",
-        "content_type": "application/pdf",
+        "file_data": "data:application/pdf;base64,JVBERi0xLjQK",
         "filename": "report.pdf",
     }
     result = _translate_part_to_converse(part)

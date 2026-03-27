@@ -222,9 +222,8 @@ def test_input_file_block_passes_through() -> None:
     """
     block = {
         "type": "input_file",
-        "file_data": "JVBERi0xLjQK",
+        "file_data": "data:application/pdf;base64,JVBERi0xLjQK",
         "filename": "report.pdf",
-        "content_type": "application/pdf",
     }
     result = _translate_block(block)
     # Passed through unchanged — same object.

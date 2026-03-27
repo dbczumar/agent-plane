@@ -275,12 +275,11 @@ def test_input_file_file_id_resolved_to_file_data(
     expected_b64 = base64.b64encode(PDF_BYTES).decode("ascii")
     # file_id must be removed.
     assert "file_id" not in file_block
-    # file_data must contain the base64-encoded content.
+    # file_data must be a data: URI with the content_type and base64.
     # Failure would mean the LLM receives no file content.
-    assert file_block["file_data"] == expected_b64
-    # content_type from file store metadata must be included.
-    # Failure would mean the provider can't determine the file format.
-    assert file_block["content_type"] == "application/pdf"
+    assert file_block["file_data"] == f"data:application/pdf;base64,{expected_b64}"
+    # content_type is embedded in the data: URI, not a separate field.
+    assert "content_type" not in file_block
     # filename must be preserved from the original block.
     assert file_block["filename"] == "report.pdf"
     assert file_block["type"] == "input_file"
@@ -514,7 +513,7 @@ def test_resolution_field_varies_by_block_type(
 ) -> None:
     """
     input_image blocks get image_url (data: URI), while input_file
-    blocks get file_data (raw base64). The resolution target field
+    blocks get file_data (data: URI). The resolution target field
     depends on block type.
     """
     item = _make_conversation_item(

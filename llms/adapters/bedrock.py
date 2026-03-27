@@ -297,16 +297,16 @@ def _translate_part_to_converse(part: dict[str, Any]) -> dict[str, Any]:
         return {"text": f"[image: {url}]"}
 
     if part_type == "input_file":
-        # application/octet-stream is the RFC 2046 default for
-        # unknown binary content — safe fallback when file store
-        # metadata lacks a content_type.
-        media_type = part.get("content_type", "application/octet-stream")
+        # file_data is a data: URI (e.g. "data:application/pdf;base64,...").
+        file_uri = parse_data_uri(part["file_data"])
+        media_type = file_uri.media_type if file_uri else "application/octet-stream"
+        data = file_uri.data if file_uri else part["file_data"]
         # MIME types are always type/subtype per RFC 2045.
         fmt = media_type.split("/")[-1]
         result: dict[str, Any] = {
             "document": {
                 "format": fmt,
-                "source": {"bytes": part["file_data"]},
+                "source": {"bytes": data},
             },
         }
         if filename := part.get("filename"):

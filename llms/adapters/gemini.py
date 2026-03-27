@@ -333,13 +333,14 @@ def _translate_part_to_gemini(part: dict[str, Any]) -> dict[str, Any]:
         return {"text": f"[image: {url}]"}
 
     if part_type == "input_file":
+        # file_data is a data: URI (e.g. "data:application/pdf;base64,...").
+        file_uri = parse_data_uri(part["file_data"])
+        mime = file_uri.media_type if file_uri else "application/octet-stream"
+        data = file_uri.data if file_uri else part["file_data"]
         return {
             "inlineData": {
-                # application/octet-stream is the RFC 2046 default for
-                # unknown binary content — safe fallback when file store
-                # metadata lacks a content_type.
-                "mimeType": part.get("content_type", "application/octet-stream"),
-                "data": part["file_data"],
+                "mimeType": mime,
+                "data": data,
             },
         }
 

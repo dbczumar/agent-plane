@@ -164,8 +164,9 @@ def _resolve_file_id_block(
         resolved["image_url"] = f"data:{content_type};base64,{encoded}"
     else:
         # input_file and any future type: inline as file_data.
-        resolved["file_data"] = encoded
-        if file_meta.content_type:
-            resolved["content_type"] = file_meta.content_type
+        # Use a data: URI so providers (OpenAI, etc.) can parse
+        # the media type alongside the payload.
+        content_type = file_meta.content_type or "application/octet-stream"
+        resolved["file_data"] = f"data:{content_type};base64,{encoded}"
 
     return resolved
