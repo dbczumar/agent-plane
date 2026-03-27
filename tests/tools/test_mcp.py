@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -975,3 +976,288 @@ async def test_connect_http_uses_default_timeouts_when_none() -> None:
     assert captured_sse_kwargs["sse_read_timeout"] == 300, (
         "sse_client sse_read_timeout must default to 300 when config timeout is None"
     )
+
+
+# ── HTTP transport: connection, headers, discovery ────────
+
+
+@dataclass
+class CapturedHttpArgs:
+    """
+    Container for kwargs captured from ``sse_client`` and
+    ``ClientSession`` during HTTP transport tests.
+
+    :param sse_kwargs: Keyword arguments passed to ``sse_client``,
+        e.g. ``{"url": "...", "headers": {...}, "timeout": 5}``.
+    :param session_kwargs: Keyword arguments passed to
+        ``ClientSession``, e.g. ``{"read_timeout_seconds": ...}``.
+    :param mock_session: The mock ``ClientSession`` instance for
+        setting up ``call_tool()`` side effects.
+    """
+
+    sse_kwargs: dict[str, Any] = field(default_factory=dict)
+    session_kwargs: dict[str, Any] = field(default_factory=dict)
+    mock_session: AsyncMock = field(default_factory=AsyncMock)
+
+
+@contextmanager
+def _mock_http_transport(
+    tools: list[MagicMock] | None = None,
+) -> Iterator[CapturedHttpArgs]:
+    """
+    Mock the HTTP (SSE) transport and session for HTTP tests.
+
+    Patches ``sse_client`` and ``ClientSession`` so that
+    ``McpServerConnection.connect()`` can run without a real
+    HTTP server. Captures the kwargs passed to both so tests
+    can verify URL, headers, timeout, and other arguments.
+
+    :param tools: Mock tool definitions to return from
+        ``list_tools()``. Defaults to an empty list.
+    :yields: A :class:`CapturedHttpArgs` with captured kwargs
+        and the mock session.
+    """
+    captured = CapturedHttpArgs()
+
+    mock_sse_ctx = AsyncMock()
+    mock_sse_ctx.__aenter__ = AsyncMock(
+        return_value=(MagicMock(), MagicMock()),
+    )
+    mock_sse_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    def _capturing_sse_client(**kwargs: Any) -> AsyncMock:
+        """
+        Fake ``sse_client`` that records kwargs.
+
+        :param kwargs: Keyword args including url, headers,
+            timeout, and sse_read_timeout.
+        :returns: An async context manager yielding mock streams.
+        """
+        captured.sse_kwargs.update(kwargs)
+        return mock_sse_ctx
+
+    def _capturing_session(
+        *args: Any,
+        **kwargs: Any,
+    ) -> AsyncMock:
+        """
+        Fake ``ClientSession`` constructor that records kwargs.
+
+        :param args: Positional args (read_stream, write_stream).
+        :param kwargs: Keyword args including read_timeout_seconds.
+        :returns: A mock session with working initialize/list_tools.
+        """
+        captured.session_kwargs.update(kwargs)
+        mock_session = AsyncMock()
+        mock_session.initialize = AsyncMock()
+        mock_tools_result = MagicMock()
+        mock_tools_result.tools = tools or []
+        mock_session.list_tools.return_value = mock_tools_result
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        captured.mock_session = mock_session
+        return mock_session
+
+    with patch(
+        "agent_plane.tools.mcp.sse_client",
+        side_effect=_capturing_sse_client,
+    ):
+        with patch(
+            "agent_plane.tools.mcp.ClientSession",
+            side_effect=_capturing_session,
+        ):
+            yield captured
+
+
+@pytest.mark.asyncio()
+async def test_http_connect_passes_url_to_sse_client() -> None:
+    """
+    HTTP ``connect()`` passes the config URL to ``sse_client``.
+    """
+    config = MCPServerConfig(
+        name="test-http",
+        transport="http",
+        url="https://mcp.example.com/sse",
+    )
+
+    with _mock_http_transport() as captured:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+    assert captured.sse_kwargs["url"] == "https://mcp.example.com/sse"
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_http_connect_passes_headers_to_sse_client() -> None:
+    """
+    HTTP ``connect()`` propagates auth headers from the config
+    to ``sse_client``.
+    """
+    config = MCPServerConfig(
+        name="test-http-headers",
+        transport="http",
+        url="http://localhost:9000/mcp",
+        headers={
+            "Authorization": "Bearer tok_xyz",
+            "X-Custom": "value",
+        },
+    )
+
+    with _mock_http_transport() as captured:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+    assert captured.sse_kwargs["headers"] == {
+        "Authorization": "Bearer tok_xyz",
+        "X-Custom": "value",
+    }
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_http_connect_passes_none_headers_when_empty() -> None:
+    """
+    HTTP ``connect()`` passes ``headers=None`` when the config
+    has no headers, so ``sse_client`` uses its default.
+    """
+    config = MCPServerConfig(
+        name="test-http-no-headers",
+        transport="http",
+        url="http://localhost:9000/mcp",
+        # headers defaults to empty dict
+    )
+
+    with _mock_http_transport() as captured:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+    # Empty dict is converted to None via `or None`.
+    assert captured.sse_kwargs["headers"] is None
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_http_connect_discovers_tools() -> None:
+    """
+    HTTP ``connect()`` discovers tools via ``list_tools()`` and
+    returns them, just like stdio transport.
+    """
+    config = MCPServerConfig(
+        name="test-http-discovery",
+        transport="http",
+        url="http://localhost:9000/mcp",
+    )
+    tool_def = _make_mcp_tool_def("http_tool")
+
+    with _mock_http_transport([tool_def]) as captured:
+        conn = McpServerConnection(config=config)
+        tools = await conn.connect()
+
+    assert len(tools) == 1
+    assert tools[0].name == "http_tool"
+    captured.mock_session.initialize.assert_awaited_once()
+    captured.mock_session.list_tools.assert_awaited_once()
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_http_call_tool_invokes_session() -> None:
+    """
+    ``call_tool()`` on an HTTP connection delegates to the
+    session's ``call_tool`` method and returns formatted results.
+    """
+    config = MCPServerConfig(
+        name="test-http-invoke",
+        transport="http",
+        url="http://localhost:9000/mcp",
+    )
+
+    with _mock_http_transport([_make_mcp_tool_def("http_tool")]) as captured:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        # Set up call_tool to return a mock result.
+        mock_result = MagicMock()
+        mock_result.content = [
+            TextContent(type="text", text="HTTP result"),
+        ]
+        mock_result.isError = False
+        captured.mock_session.call_tool.return_value = mock_result
+
+        result = await conn.call_tool("http_tool", {"query": "test"})
+
+    assert result == "HTTP result"
+    captured.mock_session.call_tool.assert_awaited_once_with(
+        name="http_tool",
+        arguments={"query": "test"},
+    )
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_http_reconnect_on_connection_error() -> None:
+    """
+    HTTP ``call_tool()`` reconnects and retries on a connection
+    error, just like stdio transport.
+    """
+    config = MCPServerConfig(
+        name="test-http-reconnect",
+        transport="http",
+        url="http://localhost:9000/mcp",
+    )
+
+    with _mock_http_transport([_make_mcp_tool_def("http_tool")]) as captured:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [
+            TextContent(type="text", text="recovered via HTTP"),
+        ]
+        ok_result.isError = False
+
+        captured.mock_session.call_tool.side_effect = [
+            ConnectionError("HTTP connection lost"),
+            ok_result,
+        ]
+
+        with patch.object(conn, "_reconnect", new_callable=AsyncMock) as mock_reconnect:
+            result = await conn.call_tool("http_tool", {"query": "retry"})
+
+    assert result == "recovered via HTTP"
+    mock_reconnect.assert_awaited_once()
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_http_connect_uses_cache() -> None:
+    """
+    HTTP ``connect()`` uses the discovery cache when fresh,
+    skipping ``list_tools()`` while still opening a live session.
+    """
+    config = MCPServerConfig(
+        name="test-http-cached",
+        transport="http",
+        url="http://localhost:9000/mcp",
+    )
+    tool_def = _make_mcp_tool_def("cached_http_tool")
+    _discovery_cache[_cache_key(config)] = [tool_def]
+
+    with _mock_http_transport() as captured:
+        conn = McpServerConnection(config=config)
+        tools = await conn.connect()
+
+    assert len(tools) == 1
+    assert tools[0].name == "cached_http_tool"
+    # Session opened (for invocation), but list_tools skipped.
+    captured.mock_session.initialize.assert_awaited_once()
+    captured.mock_session.list_tools.assert_not_awaited()
+
+    await conn.close()
