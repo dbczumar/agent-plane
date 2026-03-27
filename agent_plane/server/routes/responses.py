@@ -34,7 +34,7 @@ from agent_plane.server.schemas import (
     Usage,
 )
 from agent_plane.stores import AgentStore, ConversationStore, TaskStore
-from agent_plane.tools.client_specified import parse_callback_tool_specs
+from agent_plane.tools.client_specified import parse_client_side_tool_specs
 
 
 def _build_response_object(task: Task) -> ResponseObject:
@@ -663,9 +663,9 @@ def create_responses_router(
         client_tools: list[dict[str, Any]] | None = None
         if req.tools:
             try:
-                # Validate structure upfront; parse_callback_tool_specs
+                # Validate structure upfront; parse_client_side_tool_specs
                 # raises ValueError on malformed entries.
-                parse_callback_tool_specs(req.tools)
+                parse_client_side_tool_specs(req.tools)
             except ValueError as exc:
                 raise AgentPlaneError(str(exc), code=ErrorCode.INVALID_INPUT)
             client_tools = req.tools

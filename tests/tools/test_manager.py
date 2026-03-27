@@ -14,7 +14,7 @@ from agent_plane.spec.types import (
     SkillSpec,
 )
 from agent_plane.tools import ToolManager
-from agent_plane.tools.client_specified import CallbackToolSpec
+from agent_plane.tools.client_specified import ClientSideToolSpec
 from agent_plane.tools.mcp import clear_discovery_cache
 
 
@@ -374,22 +374,19 @@ def test_shutdown_safe_without_start(
 # ── Client-specified tools ────────────────────────────────
 
 
-def _make_callback_spec(name: str, url: str = "https://example.com/tool") -> CallbackToolSpec:
+def _make_client_side_spec(name: str) -> ClientSideToolSpec:
     """
-    Build a minimal :class:`CallbackToolSpec` for use in manager tests.
+    Build a minimal :class:`ClientSideToolSpec` for use in manager tests.
 
     :param name: Tool function name, e.g. ``"get_weather"``.
-    :param url: Callback URL. Defaults to a placeholder.
-    :returns: A :class:`CallbackToolSpec` with an empty schema and
-        no headers.
+    :returns: A :class:`ClientSideToolSpec` with a minimal schema.
     """
-    return CallbackToolSpec(
+    return ClientSideToolSpec(
         name=name,
         schema={
             "type": "function",
             "function": {"name": name, "description": "A test tool.", "parameters": {}},
         },
-        callback_url=url,
     )
 
 
@@ -408,8 +405,8 @@ def test_client_tools_registered_in_schemas(
         spec,
         work_dir,
         client_tool_specs=[
-            _make_callback_spec("get_weather"),
-            _make_callback_spec("send_email"),
+            _make_client_side_spec("get_weather"),
+            _make_client_side_spec("send_email"),
         ],
     )
 
@@ -425,40 +422,43 @@ def test_client_tools_registered_in_schemas(
     assert "send_email" in names
 
 
-def test_client_tool_callable_via_call_tool(
+def test_is_client_side_tool_returns_true_for_registered_client_tools(
     work_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    ToolManager.call_tool dispatches to CallbackTool.invoke for
-    client-specified tools, making a real HTTP callback.
+    is_client_side_tool returns True for registered ClientSideTool
+    entries and False for built-in tools and unknown names.
 
-    Verifies the dispatch chain: call_tool -> registry lookup ->
-    CallbackTool.invoke -> httpx.post.
+    The agent loop uses this to detect when to complete the response
+    instead of executing tools server-side. A failure here would
+    cause client-side tools to be dispatched through call_tool,
+    triggering RuntimeError from ClientSideTool.invoke.
     """
-
-    spec = _make_spec()
+    spec = _make_spec(skills=[SkillSpec(name="summarize", description=".", content=".")])
     mgr = ToolManager(
         spec,
         work_dir,
-        client_tool_specs=[_make_callback_spec("get_weather", "https://cb.example.com/tool")],
+        client_tool_specs=[
+            _make_client_side_spec("get_weather"),
+            _make_client_side_spec("send_email"),
+        ],
     )
 
-    mock_response = MagicMock()
-    mock_response.text = "Sunny, 65°F"
-    mock_response.raise_for_status = MagicMock()
+    # Client tools are detected as client-side
+    assert mgr.is_client_side_tool("get_weather") is True, (
+        "Expected True for registered ClientSideTool 'get_weather'. "
+        "If False, is_client_side_tool is not checking isinstance(tool, ClientSideTool)."
+    )
+    assert mgr.is_client_side_tool("send_email") is True
 
-    monkeypatch.setattr(
-        "agent_plane.tools.client_specified.httpx.post", lambda *a, **kw: mock_response
+    # Built-in tool is not client-side
+    assert mgr.is_client_side_tool("load_skill") is False, (
+        "Expected False for built-in 'load_skill'. "
+        "If True, is_client_side_tool is not type-checking correctly."
     )
 
-    result = mgr.call_tool("get_weather", json.dumps({"city": "Portland"}))
-
-    # Result is the callback response text — proves dispatch reached CallbackTool
-    assert result == "Sunny, 65°F", (
-        f"Expected callback response text, got {result!r}. "
-        "If 'Error: tool not found', client tools are not registered in the manager."
-    )
+    # Unregistered tool is not client-side
+    assert mgr.is_client_side_tool("nonexistent") is False
 
 
 def test_client_tool_shadows_skill_tool(
@@ -477,7 +477,7 @@ def test_client_tool_shadows_skill_tool(
         spec,
         work_dir,
         # 'load_skill' is the built-in skill tool name
-        client_tool_specs=[_make_callback_spec("load_skill")],
+        client_tool_specs=[_make_client_side_spec("load_skill")],
     )
 
     schemas = mgr.get_tool_schemas()
@@ -487,11 +487,11 @@ def test_client_tool_shadows_skill_tool(
         f"Expected exactly one 'load_skill' (client overwrite), got {names.count('load_skill')}."
     )
 
-    # The registered tool is the client's CallbackTool, not LoadSkillTool
-    from agent_plane.tools.client_specified import CallbackTool
+    # The registered tool is the client's ClientSideTool, not LoadSkillTool
+    from agent_plane.tools.client_specified import ClientSideTool
 
-    assert isinstance(mgr._tools["load_skill"], CallbackTool), (
-        "Expected CallbackTool after client override, "
+    assert isinstance(mgr._tools["load_skill"], ClientSideTool), (
+        "Expected ClientSideTool after client override, "
         f"got {type(mgr._tools['load_skill']).__name__}."
     )
 

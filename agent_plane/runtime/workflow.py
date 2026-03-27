@@ -45,8 +45,8 @@ from agent_plane.spec.types import LLMConfig, RetryConfig, ToolsConfig
 from agent_plane.stores import ConversationStore, TaskStore
 from agent_plane.tools import ToolManager
 from agent_plane.tools.client_specified import (
-    CallbackToolSpec,
-    parse_callback_tool_specs,
+    ClientSideToolSpec,
+    parse_client_side_tool_specs,
 )
 from llms import Client as LLMClient
 from llms.errors import PermanentLLMError, RetryableLLMError
@@ -110,6 +110,73 @@ def _close_output(task_id: str) -> None:
 
 
 # ── Responses API helpers ─────────────────────────────────
+
+
+@dataclass
+class _AgentLoopResult:
+    """
+    Typed result returned by the agent loop and all its terminal
+    helper functions.
+
+    Converted to a plain JSON-serializable dict at the DBOS workflow
+    boundary via :meth:`to_dict`.
+
+    :param status: Terminal task status, one of ``"completed"``,
+        ``"incomplete"``, or ``"failed"``, e.g. ``"completed"``.
+    :param output: Accumulated API-format output items from the loop.
+    :param completed_at: Unix timestamp of completion. ``None`` for
+        non-completed results.
+    :param error: Error details dict for failed results,
+        e.g. ``{"code": "configuration_error", "message": "..."}``.
+        ``None`` for non-failed results.
+    :param incomplete_details: Details dict for incomplete results,
+        e.g. ``{"reason": "max_iterations"}``. ``None`` for
+        non-incomplete results.
+    """
+
+    status: str
+    output: list[dict[str, Any]]
+    completed_at: int | None = None
+    error: dict[str, str] | None = None
+    incomplete_details: dict[str, str] | None = None
+
+    def to_dict(self, task_id: str) -> dict[str, Any]:
+        """
+        Convert to a JSON-serializable dict for the DBOS workflow boundary.
+
+        :param task_id: The task identifier, e.g. ``"task_abc123"``.
+        :returns: A dict with ``"task_id"``, ``"status"``, ``"output"``,
+            and optional ``"completed_at"``, ``"error"``,
+            ``"incomplete_details"`` keys.
+        """
+        out: dict[str, Any] = {
+            "task_id": task_id,
+            "status": self.status,
+            "output": self.output,
+        }
+        if self.completed_at is not None:
+            out["completed_at"] = self.completed_at
+        if self.error is not None:
+            out["error"] = self.error
+        if self.incomplete_details is not None:
+            out["incomplete_details"] = self.incomplete_details
+        return out
+
+
+@dataclass
+class _ClientToolCallsPending:
+    """
+    Returned by ``_handle_tool_calls`` when the LLM has invoked one or
+    more client-side tools. Signals the agent loop to complete the
+    response and return the ``function_call`` items to the caller.
+
+    :param last_seen: The ID of the last persisted ``function_call``
+        item. Used as the inbox-close cursor so that
+        ``close_inbox`` sees no new items and atomically closes,
+        e.g. ``"item_abc123"``.
+    """
+
+    last_seen: str
 
 
 @dataclass
@@ -629,7 +696,7 @@ def _handle_final_response(
     output_items: list[dict[str, Any]],
     task_store: TaskStore,
     conv_store: ConversationStore,
-) -> dict[str, Any] | _SteeringRetry:
+) -> _AgentLoopResult | _SteeringRetry:
     """
     Handle the no-tool-calls path using persist-first-then-check.
 
@@ -658,10 +725,10 @@ def _handle_final_response(
         dicts. Extended in place.
     :param task_store: The TaskStore for inbox operations.
     :param conv_store: The ConversationStore for persistence.
-    :returns: A result dict with ``"task_id"``,
-        ``"status"``, and ``"output"`` when the response is
-        finalized. A ``_SteeringRetry`` when late messages
-        arrived and the caller should continue the loop.
+    :returns: A completed :class:`_AgentLoopResult` when the
+        response is finalized, or a :class:`_SteeringRetry`
+        when late messages arrived and the caller should
+        continue the loop.
     """
     # ── Step 1: Persist first ──────────────────────────────
     # Commit the assistant message BEFORE checking the inbox.
@@ -725,12 +792,11 @@ def _handle_final_response(
         conversation_id,
         persisted[-1].id,
     )
-    return {
-        "task_id": task_id,
-        "status": "completed",
-        "output": output_items,
-        "completed_at": int(time.time()),
-    }
+    return _AgentLoopResult(
+        status="completed",
+        output=output_items,
+        completed_at=int(time.time()),
+    )
 
 
 def _build_function_call_items(
@@ -840,36 +906,39 @@ def _handle_tool_calls(
     history: list[ConversationItem],
     output_items: list[dict[str, Any]],
     conv_store: ConversationStore,
-) -> str:
+    tool_mgr: ToolManager,
+) -> str | _ClientToolCallsPending:
     """
-    Handle the tool execution path: build ``function_call``
-    items, persist them, execute each tool, and persist
-    outputs. Returns the updated ``last_seen`` ID.
+    Handle the tool execution path: build ``function_call`` items,
+    persist them, then either execute server-side tools or signal
+    the loop to complete for client-side tools.
 
-    :param task_id: The task identifier, e.g.
-        ``"task_abc123"``.
+    If any tool call in the batch is a client-side tool, no tools are
+    executed. The ``function_call`` items are persisted and streamed,
+    and a :class:`_ClientToolCallsPending` is returned so the loop
+    can complete the response and return the calls to the caller.
+
+    :param task_id: The task identifier, e.g. ``"task_abc123"``.
     :param conversation_id: The conversation ID, e.g.
         ``"conv_abc123"``.
-    :param llm_resp: The LLM response dict containing tool
-        calls.
+    :param llm_resp: The LLM response dict containing tool calls.
     :param agent_name: The agent's registered name, e.g.
         ``"research-agent"``.
     :param tools_config: The agent's global tools config with
         default timeout and retry policy.
-    :param history: Mutable conversation history. Extended
-        in place with function call and output items.
-    :param output_items: Mutable list of API-format output
-        dicts. Extended in place.
+    :param history: Mutable conversation history. Extended in place
+        with function call and output items.
+    :param output_items: Mutable list of API-format output dicts.
+        Extended in place.
     :param conv_store: The ConversationStore for persistence.
-    :returns: The ID of the last persisted item.
+    :param tool_mgr: The ToolManager for this workflow, used to
+        detect client-side tools.
+    :returns: The ID of the last persisted item on the server-side
+        execution path, or a :class:`_ClientToolCallsPending` on
+        the client-side path.
     """
-    # Tool calls — persist function_call items
     tool_calls = _get_tool_calls(llm_resp)
-    fc_new_items = _build_function_call_items(
-        task_id,
-        agent_name,
-        tool_calls,
-    )
+    fc_new_items = _build_function_call_items(task_id, agent_name, tool_calls)
 
     fc_items = _persist_and_stream(
         task_id,
@@ -880,7 +949,11 @@ def _handle_tool_calls(
     )
     history.extend(fc_items)
 
-    # Execute each tool call and persist output
+    if any(tool_mgr.is_client_side_tool(tc["name"]) for tc in tool_calls):
+        # At least one tool is client-side — return all function_call
+        # items to the caller without executing any tools server-side.
+        return _ClientToolCallsPending(last_seen=fc_items[-1].id)
+
     return _execute_tools(
         task_id,
         conversation_id,
@@ -889,6 +962,46 @@ def _handle_tool_calls(
         history,
         output_items,
         conv_store,
+    )
+
+
+def _complete_for_client_tools(
+    task_id: str,
+    conversation_id: str,
+    fc_last_seen: str,
+    output_items: list[dict[str, Any]],
+    task_store: TaskStore,
+) -> _AgentLoopResult:
+    """
+    Close the steering inbox and return a completed result for
+    client-side tool calls.
+
+    Called when ``_handle_tool_calls`` returns a
+    :class:`_ClientToolCallsPending`. The ``function_call`` items
+    are already persisted and streamed. This function closes the
+    inbox at the post-persist cursor so ``try_deliver`` cannot
+    inject messages after the response completes.
+
+    Known gap: steering messages that arrive during LLM streaming
+    (before the ``function_call`` items are persisted) may be missed.
+    See LOOPGAPS.md.
+
+    :param task_id: The task identifier, e.g. ``"task_abc123"``.
+    :param conversation_id: The conversation ID, e.g.
+        ``"conv_abc123"``.
+    :param fc_last_seen: ID of the last persisted ``function_call``
+        item. Used as the cursor for ``close_inbox``, e.g.
+        ``"item_abc123"``.
+    :param output_items: Accumulated output items to include in the
+        response.
+    :param task_store: The TaskStore for inbox close operations.
+    :returns: A completed :class:`_AgentLoopResult`.
+    """
+    task_store.close_inbox(task_id, conversation_id, fc_last_seen)
+    return _AgentLoopResult(
+        status="completed",
+        output=output_items,
+        completed_at=int(time.time()),
     )
 
 
@@ -1106,7 +1219,7 @@ def _handle_execution_timeout(
     task_id: str,
     output_items: list[dict[str, Any]],
     execution_timeout: int,
-) -> dict[str, Any]:
+) -> _AgentLoopResult:
     """
     Handle execution timeout: emit SSE error event and return
     incomplete result.
@@ -1115,7 +1228,7 @@ def _handle_execution_timeout(
     :param output_items: Accumulated output items so far.
     :param execution_timeout: The timeout that was exceeded,
         in seconds, e.g. ``3600``.
-    :returns: An incomplete result dict with
+    :returns: An incomplete :class:`_AgentLoopResult` with
         ``"execution_timeout"`` reason.
     """
     _write_output(
@@ -1130,12 +1243,11 @@ def _handle_execution_timeout(
             },
         },
     )
-    return {
-        "task_id": task_id,
-        "status": "incomplete",
-        "output": output_items,
-        "incomplete_details": {"reason": "execution_timeout"},
-    }
+    return _AgentLoopResult(
+        status="incomplete",
+        output=output_items,
+        incomplete_details={"reason": "execution_timeout"},
+    )
 
 
 # ── The agent loop ────────────────────────────────────────
@@ -1148,10 +1260,10 @@ def _run_agent_loop(
     agent_name: str,
     instructions: str | None,
     tool_mgr: ToolManager,
-) -> dict[str, Any]:
+) -> _AgentLoopResult:
     """
     Core agent loop: load history, call LLM, dispatch to
-    final response or tool call handler. Returns result dict.
+    final response or tool call handler.
 
     :param task_id: The task identifier, e.g.
         ``"task_abc123"``.
@@ -1164,8 +1276,8 @@ def _run_agent_loop(
     :param instructions: Optional per-request instructions
         to include in the system message.
     :param tool_mgr: The ToolManager for this workflow.
-    :returns: A result dict with ``"task_id"``,
-        ``"status"``, and ``"output"`` keys.
+    :returns: A :class:`_AgentLoopResult` describing the
+        terminal state of the loop.
     """
     tool_mgr.start()
     tool_schemas = tool_mgr.get_tool_schemas()
@@ -1239,7 +1351,7 @@ def _run_agent_loop(
         # outputs get positions after the steered message, so
         # using the post-tool last_seen would skip it.
         pre_tool_last_seen = last_seen
-        last_seen = _handle_tool_calls(
+        handle_result = _handle_tool_calls(
             task_id,
             conversation_id,
             llm_resp,
@@ -1248,7 +1360,19 @@ def _run_agent_loop(
             history,
             output_items,
             conv_store,
+            tool_mgr,
         )
+        if isinstance(handle_result, _ClientToolCallsPending):
+            # Client-side tool calls — return function_call items to
+            # the caller and complete without server-side execution.
+            return _complete_for_client_tools(
+                task_id,
+                conversation_id,
+                handle_result.last_seen,
+                output_items,
+                task_store,
+            )
+        last_seen = handle_result
         # Check for steered messages that arrived between the
         # LLM call and tool completion. Use the pre-tool cursor
         # to catch messages with positions interleaved among
@@ -1262,12 +1386,11 @@ def _run_agent_loop(
         )
 
     # Hit max iterations without a final response
-    return {
-        "task_id": task_id,
-        "status": "incomplete",
-        "output": output_items,
-        "incomplete_details": {"reason": "max_iterations"},
-    }
+    return _AgentLoopResult(
+        status="incomplete",
+        output=output_items,
+        incomplete_details={"reason": "max_iterations"},
+    )
 
 
 @workflow()
@@ -1303,13 +1426,14 @@ def agent_execution_workflow(
     :param reasoning: Optional reasoning configuration dict,
         e.g. ``{"effort": "high"}``. Stored by DBOS for
         recovery; not yet consumed by the loop.
-    :param tools: Optional list of client-specified tool dicts
-        (OpenAI format with ``agent_plane`` extension). Each
-        entry must include ``agent_plane.callback.url``.
-        Stored by DBOS for recovery. ``None`` and ``[]`` are
-        equivalent (no client tools), e.g.
-        ``[{"type": "function", "function": {...},
-        "agent_plane": {"callback": {"url": "..."}}}]``.
+    :param tools: Optional list of client-specified tool dicts in
+        standard OpenAI function format. When the LLM invokes one,
+        the ``function_call`` output items are returned to the caller
+        (the response completes) rather than being executed
+        server-side. Stored by DBOS for recovery. ``None`` and ``[]``
+        are equivalent (no client tools), e.g.
+        ``[{"type": "function", "function": {"name": "...",
+        "description": "...", "parameters": {...}}}]``.
     :returns: A result dict with ``"task_id"``,
         ``"status"``, and ``"output"`` keys.
     """
@@ -1325,21 +1449,20 @@ def agent_execution_workflow(
         agent_name = agent.name if agent else agent_id
 
         if spec.llm is None:
-            return {
-                "task_id": task_id,
-                "status": "failed",
-                "output": [],
-                "error": {
+            return _AgentLoopResult(
+                status="failed",
+                output=[],
+                error={
                     "code": "configuration_error",
                     "message": "Agent spec has no LLM configuration",
                 },
-            }
+            ).to_dict(task_id)
 
-        client_tool_specs: list[CallbackToolSpec] = parse_callback_tool_specs(tools or [])
+        client_tool_specs: list[ClientSideToolSpec] = parse_client_side_tool_specs(tools or [])
         tool_mgr = ToolManager(spec, work_dir, client_tool_specs=client_tool_specs)
         set_tool_manager(tool_mgr)
 
-        return _run_agent_loop(
+        result = _run_agent_loop(
             task_id,
             conversation_id,
             spec,
@@ -1347,6 +1470,7 @@ def agent_execution_workflow(
             instructions,
             tool_mgr,
         )
+        return result.to_dict(task_id)
     except Exception:
         _logger.exception(
             "agent loop failed for task %s",
