@@ -597,6 +597,8 @@ def _make_tool_manager(
     ]
     return ToolManager(
         spec=spec,
+        # work_dir is unused by _split_tool_calls — it only
+        # matters for local tool execution (not tested here)
         work_dir=Path("/tmp/test"),
         client_tool_specs=client_specs,
     )
