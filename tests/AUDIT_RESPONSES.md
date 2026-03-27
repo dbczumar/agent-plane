@@ -2,7 +2,7 @@
 
 Auditor compared `/agent_plane/server/routes/responses.py` and `/agent_plane/server/models.py`
 against the spec in `/agent_plane/server/API.md` (Inference section, Status Lifecycle,
-Background x Stream Behavior Matrix) and the runtime design in `/agent_plane/runtime/RUNTIME.md`
+Background x Stream Behavior Matrix) and the runtime design in `/designs/RUNTIME.md`
 (handler pseudocode lines 456-527, all 9 flows lines 518-755).
 
 ---

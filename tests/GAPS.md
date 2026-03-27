@@ -1,7 +1,7 @@
 # Implementation Gaps
 
 Issues found during spec compliance audit of the FastAPI server against
-API.md and RUNTIME.md. Grouped by severity.
+API.md and designs/RUNTIME.md. Grouped by severity.
 
 ---
 
@@ -62,7 +62,7 @@ there.
 append to the existing conversation. Fork detection only triggers as a 400
 error when the caller explicitly passes `conversation`.
 
-**Status**: Already listed in RUNTIME.md "Not Yet" section. Requires:
+**Status**: Already listed in designs/RUNTIME.md "Not Yet" section. Requires:
 - `conversation_store.fork_conversation(source_conversation_id, fork_at_response_id)`
   method to copy items and create a new conversation.
 - Route logic in `responses.py` to detect implicit forks (when
@@ -152,9 +152,9 @@ documents 200 and 404 for the cancel endpoint.
 `_to_api_item()` now uses `item.status` instead of hard-coded
 `"completed"`, reflecting the actual persisted status.
 
-### ~~16. RUNTIME.md is stale~~ — FIXED
+### ~~16. designs/RUNTIME.md is stale~~ — FIXED
 
-Updated RUNTIME.md to match current code: TaskStore.create() signature,
+Updated designs/RUNTIME.md to match current code: TaskStore.create() signature,
 full Task dataclass fields, ConversationItem.status, Conversation.title,
 ConversationStore methods, list_tasks, removed AgentSpec references.
 

@@ -5,7 +5,7 @@ files via ``file_id`` and replaces them with inline base64 content.
 This runs as a pre-processing step before prompt construction so the
 prompt builder remains pure (no I/O).
 
-See ``MULTIMODAL_INFERENCE.md`` for the full design.
+See ``designs/MULTIMODAL_INFERENCE.md`` for the full design.
 """
 
 from __future__ import annotations

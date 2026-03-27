@@ -70,7 +70,7 @@ from llms.types import (
 _logger = logging.getLogger(__name__)
 
 # Hard upper bound on LLM turns per execution. Prevents runaway loops.
-# See AGENTLOOP.md "Not Yet" for making this configurable.
+# See designs/AGENTLOOP.md "Not Yet" for making this configurable.
 _MAX_ITERATIONS = 1000
 
 # Lazy singleton — created on first LLM call so import doesn't
@@ -551,7 +551,7 @@ def _item_to_output(item: ConversationItem) -> dict[str, Any]:
     """
     Convert a persisted ConversationItem to the API output
     format. Mirrors ``_to_api_item()`` in conversations.py —
-    see LOOPGAPS.md.
+    see designs/LOOPGAPS.md.
 
     :param item: The persisted conversation item to convert.
     :returns: A flat dict with item fields suitable for the

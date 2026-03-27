@@ -33,7 +33,7 @@ Check each file against this checklist:
    with a comment explaining why.
 
 6. SPEC COMPLIANCE: Changes to API routes must match server/API.md. Changes
-   to store interfaces must match runtime/RUNTIME.md. Check field names,
+   to store interfaces must match designs/RUNTIME.md. Check field names,
    types, required/optional, and behavior.
 
 7. TYPE HINTS: Use specific types, not Any, object, dict, list, Callable,
