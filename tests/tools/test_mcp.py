@@ -22,9 +22,11 @@ from agent_plane.tools.mcp import (
     McpTool,
     _backoff_delay,
     _cache_key,
+    _collect_problematic_keywords,
     _discovery_cache,
     _format_call_result,
     _is_connection_error,
+    _normalize_input_schema,
     _run_async,
     clear_discovery_cache,
 )
@@ -368,6 +370,253 @@ def test_mcp_tool_invoke_delegates_to_run_sync() -> None:
 
     assert result == "result text"
     mock_run_sync.assert_called_once()
+
+
+# ── _normalize_input_schema ───────────────────────────────
+
+
+def test_normalize_none_schema_returns_empty_object() -> None:
+    """
+    ``None`` inputSchema (tool has no parameters) is normalized
+    to a valid empty object schema.
+    """
+    result = _normalize_input_schema(None, "no_args_tool")
+    assert result == {"type": "object", "properties": {}}
+
+
+def test_normalize_missing_properties_injects_empty() -> None:
+    """
+    A schema with ``type: object`` but no ``properties`` key
+    gets ``properties: {}`` injected. OpenAI rejects schemas
+    without this key (openai/openai-agents-python#449).
+    """
+    schema = {"type": "object"}
+    result = _normalize_input_schema(schema, "bare_object_tool")
+    assert result["properties"] == {}
+    assert result["type"] == "object"
+
+
+def test_normalize_preserves_existing_properties() -> None:
+    """
+    A schema that already has ``properties`` is returned as-is
+    (no double-injection).
+    """
+    schema = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+    }
+    result = _normalize_input_schema(schema, "normal_tool")
+    assert result["properties"] == {"query": {"type": "string"}}
+    assert result["required"] == ["query"]
+
+
+def test_normalize_does_not_mutate_original_schema() -> None:
+    """
+    ``_normalize_input_schema`` returns a new dict when
+    modifying — it does not mutate the original schema dict.
+    """
+    original = {"type": "object"}
+    result = _normalize_input_schema(original, "test")
+    # Result has properties injected.
+    assert "properties" in result
+    # Original is untouched.
+    assert "properties" not in original
+
+
+def test_normalize_non_object_schema_unchanged() -> None:
+    """
+    A schema with a non-object type (e.g. ``array``) is not
+    modified — ``properties`` injection only applies to objects.
+    """
+    schema = {"type": "array", "items": {"type": "string"}}
+    result = _normalize_input_schema(schema, "array_tool")
+    assert result == schema
+    assert "properties" not in result
+
+
+def test_normalize_warns_on_ref(caplog: pytest.LogCaptureFixture) -> None:
+    """
+    A schema containing ``$ref`` triggers a warning log.
+    """
+    schema = {
+        "type": "object",
+        "properties": {
+            "item": {"$ref": "#/$defs/Item"},
+        },
+        "$defs": {
+            "Item": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+            },
+        },
+    }
+    _normalize_input_schema(schema, "ref_tool")
+    assert any("$ref" in msg for msg in caplog.messages)
+
+
+def test_normalize_warns_on_oneof(caplog: pytest.LogCaptureFixture) -> None:
+    """
+    A schema containing ``oneOf`` triggers a warning log.
+    """
+    schema = {
+        "type": "object",
+        "properties": {
+            "value": {
+                "oneOf": [
+                    {"type": "string"},
+                    {"type": "integer"},
+                ],
+            },
+        },
+    }
+    _normalize_input_schema(schema, "oneof_tool")
+    assert any("oneOf" in msg for msg in caplog.messages)
+
+
+def test_normalize_no_warning_for_clean_schema(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A clean schema with no problematic keywords produces no
+    warnings.
+    """
+    schema = {
+        "type": "object",
+        "properties": {"q": {"type": "string"}},
+    }
+    _normalize_input_schema(schema, "clean_tool")
+    assert not any("reject" in msg or "inconsistent" in msg for msg in caplog.messages)
+
+
+# ── _collect_problematic_keywords ─────────────────────────
+
+
+def test_collect_finds_ref_in_properties() -> None:
+    """
+    ``$ref`` nested inside a property is detected.
+    """
+    schema = {
+        "type": "object",
+        "properties": {
+            "item": {"$ref": "#/$defs/Item"},
+        },
+    }
+    assert "$ref" in _collect_problematic_keywords(schema)
+
+
+def test_collect_finds_oneof_in_nested_property() -> None:
+    """
+    ``oneOf`` inside a nested property is detected.
+    """
+    schema = {
+        "type": "object",
+        "properties": {
+            "value": {
+                "oneOf": [
+                    {"type": "string"},
+                    {"type": "integer"},
+                ],
+            },
+        },
+    }
+    assert "oneOf" in _collect_problematic_keywords(schema)
+
+
+def test_collect_finds_keywords_in_array_items() -> None:
+    """
+    Problematic keywords inside ``items`` of an array are
+    detected.
+    """
+    schema = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "x": {"$ref": "#/$defs/X"},
+            },
+        },
+    }
+    assert "$ref" in _collect_problematic_keywords(schema)
+
+
+def test_collect_finds_keywords_in_defs() -> None:
+    """
+    Problematic keywords inside ``$defs`` are detected.
+    """
+    schema = {
+        "type": "object",
+        "properties": {},
+        "$defs": {
+            "Node": {
+                "type": "object",
+                "properties": {
+                    "child": {"$ref": "#/$defs/Node"},
+                },
+            },
+        },
+    }
+    assert "$ref" in _collect_problematic_keywords(schema)
+
+
+def test_collect_returns_empty_for_clean_schema() -> None:
+    """
+    A clean schema returns an empty set.
+    """
+    schema = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "count": {"type": "integer"},
+        },
+    }
+    assert _collect_problematic_keywords(schema) == set()
+
+
+def test_mcp_tool_schema_normalizes_missing_properties() -> None:
+    """
+    ``McpTool.get_schema()`` normalizes a schema missing
+    ``properties`` — the LLM receives a valid schema.
+    """
+    tool_def = MagicMock()
+    tool_def.name = "bare_tool"
+    tool_def.description = "A tool with no properties."
+    # MCP allows {"type": "object"} with no properties.
+    tool_def.inputSchema = {"type": "object"}
+
+    conn = McpServerConnection(config=_make_stdio_config())
+    tool = McpTool(
+        tool_def=tool_def,
+        connection=conn,
+        run_sync=MagicMock(),
+    )
+    schema = tool.get_schema()
+
+    params = schema["function"]["parameters"]
+    assert params["type"] == "object"
+    assert params["properties"] == {}
+
+
+def test_mcp_tool_schema_normalizes_none_input_schema() -> None:
+    """
+    ``McpTool.get_schema()`` handles ``inputSchema=None``
+    (no parameters) by returning a valid empty object schema.
+    """
+    tool_def = MagicMock()
+    tool_def.name = "no_params_tool"
+    tool_def.description = "Tool with no inputSchema."
+    tool_def.inputSchema = None
+
+    conn = McpServerConnection(config=_make_stdio_config())
+    tool = McpTool(
+        tool_def=tool_def,
+        connection=conn,
+        run_sync=MagicMock(),
+    )
+    schema = tool.get_schema()
+
+    params = schema["function"]["parameters"]
+    assert params == {"type": "object", "properties": {}}
 
 
 # ── _format_call_result ──────────────────────────────────

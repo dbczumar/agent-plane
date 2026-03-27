@@ -524,6 +524,131 @@ class McpServerConnection:
         return read_stream, write_stream
 
 
+# JSON Schema keywords that LLM providers either reject outright
+# or handle inconsistently. Presence of these in an MCP tool's
+# inputSchema does not block registration, but operators should
+# know the tool may produce API errors at call time.
+_PROBLEMATIC_SCHEMA_KEYWORDS = frozenset(
+    {
+        # $ref with sibling properties — OpenAI ignores siblings,
+        # Anthropic rejects the combination.
+        "$ref",
+        # oneOf — OpenAI rejects in nested contexts (must use anyOf).
+        "oneOf",
+        # allOf with $ref — Anthropic rejects the combination.
+        "allOf",
+    }
+)
+
+
+def _normalize_input_schema(
+    schema: dict[str, Any] | None,
+    tool_name: str,
+) -> dict[str, Any]:
+    """
+    Normalize an MCP ``inputSchema`` for LLM consumption.
+
+    MCP allows schemas that LLM providers reject. This function
+    applies the minimum transformations needed to avoid the most
+    common real-world failures, following the approach used by
+    the OpenAI Agents Python SDK:
+
+    1. **Missing or None schema** → default to
+       ``{"type": "object", "properties": {}}``. Many MCP tools
+       (especially no-arg tools) omit ``inputSchema`` entirely.
+    2. **Missing ``properties`` key** → inject ``"properties": {}``.
+       MCP spec allows ``{"type": "object"}`` without
+       ``properties``, but OpenAI rejects it (see
+       openai/openai-agents-python#449).
+    3. **Problematic keywords** (``$ref``, ``oneOf``, ``allOf``) →
+       log a warning. We don't attempt to transform these because
+       inlining ``$ref`` and converting ``oneOf`` → ``anyOf`` is
+       complex and lossy. Operators see the warning and can fix
+       the MCP server's schema.
+
+    :param schema: The raw ``inputSchema`` dict from the MCP tool
+        definition, or ``None`` if the tool has no parameters.
+    :param tool_name: Tool name for log messages, e.g.
+        ``"list_directory"``.
+    :returns: A normalized schema dict safe for OpenAI/Anthropic.
+    """
+    if schema is None:
+        return {"type": "object", "properties": {}}
+
+    # MCP allows {"type": "object"} with no properties key.
+    # OpenAI requires "properties" to be present, even if empty.
+    if schema.get("type") == "object" and "properties" not in schema:
+        schema = {**schema, "properties": {}}
+
+    _warn_problematic_keywords(schema, tool_name)
+    return schema
+
+
+def _warn_problematic_keywords(
+    schema: dict[str, Any],
+    tool_name: str,
+) -> None:
+    """
+    Log warnings for JSON Schema keywords that LLM providers
+    handle poorly or reject.
+
+    Walks the schema tree (objects, arrays, anyOf/oneOf/allOf
+    branches, and $defs) to find problematic keywords at any
+    nesting depth.
+
+    :param schema: The input schema dict to inspect.
+    :param tool_name: Tool name for log messages.
+    """
+    found = _collect_problematic_keywords(schema)
+    for keyword in sorted(found):
+        _logger.warning(
+            "MCP tool %r schema contains %r which some LLM "
+            "providers reject or handle inconsistently — "
+            "the tool may fail at call time",
+            tool_name,
+            keyword,
+        )
+
+
+def _collect_problematic_keywords(
+    schema: dict[str, Any],
+) -> set[str]:
+    """
+    Recursively collect problematic JSON Schema keywords from
+    a schema tree.
+
+    :param schema: A JSON Schema dict node to inspect.
+    :returns: Set of problematic keyword strings found anywhere
+        in the schema tree.
+    """
+    found: set[str] = set()
+    found.update(kw for kw in _PROBLEMATIC_SCHEMA_KEYWORDS if kw in schema)
+
+    # Recurse into object properties.
+    for prop_schema in schema.get("properties", {}).values():
+        if isinstance(prop_schema, dict):
+            found.update(_collect_problematic_keywords(prop_schema))
+
+    # Recurse into array items.
+    items = schema.get("items")
+    if isinstance(items, dict):
+        found.update(_collect_problematic_keywords(items))
+
+    # Recurse into composition keywords (anyOf, oneOf, allOf).
+    for keyword in ("anyOf", "oneOf", "allOf"):
+        for branch in schema.get(keyword, []):
+            if isinstance(branch, dict):
+                found.update(_collect_problematic_keywords(branch))
+
+    # Recurse into $defs / definitions.
+    for defs_key in ("$defs", "definitions"):
+        for def_schema in schema.get(defs_key, {}).values():
+            if isinstance(def_schema, dict):
+                found.update(_collect_problematic_keywords(def_schema))
+
+    return found
+
+
 class McpTool(Tool):
     """
     Proxy tool that delegates invocation to an MCP server session.
@@ -578,7 +703,9 @@ class McpTool(Tool):
         Return OpenAI Chat Completions tool schema.
 
         Converts the MCP tool definition's ``inputSchema`` to
-        the OpenAI format expected by the LLM client.
+        the OpenAI format expected by the LLM client. Normalizes
+        the schema to handle MCP edge cases that LLM providers
+        reject (see :func:`_normalize_input_schema`).
 
         :returns: An OpenAI-format tool schema dict.
         """
@@ -589,7 +716,10 @@ class McpTool(Tool):
                 # OpenAI tool schema requires description to be
                 # a string, not None.
                 "description": (self._tool_def.description or ""),
-                "parameters": (self._tool_def.inputSchema),
+                "parameters": _normalize_input_schema(
+                    self._tool_def.inputSchema,
+                    self._tool_def.name,
+                ),
             },
         }
 
