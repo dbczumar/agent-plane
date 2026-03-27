@@ -11,10 +11,11 @@ import pytest
 from agent_plane.runtime.llm_retry import (
     classify_llm_error,
     compute_backoff_delay,
+    detail_to_dict,
     execute_with_retry,
 )
 from agent_plane.spec.types import RetryConfig
-from llms.errors import PermanentLLMError, RetryableLLMError
+from llms.errors import LLMErrorDetail, PermanentLLMError, RetryableLLMError
 
 
 @pytest.fixture()
@@ -143,9 +144,7 @@ def test_compute_backoff_basic() -> None:
     base = 2.0
     max_delay = 30.0
 
-    delay = compute_backoff_delay(
-        attempt_index=2, backoff_base=base, backoff_max=max_delay
-    )
+    delay = compute_backoff_delay(attempt_index=2, backoff_base=base, backoff_max=max_delay)
 
     deterministic_max = min(base**2, max_delay)
     # Delay must not exceed the deterministic ceiling (base^index).
@@ -161,9 +160,7 @@ def test_compute_backoff_capped() -> None:
     Backoff delay must be capped at backoff_max even when base^index exceeds it.
     """
     # base=10, index=3 → 1000, but max=5 should cap it.
-    delay = compute_backoff_delay(
-        attempt_index=3, backoff_base=10.0, backoff_max=5.0
-    )
+    delay = compute_backoff_delay(attempt_index=3, backoff_base=10.0, backoff_max=5.0)
 
     # Delay must never exceed backoff_max regardless of base^index.
     # Failure would mean the cap is not applied, causing excessive waits.
@@ -208,9 +205,7 @@ def test_execute_with_retry_retries_on_timeout(
     # Patch time.sleep to avoid real delays in tests.
     monkeypatch.setattr("agent_plane.runtime.llm_retry.time.sleep", lambda _: None)
 
-    call_fn = MagicMock(
-        side_effect=[httpx.TimeoutException("timeout"), "recovered"]
-    )
+    call_fn = MagicMock(side_effect=[httpx.TimeoutException("timeout"), "recovered"])
     on_retry = MagicMock()
 
     result = execute_with_retry(call_fn, retry_config_fast, on_retry)
@@ -277,3 +272,172 @@ def test_execute_with_retry_exhausted_raises(
     # on_retry fires between attempts, so (max_attempts - 1) times.
     # Failure would mean retry events don't match the actual retry count.
     assert on_retry.call_count == retry_config_fast.max_attempts - 1
+
+
+# ── SSE retry event structure ────────────────────────────────────────
+
+
+def test_retry_event_structure_on_timeout(
+    retry_config_fast: RetryConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Timeout retry event must contain the exact SSE payload structure.
+
+    Verifies every field of the ``response.retry`` event dict passed
+    to ``on_retry`` when a timeout triggers a retry.
+    """
+    # Patch time.sleep to avoid real delays in tests.
+    monkeypatch.setattr("agent_plane.runtime.llm_retry.time.sleep", lambda _: None)
+
+    call_fn = MagicMock(
+        side_effect=[httpx.TimeoutException("timeout"), "ok"],
+    )
+    captured_events: list[dict[str, Any]] = []
+
+    def on_retry(event: dict[str, Any]) -> None:
+        """Capture retry events for inspection."""
+        captured_events.append(event)
+
+    execute_with_retry(call_fn, retry_config_fast, on_retry)
+
+    # Exactly one retry event must be captured.
+    # Failure would mean the retry loop emitted wrong number of events.
+    assert len(captured_events) == 1
+    event = captured_events[0]
+
+    # "type" must be "response.retry" — the SSE event discriminator.
+    # Failure would break client-side event routing.
+    assert event["type"] == "response.retry"
+
+    # "source" must be "llm" — distinguishes LLM retries from others.
+    # Failure would cause clients to misattribute the retry source.
+    assert event["source"] == "llm"
+
+    # "attempt" must be 2 — next attempt number, 1-based.
+    # First call is attempt 1, so the retry targets attempt 2.
+    # Failure would mean attempt numbering is off-by-one.
+    assert event["attempt"] == 2
+
+    # "max_attempts" must match the retry config value.
+    # Failure would give clients wrong retry budget information.
+    assert event["max_attempts"] == retry_config_fast.max_attempts
+
+    # "delay_seconds" must be a positive float (backoff duration).
+    # Failure would mean the backoff calculation produced invalid delay.
+    assert isinstance(event["delay_seconds"], float)
+    assert event["delay_seconds"] > 0
+
+    # "error.code" must be "timeout" for timeout-triggered retries.
+    # Failure would mean the error classification is wrong.
+    assert event["error"]["code"] == "timeout"
+
+    # "error.message" must contain "timed out" from the classification.
+    # Failure would mean the human-readable message is malformed.
+    assert "timed out" in event["error"]["message"]
+
+    # "error.detail" must be None because LLMErrorDetail() has all
+    # None fields, which detail_to_dict converts to None.
+    # Failure would mean empty details leak into the SSE payload.
+    assert event["error"]["detail"] is None
+
+
+def test_retry_event_structure_on_http_429(
+    retry_config_fast: RetryConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    HTTP 429 retry event must carry status code and body in error detail.
+
+    Verifies the ``error.code`` and ``error.detail`` fields when a
+    rate-limit response triggers a retry.
+    """
+    # Patch time.sleep to avoid real delays in tests.
+    monkeypatch.setattr("agent_plane.runtime.llm_retry.time.sleep", lambda _: None)
+
+    exc = _make_http_status_error(429, body="rate limited")
+    call_fn = MagicMock(side_effect=[exc, "ok"])
+    captured_events: list[dict[str, Any]] = []
+
+    def on_retry(event: dict[str, Any]) -> None:
+        """Capture retry events for inspection."""
+        captured_events.append(event)
+
+    execute_with_retry(call_fn, retry_config_fast, on_retry)
+
+    # Exactly one retry event must be captured.
+    # Failure would mean wrong number of retry events emitted.
+    assert len(captured_events) == 1
+    event = captured_events[0]
+
+    # "error.code" must be "429" — the string form of the status code.
+    # Failure would mean HTTP status is not propagated correctly.
+    assert event["error"]["code"] == "429"
+
+    # "error.detail" must be a dict with status_code and response_body.
+    # Failure would mean provider diagnostics are lost in the SSE event.
+    assert event["error"]["detail"] == {
+        "status_code": 429,
+        "response_body": "rate limited",
+    }
+
+    # Top-level fields must still follow the standard structure.
+    # Failure would mean the event schema is inconsistent across errors.
+    assert event["type"] == "response.retry"
+    assert event["source"] == "llm"
+    assert event["attempt"] == 2
+    assert event["max_attempts"] == retry_config_fast.max_attempts
+    assert isinstance(event["delay_seconds"], float)
+    assert event["delay_seconds"] > 0
+
+
+# ── detail_to_dict ───────────────────────────────────────────────────
+
+
+def test_detail_to_dict_with_all_fields() -> None:
+    """
+    detail_to_dict must include all non-None fields from LLMErrorDetail.
+    """
+    detail = LLMErrorDetail(
+        provider="openai",
+        status_code=429,
+        response_body='{"error": "rate limit"}',
+    )
+
+    result = detail_to_dict(detail)
+
+    # All three fields are set — dict must contain all of them.
+    # Failure would mean some fields are silently dropped.
+    assert result == {
+        "provider": "openai",
+        "status_code": 429,
+        "response_body": '{"error": "rate limit"}',
+    }
+
+
+def test_detail_to_dict_with_none() -> None:
+    """
+    detail_to_dict(None) must return None — no detail to serialize.
+    """
+    result = detail_to_dict(None)
+
+    # None input must produce None output, not an empty dict.
+    # Failure would mean the SSE payload contains a spurious empty dict.
+    assert result is None
+
+
+def test_detail_to_dict_with_empty_detail() -> None:
+    """
+    detail_to_dict with all-None fields must return None, not empty dict.
+
+    An LLMErrorDetail with no fields set (e.g. timeout errors) produces
+    an empty dict internally, which is collapsed to None to keep the
+    SSE JSON payload clean.
+    """
+    detail = LLMErrorDetail()
+
+    result = detail_to_dict(detail)
+
+    # All fields are None → empty dict → collapsed to None.
+    # Failure would mean empty dicts leak into the SSE event payload.
+    assert result is None

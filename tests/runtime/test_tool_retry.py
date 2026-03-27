@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -250,3 +251,252 @@ def test_execute_tool_with_retry_returns_error_string_on_exhaustion(
     error_events = [e for e in captured_events if e["type"] == "response.error"]
     assert len(error_events) == 1
     assert error_events[0]["tool_name"] == "stuck_tool"
+
+
+# -- SSE event structure validation --
+
+
+def test_tool_retry_event_has_correct_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    on_event: MagicMock,
+    captured_events: list[dict[str, Any]],
+) -> None:
+    """
+    When a tool times out and retries, the emitted retry event
+    contains all required fields with correct types and values.
+
+    :param monkeypatch: Pytest monkeypatch fixture for patching.
+    :param on_event: Mock callback that records emitted events.
+    :param captured_events: List accumulating events for inspection.
+    """
+    # Patch time.sleep to avoid real delays.
+    monkeypatch.setattr("agent_plane.runtime.tool_retry.time.sleep", lambda _: None)
+    # Fix random.uniform to 1.0 so delay is deterministic.
+    monkeypatch.setattr(
+        "agent_plane.runtime.tool_retry.random.uniform",
+        lambda _low, _high: 1.0,
+    )
+
+    call_count = 0
+
+    def timeout_then_succeed(call_fn: Callable[[], str], timeout: int) -> str:
+        """
+        Raises TimeoutError on first call, returns success on second.
+
+        :param call_fn: The tool callable (ignored in this stub).
+        :param timeout: The timeout value (ignored in this stub).
+        :returns: ``"ok"`` on second call.
+        :raises TimeoutError: On first call.
+        """
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise TimeoutError("Tool execution timed out after 5s")
+        return "ok"
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.tool_retry.call_tool_with_timeout",
+        timeout_then_succeed,
+    )
+
+    retry_config = RetryConfig(max_attempts=3, backoff_base=1.0, backoff_max=10.0)
+    result = execute_tool_with_retry(
+        tool_name="my_tool",
+        call_fn=lambda: "unused",
+        timeout=5,
+        retry_config=retry_config,
+        on_event=on_event,
+    )
+
+    # Tool recovered on second attempt so result must be "ok".
+    # Failure means the retry loop did not succeed after recovery.
+    assert result == "ok"
+
+    retry_events = [e for e in captured_events if e["type"] == "response.retry"]
+    # Exactly one retry event for the single timeout failure.
+    # Failure means the function emitted too many or too few retry events.
+    assert len(retry_events) == 1
+
+    evt = retry_events[0]
+
+    # "type" must be "response.retry" — identifies this as a retry SSE event.
+    # Failure means the event type is wrong, breaking SSE consumers.
+    assert evt["type"] == "response.retry"
+
+    # "source" must be "tool" — distinguishes tool retries from other sources.
+    # Failure means the event source label is incorrect.
+    assert evt["source"] == "tool"
+
+    # "tool_name" must match the tool that was retried.
+    # Failure means the event references the wrong tool.
+    assert evt["tool_name"] == "my_tool"
+
+    # "attempt" is the 1-based NEXT attempt number: attempt=0 (zero-based)
+    # produces attempt + 2 = 2 in the event.
+    # Failure means attempt numbering logic is wrong.
+    assert evt["attempt"] == 2
+
+    # "max_attempts" must reflect the retry config.
+    # Failure means the event does not report the configured limit.
+    assert evt["max_attempts"] == 3
+
+    # "delay_seconds" with backoff_base=1.0, attempt=0, random=1.0:
+    # min(1.0 ** 0, 10.0) * 1.0 = 1.0, rounded to 2 decimals = 1.0.
+    # Failure means the backoff calculation or rounding is wrong.
+    assert evt["delay_seconds"] == 1.0
+    assert isinstance(evt["delay_seconds"], float)
+
+    # "error.code" must be "timeout" for timeout-triggered retries.
+    # Failure means the error classification is wrong.
+    assert evt["error"]["code"] == "timeout"
+
+    # "error.message" must contain "timed out" from the TimeoutError.
+    # Failure means the original error message was lost or altered.
+    assert "timed out" in evt["error"]["message"]
+
+    # "error.detail" must be None — no additional detail for timeouts.
+    # Failure means unexpected detail was attached.
+    assert evt["error"]["detail"] is None
+
+
+def test_tool_error_event_has_correct_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    on_event: MagicMock,
+    captured_events: list[dict[str, Any]],
+) -> None:
+    """
+    When all retries are exhausted, the emitted error event contains
+    all required fields with correct types and values.
+
+    :param monkeypatch: Pytest monkeypatch fixture for patching.
+    :param on_event: Mock callback that records emitted events.
+    :param captured_events: List accumulating events for inspection.
+    """
+    # Patch time.sleep to avoid real delays.
+    monkeypatch.setattr("agent_plane.runtime.tool_retry.time.sleep", lambda _: None)
+
+    # Every call raises TimeoutError to exhaust all attempts.
+    monkeypatch.setattr(
+        "agent_plane.runtime.tool_retry.call_tool_with_timeout",
+        lambda call_fn, timeout: (_ for _ in ()).throw(
+            TimeoutError("Tool execution timed out after 5s")
+        ),
+    )
+
+    retry_config = RetryConfig(max_attempts=2, backoff_base=1.0, backoff_max=10.0)
+    execute_tool_with_retry(
+        tool_name="stuck_tool",
+        call_fn=lambda: "unused",
+        timeout=5,
+        retry_config=retry_config,
+        on_event=on_event,
+    )
+
+    error_events = [e for e in captured_events if e["type"] == "response.error"]
+    # Exactly one terminal error event after exhaustion.
+    # Failure means the function emitted multiple error events or none.
+    assert len(error_events) == 1
+
+    evt = error_events[0]
+
+    # "type" must be "response.error" — identifies this as a terminal
+    # error SSE event.
+    # Failure means the event type is wrong, breaking SSE consumers.
+    assert evt["type"] == "response.error"
+
+    # "source" must be "tool" — distinguishes tool errors from others.
+    # Failure means the event source label is incorrect.
+    assert evt["source"] == "tool"
+
+    # "tool_name" must match the tool that failed.
+    # Failure means the event references the wrong tool.
+    assert evt["tool_name"] == "stuck_tool"
+
+    # "error.code" must be "timeout" for timeout-based exhaustion.
+    # Failure means the error classification is wrong.
+    assert evt["error"]["code"] == "timeout"
+
+    # "error.message" must contain "attempts exhausted" to indicate
+    # terminal failure, and include the attempt count.
+    # Failure means the exhaustion message format changed.
+    assert "attempts exhausted" in evt["error"]["message"]
+    assert "2 attempts" in evt["error"]["message"]
+
+    # "error.detail" must be None — no additional detail for timeouts.
+    # Failure means unexpected detail was attached.
+    assert evt["error"]["detail"] is None
+
+
+def test_tool_retry_non_timeout_exception_no_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    on_event: MagicMock,
+    captured_events: list[dict[str, Any]],
+) -> None:
+    """
+    When a tool raises a non-timeout exception, the retry loop breaks
+    immediately and emits only a terminal error event (no retries).
+
+    :param monkeypatch: Pytest monkeypatch fixture for patching.
+    :param on_event: Mock callback that records emitted events.
+    :param captured_events: List accumulating events for inspection.
+    """
+
+    def raise_value_error(call_fn: Callable[[], str], timeout: int) -> str:
+        """
+        Always raises ValueError to simulate a non-timeout failure.
+
+        :param call_fn: The tool callable (ignored in this stub).
+        :param timeout: The timeout value (ignored in this stub).
+        :raises ValueError: Always.
+        """
+        raise ValueError("bad input")
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.tool_retry.call_tool_with_timeout",
+        raise_value_error,
+    )
+
+    retry_config = RetryConfig(max_attempts=3, backoff_base=1.0, backoff_max=10.0)
+    result = execute_tool_with_retry(
+        tool_name="broken_tool",
+        call_fn=lambda: "unused",
+        timeout=5,
+        retry_config=retry_config,
+        on_event=on_event,
+    )
+
+    # No retry events should be emitted for non-timeout exceptions.
+    # Failure means the function retried when it should have broken out.
+    retry_events = [e for e in captured_events if e["type"] == "response.retry"]
+    assert len(retry_events) == 0
+
+    # Exactly one terminal error event for the immediate failure.
+    # Failure means the function did not emit the error event.
+    error_events = [e for e in captured_events if e["type"] == "response.error"]
+    assert len(error_events) == 1
+
+    evt = error_events[0]
+
+    # "type" must be "response.error" — terminal failure event.
+    assert evt["type"] == "response.error"
+
+    # "source" must be "tool".
+    assert evt["source"] == "tool"
+
+    # "tool_name" must match the tool that failed.
+    assert evt["tool_name"] == "broken_tool"
+
+    # "error.message" must contain "ValueError" so the error type is
+    # visible to the caller, and "attempts exhausted" for the terminal
+    # format.
+    # Failure means the original exception type was lost.
+    assert "ValueError" in evt["error"]["message"]
+    assert "attempts exhausted" in evt["error"]["message"]
+
+    # "error.detail" must be None.
+    assert evt["error"]["detail"] is None
+
+    # The return value must be an error string (not raised).
+    # Failure means the function let the ValueError propagate.
+    assert isinstance(result, str)
+    assert "ValueError" in result

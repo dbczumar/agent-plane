@@ -180,6 +180,31 @@ class _ClientToolCallsPending:
 
 
 @dataclass
+class _ToolCall:
+    """
+    A single tool invocation requested by the LLM.
+
+    Extracted from the raw ``llm_resp`` dict at the
+    :func:`_get_tool_calls` boundary and used throughout
+    the tool execution pipeline. The raw dicts remain in
+    ``llm_resp`` for DBOS checkpoint serialization; this
+    dataclass is the typed representation used by workflow
+    logic.
+
+    :param call_id: The unique call ID assigned by the LLM,
+        e.g. ``"call_abc123"``.
+    :param name: The tool function name, e.g.
+        ``"load_skill"`` or ``"get_weather"``.
+    :param arguments: JSON-encoded arguments string from the
+        LLM, e.g. ``'{"city": "San Francisco"}'``.
+    """
+
+    call_id: str
+    name: str
+    arguments: str
+
+
+@dataclass
 class _SteeringRetry:
     """
     Returned by ``_handle_final_response`` when late steering
@@ -552,18 +577,28 @@ def _has_tool_calls(llm_resp: dict[str, Any]) -> bool:
 
 def _get_tool_calls(
     llm_resp: dict[str, Any],
-) -> list[dict[str, Any]]:
+) -> list[_ToolCall]:
     """
     Extract the tool call list from the LLM response.
 
+    Converts raw dicts (kept in ``llm_resp`` for DBOS checkpoint
+    serialization) into typed :class:`_ToolCall` instances for
+    use in the workflow pipeline.
+
     :param llm_resp: The LLM response dict (from
         :func:`_call_llm` or :func:`_call_llm_streaming`).
-    :returns: List of tool call dicts, each containing
-        ``"call_id"``, ``"name"``, and ``"arguments"`` keys.
-        Empty list if no tool calls.
+    :returns: List of :class:`_ToolCall` instances. Empty list
+        if no tool calls.
     """
-    tool_calls: list[dict[str, Any]] = llm_resp["tool_calls"]
-    return tool_calls
+    raw: list[dict[str, Any]] = llm_resp["tool_calls"]
+    return [
+        _ToolCall(
+            call_id=tc["call_id"],
+            name=tc["name"],
+            arguments=tc["arguments"],
+        )
+        for tc in raw
+    ]
 
 
 def _get_text_content(llm_resp: dict[str, Any]) -> str | None:
@@ -802,7 +837,7 @@ def _handle_final_response(
 def _build_function_call_items(
     task_id: str,
     agent_name: str,
-    tool_calls: list[dict[str, Any]],
+    tool_calls: list[_ToolCall],
 ) -> list[NewConversationItem]:
     """
     Build NewConversationItem list for ``function_call``
@@ -812,8 +847,7 @@ def _build_function_call_items(
         ``response_id``, e.g. ``"task_abc123"``.
     :param agent_name: The agent's registered name, e.g.
         ``"research-agent"``.
-    :param tool_calls: Tool call dicts from the LLM response,
-        each containing ``"id"`` and ``"function"`` keys.
+    :param tool_calls: Typed tool calls from the LLM response.
     :returns: A list of NewConversationItem instances ready
         for persistence.
     """
@@ -825,9 +859,9 @@ def _build_function_call_items(
                 response_id=task_id,
                 data=FunctionCallData(
                     agent=agent_name,
-                    name=tc["name"],
-                    arguments=tc["arguments"],
-                    call_id=tc["call_id"],
+                    name=tc.name,
+                    arguments=tc.arguments,
+                    call_id=tc.call_id,
                 ),
             )
         )
@@ -837,7 +871,7 @@ def _build_function_call_items(
 def _execute_tools(
     task_id: str,
     conversation_id: str,
-    tool_calls: list[dict[str, Any]],
+    tool_calls: list[_ToolCall],
     tools_config: ToolsConfig,
     history: list[ConversationItem],
     output_items: list[dict[str, Any]],
@@ -852,9 +886,7 @@ def _execute_tools(
         ``"task_abc123"``.
     :param conversation_id: The conversation ID, e.g.
         ``"conv_abc123"``.
-    :param tool_calls: Tool call dicts from the LLM response,
-        each containing ``"call_id"``, ``"name"``, and
-        ``"arguments"`` keys.
+    :param tool_calls: Typed tool calls to execute.
     :param tools_config: The agent's global tools config with
         default timeout and retry policy.
     :param history: Mutable conversation history. Extended
@@ -868,8 +900,8 @@ def _execute_tools(
     for tc in tool_calls:
         result = _call_tool(
             task_id,
-            tc["name"],
-            tc["arguments"],
+            tc.name,
+            tc.arguments,
             tools_config.timeout,
             tools_config.retry,
         )
@@ -883,7 +915,7 @@ def _execute_tools(
                     type="function_call_output",
                     response_id=task_id,
                     data=FunctionCallOutputData(
-                        call_id=tc["call_id"],
+                        call_id=tc.call_id,
                         output=result,
                     ),
                 ),
@@ -895,6 +927,49 @@ def _execute_tools(
     # tool_calls is always non-empty when this function is called
     assert last_seen is not None
     return last_seen
+
+
+@dataclass
+class _ToolCallSplit:
+    """
+    Result of partitioning a tool call batch into server-side
+    and client-side groups.
+
+    :param server: Tool calls that must be executed server-side
+        (MCP, skills, etc.).
+    :param has_client: ``True`` if the batch contains at least
+        one client-side tool call.
+    """
+
+    server: list[_ToolCall]
+    has_client: bool
+
+
+def _split_tool_calls(
+    tool_calls: list[_ToolCall],
+    tool_mgr: ToolManager,
+) -> _ToolCallSplit:
+    """
+    Partition a batch of tool calls into server-side and client-side.
+
+    Server-side tools (MCP, skills) need execution. Client-side
+    tools are returned to the caller as ``function_call`` items
+    without server-side execution.
+
+    :param tool_calls: Typed tool calls from the LLM response.
+    :param tool_mgr: The ToolManager that knows which tools are
+        client-side via ``is_client_side_tool()``.
+    :returns: A :class:`_ToolCallSplit` with the server-side tool
+        calls and a flag indicating client-side presence.
+    """
+    server: list[_ToolCall] = []
+    has_client = False
+    for tc in tool_calls:
+        if tool_mgr.is_client_side_tool(tc.name):
+            has_client = True
+        else:
+            server.append(tc)
+    return _ToolCallSplit(server=server, has_client=has_client)
 
 
 def _handle_tool_calls(
@@ -910,13 +985,15 @@ def _handle_tool_calls(
 ) -> str | _ClientToolCallsPending:
     """
     Handle the tool execution path: build ``function_call`` items,
-    persist them, then either execute server-side tools or signal
-    the loop to complete for client-side tools.
+    persist them, execute server-side tools, and signal the loop
+    to complete if client-side tools are present.
 
-    If any tool call in the batch is a client-side tool, no tools are
-    executed. The ``function_call`` items are persisted and streamed,
-    and a :class:`_ClientToolCallsPending` is returned so the loop
-    can complete the response and return the calls to the caller.
+    When a batch contains both server-side and client-side tools,
+    the server-side tools are executed and their
+    ``function_call_output`` items are persisted. The client-side
+    ``function_call`` items are left unexecuted — the caller
+    handles them externally. A :class:`_ClientToolCallsPending`
+    is returned so the loop completes the response.
 
     :param task_id: The task identifier, e.g. ``"task_abc123"``.
     :param conversation_id: The conversation ID, e.g.
@@ -932,7 +1009,7 @@ def _handle_tool_calls(
         Extended in place.
     :param conv_store: The ConversationStore for persistence.
     :param tool_mgr: The ToolManager for this workflow, used to
-        detect client-side tools.
+        detect client-side tools and dispatch server-side tools.
     :returns: The ID of the last persisted item on the server-side
         execution path, or a :class:`_ClientToolCallsPending` on
         the client-side path.
@@ -949,20 +1026,29 @@ def _handle_tool_calls(
     )
     history.extend(fc_items)
 
-    if any(tool_mgr.is_client_side_tool(tc["name"]) for tc in tool_calls):
-        # At least one tool is client-side — return all function_call
-        # items to the caller without executing any tools server-side.
-        return _ClientToolCallsPending(last_seen=fc_items[-1].id)
+    split = _split_tool_calls(tool_calls, tool_mgr)
 
-    return _execute_tools(
-        task_id,
-        conversation_id,
-        tool_calls,
-        tools_config,
-        history,
-        output_items,
-        conv_store,
-    )
+    # Always execute server-side tools — even in mixed batches
+    last_seen = fc_items[-1].id
+    if split.server:
+        last_seen = _execute_tools(
+            task_id,
+            conversation_id,
+            split.server,
+            tools_config,
+            history,
+            output_items,
+            conv_store,
+        )
+
+    if split.has_client:
+        # Client-side function_call items are already persisted
+        # and streamed. Server-side tool outputs (if any) are
+        # also persisted. Complete the response so the caller
+        # can handle the client-side calls externally.
+        return _ClientToolCallsPending(last_seen=last_seen)
+
+    return last_seen
 
 
 def _complete_for_client_tools(
