@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -1741,7 +1742,7 @@ def test_circuit_breaker_trips_after_threshold_failures() -> None:
     """
     breaker = _CircuitBreaker(failure_threshold=3, cooldown_seconds=60.0)
     for _ in range(3):
-        breaker.record_failure()
+        breaker.record_failure("test-server")
 
     assert breaker.is_tripped is True
     with pytest.raises(McpServerDisabledError) as exc_info:
@@ -1756,7 +1757,7 @@ def test_circuit_breaker_does_not_trip_below_threshold() -> None:
     """
     breaker = _CircuitBreaker(failure_threshold=5, cooldown_seconds=10.0)
     for _ in range(4):
-        breaker.record_failure()
+        breaker.record_failure("test-server")
 
     assert breaker.is_tripped is False
     # Should not raise.
@@ -1770,7 +1771,7 @@ def test_circuit_breaker_resets_on_success() -> None:
     """
     breaker = _CircuitBreaker(failure_threshold=3, cooldown_seconds=60.0)
     for _ in range(3):
-        breaker.record_failure()
+        breaker.record_failure("test-server")
     assert breaker.is_tripped is True
 
     breaker.record_success()
@@ -1790,8 +1791,8 @@ def test_circuit_breaker_half_open_after_cooldown(
     import time as time_module
 
     breaker = _CircuitBreaker(failure_threshold=2, cooldown_seconds=10.0)
-    breaker.record_failure()
-    breaker.record_failure()
+    breaker.record_failure("test-server")
+    breaker.record_failure("test-server")
     assert breaker.is_tripped is True
 
     # Advance time past the cooldown.
@@ -1816,8 +1817,8 @@ def test_circuit_breaker_re_trips_on_half_open_failure(
     import time as time_module
 
     breaker = _CircuitBreaker(failure_threshold=2, cooldown_seconds=10.0)
-    breaker.record_failure()
-    breaker.record_failure()
+    breaker.record_failure("test-server")
+    breaker.record_failure("test-server")
 
     # Advance time past the cooldown.
     original_monotonic = time_module.monotonic
@@ -1830,7 +1831,7 @@ def test_circuit_breaker_re_trips_on_half_open_failure(
     # Half-open probe allowed.
     breaker.pre_call("test-server")
     # Probe fails — re-trip.
-    breaker.record_failure()
+    breaker.record_failure("test-server")
     assert breaker.is_tripped is True
 
 
@@ -1840,7 +1841,7 @@ def test_circuit_breaker_cooldown_remaining_in_error() -> None:
     cooldown remaining.
     """
     breaker = _CircuitBreaker(failure_threshold=1, cooldown_seconds=30.0)
-    breaker.record_failure()
+    breaker.record_failure("test-server")
 
     with pytest.raises(McpServerDisabledError) as exc_info:
         breaker.pre_call("test-server")
@@ -1853,14 +1854,35 @@ def test_circuit_breaker_failure_count_resets_on_success() -> None:
     Interspersed successes prevent the breaker from tripping.
     """
     breaker = _CircuitBreaker(failure_threshold=3, cooldown_seconds=10.0)
-    breaker.record_failure()
-    breaker.record_failure()
+    breaker.record_failure("test-server")
+    breaker.record_failure("test-server")
     # Success resets the counter.
     breaker.record_success()
-    breaker.record_failure()
-    breaker.record_failure()
+    breaker.record_failure("test-server")
+    breaker.record_failure("test-server")
     # Only 2 consecutive failures — not at threshold.
     assert breaker.is_tripped is False
+
+
+def test_circuit_breaker_trip_log_includes_server_name(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    When the breaker trips, the warning log message includes the
+    server name so operators can identify which MCP server failed.
+
+    :param caplog: Pytest fixture that captures log records.
+    """
+    breaker = _CircuitBreaker(failure_threshold=2, cooldown_seconds=10.0)
+    with caplog.at_level(logging.WARNING, logger="agent_plane.tools.mcp"):
+        breaker.record_failure("my-flaky-server")
+        breaker.record_failure("my-flaky-server")
+
+    assert breaker.is_tripped is True
+    # The trip log must name the specific server.
+    trip_messages = [r.message for r in caplog.records if "tripped" in r.message]
+    assert len(trip_messages) == 1, f"Expected 1 trip log, got {len(trip_messages)}"
+    assert "my-flaky-server" in trip_messages[0]
 
 
 def test_circuit_breaker_default_constants() -> None:

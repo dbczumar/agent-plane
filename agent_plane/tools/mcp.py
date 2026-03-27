@@ -183,19 +183,24 @@ class _CircuitBreaker:
         self._consecutive_failures = 0
         self._tripped_at = None
 
-    def record_failure(self) -> None:
+    def record_failure(self, server_name: str) -> None:
         """
         Record a failed call and trip if threshold reached.
 
         Increments the consecutive failure counter. If the counter
         reaches ``failure_threshold``, trips the breaker by
         recording the current monotonic time.
+
+        :param server_name: The MCP server name for log messages,
+            e.g. ``"github"``.
         """
         self._consecutive_failures += 1
         if self._consecutive_failures >= self.failure_threshold:
             self._tripped_at = time.monotonic()
             _logger.warning(
-                "Circuit breaker tripped after %d consecutive failures — disabling for %.0fs",
+                "Circuit breaker tripped for MCP server %r after %d consecutive "
+                "failures — disabling for %.0fs",
+                server_name,
                 self._consecutive_failures,
                 self.cooldown_seconds,
             )
@@ -468,7 +473,7 @@ class McpServerConnection:
                 retry=retry,
             )
         except Exception:
-            self._breaker.record_failure()
+            self._breaker.record_failure(self.config.name)
             raise
         self._breaker.record_success()
         return result
