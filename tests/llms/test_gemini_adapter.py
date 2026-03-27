@@ -10,6 +10,7 @@ from llms.adapters.gemini import (
     _extract_usage,
     _gemini_to_chat,
     _normalize_finish_reason,
+    _translate_part_to_gemini,
 )
 
 # ── Request translation ──────────────────────────────────
@@ -234,3 +235,74 @@ def test_usage_extraction() -> None:
         "completion_tokens": 20,
         "total_tokens": 30,
     }
+
+
+# ── Multimodal content translation ──────────────────────
+
+
+def test_user_message_with_image_data_uri() -> None:
+    """
+    User message with image_url data URI translates to Gemini
+    inlineData part.
+    """
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/jpeg;base64,/9j/abc"},
+                },
+            ],
+        },
+    ]
+    payload = _chat_to_gemini(messages, None, {})
+    parts = payload["contents"][0]["parts"]
+    # Two parts: text + inlineData.
+    assert len(parts) == 2
+    assert parts[0] == {"text": "Describe this"}
+    assert parts[1] == {
+        "inlineData": {"mimeType": "image/jpeg", "data": "/9j/abc"},
+    }
+
+
+def test_user_message_with_external_url_becomes_text() -> None:
+    """
+    External URL falls back to text placeholder since Gemini
+    does not support URL references in content parts.
+    """
+    part = {
+        "type": "image_url",
+        "image_url": {"url": "https://example.com/photo.png"},
+    }
+    result = _translate_part_to_gemini(part)
+    assert result == {"text": "[image: https://example.com/photo.png]"}
+
+
+def test_user_message_with_file_data() -> None:
+    """
+    input_file with file_data translates to Gemini inlineData.
+    """
+    part = {
+        "type": "input_file",
+        "file_data": "JVBERi0xLjQK",
+        "content_type": "application/pdf",
+    }
+    result = _translate_part_to_gemini(part)
+    assert result == {
+        "inlineData": {
+            "mimeType": "application/pdf",
+            "data": "JVBERi0xLjQK",
+        },
+    }
+
+
+def test_string_user_content_becomes_text_part() -> None:
+    """
+    String user content becomes a single text part —
+    backward compatibility with text-only messages.
+    """
+    messages = [{"role": "user", "content": "Hello"}]
+    payload = _chat_to_gemini(messages, None, {})
+    assert payload["contents"][0]["parts"] == [{"text": "Hello"}]

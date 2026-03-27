@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 
 from agent_plane.errors import AgentPlaneError, ErrorCode
+from llms.adapters._content import parse_data_uri
 from llms.adapters.base import BaseAdapter
 
 _BASE_URL = "https://api.anthropic.com/v1"
@@ -108,7 +109,7 @@ def _chat_to_anthropic(
         elif role == "tool":
             converted.append(_convert_tool_message(m))
         elif role == "user":
-            converted.append(m)
+            converted.append(_convert_user_message(m))
 
     payload["messages"] = converted
 
@@ -191,6 +192,83 @@ def _convert_tool_message(m: dict[str, Any]) -> dict[str, Any]:
             }
         ],
     }
+
+
+def _convert_user_message(m: dict[str, Any]) -> dict[str, Any]:
+    """
+    Convert a Chat Completions user message to Anthropic format.
+
+    When content is a string, passes through as-is (Anthropic
+    accepts string content). When content is a list (multimodal),
+    translates each part to Anthropic's native format.
+
+    :param m: User message with string or list content.
+    :returns: Anthropic-format user message.
+    """
+    content = m.get("content")
+    if not isinstance(content, list):
+        return m
+    return {
+        "role": "user",
+        "content": [_translate_part_to_anthropic(part) for part in content],
+    }
+
+
+def _translate_part_to_anthropic(part: dict[str, Any]) -> dict[str, Any]:
+    """
+    Translate a single Chat Completions content part to Anthropic format.
+
+    - ``text`` → ``{"type": "text", "text": "..."}``
+    - ``image_url`` with data URI → ``{"type": "image", "source":
+      {"type": "base64", "media_type": "...", "data": "..."}}``
+    - ``image_url`` with external URL → ``{"type": "image", "source":
+      {"type": "url", "url": "..."}}``
+    - ``input_file`` with file_data → ``{"type": "document", "source":
+      {"type": "base64", "media_type": "...", "data": "..."}}``
+    - Unrecognized → passed through as-is.
+
+    :param part: A Chat Completions content part dict.
+    :returns: An Anthropic content block dict.
+    """
+    part_type = part.get("type")
+
+    if part_type == "text":
+        return {"type": "text", "text": part["text"]}
+
+    if part_type == "image_url":
+        image_url = part["image_url"]
+        url = image_url["url"]
+        parsed = parse_data_uri(url)
+        if parsed is not None:
+            return {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": parsed.media_type,
+                    "data": parsed.data,
+                },
+            }
+        # External URL — Anthropic supports URL source type.
+        return {
+            "type": "image",
+            "source": {"type": "url", "url": url},
+        }
+
+    if part_type == "input_file":
+        return {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                # application/octet-stream is the RFC 2046 default for
+                # unknown binary content — safe fallback when file store
+                # metadata lacks a content_type.
+                "media_type": part.get("content_type", "application/octet-stream"),
+                "data": part["file_data"],
+            },
+        }
+
+    # Unrecognized part type — pass through for forward compat.
+    return part
 
 
 def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:

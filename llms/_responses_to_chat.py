@@ -25,6 +25,86 @@ from llms.types import (
 
 # ── Input direction: Responses API -> Chat Completions ────
 
+# Block types that carry plain text in a ``text`` field.
+_TEXT_BLOCK_TYPES = {"input_text", "output_text", "text"}
+
+
+def _translate_content(
+    content: list[dict[str, Any]] | str | None,
+) -> list[dict[str, Any]] | str | None:
+    """
+    Translate Responses API content to Chat Completions content.
+
+    If *content* is a list of content blocks, each block is converted
+    to Chat Completions format via :func:`_translate_block`. If every
+    block is a text block, the result is collapsed to a plain string
+    (many providers handle plain strings more efficiently than
+    single-element content arrays).
+
+    If *content* is already a string or ``None``, it passes through
+    unchanged.
+
+    :param content: Responses API content — a list of content block
+        dicts, a plain string, or ``None``.
+    :returns: Chat Completions content — a list of Chat Completions
+        content parts, a plain string, or ``None``.
+    """
+    if not isinstance(content, list):
+        return content
+
+    translated = [_translate_block(block) for block in content]
+
+    # Collapse to plain string when all blocks are text — avoids
+    # unnecessarily sending a content array to providers that only
+    # support string content for text-only messages.
+    if all(part["type"] == "text" for part in translated):
+        return "\n".join(part["text"] for part in translated)
+
+    return translated
+
+
+def _translate_block(block: dict[str, Any]) -> dict[str, Any]:
+    """
+    Translate a single Responses API content block to Chat
+    Completions format.
+
+    Mapping:
+
+    - ``input_text`` / ``output_text`` / ``text``
+      → ``{"type": "text", "text": "..."}``
+    - ``input_image`` (with ``image_url``)
+      → ``{"type": "image_url", "image_url": {"url": "...", "detail": "..."}}``
+    - ``input_file`` (with ``file_data``)
+      → passed through as-is (provider adapters handle in Phase 3)
+    - Unrecognized types → passed through as-is for forward
+      compatibility.
+
+    :param block: A single Responses API content block dict,
+        e.g. ``{"type": "input_text", "text": "Hello"}``.
+    :returns: A Chat Completions content part dict.
+    """
+    block_type = block.get("type")
+
+    if block_type in _TEXT_BLOCK_TYPES:
+        return {"type": "text", "text": block["text"]}
+
+    if block_type == "input_image":
+        image_url_value = block.get("image_url")
+        if image_url_value is not None:
+            result: dict[str, Any] = {
+                "type": "image_url",
+                "image_url": {"url": image_url_value},
+            }
+            detail = block.get("detail")
+            if detail is not None:
+                result["image_url"]["detail"] = detail
+            return result
+
+    # input_file, input_audio, and any future types: pass through
+    # as-is. Provider adapters (Phase 3) are responsible for
+    # translating these into their native formats.
+    return block
+
 
 def responses_input_to_chat_messages(
     input_items: list[dict[str, Any]],
@@ -90,11 +170,14 @@ def responses_input_to_chat_messages(
                 }
             )
         else:
-            # Regular message (user or assistant)
+            # Regular message (user or assistant).
+            # Content may be a list of content blocks (multimodal)
+            # or a plain string (text-only legacy path).
+            raw_content = item.get("content")
             messages.append(
                 {
                     "role": item["role"],
-                    "content": item.get("content"),
+                    "content": _translate_content(raw_content),
                 }
             )
 

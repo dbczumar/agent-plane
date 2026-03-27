@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 
 from agent_plane.errors import AgentPlaneError, ErrorCode
+from llms.adapters._content import parse_data_uri
 from llms.adapters.base import BaseAdapter
 
 _BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
@@ -226,8 +227,7 @@ def _chat_to_gemini(
                 }
             )
         else:
-            content = m.get("content")
-            parts = [{"text": content}] if content else []
+            parts = _content_to_gemini_parts(m.get("content"))
             contents.append({"role": gemini_role, "parts": parts})
 
     payload["contents"] = contents
@@ -274,6 +274,77 @@ def _assistant_tool_calls_to_parts(
             }
         )
     return parts
+
+
+def _content_to_gemini_parts(
+    content: list[dict[str, Any]] | str | None,
+) -> list[dict[str, Any]]:
+    """
+    Convert Chat Completions content to Gemini ``parts`` array.
+
+    Handles string content (text-only), list content (multimodal),
+    and ``None`` (empty parts).
+
+    :param content: Chat Completions content — string, list of
+        content part dicts, or ``None``.
+    :returns: Gemini parts list.
+    """
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"text": content}]
+    return [_translate_part_to_gemini(part) for part in content]
+
+
+def _translate_part_to_gemini(part: dict[str, Any]) -> dict[str, Any]:
+    """
+    Translate a single Chat Completions content part to Gemini format.
+
+    - ``text`` → ``{"text": "..."}``
+    - ``image_url`` with data URI → ``{"inlineData":
+      {"mimeType": "...", "data": "..."}}``
+    - ``image_url`` with external URL → ``{"text": "[image: <url>]"}``
+      (Gemini does not support URL references in content parts)
+    - ``input_file`` with file_data → ``{"inlineData":
+      {"mimeType": "...", "data": "..."}}``
+    - Unrecognized → passed through as-is.
+
+    :param part: A Chat Completions content part dict.
+    :returns: A Gemini part dict.
+    """
+    part_type = part.get("type")
+
+    if part_type == "text":
+        return {"text": part["text"]}
+
+    if part_type == "image_url":
+        image_url = part["image_url"]
+        url = image_url["url"]
+        parsed = parse_data_uri(url)
+        if parsed is not None:
+            return {
+                "inlineData": {
+                    "mimeType": parsed.media_type,
+                    "data": parsed.data,
+                },
+            }
+        # Gemini does not support URL references in content parts.
+        # Pass URL as text so the model at least sees the reference.
+        return {"text": f"[image: {url}]"}
+
+    if part_type == "input_file":
+        return {
+            "inlineData": {
+                # application/octet-stream is the RFC 2046 default for
+                # unknown binary content — safe fallback when file store
+                # metadata lacks a content_type.
+                "mimeType": part.get("content_type", "application/octet-stream"),
+                "data": part["file_data"],
+            },
+        }
+
+    # Unrecognized part type — pass through for forward compat.
+    return part
 
 
 def _convert_tools(

@@ -13,6 +13,7 @@ import time
 from collections.abc import Iterator
 from typing import Any
 
+from llms.adapters._content import parse_data_uri
 from llms.adapters.base import BaseAdapter
 
 # Default connect timeout: 30s to establish TCP connection.
@@ -233,11 +234,87 @@ def _messages_to_converse(
                 }
             )
         else:
-            content = msg.get("content")
-            blocks = [{"text": content}] if content else []
+            blocks = _content_to_converse_blocks(msg.get("content"))
             converse_messages.append({"role": "user", "content": blocks})
 
     return converse_messages, system_prompts or None
+
+
+def _content_to_converse_blocks(
+    content: list[dict[str, Any]] | str | None,
+) -> list[dict[str, Any]]:
+    """
+    Convert Chat Completions content to Bedrock Converse content blocks.
+
+    Handles string content (text-only), list content (multimodal),
+    and ``None`` (empty blocks).
+
+    :param content: Chat Completions content — string, list of
+        content part dicts, or ``None``.
+    :returns: Bedrock Converse content block list.
+    """
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"text": content}]
+    return [_translate_part_to_converse(part) for part in content]
+
+
+def _translate_part_to_converse(part: dict[str, Any]) -> dict[str, Any]:
+    """
+    Translate a single Chat Completions content part to Bedrock
+    Converse format.
+
+    - ``text`` → ``{"text": "..."}``
+    - ``image_url`` with data URI → ``{"image": {"format": "...",
+      "source": {"bytes": "..."}}}``
+    - ``input_file`` with file_data → ``{"document": {"format": "...",
+      "name": "...", "source": {"bytes": "..."}}}``
+    - Unrecognized → rendered as text placeholder.
+
+    :param part: A Chat Completions content part dict.
+    :returns: A Bedrock Converse content block dict.
+    """
+    part_type = part.get("type")
+
+    if part_type == "text":
+        return {"text": part["text"]}
+
+    if part_type == "image_url":
+        image_url = part["image_url"]
+        url = image_url["url"]
+        parsed = parse_data_uri(url)
+        if parsed is not None:
+            # MIME types are always type/subtype per RFC 2045.
+            fmt = parsed.media_type.split("/")[-1]
+            return {
+                "image": {
+                    "format": fmt,
+                    "source": {"bytes": parsed.data},
+                },
+            }
+        # Bedrock does not support external URLs in image blocks.
+        return {"text": f"[image: {url}]"}
+
+    if part_type == "input_file":
+        # application/octet-stream is the RFC 2046 default for
+        # unknown binary content — safe fallback when file store
+        # metadata lacks a content_type.
+        media_type = part.get("content_type", "application/octet-stream")
+        # MIME types are always type/subtype per RFC 2045.
+        fmt = media_type.split("/")[-1]
+        result: dict[str, Any] = {
+            "document": {
+                "format": fmt,
+                "source": {"bytes": part["file_data"]},
+            },
+        }
+        if filename := part.get("filename"):
+            result["document"]["name"] = filename
+        return result
+
+    # Unrecognized part type — render as text placeholder.
+    return {"text": f"[unsupported content: {part_type}]"}
 
 
 def _convert_tools(

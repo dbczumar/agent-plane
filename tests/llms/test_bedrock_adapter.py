@@ -7,6 +7,7 @@ from llms.adapters.bedrock import (
     _converse_to_chat,
     _convert_tools,
     _messages_to_converse,
+    _translate_part_to_converse,
 )
 
 # ── Request translation ──────────────────────────────────
@@ -220,3 +221,79 @@ def test_converse_mixed_text_and_tool_use() -> None:
     chat = _converse_to_chat(response, "bedrock-model")
     assert chat["choices"][0]["message"]["content"] == "Let me check."
     assert len(chat["choices"][0]["message"]["tool_calls"]) == 1
+
+
+# ── Multimodal content translation ──────────────────────
+
+
+def test_user_message_with_image_data_uri() -> None:
+    """
+    User message with image_url data URI translates to Bedrock
+    image block with format and bytes.
+    """
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,abc123"},
+                },
+            ],
+        },
+    ]
+    converse_msgs, _ = _messages_to_converse(messages)
+    blocks = converse_msgs[0]["content"]
+    # Two blocks: text + image.
+    assert len(blocks) == 2
+    assert blocks[0] == {"text": "Describe this"}
+    assert blocks[1] == {
+        "image": {
+            "format": "png",
+            "source": {"bytes": "abc123"},
+        },
+    }
+
+
+def test_user_message_with_external_url_becomes_text() -> None:
+    """
+    External URL falls back to text placeholder since Bedrock
+    does not support URL references in image blocks.
+    """
+    part = {
+        "type": "image_url",
+        "image_url": {"url": "https://example.com/photo.png"},
+    }
+    result = _translate_part_to_converse(part)
+    assert result == {"text": "[image: https://example.com/photo.png]"}
+
+
+def test_user_message_with_file_data() -> None:
+    """
+    input_file with file_data translates to Bedrock document block.
+    """
+    part = {
+        "type": "input_file",
+        "file_data": "JVBERi0xLjQK",
+        "content_type": "application/pdf",
+        "filename": "report.pdf",
+    }
+    result = _translate_part_to_converse(part)
+    assert result == {
+        "document": {
+            "format": "pdf",
+            "name": "report.pdf",
+            "source": {"bytes": "JVBERi0xLjQK"},
+        },
+    }
+
+
+def test_string_user_content_becomes_text_block() -> None:
+    """
+    String user content becomes a single text block —
+    backward compatibility with text-only messages.
+    """
+    messages = [{"role": "user", "content": "Hello"}]
+    converse_msgs, _ = _messages_to_converse(messages)
+    assert converse_msgs[0]["content"] == [{"text": "Hello"}]

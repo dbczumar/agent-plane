@@ -690,6 +690,8 @@ async def test_persist_first_prevents_ghost_tokens(
     assert len(assistant_in_prompt) == 1
     # Content is now a list of content-block dicts (not a plain string)
     # after the multimodal pass-through change in history_to_input_items.
+    # .get("text", "") handles non-text blocks (e.g. input_image) that
+    # lack a "text" key — they contribute nothing to the joined string.
     assistant_content = assistant_in_prompt[0]["content"]
     assistant_text = " ".join(block.get("text", "") for block in assistant_content)
     assert "First response" in assistant_text

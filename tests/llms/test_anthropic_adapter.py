@@ -9,6 +9,7 @@ from llms.adapters.anthropic import (
     _chat_to_anthropic,
     _convert_tool_choice,
     _convert_tools,
+    _translate_part_to_anthropic,
 )
 
 
@@ -175,3 +176,84 @@ def test_anthropic_max_tokens_stop_reason() -> None:
     }
     chat = _anthropic_to_chat(resp)
     assert chat["choices"][0]["finish_reason"] == "length"
+
+
+# ── Multimodal content translation ──────────────────────
+
+
+def test_user_message_with_image_data_uri() -> None:
+    """
+    User message with image_url data URI translates to Anthropic
+    base64 image source.
+    """
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,abc123"},
+                },
+            ],
+        },
+    ]
+    payload = _chat_to_anthropic(messages, "claude-test", None, {})
+    content = payload["messages"][0]["content"]
+    # Two blocks: text + image.
+    assert len(content) == 2
+    assert content[0] == {"type": "text", "text": "Describe this"}
+    assert content[1] == {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "abc123",
+        },
+    }
+
+
+def test_user_message_with_external_url() -> None:
+    """
+    External image URL translates to Anthropic URL source type.
+    """
+    part = {
+        "type": "image_url",
+        "image_url": {"url": "https://example.com/photo.png"},
+    }
+    result = _translate_part_to_anthropic(part)
+    assert result == {
+        "type": "image",
+        "source": {"type": "url", "url": "https://example.com/photo.png"},
+    }
+
+
+def test_user_message_with_file_data() -> None:
+    """
+    input_file with file_data translates to Anthropic document type.
+    """
+    part = {
+        "type": "input_file",
+        "file_data": "JVBERi0xLjQK",
+        "content_type": "application/pdf",
+    }
+    result = _translate_part_to_anthropic(part)
+    assert result == {
+        "type": "document",
+        "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": "JVBERi0xLjQK",
+        },
+    }
+
+
+def test_string_user_content_passes_through() -> None:
+    """
+    String user content passes through unchanged — no translation
+    needed for text-only messages.
+    """
+    messages = [{"role": "user", "content": "Hello"}]
+    payload = _chat_to_anthropic(messages, "claude-test", None, {})
+    # String content passed through as-is.
+    assert payload["messages"][0]["content"] == "Hello"

@@ -1,6 +1,10 @@
 """Tests for llms._responses_to_chat — bidirectional translation."""
 
+import pytest
+
 from llms._responses_to_chat import (
+    _translate_block,
+    _translate_content,
     chat_response_to_response,
     chat_stream_to_response_events,
     responses_input_to_chat_messages,
@@ -128,6 +132,188 @@ def test_full_conversation_round_trip() -> None:
         "role": "assistant",
         "content": "It's rainy and 15C in London.",
     }
+
+
+# ── Content block translation (multimodal) ─────────────────
+
+
+def test_text_only_content_blocks_collapse_to_string() -> None:
+    """
+    When all content blocks are text, _translate_content collapses
+    them to a plain string — avoids sending content arrays to
+    providers that only support string content for text-only messages.
+    """
+    content = [
+        {"type": "input_text", "text": "Hello"},
+        {"type": "input_text", "text": "World"},
+    ]
+    result = _translate_content(content)
+    # Collapsed to a single joined string, not a list.
+    assert result == "Hello\nWorld"
+
+
+def test_single_text_block_collapses_to_string() -> None:
+    """
+    Even a single text block collapses to a plain string — this is
+    the common case and ensures backward compatibility with providers
+    that expect string content.
+    """
+    content = [{"type": "input_text", "text": "Hello"}]
+    assert _translate_content(content) == "Hello"
+
+
+def test_string_content_passes_through() -> None:
+    """
+    Plain string content (legacy path) passes through unchanged.
+    """
+    assert _translate_content("Hello") == "Hello"
+
+
+def test_none_content_passes_through() -> None:
+    """
+    None content (e.g. assistant messages with only tool_calls)
+    passes through unchanged.
+    """
+    assert _translate_content(None) is None
+
+
+def test_image_block_translated_to_chat_format() -> None:
+    """
+    input_image with image_url translates to Chat Completions
+    image_url format with nested url field.
+    """
+    block = {
+        "type": "input_image",
+        "image_url": "data:image/png;base64,abc123",
+        "detail": "high",
+    }
+    result = _translate_block(block)
+    assert result == {
+        "type": "image_url",
+        "image_url": {
+            "url": "data:image/png;base64,abc123",
+            "detail": "high",
+        },
+    }
+
+
+def test_image_block_without_detail() -> None:
+    """
+    input_image without detail field omits detail from output —
+    we don't invent a default.
+    """
+    block = {
+        "type": "input_image",
+        "image_url": "data:image/png;base64,abc123",
+    }
+    result = _translate_block(block)
+    assert result == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,abc123"},
+    }
+    # detail must NOT be present — no invented default.
+    assert "detail" not in result["image_url"]
+
+
+def test_input_file_block_passes_through() -> None:
+    """
+    input_file blocks pass through as-is — provider adapters
+    (Phase 3) are responsible for translating to native format.
+    """
+    block = {
+        "type": "input_file",
+        "file_data": "JVBERi0xLjQK",
+        "filename": "report.pdf",
+        "content_type": "application/pdf",
+    }
+    result = _translate_block(block)
+    # Passed through unchanged — same object.
+    assert result is block
+
+
+def test_unknown_block_type_passes_through() -> None:
+    """
+    Unrecognized block types (e.g. input_audio) pass through
+    as-is for forward compatibility.
+    """
+    block = {"type": "input_audio", "file_data": "base64data"}
+    result = _translate_block(block)
+    assert result is block
+
+
+def test_mixed_text_and_image_stays_as_list() -> None:
+    """
+    When content contains both text and non-text blocks, the
+    result is a list (not collapsed to string) so multimodal
+    content reaches the provider.
+    """
+    content = [
+        {"type": "input_text", "text": "What's in this image?"},
+        {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,abc",
+            "detail": "auto",
+        },
+    ]
+    result = _translate_content(content)
+    assert isinstance(result, list)
+    # Two translated blocks: text + image_url.
+    assert len(result) == 2
+    assert result[0] == {"type": "text", "text": "What's in this image?"}
+    assert result[1] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,abc", "detail": "auto"},
+    }
+
+
+def test_multimodal_content_in_full_message() -> None:
+    """
+    End-to-end: a user message with content blocks flows through
+    responses_input_to_chat_messages with correct translation.
+    """
+    items = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Describe this"},
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,img",
+                },
+            ],
+        },
+    ]
+    messages = responses_input_to_chat_messages(items, None)
+    # One user message with translated content blocks.
+    assert len(messages) == 1
+    content = messages[0]["content"]
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "Describe this"}
+    assert content[1] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,img"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("block_type", "text_key"),
+    [
+        pytest.param("input_text", "text", id="input_text"),
+        pytest.param("output_text", "text", id="output_text"),
+        pytest.param("text", "text", id="bare_text"),
+    ],
+)
+def test_all_text_block_types_translate(
+    block_type: str,
+    text_key: str,
+) -> None:
+    """
+    All recognized text block types (input_text, output_text, text)
+    translate to Chat Completions ``{"type": "text", ...}`` format.
+    """
+    block = {"type": block_type, text_key: "Hello"}
+    result = _translate_block(block)
+    assert result == {"type": "text", "text": "Hello"}
 
 
 # ── Output direction: Chat Completions -> Responses API ───
