@@ -115,7 +115,7 @@ def _parse_llm(raw: dict[str, Any] | None) -> LLMConfig | None:
     connection: dict[str, str] | None = None
     if isinstance(connection_raw, dict):
         # Expand ${VAR} references so api_key: ${OPENAI_API_KEY} works.
-        connection = _expand_env_vars({str(k): str(v) for k, v in connection_raw.items()})
+        connection = expand_env_vars({str(k): str(v) for k, v in connection_raw.items()})
     timeout = int(raw["timeout"]) if "timeout" in raw else 300
     retry = _parse_retry(raw.get("retry"))
     reserved = {"model", "connection", "timeout", "retry"}
@@ -507,7 +507,7 @@ def _discover_mcp_servers(
                 name=str(name),
                 description=raw.get("description"),
                 url=str(url),
-                headers=_expand_env_vars(raw.get("headers", {})),
+                headers=expand_env_vars(raw.get("headers", {})),
                 timeout=int(raw["timeout"]) if "timeout" in raw else None,
                 retry=_parse_retry(raw["retry"]) if "retry" in raw else None,
             )

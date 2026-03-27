@@ -180,7 +180,21 @@ def deploy(path: str, server: str) -> None:
 
 def _bundle(source: Path) -> bytes:
     """
-    Produce a tar.gz bundle from a directory or pass through an existing tarball.
+    Produce a tar.gz bundle from a directory or pass
+    through an existing tarball.
+
+    Environment variable references (``${VAR}``) in
+    ``config.yaml`` and ``tools/mcp/*.yaml`` are expanded
+    using the client's environment before bundling. This
+    ensures the server receives resolved secrets rather
+    than unresolved ``${VAR}`` references it cannot
+    resolve.
+
+    :param source: Path to an agent image directory or an
+        existing ``.tar.gz`` bundle file.
+    :returns: The gzipped tarball bytes.
+    :raises AgentPlaneError: If a required env var is
+        missing during expansion.
     """
     if source.is_file():
         return source.read_bytes()
@@ -188,14 +202,132 @@ def _bundle(source: Path) -> bytes:
     import io
     import tarfile
 
+    # Pre-resolve env vars in YAML files that contain secrets.
+    resolved = _resolve_bundle_env_vars(source)
+
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         for file_path in source.rglob("*"):
             if file_path.is_file():
-                # Relative path inside the bundle (e.g. "config.yaml")
                 arcname = str(file_path.relative_to(source))
-                tf.add(str(file_path), arcname=arcname)
+                if arcname in resolved:
+                    # Write the resolved YAML instead of the
+                    # original file (which has ${VAR} refs).
+                    data = resolved[arcname].encode("utf-8")
+                    info = tarfile.TarInfo(name=arcname)
+                    info.size = len(data)
+                    tf.addfile(info, io.BytesIO(data))
+                else:
+                    tf.add(str(file_path), arcname=arcname)
     return buf.getvalue()
+
+
+def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
+    """
+    Expand ``${VAR}`` references in YAML files that contain
+    secrets, using the client's environment.
+
+    Returns a mapping of ``arcname → resolved YAML text`` for
+    files that were modified. Files without env var references
+    are omitted (bundled as-is).
+
+    Expanded fields:
+
+    - ``config.yaml``: ``llm.connection.*`` values and
+      ``tools.builtins[*]`` dict-entry values (except ``name``)
+    - ``tools/mcp/*.yaml``: ``headers.*`` values
+
+    :param source: The agent image directory.
+    :returns: ``{arcname: resolved_yaml_text}`` for files
+        that had env vars expanded.
+    :raises AgentPlaneError: If a ``${VAR}`` reference
+        cannot be resolved from the environment.
+    """
+    from agent_plane.spec import expand_env_vars
+
+    resolved: dict[str, str] = {}
+
+    # ── config.yaml ──────────────────────────────────
+    config_path = source / "config.yaml"
+    if config_path.exists():
+        raw = yaml.safe_load(config_path.read_text())
+        if isinstance(raw, dict):
+            changed = _expand_config_env_vars(raw, expand_env_vars)
+            if changed:
+                resolved["config.yaml"] = yaml.dump(
+                    raw,
+                    default_flow_style=False,
+                )
+
+    # ── tools/mcp/*.yaml ─────────────────────────────
+    mcp_dir = source / "tools" / "mcp"
+    if mcp_dir.is_dir():
+        for yaml_file in sorted(mcp_dir.glob("*.yaml")):
+            raw = yaml.safe_load(yaml_file.read_text())
+            if isinstance(raw, dict) and "headers" in raw:
+                headers = raw.get("headers")
+                if isinstance(headers, dict):
+                    raw["headers"] = expand_env_vars(
+                        {str(k): str(v) for k, v in headers.items()},
+                    )
+                    arcname = str(yaml_file.relative_to(source))
+                    resolved[arcname] = yaml.dump(
+                        raw,
+                        default_flow_style=False,
+                    )
+
+    return resolved
+
+
+def _expand_config_env_vars(
+    raw: dict[str, Any],
+    expand_fn: Any,
+) -> bool:
+    """
+    Expand ``${VAR}`` references in-place in a parsed
+    ``config.yaml`` dict. Returns ``True`` if any field
+    was expanded.
+
+    Expanded fields:
+
+    - ``llm.connection`` — all values
+    - ``tools.builtins[*]`` — dict-entry values except ``name``
+
+    :param raw: The parsed config.yaml dict (modified in-place).
+    :param expand_fn: The ``expand_env_vars`` function.
+    :returns: ``True`` if any values were expanded.
+    """
+    changed = False
+
+    # llm.connection
+    llm = raw.get("llm")
+    if isinstance(llm, dict):
+        connection = llm.get("connection")
+        if isinstance(connection, dict):
+            llm["connection"] = expand_fn(
+                {str(k): str(v) for k, v in connection.items()},
+            )
+            changed = True
+
+    # tools.builtins dict entries
+    tools = raw.get("tools")
+    if isinstance(tools, dict):
+        builtins = tools.get("builtins")
+        if isinstance(builtins, list):
+            for i, entry in enumerate(builtins):
+                if isinstance(entry, dict):
+                    config_fields = {str(k): str(v) for k, v in entry.items() if k != "name"}
+                    if config_fields:
+                        expanded = expand_fn(config_fields)
+                        # Rebuild the entry with name first,
+                        # then expanded config fields.
+                        builtins[i] = {
+                            "name": entry["name"],
+                            **expanded,
+                        }
+                        changed = True
+
+    return changed
 
 
 if __name__ == "__main__":

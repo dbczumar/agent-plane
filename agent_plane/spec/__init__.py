@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from agent_plane.errors import AgentPlaneError, ErrorCode
-from agent_plane.spec.parser import parse
+from agent_plane.spec.parser import expand_env_vars, parse
 from agent_plane.spec.tar_utils import ExtractionError, extract_safe
 from agent_plane.spec.types import (
     AgentSpec,
@@ -36,6 +36,7 @@ __all__ = [
     "SkillSpec",
     "ToolsConfig",
     "ValidationResult",
+    "expand_env_vars",
     "extract_safe",
     "load",
     "parse",
