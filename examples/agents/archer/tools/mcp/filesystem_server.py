@@ -15,7 +15,8 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("filesystem")
+# port=8100 matches the url in filesystem.yaml
+mcp = FastMCP("filesystem", port=8100)
 
 # Root directory the server is allowed to access. Defaults to
 # the current working directory when launched by agent-plane.
@@ -100,4 +101,5 @@ def search_files(pattern: str, path: str = ".") -> str:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    # Serve over HTTP (SSE) on port 8100 — matches filesystem.yaml url.
+    mcp.run(transport="sse")

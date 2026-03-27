@@ -1,3 +1,4 @@
 name: filesystem
 description: Read, search, and navigate files on the local filesystem.
-url: http://localhost:8100/mcp
+transport: http
+url: http://localhost:8100/sse

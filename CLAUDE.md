@@ -192,6 +192,14 @@ Check each file against this checklist:
     (e.g. domain-specific invariants that no library enforces), add
     a comment explaining why no existing library suffices.
 
+30. NO SKIPPED TESTS: Never use `pytest.mark.skip` or
+    `pytest.mark.skipIf` to defer broken or incomplete tests. Skipped
+    tests are invisible coverage loss — they silently rot and nobody
+    remembers to unskip them. If a test can't pass, rewrite it to
+    work with the current architecture, or delete it if the feature
+    no longer exists. Never mark a test as skipped "until we rewrite
+    it later."
+
 Report each finding as:
   [FILE:LINE] ISSUE — description of the problem and suggested fix
 
@@ -204,6 +212,76 @@ If no issues found, say "No issues found."
 - After refactoring or renaming
 - After adding new store implementations or route handlers
 - NOT needed for: documentation-only changes, memory updates, test-only changes
+
+## Mandatory Test Authoring Review
+
+**🚨 EXTREMELY IMPORTANT: After writing or modifying ANY test code (before committing), you MUST spawn a SECOND review subagent that checks test authoring guidelines. This runs IN ADDITION to the anti-pattern review above. Both must pass before committing.**
+
+### How to run the test authoring review
+
+Spawn an `Explore` subagent with the following prompt structure:
+
+```
+Review the following test files for test authoring guideline violations:
+[list the test files you changed or created]
+
+Check each test file against this checklist:
+
+1. NO SKIPPED TESTS: No `pytest.mark.skip` or `pytest.mark.skipIf`.
+   Tests must pass or be deleted, never deferred. Skipped tests are
+   invisible coverage loss that silently rots.
+
+2. TEST INTEGRITY: For every test, can you explain which production
+   breakage would cause it to fail? If the answer is "nothing" or
+   "I'm not sure," the test is fake.
+
+3. NO FAKE CONCURRENCY: Tests claiming to test concurrency must have
+   a blocked call (mock_llm.add_call(block=True)), a sync gate
+   (call_event.wait()), a concurrent action while blocked, and a
+   release. Sequential operations are not concurrency tests.
+
+4. ASSERTION DEPTH: Assertions must check actual content values, not
+   just structure. No vacuous assertions (is not None, len > 0).
+   Every workflow test must assert on persisted store state.
+
+5. ASSERTION DOCUMENTATION: Non-trivial numeric assertions (call
+   counts, lengths) must have comments explaining what the expected
+   value means and what a wrong value would indicate.
+
+6. MOCK INTEGRITY: No MagicMock when real types exist. All data
+   objects must use real types (SDK types, Pydantic, dataclasses).
+   MagicMock only for client/interface stubs.
+
+7. NO INTERNAL METHOD CALLS: Tests must not call _-prefixed private
+   methods. Test through the public API only.
+
+8. NO TIME.SLEEP: No time.sleep() in tests. Use await, event-driven
+   checks, or restructure.
+
+9. FUNCTION-BASED ONLY: No class TestFoo groupings. Use plain
+   functions with fixtures.
+
+10. FIXTURE LOCALITY: Fixtures belong in the test file unless shared
+    across multiple files.
+
+11. RIGHT TEST LAYER: Ordering invariants and cursor arithmetic
+    belong in focused unit tests, not workflow integration tests.
+
+12. NO DUPLICATE TESTS: Grep for the same API calls and assertions
+    in other test files before writing a new test.
+
+Report each finding as:
+  [FILE:LINE] ISSUE — description and suggested fix
+
+If no issues found, say "No issues found."
+```
+
+### When to run
+
+- After writing any new test
+- After modifying existing test assertions, fixtures, or mocks
+- After adding test helpers or conftest changes
+- Runs IN ADDITION to the anti-pattern review — both are mandatory
 
 ## Testing: Mock Integrity and Assertion Depth
 
