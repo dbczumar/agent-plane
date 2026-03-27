@@ -26,6 +26,7 @@ import logging
 import mimetypes
 import os
 import pathlib
+import shlex
 import signal
 import subprocess
 import sys
@@ -1025,10 +1026,32 @@ def _parse_clipboard_paths(clipboard: str) -> list[_UploadedFile]:
         line = line.strip()
         if not line:
             continue
-        path = pathlib.Path(line)
+        # Strip surrounding quotes added by some terminals on
+        # drag-and-drop (e.g. '/Users/me/my file.png').
+        stripped = line.strip("'\"")
+        path = pathlib.Path(stripped)
         if _is_supported_file(path):
             paths.append(path)
     return _upload_paths(paths)
+
+
+def _shell_tokenize(text: str) -> list[str]:
+    """
+    Split user input into tokens, handling shell quoting and escapes.
+
+    Terminals convert drag-and-drop into paths with shell escaping,
+    e.g. ``'/Users/me/my file.png'`` or ``/Users/me/my\\ file.png``.
+    ``shlex.split`` handles both. Falls back to naive whitespace
+    split if the input has unbalanced quotes.
+
+    :param text: Raw user input text.
+    :returns: List of unescaped tokens.
+    """
+    try:
+        return shlex.split(text)
+    except ValueError:
+        # Unbalanced quotes — fall back to whitespace split.
+        return text.split()
 
 
 def _extract_file_paths(text: str) -> list[_UploadedFile]:
@@ -1036,14 +1059,16 @@ def _extract_file_paths(text: str) -> list[_UploadedFile]:
     Extract and upload file paths from user input text.
 
     Recognizes absolute paths (starting with ``/``) and relative
-    paths with recognized file extensions. Tokens that resolve to
-    existing files are uploaded.
+    paths with recognized file extensions. Handles shell-quoted
+    and backslash-escaped paths from terminal drag-and-drop.
 
     :param text: The raw user input text.
     :returns: List of uploaded file references.
     """
     paths = [
-        pathlib.Path(token) for token in text.split() if _is_supported_file(pathlib.Path(token))
+        pathlib.Path(token)
+        for token in _shell_tokenize(text)
+        if _is_supported_file(pathlib.Path(token))
     ]
     return _upload_paths(paths)
 
@@ -1053,13 +1078,13 @@ def _strip_file_paths(text: str) -> str:
     Remove file path tokens from user input text.
 
     Strips tokens that were recognized as uploadable files so
-    the text sent to the LLM is clean.
+    the text sent to the LLM is clean. Uses shell-aware
+    tokenization to match what ``_extract_file_paths`` detects.
 
     :param text: The raw user input text.
     :returns: Text with file path tokens removed.
     """
-    tokens = text.split()
-    kept = [t for t in tokens if not _is_supported_file(pathlib.Path(t))]
+    kept = [t for t in _shell_tokenize(text) if not _is_supported_file(pathlib.Path(t))]
     return " ".join(kept)
 
 
