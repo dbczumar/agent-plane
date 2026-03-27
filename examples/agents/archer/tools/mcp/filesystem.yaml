@@ -1,0 +1,6 @@
+name: filesystem
+description: Read, search, and navigate files on the local filesystem.
+transport: stdio
+command: python
+args:
+  - "tools/mcp/filesystem_server.py"

@@ -17,8 +17,9 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import threading
 import time
-from collections.abc import Awaitable
+from collections.abc import Callable, Coroutine
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -49,22 +50,78 @@ _WriteStream = MemoryObjectSendStream[SessionMessage]
 
 _logger = logging.getLogger(__name__)
 
+# Maximum time to wait for the background event loop thread
+# to stop during shutdown, in seconds.
+_LOOP_STOP_TIMEOUT_SECONDS = 5
 
-def _run_async(coro: Awaitable[_T]) -> _T:
+
+class EventLoopThread:
     """
-    Run an async coroutine from synchronous code.
+    Persistent event loop running in a daemon thread.
 
-    If no event loop is running on the current thread, creates
-    a new loop and runs the coroutine directly. If an event
-    loop IS running (e.g. inside ``pytest-asyncio`` or Jupyter),
-    spawns a background thread with its own loop to avoid the
-    ``"Cannot run the event loop while another loop is
-    running"`` error.
+    MCP sessions are bound to the event loop they were created
+    on — using a fresh ``asyncio.run()`` per call would close the
+    loop and kill the session between ``connect()`` and
+    ``call_tool()``. This class keeps a single loop alive so
+    that ``connect()``, ``call_tool()``, and ``close()`` all
+    execute on the same loop.
 
-    :param coro: An awaitable object, e.g.
-        ``session.call_tool("name", {})``.
-    :returns: The coroutine's return value, typed via
-        ``TypeVar`` so callers preserve the concrete type.
+    Owned by ``ToolManager``: created at ``start()``, stopped at
+    ``shutdown()``.
+    """
+
+    def __init__(self) -> None:
+        """
+        Create and start the background event loop thread.
+        """
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop.run_forever,
+            daemon=True,
+        )
+        self._thread.start()
+
+    def run(self, coro: Coroutine[Any, Any, _T]) -> _T:
+        """
+        Submit a coroutine to the persistent loop and block
+        until it completes.
+
+        :param coro: An awaitable object, e.g.
+            ``conn.call_tool("name", {})``.
+        :returns: The coroutine's return value.
+        """
+        future: concurrent.futures.Future[_T] = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result()
+
+    def stop(self) -> None:
+        """
+        Stop the event loop and join the background thread.
+
+        Safe to call multiple times.
+        """
+        if self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=_LOOP_STOP_TIMEOUT_SECONDS)
+        if not self._loop.is_closed():
+            self._loop.close()
+
+
+def _run_async(coro: Coroutine[Any, Any, _T]) -> _T:
+    """
+    Run an async coroutine from synchronous code (one-shot).
+
+    Creates a temporary event loop, runs the coroutine, and
+    closes the loop. Suitable for isolated async calls that
+    don't need a persistent session (e.g. tests). For MCP
+    tool invocation, use :class:`EventLoopThread` instead —
+    MCP sessions are bound to the loop they were created on.
+
+    If an event loop is already running on the current thread
+    (e.g. inside ``pytest-asyncio``), spawns a background
+    thread with its own loop.
+
+    :param coro: An awaitable object.
+    :returns: The coroutine's return value.
     """
     try:
         asyncio.get_running_loop()
@@ -81,7 +138,7 @@ def _run_async(coro: Awaitable[_T]) -> _T:
     return _run_in_thread(coro)
 
 
-def _run_in_thread(coro: Awaitable[_T]) -> _T:
+def _run_in_thread(coro: Coroutine[Any, Any, _T]) -> _T:
     """
     Run an async coroutine in a separate thread with its own
     event loop.
@@ -470,12 +527,16 @@ class McpTool(Tool):
     :param tool_def: The MCP tool definition from discovery.
     :param connection: The ``McpServerConnection`` that owns
         the session for invoking this tool.
+    :param run_sync: Callable that bridges async → sync,
+        e.g. ``EventLoopThread.run``. Must execute coroutines
+        on the same event loop that the connection was created on.
     """
 
     def __init__(
         self,
         tool_def: McpToolDef,
         connection: McpServerConnection,
+        run_sync: Callable[[Coroutine[Any, Any, str]], str],
     ) -> None:
         """
         Initialize the MCP tool proxy.
@@ -484,9 +545,12 @@ class McpTool(Tool):
             containing name, description, and input schema.
         :param connection: The ``McpServerConnection`` to use
             for invocation.
+        :param run_sync: Callable that runs an awaitable on the
+            persistent event loop, e.g. ``EventLoopThread.run``.
         """
         self._tool_def = tool_def
         self._connection = connection
+        self._run_sync = run_sync
 
     @property
     def name(self) -> str:
@@ -526,14 +590,14 @@ class McpTool(Tool):
 
         Parses the JSON arguments string and delegates to the
         ``McpServerConnection.call_tool()`` async method via
-        ``_run_async()``, which creates an isolated event loop.
+        the persistent event loop provided at construction.
 
         :param arguments: JSON-encoded arguments string from
             the LLM.
         :returns: The tool result as a string.
         """
         parsed = json.loads(arguments) if arguments else {}
-        return _run_async(self._connection.call_tool(self.name, parsed))
+        return self._run_sync(self._connection.call_tool(self.name, parsed))
 
 
 # Exception types that indicate a dead/broken connection

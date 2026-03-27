@@ -315,7 +315,12 @@ def test_mcp_tool_name() -> None:
     """
     tool_def = _make_mcp_tool_def("my_tool")
     conn = McpServerConnection(config=_make_stdio_config())
-    tool = McpTool(tool_def=tool_def, connection=conn)
+    tool = McpTool(
+        tool_def=tool_def,
+        connection=conn,
+        # Stub run_sync — not exercised in this test.
+        run_sync=MagicMock(),
+    )
     assert tool.name == "my_tool"
 
 
@@ -325,7 +330,12 @@ def test_mcp_tool_schema_openai_format() -> None:
     """
     tool_def = _make_mcp_tool_def("search")
     conn = McpServerConnection(config=_make_stdio_config())
-    tool = McpTool(tool_def=tool_def, connection=conn)
+    tool = McpTool(
+        tool_def=tool_def,
+        connection=conn,
+        # Stub run_sync — not exercised in this test.
+        run_sync=MagicMock(),
+    )
     schema = tool.get_schema()
 
     assert schema["type"] == "function"
@@ -334,33 +344,24 @@ def test_mcp_tool_schema_openai_format() -> None:
     assert "properties" in schema["function"]["parameters"]
 
 
-def test_mcp_tool_invoke_delegates_to_connection() -> None:
+def test_mcp_tool_invoke_delegates_to_run_sync() -> None:
     """
     McpTool.invoke parses JSON args and calls the connection's
-    call_tool method via _run_async.
+    call_tool method via the run_sync callable.
     """
     tool_def = _make_mcp_tool_def("search")
     conn = McpServerConnection(config=_make_stdio_config())
 
-    mock_result = MagicMock()
-    mock_result.content = [MagicMock(text="result text")]
-    mock_result.isError = False
-
-    with patch.object(
-        conn,
-        "call_tool",
-        new_callable=AsyncMock,
-        return_value="result text",
-    ):
-        with patch(
-            "agent_plane.tools.mcp._run_async",
-            return_value="result text",
-        ) as mock_run:
-            tool = McpTool(tool_def=tool_def, connection=conn)
-            result = tool.invoke(json.dumps({"query": "hello"}))
+    mock_run_sync = MagicMock(return_value="result text")
+    tool = McpTool(
+        tool_def=tool_def,
+        connection=conn,
+        run_sync=mock_run_sync,
+    )
+    result = tool.invoke(json.dumps({"query": "hello"}))
 
     assert result == "result text"
-    mock_run.assert_called_once()
+    mock_run_sync.assert_called_once()
 
 
 # ── _format_call_result ──────────────────────────────────

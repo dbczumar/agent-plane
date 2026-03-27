@@ -306,15 +306,17 @@ def test_start_mcp_tools_callable(
     with _patch_mcp_connect([tool_def]):
         mgr.start()
 
-    # McpTool.invoke calls _run_async(conn.call_tool(...))
-    with patch(
-        "agent_plane.tools.mcp._run_async",
-        return_value="tool result",
-    ):
-        result = mgr.call_tool(
-            "do_thing",
-            json.dumps({"param": "value"}),
-        )
+    # McpTool.invoke delegates to its _run_sync callable,
+    # which is EventLoopThread.run. Patch the registered
+    # tool's _run_sync to return a canned result without
+    # hitting the real event loop.
+    mcp_tool = mgr._tools["do_thing"]
+    mcp_tool._run_sync = MagicMock(return_value="tool result")
+
+    result = mgr.call_tool(
+        "do_thing",
+        json.dumps({"param": "value"}),
+    )
 
     assert result == "tool result"
 

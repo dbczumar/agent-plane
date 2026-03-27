@@ -21,9 +21,9 @@ from agent_plane.tools.builtins import (
     any_skill_has_resources,
 )
 from agent_plane.tools.mcp import (
+    EventLoopThread,
     McpServerConnection,
     McpTool,
-    _run_async,
 )
 
 _logger = logging.getLogger(__name__)
@@ -37,6 +37,11 @@ class ToolManager:
     at ``start()`` time (MCP tools discovered from configured
     servers). Dispatch is via ``self._tools[name].invoke(arguments)``
     — no hardcoded if/elif chains.
+
+    Owns a persistent :class:`EventLoopThread` for MCP operations.
+    MCP sessions are bound to the event loop they were created on,
+    so ``connect()``, ``call_tool()``, and ``close()`` must all
+    run on the same loop.
 
     Registers:
     - ``load_skill`` (if the agent has skills)
@@ -64,6 +69,7 @@ class ToolManager:
         self._started = False
         self._tools: dict[str, Tool] = {}
         self._mcp_connections: list[McpServerConnection] = []
+        self._loop_thread: EventLoopThread | None = None
         self._register_skill_tools()
 
     def _register_skill_tools(self) -> None:
@@ -85,24 +91,27 @@ class ToolManager:
         """
         Connect to MCP servers and discover their tools.
 
-        For each MCP server in the agent spec, establishes a
-        connection (or uses cached discovery results) and
-        registers the discovered tools in the tool registry.
-        Duplicate tool names across servers are logged as
-        warnings — the last server wins.
+        Creates a persistent event loop thread for MCP
+        operations, connects to each configured server, and
+        registers their tools. Duplicate tool names across
+        servers are logged as warnings — the last server wins.
         """
         if self._spec.mcp_servers:
-            _run_async(self._connect_mcp_servers())
+            self._loop_thread = EventLoopThread()
+            self._loop_thread.run(self._connect_mcp_servers())
         self._started = True
 
     def shutdown(self) -> None:
         """
-        Disconnect from all MCP servers.
+        Disconnect from all MCP servers and stop the event loop.
 
         Safe to call even if ``start()`` was never called.
         """
-        if self._mcp_connections:
-            _run_async(self._close_mcp_servers())
+        if self._mcp_connections and self._loop_thread is not None:
+            self._loop_thread.run(self._close_mcp_servers())
+        if self._loop_thread is not None:
+            self._loop_thread.stop()
+            self._loop_thread = None
         self._started = False
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
@@ -167,6 +176,7 @@ class ToolManager:
         :param tools: List of MCP tool definitions from
             ``tools/list``.
         """
+        assert self._loop_thread is not None
         for tool_def in tools:
             if tool_def.name in self._tools:
                 _logger.warning(
@@ -177,6 +187,7 @@ class ToolManager:
             mcp_tool = McpTool(
                 tool_def=tool_def,
                 connection=connection,
+                run_sync=self._loop_thread.run,
             )
             self._tools[mcp_tool.name] = mcp_tool
 
