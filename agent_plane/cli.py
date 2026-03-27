@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import click
 import yaml
+from pydantic import BaseModel, ConfigDict
 
 
 # Any: YAML configs have heterogeneous value types (str, int, list, etc.)
@@ -279,9 +281,70 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
     return resolved
 
 
+class _LLMDeploy(BaseModel):
+    """
+    Pydantic model for the ``llm:`` block during deploy-time
+    env var expansion.
+
+    :param connection: Key-value pairs for LLM connection
+        config, e.g. ``{"api_key": "${OPENAI_API_KEY}"}``.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    connection: dict[str, str] | None = None
+
+
+class _BuiltinEntry(BaseModel):
+    """
+    Pydantic model for a single dict entry in
+    ``tools.builtins`` during deploy-time env var expansion.
+
+    :param name: The built-in tool name, e.g.
+        ``"web_search_google"``.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    name: str
+
+
+class _ToolsDeploy(BaseModel):
+    """
+    Pydantic model for the ``tools:`` block during deploy-time
+    env var expansion.
+
+    :param builtins: Mixed list of string tool names and dict
+        entries with config fields, e.g.
+        ``["web_search_openai", {"name": "web_search_google",
+        "api_key": "${KEY}"}]``.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    builtins: list[str | dict[str, Any]] | None = None
+
+
+class _DeployConfig(BaseModel):
+    """
+    Pydantic model for the top-level config.yaml structure
+    during deploy-time env var expansion.
+
+    Only the fields containing secrets (``llm``, ``tools``)
+    are modeled; all other fields pass through via
+    ``extra="allow"``.
+
+    :param llm: The LLM configuration block, or ``None``
+        if absent.
+    :param tools: The tools configuration block, or ``None``
+        if absent.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    llm: _LLMDeploy | None = None
+    tools: _ToolsDeploy | None = None
+
+
 def _expand_config_env_vars(
     raw: dict[str, Any],
-    expand_fn: Any,
+    expand_fn: Callable[[dict[str, str]], dict[str, str]],
 ) -> bool:
     """
     Expand ``${VAR}`` references in-place in a parsed
@@ -294,39 +357,64 @@ def _expand_config_env_vars(
     - ``tools.builtins[*]`` — dict-entry values except ``name``
 
     :param raw: The parsed config.yaml dict (modified in-place).
-    :param expand_fn: The ``expand_env_vars`` function.
+    :param expand_fn: Callable that expands env var references
+        in a string-to-string dict, e.g.
+        :func:`agent_plane.spec.expand_env_vars`.
+    :returns: ``True`` if any values were expanded.
+    """
+    cfg = _DeployConfig.model_validate(raw)
+    changed = False
+
+    if cfg.llm is not None and cfg.llm.connection is not None:
+        raw["llm"]["connection"] = expand_fn(cfg.llm.connection)
+        changed = True
+
+    if cfg.tools is not None and cfg.tools.builtins is not None:
+        changed = (
+            _expand_builtin_env_vars(
+                raw["tools"]["builtins"],
+                cfg.tools.builtins,
+                expand_fn,
+            )
+            or changed
+        )
+
+    return changed
+
+
+def _expand_builtin_env_vars(
+    raw_builtins: list[str | dict[str, Any]],
+    parsed_builtins: list[str | dict[str, Any]],
+    expand_fn: Callable[[dict[str, str]], dict[str, str]],
+) -> bool:
+    """
+    Expand ``${VAR}`` references in dict entries of
+    ``tools.builtins``, modifying *raw_builtins* in-place.
+
+    String entries are skipped (no config to expand). Dict
+    entries have all fields except ``name`` expanded.
+
+    :param raw_builtins: The mutable builtins list from the
+        raw config dict (modified in-place).
+    :param parsed_builtins: The Pydantic-parsed builtins list
+        used for typed access.
+    :param expand_fn: Callable that expands env var references
+        in a string-to-string dict.
     :returns: ``True`` if any values were expanded.
     """
     changed = False
-
-    # llm.connection
-    llm = raw.get("llm")
-    if isinstance(llm, dict):
-        connection = llm.get("connection")
-        if isinstance(connection, dict):
-            llm["connection"] = expand_fn(
-                {str(k): str(v) for k, v in connection.items()},
-            )
+    for i, entry in enumerate(parsed_builtins):
+        if not isinstance(entry, dict):
+            continue
+        parsed = _BuiltinEntry.model_validate(entry)
+        # Extra fields are the tool-specific config (api_key, etc.).
+        config_fields = (
+            {str(k): str(v) for k, v in parsed.model_extra.items()} if parsed.model_extra else {}
+        )
+        if config_fields:
+            expanded = expand_fn(config_fields)
+            raw_builtins[i] = {"name": parsed.name, **expanded}
             changed = True
-
-    # tools.builtins dict entries
-    tools = raw.get("tools")
-    if isinstance(tools, dict):
-        builtins = tools.get("builtins")
-        if isinstance(builtins, list):
-            for i, entry in enumerate(builtins):
-                if isinstance(entry, dict):
-                    config_fields = {str(k): str(v) for k, v in entry.items() if k != "name"}
-                    if config_fields:
-                        expanded = expand_fn(config_fields)
-                        # Rebuild the entry with name first,
-                        # then expanded config fields.
-                        builtins[i] = {
-                            "name": entry["name"],
-                            **expanded,
-                        }
-                        changed = True
-
     return changed
 
 
