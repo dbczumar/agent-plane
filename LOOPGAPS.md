@@ -5,7 +5,7 @@ Gaps discovered during agent loop implementation. Review before committing.
 ## Addressed During Implementation
 
 ### MCP tool support
-`ToolManager.start()` now connects to MCP servers (stdio and HTTP transports), discovers tools
+`ToolManager.start()` now connects to MCP servers (HTTP transport), discovers tools
 via `tools/list`, and registers them as `McpTool` proxy objects. Discovery results are cached
 at the module level with a configurable TTL (default 5 minutes) so sequential workflow executions
 don't re-discover tools unnecessarily. Connection failures are logged and skipped — other servers

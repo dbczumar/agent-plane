@@ -44,36 +44,20 @@ def _clean_cache() -> None:
     clear_discovery_cache()
 
 
-def _make_stdio_config(
-    name: str = "test-server",
-) -> MCPServerConfig:
-    """
-    Create a minimal stdio MCP server config.
-
-    :param name: Server name identifier.
-    :returns: An ``MCPServerConfig`` for stdio transport.
-    """
-    return MCPServerConfig(
-        name=name,
-        transport="stdio",
-        command="echo",
-        args=["hello"],
-    )
-
-
 def _make_http_config(
-    name: str = "test-http",
+    name: str = "test-server",
+    url: str = "http://localhost:9000/mcp",
 ) -> MCPServerConfig:
     """
     Create a minimal HTTP MCP server config.
 
     :param name: Server name identifier.
+    :param url: Server endpoint URL.
     :returns: An ``MCPServerConfig`` for HTTP transport.
     """
     return MCPServerConfig(
         name=name,
-        transport="http",
-        url="http://localhost:9000/mcp",
+        url=url,
     )
 
 
@@ -112,7 +96,7 @@ def _mock_mcp_transport(
     """
     Mock the MCP transport and session for ``connect()`` tests.
 
-    Patches ``stdio_client`` and ``ClientSession`` so that
+    Patches ``sse_client`` and ``ClientSession`` so that
     ``McpServerConnection.connect()`` can run without a real
     MCP server. The mock session's ``list_tools()`` returns
     the provided tool definitions.
@@ -134,7 +118,7 @@ def _mock_mcp_transport(
     mock_ctx.__aexit__ = AsyncMock(return_value=False)
 
     with patch(
-        "agent_plane.tools.mcp.stdio_client",
+        "agent_plane.tools.mcp.sse_client",
         return_value=mock_ctx,
     ):
         with patch(
@@ -147,24 +131,14 @@ def _mock_mcp_transport(
 # ── _cache_key ───────────────────────────────────────────
 
 
-def test_cache_key_stdio_includes_command_and_args() -> None:
+def test_cache_key_includes_name_and_url() -> None:
     """
-    Cache key for stdio config includes name, command, and args.
-    """
-    config = _make_stdio_config()
-    key = _cache_key(config)
-    assert "stdio" in key
-    assert "test-server" in key
-    assert "echo" in key
-
-
-def test_cache_key_http_includes_url() -> None:
-    """
-    Cache key for HTTP config includes name and url.
+    Cache key includes the server name and URL.
     """
     config = _make_http_config()
     key = _cache_key(config)
     assert "http" in key
+    assert "test-server" in key
     assert "localhost:9000" in key
 
 
@@ -172,8 +146,8 @@ def test_cache_key_different_configs_differ() -> None:
     """
     Different server configs produce different cache keys.
     """
-    key1 = _cache_key(_make_stdio_config("server-a"))
-    key2 = _cache_key(_make_stdio_config("server-b"))
+    key1 = _cache_key(_make_http_config("server-a"))
+    key2 = _cache_key(_make_http_config("server-b"))
     assert key1 != key2
 
 
@@ -187,7 +161,7 @@ async def test_connect_skips_list_tools_when_cache_fresh() -> None:
     the cache is fresh, but still opens a live session so
     ``call_tool()`` works.
     """
-    config = _make_stdio_config()
+    config = _make_http_config()
     tool_def = _make_mcp_tool_def()
 
     # Pre-populate the cache — TTLCache uses dict assignment.
@@ -213,7 +187,7 @@ async def test_cached_connect_has_live_session() -> None:
     When discovery is served from cache, the connection still
     has a live session that can invoke tools.
     """
-    config = _make_stdio_config()
+    config = _make_http_config()
     _discovery_cache[_cache_key(config)] = [_make_mcp_tool_def()]
 
     with _mock_mcp_transport() as mock_session:
@@ -239,7 +213,7 @@ async def test_connect_skips_expired_cache() -> None:
     ``connect()`` ignores cache entries older than the TTL and
     performs a live discovery via ``list_tools()``.
     """
-    config = _make_stdio_config()
+    config = _make_http_config()
 
     # Use a TTLCache with a controllable timer so we can
     # simulate expiry without sleeping. Start at t=0, insert
@@ -274,7 +248,7 @@ async def test_connect_populates_cache() -> None:
     A successful live ``connect()`` stores results in the
     module-level cache.
     """
-    config = _make_stdio_config()
+    config = _make_http_config()
     tool_def = _make_mcp_tool_def("cached_tool")
 
     with _mock_mcp_transport([tool_def]):
@@ -300,7 +274,7 @@ async def test_call_tool_raises_without_connect() -> None:
     ``call_tool()`` raises RuntimeError when ``connect()``
     was never called.
     """
-    conn = McpServerConnection(config=_make_stdio_config())
+    conn = McpServerConnection(config=_make_http_config())
 
     with pytest.raises(RuntimeError, match="no live session"):
         await conn.call_tool("test_tool", {"query": "hi"})
@@ -314,7 +288,7 @@ async def test_close_is_safe_when_never_connected() -> None:
     """
     ``close()`` does not raise if ``connect()`` was never called.
     """
-    conn = McpServerConnection(config=_make_stdio_config())
+    conn = McpServerConnection(config=_make_http_config())
     await conn.close()
 
 
@@ -326,7 +300,7 @@ def test_mcp_tool_name() -> None:
     McpTool.name returns the MCP tool definition's name.
     """
     tool_def = _make_mcp_tool_def("my_tool")
-    conn = McpServerConnection(config=_make_stdio_config())
+    conn = McpServerConnection(config=_make_http_config())
     tool = McpTool(
         tool_def=tool_def,
         connection=conn,
@@ -341,7 +315,7 @@ def test_mcp_tool_schema_openai_format() -> None:
     McpTool.get_schema returns an OpenAI-format tool schema.
     """
     tool_def = _make_mcp_tool_def("search")
-    conn = McpServerConnection(config=_make_stdio_config())
+    conn = McpServerConnection(config=_make_http_config())
     tool = McpTool(
         tool_def=tool_def,
         connection=conn,
@@ -362,7 +336,7 @@ def test_mcp_tool_invoke_delegates_to_run_sync() -> None:
     call_tool method via the run_sync callable.
     """
     tool_def = _make_mcp_tool_def("search")
-    conn = McpServerConnection(config=_make_stdio_config())
+    conn = McpServerConnection(config=_make_http_config())
 
     mock_run_sync = MagicMock(return_value="result text")
     tool = McpTool(
@@ -588,7 +562,7 @@ def test_mcp_tool_schema_normalizes_missing_properties() -> None:
     # MCP allows {"type": "object"} with no properties.
     tool_def.inputSchema = {"type": "object"}
 
-    conn = McpServerConnection(config=_make_stdio_config())
+    conn = McpServerConnection(config=_make_http_config())
     tool = McpTool(
         tool_def=tool_def,
         connection=conn,
@@ -611,7 +585,7 @@ def test_mcp_tool_schema_normalizes_none_input_schema() -> None:
     tool_def.description = "Tool with no inputSchema."
     tool_def.inputSchema = None
 
-    conn = McpServerConnection(config=_make_stdio_config())
+    conn = McpServerConnection(config=_make_http_config())
     tool = McpTool(
         tool_def=tool_def,
         connection=conn,
@@ -712,7 +686,7 @@ def test_clear_discovery_cache() -> None:
     """
     ``clear_discovery_cache()`` empties the module-level cache.
     """
-    config = _make_stdio_config()
+    config = _make_http_config()
     _discovery_cache[_cache_key(config)] = []
     assert len(_discovery_cache) > 0
 
@@ -742,23 +716,6 @@ def test_discovery_cache_evicts_lru_when_full() -> None:
     assert "server-b" in small_cache
     assert "server-c" in small_cache
     assert len(small_cache) == 2
-
-
-# ── _open_transport validation ───────────────────────────
-
-
-@pytest.mark.asyncio()
-async def test_connect_raises_on_unsupported_transport() -> None:
-    """
-    ``connect()`` raises ValueError for unknown transport types.
-    """
-    config = MCPServerConfig(
-        name="bad",
-        transport="grpc",
-    )
-    conn = McpServerConnection(config=config)
-    with pytest.raises(ValueError, match="Unsupported MCP transport"):
-        await conn.connect()
 
 
 # ── _run_async ───────────────────────────────────────────
@@ -907,7 +864,7 @@ async def test_call_tool_reconnects_on_connection_error() -> None:
     When a tool call fails with a connection error, the
     connection reconnects with backoff and retries.
     """
-    config = _make_stdio_config()
+    config = _make_http_config()
 
     with _mock_mcp_transport() as mock_session:
         conn = McpServerConnection(config=config)
@@ -943,7 +900,7 @@ async def test_call_tool_does_not_reconnect_on_tool_error() -> None:
     When a tool call fails with a non-connection error (e.g.
     McpError for invalid params), no reconnect is attempted.
     """
-    config = _make_stdio_config()
+    config = _make_http_config()
 
     with _mock_mcp_transport() as mock_session:
         conn = McpServerConnection(config=config)
@@ -972,8 +929,7 @@ async def test_call_tool_exhausts_all_retries_then_raises() -> None:
     # expect 3 invoke calls total (1 initial + 2 retries).
     config = MCPServerConfig(
         name="test-retry-exhaust",
-        transport="stdio",
-        command="echo",
+        url="http://localhost:9000/mcp",
         retry=RetryConfig(
             max_attempts=3,
             backoff_base=1.0,
@@ -1009,8 +965,7 @@ async def test_call_tool_uses_config_retry_policy() -> None:
     # Only 2 attempts — should fail after 2 invoke calls.
     config = MCPServerConfig(
         name="test-custom-retry",
-        transport="stdio",
-        command="echo",
+        url="http://localhost:9000/mcp",
         retry=RetryConfig(
             max_attempts=2,
             backoff_base=0.5,
@@ -1044,8 +999,7 @@ async def test_call_tool_sleeps_between_retries() -> None:
     """
     config = MCPServerConfig(
         name="test-backoff",
-        transport="stdio",
-        command="echo",
+        url="http://localhost:9000/mcp",
         retry=RetryConfig(
             max_attempts=3,
             backoff_base=2.0,
@@ -1095,8 +1049,7 @@ async def test_call_tool_default_retry_has_three_attempts() -> None:
     # No retry config — should use default (3 attempts).
     config = MCPServerConfig(
         name="test-default-retry",
-        transport="stdio",
-        command="echo",
+        url="http://localhost:9000/mcp",
         # retry defaults to None
     )
 
@@ -1130,9 +1083,7 @@ async def test_connect_passes_timeout_to_client_session() -> None:
     """
     config = MCPServerConfig(
         name="test-timeout",
-        transport="stdio",
-        command="echo",
-        args=["hello"],
+        url="http://localhost:9000/mcp",
         timeout=60,
     )
 
@@ -1170,7 +1121,7 @@ async def test_connect_passes_timeout_to_client_session() -> None:
         side_effect=_capturing_session,
     ):
         with patch(
-            "agent_plane.tools.mcp.stdio_client",
+            "agent_plane.tools.mcp.sse_client",
             return_value=mock_ctx,
         ):
             conn = McpServerConnection(config=config)
@@ -1195,9 +1146,7 @@ async def test_connect_passes_none_timeout_to_client_session() -> None:
     """
     config = MCPServerConfig(
         name="test-no-timeout",
-        transport="stdio",
-        command="echo",
-        args=["hello"],
+        url="http://localhost:9000/mcp",
         # timeout defaults to None
     )
 
@@ -1235,7 +1184,7 @@ async def test_connect_passes_none_timeout_to_client_session() -> None:
         side_effect=_capturing_session,
     ):
         with patch(
-            "agent_plane.tools.mcp.stdio_client",
+            "agent_plane.tools.mcp.sse_client",
             return_value=mock_ctx,
         ):
             conn = McpServerConnection(config=config)
@@ -1253,13 +1202,12 @@ async def test_connect_passes_none_timeout_to_client_session() -> None:
 @pytest.mark.asyncio()
 async def test_connect_http_passes_timeout_to_sse_client() -> None:
     """
-    When ``MCPServerConfig(transport="http", timeout=60)``,
+    When ``MCPServerConfig(timeout=60)``,
     ``connect()`` must pass ``timeout=60.0`` and
     ``sse_read_timeout=60.0`` to ``sse_client``.
     """
     config = MCPServerConfig(
         name="test-http-timeout",
-        transport="http",
         url="http://localhost:9000/mcp",
         timeout=60,
     )
@@ -1329,13 +1277,12 @@ async def test_connect_http_passes_timeout_to_sse_client() -> None:
 @pytest.mark.asyncio()
 async def test_connect_http_uses_default_timeouts_when_none() -> None:
     """
-    When ``MCPServerConfig(transport="http", timeout=None)``,
+    When ``MCPServerConfig(timeout=None)``,
     ``connect()`` must pass the MCP SDK defaults: ``timeout=5``
     and ``sse_read_timeout=300``.
     """
     config = MCPServerConfig(
         name="test-http-default",
-        transport="http",
         url="http://localhost:9000/mcp",
         # timeout defaults to None
     )
@@ -1498,7 +1445,6 @@ async def test_http_connect_passes_url_to_sse_client() -> None:
     """
     config = MCPServerConfig(
         name="test-http",
-        transport="http",
         url="https://mcp.example.com/sse",
     )
 
@@ -1519,7 +1465,6 @@ async def test_http_connect_passes_headers_to_sse_client() -> None:
     """
     config = MCPServerConfig(
         name="test-http-headers",
-        transport="http",
         url="http://localhost:9000/mcp",
         headers={
             "Authorization": "Bearer tok_xyz",
@@ -1547,7 +1492,6 @@ async def test_http_connect_passes_none_headers_when_empty() -> None:
     """
     config = MCPServerConfig(
         name="test-http-no-headers",
-        transport="http",
         url="http://localhost:9000/mcp",
         # headers defaults to empty dict
     )
@@ -1566,11 +1510,10 @@ async def test_http_connect_passes_none_headers_when_empty() -> None:
 async def test_http_connect_discovers_tools() -> None:
     """
     HTTP ``connect()`` discovers tools via ``list_tools()`` and
-    returns them, just like stdio transport.
+    returns them.
     """
     config = MCPServerConfig(
         name="test-http-discovery",
-        transport="http",
         url="http://localhost:9000/mcp",
     )
     tool_def = _make_mcp_tool_def("http_tool")
@@ -1595,7 +1538,6 @@ async def test_http_call_tool_invokes_session() -> None:
     """
     config = MCPServerConfig(
         name="test-http-invoke",
-        transport="http",
         url="http://localhost:9000/mcp",
     )
 
@@ -1626,11 +1568,10 @@ async def test_http_call_tool_invokes_session() -> None:
 async def test_http_reconnect_on_connection_error() -> None:
     """
     HTTP ``call_tool()`` reconnects and retries on a connection
-    error, just like stdio transport.
+    error.
     """
     config = MCPServerConfig(
         name="test-http-reconnect",
-        transport="http",
         url="http://localhost:9000/mcp",
     )
 
@@ -1667,7 +1608,6 @@ async def test_http_connect_uses_cache() -> None:
     """
     config = MCPServerConfig(
         name="test-http-cached",
-        transport="http",
         url="http://localhost:9000/mcp",
     )
     tool_def = _make_mcp_tool_def("cached_http_tool")
@@ -1842,7 +1782,7 @@ async def test_call_tool_trips_breaker_after_repeated_failures() -> None:
     circuit breaker. After ``failure_threshold`` exhausted
     invocations, subsequent calls raise ``McpServerDisabledError``.
     """
-    config = _make_stdio_config()
+    config = _make_http_config()
 
     with _mock_mcp_transport() as mock_session:
         conn = McpServerConnection(config=config)
@@ -1880,7 +1820,7 @@ async def test_call_tool_resets_breaker_on_success() -> None:
     A successful ``call_tool()`` resets the circuit breaker so
     that prior failures don't accumulate across successes.
     """
-    config = _make_stdio_config()
+    config = _make_http_config()
 
     with _mock_mcp_transport() as mock_session:
         conn = McpServerConnection(config=config)

@@ -178,32 +178,17 @@ Everything after the frontmatter is markdown content passed to the model.
 
 Declares an MCP server the agent can use.
 
-**stdio transport:**
-```yaml
-name: github
-description: Access GitHub repos, issues, and PRs.
-transport: stdio
-command: npx
-args:
-  - -y
-  - "@modelcontextprotocol/server-github"
-env:                          # optional environment variables
-  GITHUB_TOKEN: ${GITHUB_TOKEN}
-```
+Only the HTTP (SSE) transport is supported.
 
-**HTTP transport:**
 ```yaml
 name: my-service
 description: Internal service tools.
-transport: http
 url: http://localhost:9000/mcp
 headers:                      # optional headers
   Authorization: Bearer ${API_KEY}
 ```
 
-**Required fields:** `name`, `transport`
-**stdio requires:** `command`
-**http requires:** `url`
+**Required fields:** `name`, `url`
 
 ---
 
@@ -257,9 +242,7 @@ The validator (`validator.py`) enforces:
 - Skill `name` in frontmatter must match the directory name
 - Skill `name`: max 64 chars, pattern `[a-z0-9-]+`
 - Skill `description`: max 1024 chars
-- MCP `transport` must be `stdio` or `http`
-- MCP stdio configs must have `command`
-- MCP http configs must have `url`
+- MCP configs must have `url` (only HTTP transport is supported)
 - No duplicate skill names across `skills/`
 - No duplicate tool names across `tools/mcp/`, `tools/python/`, and
   `tools/typescript/`

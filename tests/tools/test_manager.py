@@ -20,16 +20,6 @@ from agent_plane.tools.mcp import clear_discovery_cache
 
 
 @pytest.fixture()
-def work_dir(tmp_path: Path) -> Path:
-    """
-    Temporary working directory for the ToolManager.
-
-    :returns: A ``Path`` to a temp directory.
-    """
-    return tmp_path / "work"
-
-
-@pytest.fixture()
 def skill_with_resources(tmp_path: Path) -> SkillSpec:
     """
     A skill with a ``references/`` directory containing a
@@ -98,7 +88,6 @@ def _make_spec(
 
 
 def test_registry_dispatches_to_load_skill(
-    work_dir: Path,
     skill_no_resources: SkillSpec,
 ) -> None:
     """
@@ -107,7 +96,6 @@ def test_registry_dispatches_to_load_skill(
     """
     mgr = ToolManager(
         _make_spec([skill_no_resources]),
-        work_dir,
     )
     result = mgr.call_tool(
         "load_skill",
@@ -117,7 +105,6 @@ def test_registry_dispatches_to_load_skill(
 
 
 def test_registry_dispatches_to_read_skill_file(
-    work_dir: Path,
     skill_with_resources: SkillSpec,
 ) -> None:
     """
@@ -126,7 +113,6 @@ def test_registry_dispatches_to_read_skill_file(
     """
     mgr = ToolManager(
         _make_spec([skill_with_resources]),
-        work_dir,
     )
     result = mgr.call_tool(
         "read_skill_file",
@@ -141,7 +127,6 @@ def test_registry_dispatches_to_read_skill_file(
 
 
 def test_registry_unknown_tool_returns_error(
-    work_dir: Path,
     skill_no_resources: SkillSpec,
 ) -> None:
     """
@@ -149,7 +134,6 @@ def test_registry_unknown_tool_returns_error(
     """
     mgr = ToolManager(
         _make_spec([skill_no_resources]),
-        work_dir,
     )
     result = mgr.call_tool("nonexistent", json.dumps({}))
     assert "not found" in result
@@ -160,7 +144,6 @@ def test_registry_unknown_tool_returns_error(
 
 
 def test_schemas_include_load_skill_when_skills_exist(
-    work_dir: Path,
     skill_no_resources: SkillSpec,
 ) -> None:
     """
@@ -169,7 +152,6 @@ def test_schemas_include_load_skill_when_skills_exist(
     """
     mgr = ToolManager(
         _make_spec([skill_no_resources]),
-        work_dir,
     )
     schemas = mgr.get_tool_schemas()
     names = [s["function"]["name"] for s in schemas]
@@ -177,7 +159,6 @@ def test_schemas_include_load_skill_when_skills_exist(
 
 
 def test_schemas_include_read_skill_file_with_resources(
-    work_dir: Path,
     skill_with_resources: SkillSpec,
 ) -> None:
     """
@@ -186,7 +167,6 @@ def test_schemas_include_read_skill_file_with_resources(
     """
     mgr = ToolManager(
         _make_spec([skill_with_resources]),
-        work_dir,
     )
     schemas = mgr.get_tool_schemas()
     names = [s["function"]["name"] for s in schemas]
@@ -194,7 +174,6 @@ def test_schemas_include_read_skill_file_with_resources(
 
 
 def test_schemas_exclude_read_skill_file_without_resources(
-    work_dir: Path,
     skill_no_resources: SkillSpec,
 ) -> None:
     """
@@ -203,20 +182,17 @@ def test_schemas_exclude_read_skill_file_without_resources(
     """
     mgr = ToolManager(
         _make_spec([skill_no_resources]),
-        work_dir,
     )
     schemas = mgr.get_tool_schemas()
     names = [s["function"]["name"] for s in schemas]
     assert "read_skill_file" not in names
 
 
-def test_schemas_empty_when_no_skills(
-    work_dir: Path,
-) -> None:
+def test_schemas_empty_when_no_skills() -> None:
     """
     get_tool_schemas returns empty when agent has no skills.
     """
-    mgr = ToolManager(_make_spec([]), work_dir)
+    mgr = ToolManager(_make_spec([]))
     assert mgr.get_tool_schemas() == []
 
 
@@ -261,20 +237,17 @@ def _patch_mcp_connect(
     )
 
 
-def test_start_discovers_mcp_tools(
-    work_dir: Path,
-) -> None:
+def test_start_discovers_mcp_tools() -> None:
     """
     ``start()`` discovers MCP tools and registers them so they
     appear in ``get_tool_schemas()``.
     """
     mcp_config = MCPServerConfig(
         name="test-mcp",
-        transport="stdio",
-        command="echo",
+        url="http://localhost:9000/mcp",
     )
     spec = _make_spec(mcp_servers=[mcp_config])
-    mgr = ToolManager(spec, work_dir)
+    mgr = ToolManager(spec)
 
     tool_def = _make_mock_mcp_tool("github_search")
 
@@ -288,20 +261,17 @@ def test_start_discovers_mcp_tools(
     mgr.shutdown()
 
 
-def test_start_mcp_tools_callable(
-    work_dir: Path,
-) -> None:
+def test_start_mcp_tools_callable() -> None:
     """
     MCP tools registered by ``start()`` can be dispatched via
     ``call_tool()``.
     """
     mcp_config = MCPServerConfig(
         name="test-mcp",
-        transport="stdio",
-        command="echo",
+        url="http://localhost:9000/mcp",
     )
     spec = _make_spec(mcp_servers=[mcp_config])
-    mgr = ToolManager(spec, work_dir)
+    mgr = ToolManager(spec)
 
     tool_def = _make_mock_mcp_tool("do_thing")
 
@@ -326,7 +296,6 @@ def test_start_mcp_tools_callable(
 
 
 def test_start_mcp_failure_does_not_block_other_tools(
-    work_dir: Path,
     skill_no_resources: SkillSpec,
 ) -> None:
     """
@@ -334,14 +303,13 @@ def test_start_mcp_failure_does_not_block_other_tools(
     """
     mcp_config = MCPServerConfig(
         name="broken-mcp",
-        transport="stdio",
-        command="nonexistent",
+        url="http://localhost:9000/mcp",
     )
     spec = _make_spec(
         skills=[skill_no_resources],
         mcp_servers=[mcp_config],
     )
-    mgr = ToolManager(spec, work_dir)
+    mgr = ToolManager(spec)
 
     with patch(
         "agent_plane.tools.manager.McpServerConnection.connect",
@@ -361,14 +329,12 @@ def test_start_mcp_failure_does_not_block_other_tools(
     mgr.shutdown()
 
 
-def test_shutdown_safe_without_start(
-    work_dir: Path,
-) -> None:
+def test_shutdown_safe_without_start() -> None:
     """
     ``shutdown()`` is safe to call without ``start()``.
     """
     spec = _make_spec()
-    mgr = ToolManager(spec, work_dir)
+    mgr = ToolManager(spec)
     mgr.shutdown()
 
 
@@ -391,9 +357,7 @@ def _make_client_side_spec(name: str) -> ClientSideToolSpec:
     )
 
 
-def test_client_tools_registered_in_schemas(
-    work_dir: Path,
-) -> None:
+def test_client_tools_registered_in_schemas() -> None:
     """
     Client-specified tools appear in get_tool_schemas() alongside
     built-in tools without calling start().
@@ -404,7 +368,6 @@ def test_client_tools_registered_in_schemas(
     spec = _make_spec()
     mgr = ToolManager(
         spec,
-        work_dir,
         client_tool_specs=[
             _make_client_side_spec("get_weather"),
             _make_client_side_spec("send_email"),
@@ -423,9 +386,7 @@ def test_client_tools_registered_in_schemas(
     assert "send_email" in names
 
 
-def test_is_client_side_tool_returns_true_for_registered_client_tools(
-    work_dir: Path,
-) -> None:
+def test_is_client_side_tool_returns_true_for_registered_client_tools() -> None:
     """
     is_client_side_tool returns True for registered ClientSideTool
     entries and False for built-in tools and unknown names.
@@ -438,7 +399,6 @@ def test_is_client_side_tool_returns_true_for_registered_client_tools(
     spec = _make_spec(skills=[SkillSpec(name="summarize", description=".", content=".")])
     mgr = ToolManager(
         spec,
-        work_dir,
         client_tool_specs=[
             _make_client_side_spec("get_weather"),
             _make_client_side_spec("send_email"),
@@ -463,7 +423,6 @@ def test_is_client_side_tool_returns_true_for_registered_client_tools(
 
 
 def test_client_tool_shadows_skill_tool(
-    work_dir: Path,
     skill_no_resources: SkillSpec,
 ) -> None:
     """
@@ -476,7 +435,6 @@ def test_client_tool_shadows_skill_tool(
     spec = _make_spec(skills=[skill_no_resources])
     mgr = ToolManager(
         spec,
-        work_dir,
         # 'load_skill' is the built-in skill tool name
         client_tool_specs=[_make_client_side_spec("load_skill")],
     )
@@ -497,40 +455,34 @@ def test_client_tool_shadows_skill_tool(
     )
 
 
-def test_client_tools_none_equivalent_to_empty(
-    work_dir: Path,
-) -> None:
+def test_client_tools_none_equivalent_to_empty() -> None:
     """
     Passing client_tool_specs=None and client_tool_specs=[] produce
     the same result: no client tools registered.
     """
     spec = _make_spec()
-    mgr_none = ToolManager(spec, work_dir, client_tool_specs=None)
-    mgr_empty = ToolManager(spec, work_dir, client_tool_specs=[])
+    mgr_none = ToolManager(spec, client_tool_specs=None)
+    mgr_empty = ToolManager(spec, client_tool_specs=[])
 
     assert mgr_none.get_tool_schemas() == []
     assert mgr_empty.get_tool_schemas() == []
 
 
-def test_mcp_duplicate_tool_name_last_wins(
-    work_dir: Path,
-) -> None:
+def test_mcp_duplicate_tool_name_last_wins() -> None:
     """
     When two MCP servers expose a tool with the same name, the
     last server's tool wins (with a warning log).
     """
     config_a = MCPServerConfig(
         name="server-a",
-        transport="stdio",
-        command="echo",
+        url="http://localhost:9000/mcp",
     )
     config_b = MCPServerConfig(
         name="server-b",
-        transport="stdio",
-        command="echo",
+        url="http://localhost:9000/mcp",
     )
     spec = _make_spec(mcp_servers=[config_a, config_b])
-    mgr = ToolManager(spec, work_dir)
+    mgr = ToolManager(spec)
 
     tool_a = _make_mock_mcp_tool("shared_tool")
     tool_b = _make_mock_mcp_tool("shared_tool")
@@ -589,7 +541,6 @@ def test_mcp_duplicate_tool_name_last_wins(
     ],
 )
 def test_mcp_tool_invalid_name_skipped(
-    work_dir: Path,
     name: str,
 ) -> None:
     """
@@ -599,11 +550,10 @@ def test_mcp_tool_invalid_name_skipped(
     """
     mcp_config = MCPServerConfig(
         name="test-mcp",
-        transport="stdio",
-        command="echo",
+        url="http://localhost:9000/mcp",
     )
     spec = _make_spec(mcp_servers=[mcp_config])
-    mgr = ToolManager(spec, work_dir)
+    mgr = ToolManager(spec)
 
     tool_def = _make_mock_mcp_tool(name)
 
@@ -615,20 +565,17 @@ def test_mcp_tool_invalid_name_skipped(
     mgr.shutdown()
 
 
-def test_mcp_tool_valid_names_registered(
-    work_dir: Path,
-) -> None:
+def test_mcp_tool_valid_names_registered() -> None:
     """
     MCP tools with valid names (alphanumeric, underscore,
     hyphen, up to 64 chars) are registered normally.
     """
     mcp_config = MCPServerConfig(
         name="test-mcp",
-        transport="stdio",
-        command="echo",
+        url="http://localhost:9000/mcp",
     )
     spec = _make_spec(mcp_servers=[mcp_config])
-    mgr = ToolManager(spec, work_dir)
+    mgr = ToolManager(spec)
 
     tools = [
         _make_mock_mcp_tool("simple"),
@@ -647,20 +594,17 @@ def test_mcp_tool_valid_names_registered(
     mgr.shutdown()
 
 
-def test_mcp_tool_mixed_valid_and_invalid(
-    work_dir: Path,
-) -> None:
+def test_mcp_tool_mixed_valid_and_invalid() -> None:
     """
     When an MCP server returns a mix of valid and invalid tool
     names, only valid tools are registered.
     """
     mcp_config = MCPServerConfig(
         name="test-mcp",
-        transport="stdio",
-        command="echo",
+        url="http://localhost:9000/mcp",
     )
     spec = _make_spec(mcp_servers=[mcp_config])
-    mgr = ToolManager(spec, work_dir)
+    mgr = ToolManager(spec)
 
     tools = [
         _make_mock_mcp_tool("valid_tool"),
@@ -694,7 +638,6 @@ def test_mcp_tool_mixed_valid_and_invalid(
     ],
 )
 def test_client_tool_invalid_name_raises(
-    work_dir: Path,
     name: str,
 ) -> None:
     """
@@ -705,6 +648,5 @@ def test_client_tool_invalid_name_raises(
     with pytest.raises(AgentPlaneError, match="Invalid client tool name"):
         ToolManager(
             spec,
-            work_dir,
             client_tool_specs=[_make_client_side_spec(name)],
         )

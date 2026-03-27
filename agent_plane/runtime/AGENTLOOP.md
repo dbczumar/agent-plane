@@ -24,7 +24,7 @@ inside DBOS `@step` functions. Add `litellm>=1.40` to dependencies.
 
 ### MCP client: the `mcp` package
 
-The `mcp` PyPI package provides stdio and HTTP transport clients. It's
+The `mcp` PyPI package provides HTTP (SSE) transport clients. It's
 async-only, but DBOS step threads have no running event loop, so
 `asyncio.run()` works inside steps. Add `mcp>=1.0` to dependencies.
 
@@ -167,16 +167,15 @@ Pure functions, no side effects. Key interfaces:
 
 ```python
 class ToolManager:
-    def __init__(self, spec: AgentSpec, work_dir: Path): ...
+    def __init__(self, spec: AgentSpec): ...
     def start(self) -> None:          # connect MCP servers, discover tools, register builtins
     def shutdown(self) -> None:       # close all connections
     def get_tool_schemas(self) -> list[dict]:  # OpenAI-format tool schemas
     def call_tool(self, name: str, arguments: str) -> str:  # route and execute
 ```
 
-- **MCP stdio**: `asyncio.run(stdio_client(...))` inside sync methods —
-  safe because DBOS step threads have no event loop
-- **MCP HTTP**: `asyncio.run(streamablehttp_client(...))`
+- **MCP HTTP**: `asyncio.run(sse_client(...))` — safe because DBOS step
+  threads have no event loop
 - **Built-in `load_skill`**: looks up skill by name in `spec.skills`,
   returns full `SkillSpec.content`
 - **Local tools**: deferred — returns error message if called in MVP
@@ -434,7 +433,7 @@ mcp>=1.0
    server, registers an agent bundle with a real LLM config using the
    provided key, `POST /v1/responses`, and verifies the response comes
    back with real LLM output.
-4. **Tool test**: Agent with an MCP server (e.g. a trivial stdio tool),
+4. **Tool test**: Agent with an MCP server (e.g. a trivial HTTP tool),
    verify `function_call` → `function_call_output` round-trip
 
 ---
@@ -443,7 +442,7 @@ mcp>=1.0
 
 - MCP connection pooling — keep long-lived MCP server connections across requests instead of
   reconnecting on every workflow execution. Would reduce per-request latency for agents with
-  slow-to-start MCP servers (e.g. database tools, heavy stdio processes). Requires health checks,
+  slow-to-start MCP servers (e.g. database tools). Requires health checks,
   reconnection logic, and cleanup on agent eviction.
 - Local tool execution — Python/TypeScript tool files bundled with the agent image. Currently
   returns an error if called. Needs sandboxing design (subprocess? container? WASM?).

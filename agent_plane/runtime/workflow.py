@@ -22,12 +22,15 @@ from agent_plane.entities import (
 from agent_plane.runtime import (
     get_agent_cache,
     get_agent_store,
+    get_artifact_store,
     get_caps,
     get_conversation_store,
+    get_file_store,
     get_task_store,
     get_tool_manager,
     set_tool_manager,
 )
+from agent_plane.runtime.content_resolver import resolve_content_references
 from agent_plane.runtime.durability import (
     close_stream,
     get_workflow_id,
@@ -1216,6 +1219,12 @@ def _call_llm_for_iteration(
     :returns: The LLM response dict.
     """
     sys_instructions = build_instructions(spec, instructions, tool_schemas)
+    # Resolve file_id references to inline base64 content before
+    # building the prompt. Skipped when stores are not configured.
+    file_store = get_file_store()
+    artifact_store = get_artifact_store()
+    if file_store is not None and artifact_store is not None:
+        history = resolve_content_references(history, file_store, artifact_store)
     input_items = history_to_input_items(history)
     if stream:
         return _call_llm_streaming(
@@ -1536,7 +1545,6 @@ def agent_execution_workflow(
     try:
         loaded = get_agent_cache().load(agent_id)
         spec = loaded.spec
-        work_dir = loaded.workdir
 
         agent = get_agent_store().get(agent_id)
         agent_name = agent.name if agent else agent_id
@@ -1552,7 +1560,7 @@ def agent_execution_workflow(
             ).to_dict(task_id)
 
         client_tool_specs: list[ClientSideToolSpec] = parse_client_side_tool_specs(tools or [])
-        tool_mgr = ToolManager(spec, work_dir, client_tool_specs=client_tool_specs)
+        tool_mgr = ToolManager(spec, client_tool_specs=client_tool_specs)
         set_tool_manager(tool_mgr)
 
         result = _run_agent_loop(

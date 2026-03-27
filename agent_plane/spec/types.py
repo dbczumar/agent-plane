@@ -200,21 +200,15 @@ class MCPServerConfig:
     """
     An MCP server declaration from ``tools/mcp/<name>.yaml``.
 
+    Only the HTTP (SSE) transport is supported. Agents that need
+    local subprocess tools should use client-side tools instead.
+
     :param name: Unique server identifier, e.g. ``"github"``.
-    :param transport: Connection protocol. Must be ``"stdio"`` or
-        ``"http"``.
     :param description: Optional human-readable summary of the
         server's purpose.
-    :param command: Executable to launch for ``stdio`` transport,
-        e.g. ``"npx"``. Required when transport is ``"stdio"``.
-    :param args: Command-line arguments for the ``stdio`` command,
-        e.g. ``["-y", "@modelcontextprotocol/server-github"]``.
-    :param env: Environment variables to set for the ``stdio``
-        process, e.g. ``{"GITHUB_TOKEN": "ghp_abc123"}``.
-    :param url: Endpoint URL for ``http`` transport, e.g.
-        ``"https://mcp.example.com/sse"``. Required when transport
-        is ``"http"``.
-    :param headers: HTTP headers to include with ``http`` requests,
+    :param url: Endpoint URL for the HTTP (SSE) transport, e.g.
+        ``"https://mcp.example.com/sse"``.
+    :param headers: HTTP headers to include with requests,
         e.g. ``{"Authorization": "Bearer tok_xyz"}``.
     :param timeout: Per-tool timeout in seconds. ``None`` inherits
         ``tools.timeout``.
@@ -223,13 +217,7 @@ class MCPServerConfig:
     """
 
     name: str
-    transport: str  # "stdio" | "http"
     description: str | None = None
-    # stdio fields
-    command: str | None = None
-    args: list[str] = field(default_factory=list)
-    env: dict[str, str] = field(default_factory=dict)
-    # http fields
     url: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
     # Per-tool timeout/retry overrides. None = inherit from

@@ -10,7 +10,6 @@ from agent_plane.spec.types import AgentSpec
 _SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9-]+$")
 _SKILL_NAME_MAX_LEN = 64
 _SKILL_DESC_MAX_LEN = 1024
-_VALID_TRANSPORTS = {"stdio", "http"}
 _VALID_INPUT_MODALITIES = {"text", "image", "audio", "video", "file"}
 _VALID_OUTPUT_MODALITIES = {"text", "image", "audio"}
 
@@ -172,18 +171,11 @@ def _validate_mcp_servers(spec: AgentSpec, result: ValidationResult) -> None:
     seen_names: set[str] = set()
     for i, mcp in enumerate(spec.mcp_servers):
         prefix = f"mcp_servers[{i}]"
-        # Transport
-        if mcp.transport not in _VALID_TRANSPORTS:
-            result.add(
-                f"{prefix}.transport",
-                f"must be 'stdio' or 'http', got {mcp.transport!r}",
-            )
-        # stdio requires command
-        if mcp.transport == "stdio" and not mcp.command:
-            result.add(f"{prefix}.command", "required for stdio transport")
-        # http requires url
-        if mcp.transport == "http" and not mcp.url:
-            result.add(f"{prefix}.url", "required for http transport")
+        # URL is required — the parser already rejects non-HTTP
+        # transports, so every MCPServerConfig that reaches here
+        # is HTTP.
+        if not mcp.url:
+            result.add(f"{prefix}.url", "required for MCP server")
         # Duplicate names
         if mcp.name in seen_names:
             result.add(f"{prefix}.name", f"duplicate MCP server name: {mcp.name!r}")

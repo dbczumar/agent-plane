@@ -1,10 +1,10 @@
 """Lightweight filesystem MCP server for the archer agent.
 
 Exposes read-only filesystem tools (list directory, read file,
-search for text) via the MCP stdio transport. Uses FastMCP for
+search for text) via HTTP (SSE) transport. Uses FastMCP for
 minimal boilerplate.
 
-Usage (stdio transport — launched by agent-plane automatically):
+Usage (start the server, then point the agent config at the URL):
     python filesystem_server.py
 """
 
@@ -35,10 +35,7 @@ def _safe_resolve(path: str) -> Path:
     """
     resolved = (_ALLOWED_ROOT / path).resolve()
     if not resolved.is_relative_to(_ALLOWED_ROOT):
-        raise ValueError(
-            f"Path {path!r} is outside the allowed "
-            f"directory: {_ALLOWED_ROOT}"
-        )
+        raise ValueError(f"Path {path!r} is outside the allowed directory: {_ALLOWED_ROOT}")
     return resolved
 
 
@@ -96,16 +93,10 @@ def search_files(pattern: str, path: str = ".") -> str:
         raise ValueError(f"Not a directory: {path}")
     matches = sorted(resolved.glob(pattern))
     # Filter to only files within the allowed root.
-    safe_matches = [
-        m for m in matches
-        if m.is_file() and m.is_relative_to(_ALLOWED_ROOT)
-    ]
+    safe_matches = [m for m in matches if m.is_file() and m.is_relative_to(_ALLOWED_ROOT)]
     if not safe_matches:
         return "(no matches)"
-    return "\n".join(
-        str(m.relative_to(_ALLOWED_ROOT))
-        for m in safe_matches
-    )
+    return "\n".join(str(m.relative_to(_ALLOWED_ROOT)) for m in safe_matches)
 
 
 if __name__ == "__main__":

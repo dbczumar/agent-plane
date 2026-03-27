@@ -297,39 +297,6 @@ def test_parse_skill_missing_description(agent_dir: Path) -> None:
         parse(agent_dir)
 
 
-def test_parse_mcp_stdio(
-    agent_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Parse a stdio MCP server config with env var expansion.
-
-    :param agent_dir: Temporary agent directory fixture.
-    :param monkeypatch: Pytest monkeypatch for env vars.
-    """
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test123")
-    mcp_dir = agent_dir / "tools" / "mcp"
-    mcp_dir.mkdir(parents=True)
-    mcp_config = {
-        "name": "github",
-        "description": "Access GitHub repos.",
-        "transport": "stdio",
-        "command": "npx",
-        "args": ["-y", "@modelcontextprotocol/server-github"],
-        "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"},
-    }
-    (mcp_dir / "github.yaml").write_text(yaml.dump(mcp_config))
-    spec = parse(agent_dir)
-    assert len(spec.mcp_servers) == 1
-    mcp = spec.mcp_servers[0]
-    assert mcp.name == "github"
-    assert mcp.transport == "stdio"
-    assert mcp.command == "npx"
-    assert mcp.args == ["-y", "@modelcontextprotocol/server-github"]
-    # ${GITHUB_TOKEN} expanded to the value set via monkeypatch.
-    assert mcp.env == {"GITHUB_TOKEN": "ghp_test123"}
-
-
 def test_parse_mcp_http(
     agent_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -352,7 +319,6 @@ def test_parse_mcp_http(
     (mcp_dir / "service.yaml").write_text(yaml.dump(mcp_config))
     spec = parse(agent_dir)
     mcp = spec.mcp_servers[0]
-    assert mcp.transport == "http"
     assert mcp.url == "http://localhost:9000/mcp"
     # ${API_KEY} expanded to the value set via monkeypatch.
     assert mcp.headers == {"Authorization": "Bearer sk-test-key"}
@@ -375,9 +341,9 @@ def test_parse_mcp_env_unresolved_var_raises(
     mcp_dir.mkdir(parents=True)
     mcp_config = {
         "name": "github",
-        "transport": "stdio",
-        "command": "npx",
-        "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"},
+        "transport": "http",
+        "url": "http://localhost:9000/mcp",
+        "headers": {"Authorization": "Bearer ${GITHUB_TOKEN}"},
     }
     (mcp_dir / "github.yaml").write_text(yaml.dump(mcp_config))
     with pytest.raises(AgentPlaneError, match="Unresolved environment variable"):
@@ -424,9 +390,9 @@ def test_parse_mcp_env_dollar_without_braces_raises(
     mcp_dir.mkdir(parents=True)
     mcp_config = {
         "name": "test",
-        "transport": "stdio",
-        "command": "echo",
-        "env": {"SECRET": "$MY_SECRET"},
+        "transport": "http",
+        "url": "http://localhost:9000/mcp",
+        "headers": {"Secret": "$MY_SECRET"},
     }
     (mcp_dir / "test.yaml").write_text(yaml.dump(mcp_config))
     with pytest.raises(AgentPlaneError, match="Unresolved environment variable"):
@@ -436,7 +402,7 @@ def test_parse_mcp_env_dollar_without_braces_raises(
 def test_parse_mcp_missing_name(agent_dir: Path) -> None:
     mcp_dir = agent_dir / "tools" / "mcp"
     mcp_dir.mkdir(parents=True)
-    (mcp_dir / "bad.yaml").write_text(yaml.dump({"transport": "stdio"}))
+    (mcp_dir / "bad.yaml").write_text(yaml.dump({"transport": "http", "url": "http://x"}))
     with pytest.raises(AgentPlaneError, match="missing required field 'name'"):
         parse(agent_dir)
 
@@ -555,13 +521,13 @@ def test_mcp_env_vars_expanded_from_environment(
     mcp_dir.mkdir(parents=True)
     mcp_config = {
         "name": "token-server",
-        "transport": "stdio",
-        "command": "echo",
-        "env": {"TOKEN": "${MY_TOKEN}"},
+        "transport": "http",
+        "url": "http://localhost:9000/mcp",
+        "headers": {"Authorization": "Bearer ${MY_TOKEN}"},
     }
     (mcp_dir / "token.yaml").write_text(yaml.dump(mcp_config))
     spec = parse(agent_dir)
-    assert spec.mcp_servers[0].env == {"TOKEN": "secret-123"}
+    assert spec.mcp_servers[0].headers == {"Authorization": "Bearer secret-123"}
 
 
 def test_mcp_headers_expanded_from_environment(
@@ -605,9 +571,9 @@ def test_mcp_env_expansion_mixed_set_and_unset_raises(
     mcp_dir.mkdir(parents=True)
     mcp_config = {
         "name": "mixed",
-        "transport": "stdio",
-        "command": "echo",
-        "env": {
+        "transport": "http",
+        "url": "http://localhost:9000/mcp",
+        "headers": {
             "A": "${SET_VAR}",
             "B": "${UNSET_VAR}",
             "C": "plain-value",
@@ -735,8 +701,8 @@ def test_parse_mcp_server_with_timeout_and_retry(
     mcp_dir.mkdir(parents=True)
     mcp_config = {
         "name": "slow-service",
-        "transport": "stdio",
-        "command": "echo",
+        "transport": "http",
+        "url": "http://localhost:9000/mcp",
         "timeout": 120,
         "retry": {
             "max_attempts": 7,

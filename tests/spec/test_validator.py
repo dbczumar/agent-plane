@@ -141,38 +141,14 @@ def test_duplicate_skill_names() -> None:
     assert any("duplicate skill name" in e.message for e in result.errors)
 
 
-def test_mcp_stdio_valid() -> None:
-    spec = _minimal_spec(
-        mcp_servers=[MCPServerConfig(name="gh", transport="stdio", command="npx")]
-    )
-    result = validate(spec)
-    assert result.valid
-
-
 def test_mcp_http_valid() -> None:
-    spec = _minimal_spec(
-        mcp_servers=[MCPServerConfig(name="svc", transport="http", url="http://localhost:9000")]
-    )
+    spec = _minimal_spec(mcp_servers=[MCPServerConfig(name="svc", url="http://localhost:9000")])
     result = validate(spec)
     assert result.valid
 
 
-def test_mcp_invalid_transport() -> None:
-    spec = _minimal_spec(mcp_servers=[MCPServerConfig(name="bad", transport="grpc")])
-    result = validate(spec)
-    assert not result.valid
-    assert any("stdio" in e.message and "http" in e.message for e in result.errors)
-
-
-def test_mcp_stdio_missing_command() -> None:
-    spec = _minimal_spec(mcp_servers=[MCPServerConfig(name="bad", transport="stdio")])
-    result = validate(spec)
-    assert not result.valid
-    assert any("command" in e.path for e in result.errors)
-
-
-def test_mcp_http_missing_url() -> None:
-    spec = _minimal_spec(mcp_servers=[MCPServerConfig(name="bad", transport="http")])
+def test_mcp_missing_url() -> None:
+    spec = _minimal_spec(mcp_servers=[MCPServerConfig(name="bad")])
     result = validate(spec)
     assert not result.valid
     assert any("url" in e.path for e in result.errors)
@@ -181,8 +157,8 @@ def test_mcp_http_missing_url() -> None:
 def test_duplicate_mcp_names() -> None:
     spec = _minimal_spec(
         mcp_servers=[
-            MCPServerConfig(name="dupe", transport="stdio", command="x"),
-            MCPServerConfig(name="dupe", transport="http", url="http://x"),
+            MCPServerConfig(name="dupe", url="http://a"),
+            MCPServerConfig(name="dupe", url="http://b"),
         ]
     )
     result = validate(spec)
@@ -192,7 +168,7 @@ def test_duplicate_mcp_names() -> None:
 
 def test_duplicate_tool_names_across_mcp_and_local() -> None:
     spec = _minimal_spec(
-        mcp_servers=[MCPServerConfig(name="search", transport="stdio", command="x")],
+        mcp_servers=[MCPServerConfig(name="search", url="http://localhost:9000")],
         local_tools=[
             LocalToolInfo(name="search", path="tools/python/search.py", language="python")
         ],
@@ -229,7 +205,7 @@ def test_multiple_errors_reported() -> None:
             SkillSpec(name="BAD", description="x" * 2000, content="."),
         ],
         mcp_servers=[
-            MCPServerConfig(name="bad", transport="ftp"),
+            MCPServerConfig(name="bad"),
         ],
     )
     result = validate(spec)

@@ -19,7 +19,7 @@ The core execution interface:
 
 ### tool_manager.py
 Load and manage tools for an execution:
-- Start MCP server connections (stdio subprocesses, HTTP clients)
+- Start MCP server connections (HTTP clients)
 - Load local tools from working directory (import Python modules, etc.)
 - Provide built-in tools: `load_skill()`, `load_reference()`, `load_script()`
 - Route tool calls to the correct handler

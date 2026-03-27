@@ -8,7 +8,6 @@ cached across workflow executions to avoid repeated round-trips.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any
 
 from mcp.types import Tool as McpToolDef
@@ -61,7 +60,6 @@ class ToolManager:
     def __init__(
         self,
         spec: AgentSpec,
-        work_dir: Path,
         client_tool_specs: list[ClientSideToolSpec] | None = None,
     ) -> None:
         """
@@ -72,9 +70,6 @@ class ToolManager:
 
         :param spec: The parsed AgentSpec defining which tools
             (skills, MCP servers) are available.
-        :param work_dir: Path to the extracted agent image
-            directory on disk, used as the working directory
-            for local tool execution.
         :param client_tool_specs: Optional list of
             :class:`ClientSideToolSpec` objects supplied by the API
             caller at request time, e.g.
@@ -82,7 +77,6 @@ class ToolManager:
             ``None`` and ``[]`` are equivalent (no client tools).
         """
         self._spec = spec
-        self._work_dir = work_dir
         self._started = False
         self._tools: dict[str, Tool] = {}
         self._mcp_connections: list[McpServerConnection] = []
@@ -216,10 +210,7 @@ class ToolManager:
         servers still proceed.
         """
         for config in self._spec.mcp_servers:
-            conn = McpServerConnection(
-                config=config,
-                work_dir=self._work_dir,
-            )
+            conn = McpServerConnection(config=config)
             try:
                 tools = await conn.connect()
             except Exception:

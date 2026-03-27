@@ -440,14 +440,16 @@ def _discover_mcp_servers(
                 f"MCP config missing required field 'transport': {yaml_file}",
                 code=ErrorCode.INVALID_INPUT,
             )
+        if str(transport) != "http":
+            raise AgentPlaneError(
+                f"MCP server {name!r} uses unsupported transport "
+                f"{transport!r} — only 'http' is supported: {yaml_file}",
+                code=ErrorCode.INVALID_INPUT,
+            )
         servers.append(
             MCPServerConfig(
                 name=str(name),
-                transport=str(transport),
                 description=raw.get("description"),
-                command=raw.get("command"),
-                args=raw.get("args", []),
-                env=_expand_env_vars(raw.get("env", {})),
                 url=raw.get("url"),
                 headers=_expand_env_vars(raw.get("headers", {})),
                 timeout=int(raw["timeout"]) if "timeout" in raw else None,

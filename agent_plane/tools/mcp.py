@@ -1,6 +1,6 @@
 """MCP server connections with tool discovery and caching.
 
-Manages connections to MCP servers (stdio and HTTP transports),
+Manages connections to MCP servers via the HTTP (SSE) transport,
 discovers tools via the MCP ``tools/list`` protocol, and caches
 discovery results with a configurable TTL to avoid repeated
 round-trips on every workflow execution.
@@ -24,7 +24,6 @@ from collections.abc import Callable, Coroutine
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import timedelta
-from pathlib import Path
 from typing import Any, TypeVar
 
 from anyio.streams.memory import (
@@ -32,9 +31,8 @@ from anyio.streams.memory import (
     MemoryObjectSendStream,
 )
 from cachetools import TTLCache
-from mcp import ClientSession, StdioServerParameters
+from mcp import ClientSession
 from mcp.client.sse import sse_client
-from mcp.client.stdio import stdio_client
 from mcp.shared.exceptions import McpError
 from mcp.shared.message import SessionMessage
 from mcp.types import CONNECTION_CLOSED, CallToolResult, ContentBlock, TextContent
@@ -363,16 +361,12 @@ def _cache_key(config: MCPServerConfig) -> str:
     """
     Build a stable cache key for an MCP server config.
 
-    Uses the server name + transport-specific identity (command+args
-    for stdio, url for http) so that two configs pointing at the
-    same server share the cache entry.
+    Uses the server name + URL so that two configs pointing at
+    the same server share the cache entry.
 
     :param config: The MCP server configuration.
     :returns: A string suitable as a dict key.
     """
-    if config.transport == "stdio":
-        return f"stdio:{config.name}:{config.command}:{config.args}"
-    # http transport — url is the identity
     return f"http:{config.name}:{config.url}"
 
 
@@ -390,24 +384,17 @@ class McpServerConnection:
     """
     Manages the lifecycle of a single MCP server connection.
 
-    Handles both stdio and HTTP transports. On ``connect()``,
-    establishes the transport, initializes the MCP session, and
-    discovers tools (from cache if fresh, otherwise via
-    ``tools/list``). On ``close()``, tears down the session and
-    transport.
+    Uses the HTTP (SSE) transport. On ``connect()``, establishes
+    the transport, initializes the MCP session, and discovers
+    tools (from cache if fresh, otherwise via ``tools/list``).
+    On ``close()``, tears down the session and transport.
 
     :param config: The MCP server configuration from the agent
         spec, e.g. ``MCPServerConfig(name="github",
-        transport="stdio", command="npx", ...)``.
-    :param work_dir: Working directory for stdio subprocess
-        execution. When set, the subprocess ``cwd`` is set to
-        this path so that relative command paths (e.g.
-        ``"tools/mcp/server.py"``) resolve correctly. ``None``
-        inherits the parent process CWD.
+        transport="http", url="https://mcp.example.com/sse")``.
     """
 
     config: MCPServerConfig
-    work_dir: Path | None = None
     _session: ClientSession | None = field(default=None, init=False, repr=False)
     _exit_stack: AsyncExitStack | None = field(default=None, init=False, repr=False)
     _discovered_tools: list[McpToolDef] = field(default_factory=list, init=False, repr=False)
@@ -434,8 +421,6 @@ class McpServerConnection:
 
         :returns: List of MCP tool definitions exposed by this
             server.
-        :raises ValueError: If the transport type is not
-            ``"stdio"`` or ``"http"``.
         """
         await self._open_session()
         return await self._discover_or_use_cache()
@@ -633,7 +618,7 @@ class McpServerConnection:
         self,
     ) -> tuple[_ReadStream, _WriteStream]:
         """
-        Open the MCP transport and return (read, write) streams.
+        Open the HTTP (SSE) MCP transport.
 
         The transport's async context is registered on the exit
         stack so it gets torn down on ``close()``.
@@ -641,47 +626,6 @@ class McpServerConnection:
         :returns: A ``(read_stream, write_stream)`` tuple of
             anyio memory object streams parameterized over
             ``SessionMessage``.
-        :raises ValueError: If the transport type is unsupported.
-        """
-        if self.config.transport == "stdio":
-            return await self._open_stdio()
-        if self.config.transport == "http":
-            return await self._open_http()
-        raise ValueError(f"Unsupported MCP transport: {self.config.transport!r}")
-
-    async def _open_stdio(
-        self,
-    ) -> tuple[_ReadStream, _WriteStream]:
-        """
-        Open a stdio MCP transport.
-
-        :returns: A ``(read_stream, write_stream)`` tuple from
-            the stdio client context manager.
-        """
-        assert self._exit_stack is not None
-        assert self.config.command is not None
-        params = StdioServerParameters(
-            command=self.config.command,
-            args=self.config.args,
-            env=self.config.env or None,
-            # Set cwd so relative command paths (e.g.
-            # "tools/mcp/server.py") resolve from the agent's
-            # extracted working directory.
-            cwd=self.work_dir,
-        )
-        read_stream, write_stream = await self._exit_stack.enter_async_context(
-            stdio_client(params)
-        )
-        return read_stream, write_stream
-
-    async def _open_http(
-        self,
-    ) -> tuple[_ReadStream, _WriteStream]:
-        """
-        Open an HTTP (SSE) MCP transport.
-
-        :returns: A ``(read_stream, write_stream)`` tuple from
-            the SSE client context manager.
         """
         assert self._exit_stack is not None
         assert self.config.url is not None
