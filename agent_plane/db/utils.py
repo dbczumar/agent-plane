@@ -26,6 +26,36 @@ _engine_cache: dict[str, Engine] = {}
 _engine_lock = threading.Lock()
 
 
+def _create_engine(db_uri: str) -> Engine:
+    """
+    Create a SQLAlchemy engine with connection pool configuration.
+
+    SQLite uses ``StaticPool`` (single connection, no pooling) with
+    ``busy_timeout`` for write contention. Non-SQLite databases use
+    connection pooling with ``pool_pre_ping`` to verify connections
+    before use.
+
+    :param db_uri: SQLAlchemy database connection string, e.g.
+        ``"sqlite:///mydb.db"`` or
+        ``"postgresql://user:pass@host/dbname"``.
+    :returns: A configured :class:`~sqlalchemy.engine.Engine`.
+    """
+    is_sqlite = db_uri.startswith("sqlite")
+    if is_sqlite:
+        return create_engine(db_uri)
+    return create_engine(
+        db_uri,
+        # Verify connections are alive before checking them out
+        # from the pool. Prevents "server has gone away" errors
+        # after idle periods.
+        pool_pre_ping=True,
+        # Recycle connections older than 30 minutes. Prevents
+        # stale connections when the database server restarts
+        # or closes idle connections.
+        pool_recycle=1800,
+    )
+
+
 def get_or_create_engine(db_uri: str) -> Engine:
     """
     Return a cached engine for the given URI, creating one if needed.
@@ -42,7 +72,7 @@ def get_or_create_engine(db_uri: str) -> Engine:
     if db_uri not in _engine_cache:
         with _engine_lock:
             if db_uri not in _engine_cache:
-                engine = create_engine(db_uri)
+                engine = _create_engine(db_uri)
                 _run_migrations(engine, db_uri)
                 _engine_cache[db_uri] = engine
     return _engine_cache[db_uri]

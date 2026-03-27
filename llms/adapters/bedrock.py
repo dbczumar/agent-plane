@@ -15,6 +15,38 @@ from typing import Any
 
 from llms.adapters.base import BaseAdapter
 
+# Default connect timeout: 30s to establish TCP connection.
+_BOTO_CONNECT_TIMEOUT = 30
+
+
+def _boto_config(
+    read_timeout: int,
+    max_retries: int | None = None,
+) -> Any:
+    """
+    Build a botocore ``Config`` with timeout and retry settings.
+
+    :param read_timeout: Read timeout in seconds for the HTTP
+        response, e.g. ``300``. Propagated from the agent spec's
+        ``llm.timeout``.
+    :param max_retries: Maximum retry attempts at the boto3 transport
+        layer. ``None`` disables boto3-level retries (the workflow's
+        ``execute_with_retry`` handles retries instead).
+    :returns: A ``botocore.config.Config`` instance.
+    """
+    from botocore.config import Config  # type: ignore[import-untyped]
+
+    retries = (
+        {"max_attempts": max_retries, "mode": "adaptive"}
+        if max_retries is not None
+        else {"max_attempts": 0}
+    )
+    return Config(
+        connect_timeout=_BOTO_CONNECT_TIMEOUT,
+        read_timeout=read_timeout,
+        retries=retries,
+    )
+
 
 class BedrockAdapter(BaseAdapter):
     """
@@ -23,47 +55,44 @@ class BedrockAdapter(BaseAdapter):
     Auth is handled via standard AWS environment variables
     (``AWS_ACCESS_KEY_ID``, ``AWS_SECRET_ACCESS_KEY``,
     ``AWS_DEFAULT_REGION``) or an IAM role.
+
+    Unlike other adapters, boto3 clients are not cached because
+    the read timeout is propagated from the agent spec and may
+    differ between calls.
     """
 
-    def __init__(self) -> None:
-        self._client: Any = None
-
-    def _get_client(self) -> Any:
-        """
-        Get or create the ``bedrock-runtime`` boto3 client.
-
-        :returns: A boto3 ``bedrock-runtime`` client.
-        """
-        if self._client is None:
-            import boto3  # type: ignore[import-untyped]
-
-            self._client = boto3.client("bedrock-runtime")
-        return self._client
-
-    def _create_client_from_params(
+    def _make_client(
         self,
-        params: dict[str, str],
+        timeout: int,
+        connection_params: dict[str, str] | None = None,
     ) -> Any:
         """
-        Create a fresh boto3 client from explicit connection params.
+        Create a boto3 ``bedrock-runtime`` client.
 
-        :param params: Connection overrides. Supported keys:
-            ``"aws_region"``, ``"aws_access_key_id"``,
+        :param timeout: Read timeout in seconds, propagated from
+            the agent spec's ``llm.timeout``, e.g. ``300``.
+        :param connection_params: Optional overrides. Supported
+            keys: ``"aws_region"``, ``"aws_access_key_id"``,
             ``"aws_secret_access_key"``, ``"aws_session_token"``.
         :returns: A boto3 ``bedrock-runtime`` client.
         """
-        import boto3
+        import boto3  # type: ignore[import-untyped]
 
         boto_kwargs: dict[str, str] = {}
-        if region := params.get("aws_region"):
-            boto_kwargs["region_name"] = region
-        if access_key := params.get("aws_access_key_id"):
-            boto_kwargs["aws_access_key_id"] = access_key
-        if secret_key := params.get("aws_secret_access_key"):
-            boto_kwargs["aws_secret_access_key"] = secret_key
-        if session_token := params.get("aws_session_token"):
-            boto_kwargs["aws_session_token"] = session_token
-        return boto3.client("bedrock-runtime", **boto_kwargs)
+        if connection_params:
+            if region := connection_params.get("aws_region"):
+                boto_kwargs["region_name"] = region
+            if access_key := connection_params.get("aws_access_key_id"):
+                boto_kwargs["aws_access_key_id"] = access_key
+            if secret_key := connection_params.get("aws_secret_access_key"):
+                boto_kwargs["aws_secret_access_key"] = secret_key
+            if session_token := connection_params.get("aws_session_token"):
+                boto_kwargs["aws_session_token"] = session_token
+        return boto3.client(
+            "bedrock-runtime",
+            config=_boto_config(read_timeout=timeout),
+            **boto_kwargs,
+        )
 
     def chat_completions(
         self,
@@ -88,15 +117,15 @@ class BedrockAdapter(BaseAdapter):
         :param connection_params: Per-call overrides. Supported keys:
             ``"aws_region"``, ``"aws_access_key_id"``,
             ``"aws_secret_access_key"``, ``"aws_session_token"``.
-        :param timeout: Not used by Bedrock (boto3 manages its own
-            timeouts). Accepted for interface compatibility.
+        :param timeout: Read timeout in seconds, propagated from
+            the agent spec's ``llm.timeout``. ``None`` uses the
+            module default (300s).
         :returns: Chat Completions response dict or chunk iterator.
         """
         converse_kwargs = _build_converse_kwargs(messages, model, tools, extra)
-        if connection_params:
-            client = self._create_client_from_params(connection_params)
-        else:
-            client = self._get_client()
+        # Default 300s matches the streaming default in other adapters.
+        effective_timeout = timeout if timeout is not None else 300
+        client = self._make_client(effective_timeout, connection_params)
 
         if stream:
             return _stream_converse(client, converse_kwargs)

@@ -20,6 +20,11 @@ from llms.adapters.gemini import GeminiAdapter
 
 _DEFAULT_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 
+# Timeout for the GCP OAuth token refresh HTTP request.
+# Tighter than the SDK default (120s) so a hanging metadata
+# server doesn't block the LLM call too long.
+_AUTH_REFRESH_TIMEOUT = 30
+
 
 class VertexAdapter(GeminiAdapter):
     """
@@ -51,13 +56,17 @@ class VertexAdapter(GeminiAdapter):
         if self._cached_credentials is not None and self._cached_credentials.valid:
             return self._cached_credentials
 
+        import functools
+
         import google.auth
         import google.auth.transport.requests
 
         credentials, _ = google.auth.default(scopes=_DEFAULT_SCOPES)  # type: ignore[no-untyped-call]
-        credentials.refresh(
-            google.auth.transport.requests.Request()  # type: ignore[no-untyped-call]
-        )
+        request = google.auth.transport.requests.Request()  # type: ignore[no-untyped-call]
+        # 30s timeout for the OAuth token refresh HTTP request.
+        # The SDK default is 120s; we tighten it so a hanging
+        # metadata server doesn't block the LLM call too long.
+        credentials.refresh(functools.partial(request, timeout=_AUTH_REFRESH_TIMEOUT))
         self._cached_credentials = credentials
         return credentials
 
