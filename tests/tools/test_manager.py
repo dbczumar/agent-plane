@@ -11,6 +11,7 @@ import pytest
 from agent_plane.errors import AgentPlaneError
 from agent_plane.spec.types import (
     AgentSpec,
+    LocalToolInfo,
     MCPServerConfig,
     SkillSpec,
 )
@@ -66,21 +67,25 @@ def _clean_mcp_cache() -> None:
 def _make_spec(
     skills: list[SkillSpec] | None = None,
     mcp_servers: list[MCPServerConfig] | None = None,
+    local_tools: list[LocalToolInfo] | None = None,
 ) -> AgentSpec:
     """
-    Create a minimal ``AgentSpec`` with the given skills and
-    MCP servers.
+    Create a minimal ``AgentSpec`` with the given skills,
+    MCP servers, and local tools.
 
     :param skills: Skills to include, or ``None`` for no
         skills.
     :param mcp_servers: MCP server configs, or ``None`` for
         no MCP servers.
+    :param local_tools: Local tool infos, or ``None`` for
+        no local tools.
     :returns: An ``AgentSpec`` with ``spec_version=1``.
     """
     return AgentSpec(
         spec_version=1,
         skills=skills or [],
         mcp_servers=mcp_servers or [],
+        local_tools=local_tools or [],
     )
 
 
@@ -650,3 +655,85 @@ def test_client_tool_invalid_name_raises(
             spec,
             client_tool_specs=[_make_client_side_spec(name)],
         )
+
+
+# ── Local tool registration ──────────────────────────
+
+
+def _write_local_tool(
+    workdir: Path,
+    filename: str,
+    schema_name: str,
+) -> None:
+    """
+    Write a minimal local Python tool file to
+    ``workdir/tools/python/<filename>``.
+
+    :param workdir: Agent image root directory.
+    :param filename: File name, e.g. ``"web_fetch.py"``.
+    :param schema_name: The ``name`` field in SCHEMA.
+    """
+    py_dir = workdir / "tools" / "python"
+    py_dir.mkdir(parents=True, exist_ok=True)
+    code = f'''
+"""Test tool."""
+from typing import Any
+SCHEMA: dict[str, Any] = {{
+    "type": "function",
+    "function": {{
+        "name": "{schema_name}",
+        "description": "A test tool.",
+        "parameters": {{"type": "object", "properties": {{}}}},
+    }},
+}}
+def run(arguments: dict[str, Any]) -> str:
+    """Execute."""
+    return "local_tool_result"
+'''
+    (py_dir / filename).write_text(code)
+
+
+def test_local_tools_registered_and_callable(
+    tmp_path: Path,
+) -> None:
+    """
+    ToolManager registers local Python tools from the workdir
+    and dispatches calls to them.
+    """
+    _write_local_tool(tmp_path, "echo_tool.py", "echo_tool")
+    info = LocalToolInfo(
+        name="echo_tool",
+        path="tools/python/echo_tool.py",
+        language="python",
+    )
+    spec = _make_spec(local_tools=[info])
+    mgr = ToolManager(spec, workdir=tmp_path)
+    schemas = mgr.get_tool_schemas()
+    # Local tool appears in the schema list.
+    names = [s["function"]["name"] for s in schemas]
+    assert "echo_tool" in names, (
+        f"Expected 'echo_tool' in schemas, got {names}. "
+        f"If missing, _register_local_tools did not register the tool."
+    )
+    # Dispatching works through call_tool.
+    result = mgr.call_tool("echo_tool", json.dumps({}))
+    assert result == "local_tool_result", (
+        f"Expected 'local_tool_result', got {result!r}. "
+        f"If 'Error: tool not found', the tool was not registered."
+    )
+
+
+def test_local_tools_skipped_without_workdir() -> None:
+    """
+    ToolManager with workdir=None skips local tool registration
+    without error, even if spec has local_tools.
+    """
+    info = LocalToolInfo(
+        name="some_tool",
+        path="tools/python/some_tool.py",
+        language="python",
+    )
+    spec = _make_spec(local_tools=[info])
+    # workdir=None (default) — should not raise.
+    mgr = ToolManager(spec)
+    assert mgr.get_tool_schemas() == [], "No tools should be registered when workdir is None."

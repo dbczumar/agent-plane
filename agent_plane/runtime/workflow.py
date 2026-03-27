@@ -1560,7 +1560,11 @@ def agent_execution_workflow(
             ).to_dict(task_id)
 
         client_tool_specs: list[ClientSideToolSpec] = parse_client_side_tool_specs(tools or [])
-        tool_mgr = ToolManager(spec, client_tool_specs=client_tool_specs)
+        tool_mgr = ToolManager(
+            spec,
+            client_tool_specs=client_tool_specs,
+            workdir=loaded.workdir,
+        )
         set_tool_manager(tool_mgr)
 
         result = _run_agent_loop(

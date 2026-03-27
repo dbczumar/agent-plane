@@ -46,6 +46,7 @@ Tool calls from a single LLM response are executed sequentially, not in parallel
 ### Cancellation propagation
 Workflow cancellation via DBOS does not interrupt an in-flight LLM call or tool execution.
 
-### Local tool execution
-`LocalToolInfo` tools in the agent spec are not executable. `ToolManager.call_tool()` returns
-an error for any tool that isn't `load_skill`.
+### Local tool execution (partially closed)
+Python local tools (`tools/python/*.py`) are now loaded and executed via `LocalPythonTool`.
+Each file must export `SCHEMA` (OpenAI function dict) and `run(arguments: dict) -> str`.
+TypeScript local tools (`tools/typescript/*.ts`) are not yet supported.

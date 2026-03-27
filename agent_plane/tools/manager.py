@@ -8,6 +8,7 @@ cached across workflow executions to avoid repeated round-trips.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from mcp.types import Tool as McpToolDef
@@ -21,6 +22,7 @@ from agent_plane.tools.builtins import (
     any_skill_has_resources,
 )
 from agent_plane.tools.client_specified import ClientSideTool, ClientSideToolSpec
+from agent_plane.tools.local import load_local_python_tools
 from agent_plane.tools.mcp import (
     EventLoopThread,
     McpServerConnection,
@@ -49,22 +51,21 @@ class ToolManager:
     - ``load_skill`` (if the agent has skills)
     - ``read_skill_file`` (if any skill has bundled resources)
     - One :class:`ClientSideTool` per entry in ``client_tool_specs``
+    - One :class:`LocalPythonTool` per ``tools/python/*.py`` file
 
     Registers at ``start()``:
     - MCP tools discovered from ``mcp_servers`` in the agent spec
-
-    Not yet implemented:
-    - Local tool execution (Python / TypeScript)
     """
 
     def __init__(
         self,
         spec: AgentSpec,
         client_tool_specs: list[ClientSideToolSpec] | None = None,
+        workdir: Path | None = None,
     ) -> None:
         """
-        Initialize the tool manager and register built-in and
-        client-specified tools.
+        Initialize the tool manager and register built-in,
+        client-specified, and local tools.
 
         MCP tools are not registered until ``start()`` is called.
 
@@ -75,6 +76,9 @@ class ToolManager:
             caller at request time, e.g.
             ``[ClientSideToolSpec(name="get_weather", ...)]``.
             ``None`` and ``[]`` are equivalent (no client tools).
+        :param workdir: The extracted agent image directory on disk.
+            Required for local tool loading. ``None`` skips local
+            tool registration, e.g. ``Path("/tmp/cache/ag_abc123")``.
         """
         self._spec = spec
         self._started = False
@@ -82,6 +86,7 @@ class ToolManager:
         self._mcp_connections: list[McpServerConnection] = []
         self._loop_thread: EventLoopThread | None = None
         self._register_skill_tools()
+        self._register_local_tools(workdir)
         self._register_client_tools(client_tool_specs or [])
 
     def _register_skill_tools(self) -> None:
@@ -98,6 +103,32 @@ class ToolManager:
         if any_skill_has_resources(self._spec.skills):
             read_tool = ReadSkillFileTool(self._spec.skills)
             self._tools[read_tool.name] = read_tool
+
+    def _register_local_tools(self, workdir: Path | None) -> None:
+        """
+        Load and register local Python tools from the agent image.
+
+        Tools with invalid names are skipped with a warning.
+        If ``workdir`` is ``None`` or the spec has no local tools,
+        this is a no-op.
+
+        :param workdir: The agent image directory, or ``None``.
+        """
+        if workdir is None or not self._spec.local_tools:
+            return
+        for tool in load_local_python_tools(self._spec.local_tools, workdir):
+            if not is_valid_tool_name(tool.name):
+                _logger.warning(
+                    "Local tool %r has invalid name — skipping",
+                    tool.name,
+                )
+                continue
+            if tool.name in self._tools:
+                _logger.warning(
+                    "Local tool %r shadows existing tool — overwriting",
+                    tool.name,
+                )
+            self._tools[tool.name] = tool
 
     def _register_client_tools(
         self,

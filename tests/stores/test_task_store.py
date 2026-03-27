@@ -688,7 +688,11 @@ async def test_persist_first_prevents_ghost_tokens(
     user_in_prompt = [item for item in second_call_input if item.get("role") == "user"]
     # Exactly one assistant message (the first response)
     assert len(assistant_in_prompt) == 1
-    assert "First response" in assistant_in_prompt[0]["content"]
+    # Content is now a list of content-block dicts (not a plain string)
+    # after the multimodal pass-through change in history_to_input_items.
+    assistant_content = assistant_in_prompt[0]["content"]
+    assistant_text = " ".join(block.get("text", "") for block in assistant_content)
+    assert "First response" in assistant_text
     # Two user messages: the seed + the steering message
     assert len(user_in_prompt) == 2
 
