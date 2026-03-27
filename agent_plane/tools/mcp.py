@@ -578,7 +578,7 @@ class McpTool(Tool):
         Return OpenAI Chat Completions tool schema.
 
         Converts the MCP tool definition's ``inputSchema`` to
-        the OpenAI format expected by litellm.
+        the OpenAI format expected by the LLM client.
 
         :returns: An OpenAI-format tool schema dict.
         """
