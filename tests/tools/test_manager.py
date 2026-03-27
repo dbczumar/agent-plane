@@ -40,9 +40,7 @@ def skill_with_resources(tmp_path: Path) -> SkillSpec:
     skill_dir.mkdir(parents=True)
     refs_dir = skill_dir / "references"
     refs_dir.mkdir()
-    (refs_dir / "style-guide.md").write_text(
-        "# Style Guide\n\nUse snake_case."
-    )
+    (refs_dir / "style-guide.md").write_text("# Style Guide\n\nUse snake_case.")
     return SkillSpec(
         name="code-review",
         description="Reviews code.",
@@ -130,10 +128,12 @@ def test_registry_dispatches_to_read_skill_file(
     )
     result = mgr.call_tool(
         "read_skill_file",
-        json.dumps({
-            "skill_name": "code-review",
-            "path": "references/style-guide.md",
-        }),
+        json.dumps(
+            {
+                "skill_name": "code-review",
+                "path": "references/style-guide.md",
+            }
+        ),
     )
     assert "# Style Guide" in result
 
@@ -253,8 +253,7 @@ def _patch_mcp_connect(
     :returns: A ``patch`` context manager.
     """
     return patch(
-        "agent_plane.tools.manager.McpServerConnection"
-        ".connect",
+        "agent_plane.tools.manager.McpServerConnection.connect",
         new_callable=AsyncMock,
         return_value=tools,
     )
@@ -341,8 +340,7 @@ def test_start_mcp_failure_does_not_block_other_tools(
     mgr = ToolManager(spec, work_dir)
 
     with patch(
-        "agent_plane.tools.manager.McpServerConnection"
-        ".connect",
+        "agent_plane.tools.manager.McpServerConnection.connect",
         new_callable=AsyncMock,
         side_effect=ConnectionError("failed"),
     ):
@@ -409,8 +407,7 @@ def test_mcp_duplicate_tool_name_last_wins(
         return [tool_a] if call_count == 1 else [tool_b]
 
     with patch(
-        "agent_plane.tools.manager.McpServerConnection"
-        ".connect",
+        "agent_plane.tools.manager.McpServerConnection.connect",
         new=fake_connect,
     ):
         mgr.start()

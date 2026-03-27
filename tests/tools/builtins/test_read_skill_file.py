@@ -24,9 +24,7 @@ def skill_with_resources(tmp_path: Path) -> SkillSpec:
     skill_dir.mkdir(parents=True)
     refs_dir = skill_dir / "references"
     refs_dir.mkdir()
-    (refs_dir / "style-guide.md").write_text(
-        "# Style Guide\n\nUse snake_case."
-    )
+    (refs_dir / "style-guide.md").write_text("# Style Guide\n\nUse snake_case.")
     return SkillSpec(
         name="code-review",
         description="Reviews code.",
@@ -56,10 +54,14 @@ def test_read_skill_file_returns_content(
     ReadSkillFileTool.invoke reads a file from the skill dir.
     """
     tool = ReadSkillFileTool([skill_with_resources])
-    result = tool.invoke(json.dumps({
-        "skill_name": "code-review",
-        "path": "references/style-guide.md",
-    }))
+    result = tool.invoke(
+        json.dumps(
+            {
+                "skill_name": "code-review",
+                "path": "references/style-guide.md",
+            }
+        )
+    )
     assert "# Style Guide" in result
     assert "snake_case" in result
 
@@ -71,10 +73,14 @@ def test_read_skill_file_unknown_skill(
     ReadSkillFileTool.invoke returns error for unknown skill.
     """
     tool = ReadSkillFileTool([skill_with_resources])
-    result = tool.invoke(json.dumps({
-        "skill_name": "nonexistent",
-        "path": "references/style-guide.md",
-    }))
+    result = tool.invoke(
+        json.dumps(
+            {
+                "skill_name": "nonexistent",
+                "path": "references/style-guide.md",
+            }
+        )
+    )
     assert "not found" in result
     assert "code-review" in result
 
@@ -86,10 +92,14 @@ def test_read_skill_file_traversal_blocked(
     ReadSkillFileTool.invoke rejects path traversal attempts.
     """
     tool = ReadSkillFileTool([skill_with_resources])
-    result = tool.invoke(json.dumps({
-        "skill_name": "code-review",
-        "path": "../../etc/passwd",
-    }))
+    result = tool.invoke(
+        json.dumps(
+            {
+                "skill_name": "code-review",
+                "path": "../../etc/passwd",
+            }
+        )
+    )
     assert "traversal not allowed" in result
 
 
@@ -100,10 +110,14 @@ def test_read_skill_file_absolute_path_blocked(
     ReadSkillFileTool.invoke rejects absolute paths.
     """
     tool = ReadSkillFileTool([skill_with_resources])
-    result = tool.invoke(json.dumps({
-        "skill_name": "code-review",
-        "path": "/etc/passwd",
-    }))
+    result = tool.invoke(
+        json.dumps(
+            {
+                "skill_name": "code-review",
+                "path": "/etc/passwd",
+            }
+        )
+    )
     assert "path must be relative" in result
 
 
@@ -114,10 +128,14 @@ def test_read_skill_file_not_found(
     ReadSkillFileTool.invoke returns error for missing files.
     """
     tool = ReadSkillFileTool([skill_with_resources])
-    result = tool.invoke(json.dumps({
-        "skill_name": "code-review",
-        "path": "references/nonexistent.md",
-    }))
+    result = tool.invoke(
+        json.dumps(
+            {
+                "skill_name": "code-review",
+                "path": "references/nonexistent.md",
+            }
+        )
+    )
     assert "file not found" in result
 
 
@@ -129,10 +147,14 @@ def test_read_skill_file_no_skill_dir(
     directory on disk.
     """
     tool = ReadSkillFileTool([skill_no_resources])
-    result = tool.invoke(json.dumps({
-        "skill_name": "summarize",
-        "path": "references/foo.md",
-    }))
+    result = tool.invoke(
+        json.dumps(
+            {
+                "skill_name": "summarize",
+                "path": "references/foo.md",
+            }
+        )
+    )
     assert "no directory on disk" in result
 
 

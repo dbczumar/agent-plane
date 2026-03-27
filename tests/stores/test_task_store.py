@@ -531,8 +531,11 @@ async def test_stream_closed_on_workflow_exception(
 
         events = await asyncio.wait_for(drain(), timeout=10.0)
         # subscribe() terminated — _DONE sentinel was received.
-        # LLM raised before producing output, so no events.
-        assert events == []
+        # The workflow emits a response.error SSE event for the
+        # terminal LLM failure before closing the stream.
+        assert len(events) == 1
+        assert events[0]["type"] == "response.error"
+        assert events[0]["source"] == "llm"
     finally:
         live_stream.unregister(task.id)
 

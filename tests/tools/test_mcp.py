@@ -4,21 +4,20 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-from agent_plane.spec.types import MCPServerConfig
 from mcp.shared.exceptions import McpError
 from mcp.types import CONNECTION_CLOSED, ErrorData
 
+from agent_plane.spec.types import MCPServerConfig
 from agent_plane.tools.mcp import (
     McpServerConnection,
     McpTool,
-    _CachedDiscovery,
     _cache_key,
+    _CachedDiscovery,
     _discovery_cache,
     _format_call_result,
     _format_content_block,
@@ -118,15 +117,11 @@ def _mock_mcp_transport(
     mock_tools_result.tools = tools or []
     mock_session.list_tools.return_value = mock_tools_result
     mock_session.initialize = AsyncMock()
-    mock_session.__aenter__ = AsyncMock(
-        return_value=mock_session
-    )
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session.__aexit__ = AsyncMock(return_value=False)
 
     mock_ctx = AsyncMock()
-    mock_ctx.__aenter__ = AsyncMock(
-        return_value=(MagicMock(), MagicMock())
-    )
+    mock_ctx.__aenter__ = AsyncMock(return_value=(MagicMock(), MagicMock()))
     mock_ctx.__aexit__ = AsyncMock(return_value=False)
 
     with patch(
@@ -227,9 +222,7 @@ async def test_cached_connect_has_live_session() -> None:
 
         conn = McpServerConnection(config=config)
         await conn.connect()
-        result = await conn.call_tool(
-            "test_tool", {"query": "hi"}
-        )
+        result = await conn.call_tool("test_tool", {"query": "hi"})
 
     assert result == "cached ok"
     mock_session.call_tool.assert_awaited_once()
@@ -363,12 +356,8 @@ def test_mcp_tool_invoke_delegates_to_connection() -> None:
             "agent_plane.tools.mcp._run_async",
             return_value="result text",
         ) as mock_run:
-            tool = McpTool(
-                tool_def=tool_def, connection=conn
-            )
-            result = tool.invoke(
-                json.dumps({"query": "hello"})
-            )
+            tool = McpTool(tool_def=tool_def, connection=conn)
+            result = tool.invoke(json.dumps({"query": "hello"}))
 
     assert result == "result text"
     mock_run.assert_called_once()
@@ -427,9 +416,7 @@ def test_format_call_result_non_text_content() -> None:
     # spec=[] disables auto-attribute creation so getattr(.text)
     # returns None, simulating non-text content (e.g. ImageContent).
     block = MagicMock(spec=[])
-    block.model_dump = MagicMock(
-        return_value={"type": "image", "data": "base64..."}
-    )
+    block.model_dump = MagicMock(return_value={"type": "image", "data": "base64..."})
     result = MagicMock()
     result.content = [block]
     result.isError = False
@@ -582,9 +569,7 @@ def test_is_connection_error_connection_reset() -> None:
     ConnectionResetError (subclass of ConnectionError) is
     classified as a connection error.
     """
-    assert _is_connection_error(
-        ConnectionResetError()
-    ) is True
+    assert _is_connection_error(ConnectionResetError()) is True
 
 
 def test_is_connection_error_mcp_connection_closed() -> None:
@@ -651,12 +636,8 @@ async def test_call_tool_reconnects_on_connection_error() -> None:
 
         # Patch _reconnect to re-establish the mock session
         # (in production this opens a new transport).
-        with patch.object(
-            conn, "_reconnect", new_callable=AsyncMock
-        ) as mock_reconnect:
-            result = await conn.call_tool(
-                "test_tool", {"query": "hi"}
-            )
+        with patch.object(conn, "_reconnect", new_callable=AsyncMock) as mock_reconnect:
+            result = await conn.call_tool("test_tool", {"query": "hi"})
 
         assert result == "recovered"
         mock_reconnect.assert_awaited_once()
@@ -684,9 +665,7 @@ async def test_call_tool_does_not_reconnect_on_tool_error() -> None:
         )
 
         with pytest.raises(McpError):
-            await conn.call_tool(
-                "test_tool", {"query": "hi"}
-            )
+            await conn.call_tool("test_tool", {"query": "hi"})
 
     await conn.close()
 
@@ -709,10 +688,6 @@ async def test_call_tool_propagates_if_retry_fails() -> None:
             EOFError("server died again"),
         ]
 
-        with patch.object(
-            conn, "_reconnect", new_callable=AsyncMock
-        ):
+        with patch.object(conn, "_reconnect", new_callable=AsyncMock):
             with pytest.raises(EOFError, match="died again"):
-                await conn.call_tool(
-                    "test_tool", {"query": "hi"}
-                )
+                await conn.call_tool("test_tool", {"query": "hi"})

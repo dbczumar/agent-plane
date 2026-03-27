@@ -93,6 +93,7 @@ class GeminiAdapter(BaseAdapter):
         extra: dict[str, Any],
         *,
         connection_params: dict[str, str] | None = None,
+        timeout: int | None = None,
     ) -> dict[str, Any] | Iterator[dict[str, Any]]:
         """
         Send a request to the Gemini API.
@@ -104,6 +105,8 @@ class GeminiAdapter(BaseAdapter):
         :param extra: Additional kwargs.
         :param connection_params: Per-call overrides. Supported keys:
             ``"api_key"``, ``"base_url"``.
+        :param timeout: Request timeout in seconds. ``None`` uses
+            the module default.
         :returns: Chat Completions response dict or chunk iterator.
         """
         params = connection_params or {}
@@ -113,11 +116,13 @@ class GeminiAdapter(BaseAdapter):
         effective_base = override_base.rstrip("/") if override_base else self._get_base_url()
 
         if stream:
+            effective_to = timeout if timeout is not None else _STREAM_TIMEOUT
             url = f"{effective_base}/models/{model}:streamGenerateContent?alt=sse"
-            return self._stream_request(url, headers, payload)
+            return self._stream_request(url, headers, payload, effective_to)
 
+        effective_to = timeout if timeout is not None else _REQUEST_TIMEOUT
         url = f"{effective_base}/models/{model}:generateContent"
-        return self._send_request(url, headers, payload, model)
+        return self._send_request(url, headers, payload, model, effective_to)
 
     def _send_request(
         self,
@@ -125,6 +130,7 @@ class GeminiAdapter(BaseAdapter):
         headers: dict[str, str],
         payload: dict[str, Any],
         model: str,
+        timeout: int = _REQUEST_TIMEOUT,
     ) -> dict[str, Any]:
         """
         Send a non-streaming Gemini request.
@@ -133,9 +139,10 @@ class GeminiAdapter(BaseAdapter):
         :param headers: HTTP headers.
         :param payload: Gemini API payload.
         :param model: Model name for the response.
+        :param timeout: Request timeout in seconds, e.g. ``120``.
         :returns: Chat Completions response dict.
         """
-        with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
+        with httpx.Client(timeout=timeout) as client:
             resp = client.post(url, headers=headers, json=payload)
             resp.raise_for_status()
             return _gemini_to_chat(resp.json(), model)
@@ -145,6 +152,7 @@ class GeminiAdapter(BaseAdapter):
         url: str,
         headers: dict[str, str],
         payload: dict[str, Any],
+        timeout: int = _STREAM_TIMEOUT,
     ) -> Iterator[dict[str, Any]]:
         """
         Send a streaming Gemini request.
@@ -152,9 +160,10 @@ class GeminiAdapter(BaseAdapter):
         :param url: The streaming endpoint URL.
         :param headers: HTTP headers.
         :param payload: Gemini API payload.
+        :param timeout: Request timeout in seconds, e.g. ``300``.
         :returns: Iterator of Chat Completions chunk dicts.
         """
-        with httpx.Client(timeout=_STREAM_TIMEOUT) as client:
+        with httpx.Client(timeout=timeout) as client:
             with client.stream("POST", url, headers=headers, json=payload) as resp:
                 resp.raise_for_status()
                 for line in resp.iter_lines():

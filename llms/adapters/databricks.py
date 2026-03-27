@@ -44,6 +44,7 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
         extra: dict[str, Any],
         *,
         connection_params: dict[str, str] | None = None,
+        timeout: int | None = None,
     ) -> dict[str, Any] | Iterator[dict[str, Any]]:
         """
         Send a Chat Completions request to Databricks Model Serving.
@@ -55,6 +56,8 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
         :param extra: Additional kwargs.
         :param connection_params: Required. Must contain
             ``"base_url"`` and ``"api_key"``.
+        :param timeout: Request timeout in seconds. ``None`` uses
+            the module default.
         :returns: Response dict or iterator of chunk dicts.
         :raises AgentPlaneError: If ``connection_params`` is missing or
             lacks ``"base_url"``.
@@ -72,4 +75,5 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
             stream,
             extra,
             connection_params=connection_params,
+            timeout=timeout,
         )

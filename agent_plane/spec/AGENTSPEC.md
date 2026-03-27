@@ -155,9 +155,6 @@ skill lives in its own subdirectory under `skills/`.
 ---
 name: deep-search
 description: Search the web and arxiv for sources on a topic.
-allowed_tools:
-  - search.web
-  - arxiv.search
 ---
 
 When asked to research a topic:
@@ -172,7 +169,6 @@ When asked to research a topic:
 |---|---|---|
 | `name` | yes | max 64 chars; lowercase letters, digits, hyphens; must match directory name |
 | `description` | yes | max 1024 chars; one-line description of when to use this skill |
-| `allowed_tools` | no | list of tool names this skill uses |
 
 Everything after the frontmatter is markdown content passed to the model.
 

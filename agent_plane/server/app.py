@@ -5,7 +5,7 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from agent_plane.errors import AgentPlaneError
+from agent_plane.errors import AgentPlaneError, ErrorCode
 from agent_plane.server.routes.agents import create_agents_router
 from agent_plane.server.routes.conversations import create_conversations_router
 from agent_plane.server.routes.files import create_files_router
@@ -49,11 +49,40 @@ def create_app(
 
     @app.exception_handler(AgentPlaneError)
     async def _handle_agent_plane_error(request: Request, exc: AgentPlaneError) -> JSONResponse:
+        """
+        Convert application errors to structured JSON responses.
+
+        :param request: The incoming request.
+        :param exc: The application error.
+        :returns: A JSON response with the error code and message.
+        """
         if exc.http_status >= 500:
             _logger.error("Internal error: %s", exc.message, exc_info=True)
         return JSONResponse(
             status_code=exc.http_status,
             content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    @app.exception_handler(Exception)
+    async def _handle_unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
+        """
+        Catch-all for unhandled exceptions (e.g. database
+        OperationalError). Returns the standard JSON error schema
+        so clients always get a consistent response format.
+
+        :param request: The incoming request.
+        :param exc: The unhandled exception.
+        :returns: A 500 JSON response with ``internal_error`` code.
+        """
+        _logger.error("Unhandled exception: %s", exc, exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "code": ErrorCode.INTERNAL_ERROR,
+                    "message": "An internal error occurred.",
+                },
+            },
         )
 
     app.include_router(

@@ -22,6 +22,7 @@ from agent_plane.entities import (
 from agent_plane.runtime import (
     get_agent_cache,
     get_agent_store,
+    get_caps,
     get_conversation_store,
     get_task_store,
     get_tool_manager,
@@ -36,12 +37,15 @@ from agent_plane.runtime.durability import (
 )
 from agent_plane.runtime.live_stream import close as _live_close
 from agent_plane.runtime.live_stream import publish as _live_publish
+from agent_plane.runtime.llm_retry import detail_to_dict, execute_with_retry
 from agent_plane.runtime.prompt import build_instructions, history_to_input_items
-from agent_plane.runtime.tool_manager import ToolManager
+from agent_plane.runtime.tool_retry import execute_tool_with_retry
 from agent_plane.spec import AgentSpec
-from agent_plane.spec.types import LLMConfig
+from agent_plane.spec.types import LLMConfig, RetryConfig, ToolsConfig
 from agent_plane.stores import ConversationStore, TaskStore
+from agent_plane.tools import ToolManager
 from llms import Client as LLMClient
+from llms.errors import PermanentLLMError, RetryableLLMError
 from llms.types import (
     FunctionCallOutput,
     MessageOutput,
@@ -205,17 +209,24 @@ def _response_to_dict(resp: LLMResponse) -> dict[str, Any]:
 
 @step()
 def _call_llm(
+    task_id: str,
     input_items: list[dict[str, Any]],
     instructions: str,
     model: str,
     tools: list[dict[str, Any]],
     extra: dict[str, Any],
+    connection: dict[str, str] | None = None,
+    timeout: int | None = None,
+    retry_config: RetryConfig | None = None,
 ) -> dict[str, Any]:
     """
-    Call the LLM via the Responses API (non-streaming). Returns the
-    accumulated response as a JSON-serializable dict for DBOS
-    checkpointing.
+    Call the LLM via the Responses API (non-streaming) with retry.
 
+    Retries are handled inside this ``@step`` boundary so they
+    don't cause duplicate DBOS checkpoints.
+
+    :param task_id: The task identifier for SSE event emission,
+        e.g. ``"task_abc123"``.
     :param input_items: Responses API input items (conversation
         history), e.g. ``[{"role": "user", "content": "Hello"}]``.
     :param instructions: System instructions string passed as
@@ -226,22 +237,44 @@ def _call_llm(
     :param extra: Additional kwargs from the agent's LLM config,
         e.g. ``{"temperature": 0.7}``. ``reasoning_effort`` is
         extracted and mapped to the ``reasoning`` parameter.
+    :param connection: Per-provider connection overrides, e.g.
+        ``{"api_key": "...", "base_url": "..."}``. ``None`` uses
+        environment variable defaults.
+    :param timeout: Request timeout in seconds. ``None`` uses the
+        adapter's default (120s non-streaming, 300s streaming).
+    :param retry_config: Retry policy. ``None`` means no retry
+        (single attempt).
     :returns: A JSON-serializable dict with ``"model"``, ``"text"``,
         and ``"tool_calls"`` keys.
+    :raises PermanentLLMError: On non-retryable LLM errors.
+    :raises RetryableLLMError: When all retry attempts are exhausted.
     """
     args = _build_responses_args(model, tools, extra)
-    resp = cast(
-        LLMResponse,
-        _get_llm_client().responses.create(
-            input=input_items,
-            instructions=instructions,
-            reasoning=args.reasoning,
-            **args.kwargs,
-        ),
+
+    def do_call() -> dict[str, Any]:
+        """Execute the non-streaming LLM call."""
+        resp = cast(
+            LLMResponse,
+            _get_llm_client().responses.create(
+                input=input_items,
+                instructions=instructions,
+                reasoning=args.reasoning,
+                connection_params=connection,
+                timeout=timeout,
+                **args.kwargs,
+            ),
+        )
+        return _response_to_dict(resp)
+
+    effective_retry = retry_config or RetryConfig(max_attempts=1)
+    return execute_with_retry(
+        do_call,
+        effective_retry,
+        on_retry=lambda event: _write_output(task_id, event),
     )
-    return _response_to_dict(resp)
 
 
+@step()
 def _call_llm_streaming(
     task_id: str,
     input_items: list[dict[str, Any]],
@@ -249,16 +282,20 @@ def _call_llm_streaming(
     model: str,
     tools: list[dict[str, Any]],
     extra: dict[str, Any],
+    connection: dict[str, str] | None = None,
+    timeout: int | None = None,
+    retry_config: RetryConfig | None = None,
 ) -> dict[str, Any]:
     """
-    Call the LLM via the Responses API with streaming enabled.
-    Emits ``response.output_text.delta`` and reasoning delta events
-    for each chunk, then returns the full accumulated response in the
-    same dict format as :func:`_call_llm`.
+    Call the LLM via the Responses API with streaming and retry.
 
-    NOT a ``@step`` — streaming is incompatible with DBOS
-    checkpointing since we emit side effects
-    (``write_stream``) during execution.
+    Emits ``response.output_text.delta`` and reasoning delta events
+    for each chunk, then returns the full accumulated response in
+    the same dict format as :func:`_call_llm`.
+
+    This is a ``@step`` so the result is checkpointed by DBOS.
+    On crash recovery, DBOS returns the cached response without
+    re-executing the LLM call. Retries are internal to this step.
 
     :param task_id: The task identifier, e.g.
         ``"task_abc123"``.
@@ -272,21 +309,42 @@ def _call_llm_streaming(
     :param extra: Additional kwargs from the agent's LLM config,
         e.g. ``{"temperature": 0.7}``. ``reasoning_effort`` is
         extracted and mapped to the ``reasoning`` parameter.
+    :param connection: Per-provider connection overrides, e.g.
+        ``{"api_key": "...", "base_url": "..."}``. ``None`` uses
+        environment variable defaults.
+    :param timeout: Request timeout in seconds. ``None`` uses the
+        adapter's default (120s non-streaming, 300s streaming).
+    :param retry_config: Retry policy. ``None`` means no retry
+        (single attempt).
     :returns: The accumulated response dict in the same shape
         as :func:`_call_llm`.
+    :raises PermanentLLMError: On non-retryable LLM errors.
+    :raises RetryableLLMError: When all retry attempts are exhausted.
     """
     args = _build_responses_args(model, tools, extra)
-    stream_resp = cast(
-        Iterator[ResponseStreamEvent],
-        _get_llm_client().responses.create(
-            input=input_items,
-            instructions=instructions,
-            reasoning=args.reasoning,
-            stream=True,
-            **args.kwargs,
-        ),
+
+    def do_call() -> dict[str, Any]:
+        """Execute the streaming LLM call and accumulate."""
+        stream_resp = cast(
+            Iterator[ResponseStreamEvent],
+            _get_llm_client().responses.create(
+                input=input_items,
+                instructions=instructions,
+                reasoning=args.reasoning,
+                stream=True,
+                connection_params=connection,
+                timeout=timeout,
+                **args.kwargs,
+            ),
+        )
+        return _accumulate_stream(task_id, stream_resp)
+
+    effective_retry = retry_config or RetryConfig(max_attempts=1)
+    return execute_with_retry(
+        do_call,
+        effective_retry,
+        on_retry=lambda event: _write_output(task_id, event),
     )
-    return _accumulate_stream(task_id, stream_resp)
 
 
 # SSE event types emitted for reasoning content
@@ -350,18 +408,41 @@ def _accumulate_stream(
 
 
 @step()
-def _call_tool(tool_name: str, arguments: str) -> str:
+def _call_tool(
+    task_id: str,
+    tool_name: str,
+    arguments: str,
+    timeout: int,
+    retry_config: RetryConfig,
+) -> str:
     """
-    Route a tool call to the current workflow's ToolManager.
+    Route a tool call to the current workflow's ToolManager
+    with timeout enforcement and retry.
 
+    Retries are handled inside this ``@step`` boundary so they
+    don't cause duplicate DBOS checkpoints. On exhausted retries,
+    an error string is returned (not raised) so the LLM can
+    decide how to proceed.
+
+    :param task_id: The task identifier for SSE event emission,
+        e.g. ``"task_abc123"``.
     :param tool_name: The tool function name, e.g.
         ``"load_skill"``.
     :param arguments: JSON-encoded arguments string from the
         LLM, e.g. ``'{"name": "summarize"}'``.
-    :returns: The tool's string result.
+    :param timeout: Per-call timeout in seconds, e.g. ``60``.
+    :param retry_config: Retry policy for this tool.
+    :returns: The tool's string result, or an error string
+        if all retries are exhausted.
     """
     mgr = get_tool_manager()
-    return mgr.call_tool(tool_name, arguments)
+    return execute_tool_with_retry(
+        tool_name=tool_name,
+        call_fn=lambda: mgr.call_tool(tool_name, arguments),
+        timeout=timeout,
+        retry_config=retry_config,
+        on_event=lambda event: _write_output(task_id, event),
+    )
 
 
 # ── Output helpers ────────────────────────────────────────
@@ -606,12 +687,13 @@ def _handle_final_response(
         last_seen,
     )
 
-    # Filter out our own output — close_inbox returns ALL
-    # items newer than last_seen, which includes the
-    # assistant message we just persisted (it has a position
-    # after last_seen). We only care about external steered
-    # messages.
-    steered = [ci for ci in late if ci.response_id != task_id]
+    # Filter out items we just persisted — close_inbox
+    # returns ALL items newer than last_seen, including the
+    # assistant message we committed in step 1. Exclude by
+    # ID so steered user messages (which share the same
+    # response_id as the running task) are preserved.
+    own_ids = {ci.id for ci in persisted}
+    steered = [ci for ci in late if ci.id not in own_ids]
 
     if steered:
         # ── Step 3a: Late messages arrived ─────────────────
@@ -686,12 +768,14 @@ def _execute_tools(
     task_id: str,
     conversation_id: str,
     tool_calls: list[dict[str, Any]],
+    tools_config: ToolsConfig,
     history: list[ConversationItem],
     output_items: list[dict[str, Any]],
     conv_store: ConversationStore,
 ) -> str:
     """
-    Execute each tool call and persist its output.
+    Execute each tool call with timeout/retry and persist output.
+
     Returns the ``last_seen`` ID after all tools complete.
 
     :param task_id: The task identifier, e.g.
@@ -699,7 +783,10 @@ def _execute_tools(
     :param conversation_id: The conversation ID, e.g.
         ``"conv_abc123"``.
     :param tool_calls: Tool call dicts from the LLM response,
-        each containing ``"id"`` and ``"function"`` keys.
+        each containing ``"call_id"``, ``"name"``, and
+        ``"arguments"`` keys.
+    :param tools_config: The agent's global tools config with
+        default timeout and retry policy.
     :param history: Mutable conversation history. Extended
         in place with tool output items.
     :param output_items: Mutable list of API-format output
@@ -710,8 +797,11 @@ def _execute_tools(
     last_seen: str | None = None
     for tc in tool_calls:
         result = _call_tool(
+            task_id,
             tc["name"],
             tc["arguments"],
+            tools_config.timeout,
+            tools_config.retry,
         )
 
         fco_items = _persist_and_stream(
@@ -742,6 +832,7 @@ def _handle_tool_calls(
     conversation_id: str,
     llm_resp: dict[str, Any],
     agent_name: str,
+    tools_config: ToolsConfig,
     history: list[ConversationItem],
     output_items: list[dict[str, Any]],
     conv_store: ConversationStore,
@@ -759,6 +850,8 @@ def _handle_tool_calls(
         calls.
     :param agent_name: The agent's registered name, e.g.
         ``"research-agent"``.
+    :param tools_config: The agent's global tools config with
+        default timeout and retry policy.
     :param history: Mutable conversation history. Extended
         in place with function call and output items.
     :param output_items: Mutable list of API-format output
@@ -788,10 +881,62 @@ def _handle_tool_calls(
         task_id,
         conversation_id,
         tool_calls,
+        tools_config,
         history,
         output_items,
         conv_store,
     )
+
+
+def _sync_steered_after_tools(
+    conv_store: ConversationStore,
+    conversation_id: str,
+    pre_tool_last_seen: str | None,
+    post_tool_last_seen: str,
+    history: list[ConversationItem],
+) -> str:
+    """
+    Pick up steered messages that arrived during tool execution.
+
+    ``try_deliver`` assigns ``position = MAX(position) + 1`` at
+    delivery time. If a steered message arrives between the
+    function_call persist and the function_call_output persist,
+    its position is interleaved among tool items. Using the
+    post-tool ``last_seen`` (highest tool output position) for
+    the next ``_sync_history`` would skip it.
+
+    This function fetches all items newer than
+    ``pre_tool_last_seen``, filters out items already in
+    ``history`` (the tool items we just persisted), and appends
+    any remaining steered messages.
+
+    :param conv_store: The ConversationStore to query.
+    :param conversation_id: The conversation ID, e.g.
+        ``"conv_abc123"``.
+    :param pre_tool_last_seen: Cursor from before tool
+        execution started.
+    :param post_tool_last_seen: Cursor from after tool
+        execution finished (the last tool output's ID).
+    :param history: Mutable conversation history. Extended
+        in place if steered messages are found.
+    :returns: The effective ``last_seen`` — always
+        ``post_tool_last_seen``, since tool outputs have the
+        highest positions even if steered messages were
+        interleaved.
+    """
+    if pre_tool_last_seen is None:
+        return post_tool_last_seen
+
+    all_new = fetch_all_items(
+        conv_store,
+        conversation_id,
+        after=pre_tool_last_seen,
+    )
+    known_ids = {ci.id for ci in history}
+    steered = [ci for ci in all_new if ci.id not in known_ids]
+    if steered:
+        history.extend(steered)
+    return post_tool_last_seen
 
 
 def _sync_history(
@@ -870,14 +1015,123 @@ def _call_llm_for_iteration(
             llm_config.model,
             tool_schemas,
             llm_config.extra,
+            llm_config.connection,
+            llm_config.timeout,
+            llm_config.retry,
         )
     return _call_llm(
+        task_id,
         input_items,
         sys_instructions,
         llm_config.model,
         tool_schemas,
         llm_config.extra,
+        llm_config.connection,
+        llm_config.timeout,
+        llm_config.retry,
     )
+
+
+def _call_llm_for_iteration_with_error_handling(
+    task_id: str,
+    spec: AgentSpec,
+    llm_config: LLMConfig,
+    history: list[ConversationItem],
+    instructions: str | None,
+    tool_schemas: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Call the LLM for one iteration with error handling and SSE
+    error event emission.
+
+    Wraps :func:`_call_llm_for_iteration` to catch LLM errors,
+    emit a ``response.error`` SSE event, and re-raise. This keeps
+    the agent loop clean of error-handling boilerplate.
+
+    :param task_id: The task identifier, e.g. ``"task_abc123"``.
+    :param spec: The parsed AgentSpec for the executing agent.
+    :param llm_config: The agent's LLM configuration.
+    :param history: Conversation history as persisted items.
+    :param instructions: Optional per-request instructions.
+    :param tool_schemas: OpenAI-format tool schemas.
+    :returns: The LLM response dict.
+    :raises PermanentLLMError: On non-retryable LLM errors.
+    :raises RetryableLLMError: When all retries are exhausted.
+    """
+    try:
+        return _call_llm_for_iteration(
+            task_id,
+            spec,
+            llm_config,
+            history,
+            instructions,
+            tool_schemas,
+            stream=True,
+        )
+    except (RetryableLLMError, PermanentLLMError) as exc:
+        _emit_llm_error_event(task_id, exc)
+        raise
+
+
+def _emit_llm_error_event(
+    task_id: str,
+    exc: RetryableLLMError | PermanentLLMError,
+) -> None:
+    """
+    Emit a ``response.error`` SSE event for a terminal LLM failure.
+
+    :param task_id: The task identifier for event routing.
+    :param exc: The classified LLM error.
+    """
+    detail_dict = detail_to_dict(exc.detail) if exc.detail else None
+    _write_output(
+        task_id,
+        {
+            "type": "response.error",
+            "source": "llm",
+            "error": {
+                "code": exc.code,
+                "message": str(exc),
+                "detail": detail_dict,
+            },
+        },
+    )
+
+
+def _handle_execution_timeout(
+    task_id: str,
+    output_items: list[dict[str, Any]],
+    execution_timeout: int,
+) -> dict[str, Any]:
+    """
+    Handle execution timeout: emit SSE error event and return
+    incomplete result.
+
+    :param task_id: The task identifier for SSE event emission.
+    :param output_items: Accumulated output items so far.
+    :param execution_timeout: The timeout that was exceeded,
+        in seconds, e.g. ``3600``.
+    :returns: An incomplete result dict with
+        ``"execution_timeout"`` reason.
+    """
+    _write_output(
+        task_id,
+        {
+            "type": "response.error",
+            "source": "execution",
+            "error": {
+                "code": "execution_timeout",
+                "message": (f"Wall-clock deadline exceeded after {execution_timeout}s"),
+                "detail": None,
+            },
+        },
+    )
+    return {
+        "task_id": task_id,
+        "status": "incomplete",
+        "output": output_items,
+        "incomplete_details": {"reason": "execution_timeout"},
+    }
 
 
 # ── The agent loop ────────────────────────────────────────
@@ -919,8 +1173,19 @@ def _run_agent_loop(
     # spec.llm is guaranteed non-None — checked by caller
     assert spec.llm is not None
     llm_config = spec.llm
+    tools_config = spec.tools
+    # Resolve execution timeout: min(spec, runtime cap)
+    caps = get_caps()
+    execution_timeout = min(spec.execution.timeout, caps.execution_timeout)
+    max_iterations = spec.execution.max_iterations
+    start_time = time.monotonic()
 
-    for iteration in range(_MAX_ITERATIONS):
+    for iteration in range(max_iterations):
+        # Check execution timeout at the top of each iteration.
+        elapsed = time.monotonic() - start_time
+        if elapsed >= execution_timeout:
+            return _handle_execution_timeout(task_id, output_items, execution_timeout)
+
         _logger.debug(
             "agent loop iteration %d for task %s",
             iteration,
@@ -932,15 +1197,13 @@ def _run_agent_loop(
             last_seen,
             history,
         )
-        llm_resp = _call_llm_for_iteration(
+        llm_resp = _call_llm_for_iteration_with_error_handling(
             task_id,
             spec,
             llm_config,
             history,
             instructions,
             tool_schemas,
-            # Stream tokens so SSE consumers see incremental output.
-            stream=True,
         )
 
         if not _has_tool_calls(llm_resp):
@@ -967,14 +1230,31 @@ def _run_agent_loop(
                 continue
             return result
 
+        # Save the pre-tool last_seen so we can detect steered
+        # messages that arrived during tool execution. Tool
+        # outputs get positions after the steered message, so
+        # using the post-tool last_seen would skip it.
+        pre_tool_last_seen = last_seen
         last_seen = _handle_tool_calls(
             task_id,
             conversation_id,
             llm_resp,
             agent_name,
+            tools_config,
             history,
             output_items,
             conv_store,
+        )
+        # Check for steered messages that arrived between the
+        # LLM call and tool completion. Use the pre-tool cursor
+        # to catch messages with positions interleaved among
+        # tool call items.
+        last_seen = _sync_steered_after_tools(
+            conv_store,
+            conversation_id,
+            pre_tool_last_seen,
+            last_seen,
+            history,
         )
 
     # Hit max iterations without a final response
@@ -982,7 +1262,7 @@ def _run_agent_loop(
         "task_id": task_id,
         "status": "incomplete",
         "output": output_items,
-        "incomplete_details": {"reason": "max_output_tokens"},
+        "incomplete_details": {"reason": "max_iterations"},
     }
 
 

@@ -506,3 +506,146 @@ def test_mcp_env_expansion_mixed_set_and_unset(
     assert env["A"] == "expanded"
     assert env["B"] == "${UNSET_VAR}"
     assert env["C"] == "plain-value"
+
+
+# ── Timeout / retry / execution parsing ────────────────
+
+
+def test_parse_llm_timeout_and_retry(tmp_path: Path) -> None:
+    """LLM block with explicit timeout and retry overrides."""
+    config = {
+        "spec_version": 1,
+        "llm": {
+            "model": "openai/gpt-5.4",
+            "timeout": 120,
+            "retry": {
+                "max_attempts": 5,
+                "status_codes": [429, 502],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.llm is not None
+
+    # Explicit timeout should override the 300s default.
+    # Failure means the parser ignores the timeout key.
+    assert spec.llm.timeout == 120
+
+    # Retry max_attempts should match the YAML value.
+    # Failure means retry block is not parsed or defaults are used instead.
+    assert spec.llm.retry.max_attempts == 5
+
+    # Status codes should reflect the custom list, not the defaults.
+    # Failure means the parser falls back to default status codes.
+    assert spec.llm.retry.status_codes == [429, 502]
+
+
+def test_parse_llm_timeout_defaults(tmp_path: Path) -> None:
+    """LLM block with only model inherits default timeout and retry."""
+    config = {
+        "spec_version": 1,
+        "llm": {"model": "openai/gpt-4o"},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.llm is not None
+
+    # Default LLM timeout is 300s per LLMConfig dataclass.
+    # Failure means the parser sets a different default.
+    assert spec.llm.timeout == 300
+
+    # Default retry max_attempts is 3 per RetryConfig dataclass.
+    # Failure means the parser produces a non-default retry config.
+    assert spec.llm.retry.max_attempts == 3
+
+
+def test_parse_tools_global_timeout_and_retry(tmp_path: Path) -> None:
+    """Tools block with explicit timeout and retry overrides."""
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "timeout": 30,
+            "retry": {"max_attempts": 4},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    # Explicit tools timeout should override the 60s default.
+    # Failure means the parser ignores the tools timeout key.
+    assert spec.tools.timeout == 30
+
+    # Retry max_attempts should match the YAML value.
+    # Failure means the tools retry block is not parsed.
+    assert spec.tools.retry.max_attempts == 4
+
+
+def test_parse_execution_config(tmp_path: Path) -> None:
+    """Execution block with explicit timeout and max_iterations."""
+    config = {
+        "spec_version": 1,
+        "execution": {
+            "timeout": 7200,
+            "max_iterations": 500,
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    # Explicit execution timeout should be honored.
+    # Failure means execution block parsing is broken.
+    assert spec.execution.timeout == 7200
+
+    # Explicit max_iterations should override the 1000 default.
+    # Failure means max_iterations is ignored by the parser.
+    assert spec.execution.max_iterations == 500
+
+
+def test_parse_execution_defaults(tmp_path: Path) -> None:
+    """No execution block yields ExecutionConfig defaults."""
+    config = {"spec_version": 1}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    # Default execution timeout is 3600s per ExecutionConfig.
+    # Failure means the parser uses a different default.
+    assert spec.execution.timeout == 3600
+
+    # Default max_iterations is 1000 per ExecutionConfig.
+    # Failure means the parser uses a different default.
+    assert spec.execution.max_iterations == 1000
+
+
+def test_parse_mcp_server_with_timeout_and_retry(
+    agent_dir: Path,
+) -> None:
+    """MCP server YAML with per-server timeout and retry overrides."""
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "slow-service",
+        "transport": "stdio",
+        "command": "echo",
+        "timeout": 120,
+        "retry": {
+            "max_attempts": 7,
+            "backoff_base": 3.0,
+        },
+    }
+    (mcp_dir / "slow.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    assert len(spec.mcp_servers) == 1
+    mcp = spec.mcp_servers[0]
+
+    # Per-server timeout should be parsed from the YAML.
+    # Failure means MCP timeout parsing is broken (returns None).
+    assert mcp.timeout == 120
+
+    # Per-server retry should be populated, not None.
+    # Failure means the retry block is ignored for MCP servers.
+    assert mcp.retry is not None
+
+    # Retry max_attempts should match the YAML value.
+    # Failure means MCP retry fields are not forwarded correctly.
+    assert mcp.retry.max_attempts == 7

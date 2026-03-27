@@ -31,6 +31,7 @@ class BaseAdapter(ABC):
         extra: dict[str, Any],
         *,
         connection_params: dict[str, str] | None = None,
+        timeout: int | None = None,
     ) -> dict[str, Any] | Iterator[dict[str, Any]]:
         """
         Send a chat completions request to the provider.
@@ -56,6 +57,8 @@ class BaseAdapter(ABC):
               "aws_access_key_id": "...",
               "aws_secret_access_key": "..."}``
             - Vertex: ``{"project": "...", "location": "..."}``
+        :param timeout: Request timeout in seconds. ``None`` uses the
+            adapter's default (120s non-streaming, 300s streaming).
         :returns: A Chat Completions response dict when
             ``stream=False``, or an iterator of Chat Completions
             chunk dicts when ``stream=True``.

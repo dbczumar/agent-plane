@@ -114,10 +114,7 @@ class ToolManager:
             with ``"type": "function"`` and a ``"function"``
             sub-dict describing the tool.
         """
-        return [
-            tool.get_schema()
-            for tool in self._tools.values()
-        ]
+        return [tool.get_schema() for tool in self._tools.values()]
 
     def call_tool(self, name: str, arguments: str) -> str:
         """
@@ -132,11 +129,7 @@ class ToolManager:
         """
         tool = self._tools.get(name)
         if tool is None:
-            return (
-                f"Error: tool {name!r} not found. "
-                f"Registered tools: "
-                f"{list(self._tools.keys())}"
-            )
+            return f"Error: tool {name!r} not found. Registered tools: {list(self._tools.keys())}"
         return tool.invoke(arguments)
 
     async def _connect_mcp_servers(self) -> None:
@@ -177,8 +170,7 @@ class ToolManager:
         for tool_def in tools:
             if tool_def.name in self._tools:
                 _logger.warning(
-                    "MCP tool %r from server %r "
-                    "shadows existing tool — overwriting",
+                    "MCP tool %r from server %r shadows existing tool — overwriting",
                     tool_def.name,
                     connection.config.name,
                 )

@@ -1,0 +1,279 @@
+"""Tests for LLM retry logic: classification, backoff, and retry loop."""
+
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import MagicMock
+
+import httpx
+import pytest
+
+from agent_plane.runtime.llm_retry import (
+    classify_llm_error,
+    compute_backoff_delay,
+    execute_with_retry,
+)
+from agent_plane.spec.types import RetryConfig
+from llms.errors import PermanentLLMError, RetryableLLMError
+
+
+@pytest.fixture()
+def retryable_status_codes() -> list[int]:
+    """
+    Default retryable HTTP status codes used across classification tests.
+
+    :returns: List of retryable status codes, e.g. ``[429, 500, 502, 503]``.
+    """
+    return [429, 500, 502, 503]
+
+
+@pytest.fixture()
+def retry_config_fast() -> RetryConfig:
+    """
+    Retry config with minimal backoff for fast tests.
+
+    Uses tiny backoff values so ``time.sleep`` (patched out) durations
+    are negligible even if the patch were removed.
+
+    :returns: A :class:`RetryConfig` with 3 attempts and near-zero backoff.
+    """
+    return RetryConfig(
+        max_attempts=3,
+        backoff_base=0.001,
+        backoff_max=0.01,
+        status_codes=[429, 500, 502, 503],
+    )
+
+
+def _make_http_status_error(status_code: int, body: str = "error") -> httpx.HTTPStatusError:
+    """
+    Build a minimal ``httpx.HTTPStatusError`` for testing.
+
+    :param status_code: HTTP status code for the mock response, e.g. ``429``.
+    :param body: Response body text, e.g. ``"rate limited"``.
+    :returns: An ``httpx.HTTPStatusError`` with the given status and body.
+    """
+    request = httpx.Request("POST", "http://test")
+    response = httpx.Response(status_code, text=body, request=request)
+    return httpx.HTTPStatusError("error", request=request, response=response)
+
+
+# ── classify_llm_error ───────────────────────────────────────────────
+
+
+def test_classify_timeout_is_retryable(
+    retryable_status_codes: list[int],
+) -> None:
+    """
+    Timeout exceptions must be classified as retryable with code='timeout'.
+    """
+    exc = httpx.TimeoutException("timeout")
+
+    result = classify_llm_error(exc, retryable_status_codes)
+
+    # Timeouts are always transient — must produce RetryableLLMError.
+    # Failure would mean timeouts are treated as permanent, skipping retry.
+    assert isinstance(result, RetryableLLMError)
+    # Code must be "timeout" so SSE events can distinguish timeout retries.
+    # Failure would mean downstream consumers misidentify the error type.
+    assert result.code == "timeout"
+
+
+def test_classify_retryable_http_status(
+    retryable_status_codes: list[int],
+) -> None:
+    """
+    HTTP 429 must be classified as retryable when 429 is in the retryable list.
+    """
+    exc = _make_http_status_error(429, body="rate limited")
+
+    result = classify_llm_error(exc, retryable_status_codes)
+
+    # 429 is in retryable_status_codes — must produce RetryableLLMError.
+    # Failure would mean rate-limited requests are not retried.
+    assert isinstance(result, RetryableLLMError)
+    # Code must be the string form of the status code for SSE events.
+    # Failure would mean the retry event carries the wrong error code.
+    assert result.code == "429"
+
+
+def test_classify_non_retryable_http_status(
+    retryable_status_codes: list[int],
+) -> None:
+    """
+    HTTP 401 must be classified as permanent when not in the retryable list.
+    """
+    exc = _make_http_status_error(401, body="unauthorized")
+
+    result = classify_llm_error(exc, retryable_status_codes)
+
+    # 401 is not in retryable_status_codes — must produce PermanentLLMError.
+    # Failure would mean auth failures are retried, wasting time.
+    assert isinstance(result, PermanentLLMError)
+    # Code must be the string form of the status code.
+    # Failure would mean the error event carries the wrong code.
+    assert result.code == "401"
+
+
+def test_classify_connection_error(
+    retryable_status_codes: list[int],
+) -> None:
+    """
+    Generic exceptions (connection errors) must be classified as permanent.
+    """
+    exc = Exception("DNS resolution failed")
+
+    result = classify_llm_error(exc, retryable_status_codes)
+
+    # Generic exceptions are not retryable — must produce PermanentLLMError.
+    # Failure would mean unknown errors are retried indefinitely.
+    assert isinstance(result, PermanentLLMError)
+    # Code must be "connection_error" for non-HTTP, non-timeout failures.
+    # Failure would mean SSE events misidentify the error category.
+    assert result.code == "connection_error"
+
+
+# ── compute_backoff_delay ────────────────────────────────────────────
+
+
+def test_compute_backoff_basic() -> None:
+    """
+    Backoff delay must be at most base^index (before cap), with jitter.
+    """
+    base = 2.0
+    max_delay = 30.0
+
+    delay = compute_backoff_delay(
+        attempt_index=2, backoff_base=base, backoff_max=max_delay
+    )
+
+    deterministic_max = min(base**2, max_delay)
+    # Delay must not exceed the deterministic ceiling (base^index).
+    # Failure would mean the exponential formula or cap is broken.
+    assert delay <= deterministic_max
+    # Jitter multiplier is uniform(0.5, 1.0), so delay >= 50% of ceiling.
+    # Failure would mean jitter range is wrong (too aggressive).
+    assert delay >= deterministic_max * 0.5
+
+
+def test_compute_backoff_capped() -> None:
+    """
+    Backoff delay must be capped at backoff_max even when base^index exceeds it.
+    """
+    # base=10, index=3 → 1000, but max=5 should cap it.
+    delay = compute_backoff_delay(
+        attempt_index=3, backoff_base=10.0, backoff_max=5.0
+    )
+
+    # Delay must never exceed backoff_max regardless of base^index.
+    # Failure would mean the cap is not applied, causing excessive waits.
+    assert delay <= 5.0
+    # Jitter floor is 50% of the cap.
+    # Failure would mean jitter is applied to uncapped value.
+    assert delay >= 5.0 * 0.5
+
+
+# ── execute_with_retry ───────────────────────────────────────────────
+
+
+def test_execute_with_retry_success_first_attempt(
+    retry_config_fast: RetryConfig,
+) -> None:
+    """
+    When call_fn succeeds on the first attempt, no retry callback fires.
+    """
+    call_fn = MagicMock(return_value="ok")
+    on_retry = MagicMock()
+
+    result = execute_with_retry(call_fn, retry_config_fast, on_retry)
+
+    # call_fn succeeds immediately — result must be the return value.
+    # Failure would mean the retry loop doesn't propagate success.
+    assert result == "ok"
+    # call_fn must be called exactly once (no unnecessary retries).
+    # Failure would mean the loop retries even on success.
+    assert call_fn.call_count == 1
+    # on_retry must never fire when the first attempt succeeds.
+    # Failure would mean spurious retry events are emitted.
+    assert on_retry.call_count == 0
+
+
+def test_execute_with_retry_retries_on_timeout(
+    retry_config_fast: RetryConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Timeout on first call must trigger one retry; second success is returned.
+    """
+    # Patch time.sleep to avoid real delays in tests.
+    monkeypatch.setattr("agent_plane.runtime.llm_retry.time.sleep", lambda _: None)
+
+    call_fn = MagicMock(
+        side_effect=[httpx.TimeoutException("timeout"), "recovered"]
+    )
+    on_retry = MagicMock()
+
+    result = execute_with_retry(call_fn, retry_config_fast, on_retry)
+
+    # Second call succeeds — result must be "recovered".
+    # Failure would mean the retry loop doesn't return the recovery value.
+    assert result == "recovered"
+    # call_fn must be called twice: initial failure + one retry.
+    # Failure would mean too many or too few attempts.
+    assert call_fn.call_count == 2
+    # on_retry must fire exactly once (before the single retry).
+    # Failure would mean retry events are missing or duplicated.
+    assert on_retry.call_count == 1
+
+
+def test_execute_with_retry_permanent_error_no_retry(
+    retry_config_fast: RetryConfig,
+) -> None:
+    """
+    A permanent error (401) must raise immediately without any retry.
+    """
+    exc = _make_http_status_error(401, body="unauthorized")
+    call_fn = MagicMock(side_effect=exc)
+    on_retry = MagicMock()
+
+    with pytest.raises(PermanentLLMError) as exc_info:
+        execute_with_retry(call_fn, retry_config_fast, on_retry)
+
+    # PermanentLLMError must be raised, not RetryableLLMError.
+    # Failure would mean non-retryable errors are silently retried.
+    assert exc_info.value.code == "401"
+    # call_fn must be called exactly once — no retry on permanent errors.
+    # Failure would mean wasted attempts on auth failures.
+    assert call_fn.call_count == 1
+    # on_retry must never fire for permanent errors.
+    # Failure would mean false retry events are emitted to clients.
+    assert on_retry.call_count == 0
+
+
+def test_execute_with_retry_exhausted_raises(
+    retry_config_fast: RetryConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When all attempts fail with retryable errors, RetryableLLMError is raised.
+    """
+    # Patch time.sleep to avoid real delays in tests.
+    monkeypatch.setattr("agent_plane.runtime.llm_retry.time.sleep", lambda _: None)
+
+    call_fn = MagicMock(
+        side_effect=httpx.TimeoutException("timeout"),
+    )
+    on_retry = MagicMock()
+
+    with pytest.raises(RetryableLLMError) as exc_info:
+        execute_with_retry(call_fn, retry_config_fast, on_retry)
+
+    # After exhausting all attempts, RetryableLLMError must be raised.
+    # Failure would mean the loop silently returns None or hangs.
+    assert exc_info.value.code == "timeout"
+    # call_fn must be called max_attempts times (3).
+    # Failure would mean the loop exits early or retries beyond the limit.
+    assert call_fn.call_count == retry_config_fast.max_attempts
+    # on_retry fires between attempts, so (max_attempts - 1) times.
+    # Failure would mean retry events don't match the actual retry count.
+    assert on_retry.call_count == retry_config_fast.max_attempts - 1

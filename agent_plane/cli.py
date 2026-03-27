@@ -63,12 +63,19 @@ def cli() -> None:
     default=None,
     help="Path to YAML config file.",
 )
+@click.option(
+    "--execution-timeout",
+    default=None,
+    type=int,
+    help="Max wall-clock seconds per agent execution.  [default: 7200]",
+)
 def server(
     host: str,
     port: int,
     database_uri: str | None,
     artifact_location: str | None,
     config_path: str | None,
+    execution_timeout: int | None,
 ) -> None:
     """Start the agent-plane server."""
     import uvicorn
@@ -104,16 +111,22 @@ def server(
     # can access them via getter functions (get_agent_cache(), etc.).
     from agent_plane.runtime import init as init_runtime
     from agent_plane.runtime.agent_cache import AgentCache
+    from agent_plane.runtime.caps import RuntimeCaps
 
     agent_cache = AgentCache(
         artifact_store=artifact_store,
         cache_dir=Path(art_loc) / ".cache",
     )
+    # CLI flag > config file > RuntimeCaps default (7200s = 2 hours).
+    # 7200 matches RuntimeCaps.execution_timeout default.
+    effective_timeout = execution_timeout or cfg.get("execution_timeout") or 7200
+    caps = RuntimeCaps(execution_timeout=int(effective_timeout))
     init_runtime(
         conversation_store=conversation_store,
         task_store=task_store,
         agent_store=agent_store,
         agent_cache=agent_cache,
+        caps=caps,
     )
 
     app = create_app(
@@ -147,7 +160,13 @@ def deploy(path: str, server: str) -> None:
     bundle_bytes = _bundle(Path(path))
     url = f"{server.rstrip('/')}/api/agents"
 
-    resp = httpx.post(url, files={"bundle": ("agent.tar.gz", bundle_bytes, "application/gzip")})
+    # 120s timeout: agent bundles can be large and the server
+    # needs time to extract and register the image.
+    resp = httpx.post(
+        url,
+        files={"bundle": ("agent.tar.gz", bundle_bytes, "application/gzip")},
+        timeout=120.0,
+    )
 
     if resp.status_code == 201:
         body = resp.json()

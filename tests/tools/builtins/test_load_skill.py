@@ -24,9 +24,7 @@ def skill_with_resources(tmp_path: Path) -> SkillSpec:
     skill_dir.mkdir(parents=True)
     refs_dir = skill_dir / "references"
     refs_dir.mkdir()
-    (refs_dir / "style-guide.md").write_text(
-        "# Style Guide\n\nUse snake_case."
-    )
+    (refs_dir / "style-guide.md").write_text("# Style Guide\n\nUse snake_case.")
     return SkillSpec(
         name="code-review",
         description="Reviews code.",

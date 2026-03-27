@@ -21,6 +21,7 @@ import time
 from collections.abc import Awaitable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any, TypeVar
 
 from anyio.streams.memory import (
@@ -47,6 +48,7 @@ _ReadStream = MemoryObjectReceiveStream[SessionMessage | Exception]
 _WriteStream = MemoryObjectSendStream[SessionMessage]
 
 _logger = logging.getLogger(__name__)
+
 
 def _run_async(coro: Awaitable[_T]) -> _T:
     """
@@ -103,9 +105,7 @@ def _run_in_thread(coro: Awaitable[_T]) -> _T:
         finally:
             loop.close()
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=1
-    ) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(_target)
         return future.result()
 
@@ -181,15 +181,9 @@ class McpServerConnection:
 
     config: MCPServerConfig
     cache_ttl_seconds: float = _DEFAULT_CACHE_TTL_SECONDS
-    _session: ClientSession | None = field(
-        default=None, init=False, repr=False
-    )
-    _exit_stack: AsyncExitStack | None = field(
-        default=None, init=False, repr=False
-    )
-    _discovered_tools: list[McpToolDef] = field(
-        default_factory=list, init=False, repr=False
-    )
+    _session: ClientSession | None = field(default=None, init=False, repr=False)
+    _exit_stack: AsyncExitStack | None = field(default=None, init=False, repr=False)
+    _discovered_tools: list[McpToolDef] = field(default_factory=list, init=False, repr=False)
 
     async def connect(self) -> list[McpToolDef]:
         """
@@ -244,8 +238,7 @@ class McpServerConnection:
             if not _is_connection_error(exc):
                 raise
             _logger.warning(
-                "MCP server %r: connection lost during "
-                "tool call %r, reconnecting",
+                "MCP server %r: connection lost during tool call %r, reconnecting",
                 self.config.name,
                 name,
             )
@@ -265,9 +258,7 @@ class McpServerConnection:
         :returns: The formatted tool result string.
         """
         assert self._session is not None
-        result = await self._session.call_tool(
-            name=name, arguments=arguments
-        )
+        result = await self._session.call_tool(name=name, arguments=arguments)
         return _format_call_result(result)
 
     async def _reconnect(self) -> None:
@@ -291,17 +282,22 @@ class McpServerConnection:
         self._exit_stack = AsyncExitStack()
         await self._exit_stack.__aenter__()
 
-        read_stream, write_stream = (
-            await self._open_transport()
+        read_stream, write_stream = await self._open_transport()
+        # Session-level read timeout applies to initialize(),
+        # list_tools(), and any call_tool() that doesn't pass
+        # its own per-call timeout. Falls back to the MCP SDK
+        # default (no timeout) when config.timeout is None.
+        session_timeout = (
+            timedelta(seconds=self.config.timeout) if self.config.timeout is not None else None
         )
         self._session = ClientSession(
-            read_stream, write_stream
+            read_stream,
+            write_stream,
+            read_timeout_seconds=session_timeout,
         )
         # Enter the session's async context via the exit stack
         # so it gets cleaned up on close().
-        await self._exit_stack.enter_async_context(
-            self._session
-        )
+        await self._exit_stack.enter_async_context(self._session)
         await self._session.initialize()
 
     async def _discover_or_use_cache(
@@ -323,8 +319,7 @@ class McpServerConnection:
         if cached is not None:
             self._discovered_tools = cached
             _logger.debug(
-                "MCP server %r: using cached discovery "
-                "(%d tools)",
+                "MCP server %r: using cached discovery (%d tools)",
                 self.config.name,
                 len(cached),
             )
@@ -381,9 +376,7 @@ class McpServerConnection:
             return None
         return cached.tools
 
-    def _update_cache(
-        self, tools: list[McpToolDef]
-    ) -> None:
+    def _update_cache(self, tools: list[McpToolDef]) -> None:
         """
         Store discovery results in the module-level cache.
 
@@ -413,10 +406,7 @@ class McpServerConnection:
             return await self._open_stdio()
         if self.config.transport == "http":
             return await self._open_http()
-        raise ValueError(
-            f"Unsupported MCP transport: "
-            f"{self.config.transport!r}"
-        )
+        raise ValueError(f"Unsupported MCP transport: {self.config.transport!r}")
 
     async def _open_stdio(
         self,
@@ -434,10 +424,8 @@ class McpServerConnection:
             args=self.config.args,
             env=self.config.env or None,
         )
-        read_stream, write_stream = (
-            await self._exit_stack.enter_async_context(
-                stdio_client(params)
-            )
+        read_stream, write_stream = await self._exit_stack.enter_async_context(
+            stdio_client(params)
         )
         return read_stream, write_stream
 
@@ -452,12 +440,19 @@ class McpServerConnection:
         """
         assert self._exit_stack is not None
         assert self.config.url is not None
-        read_stream, write_stream = (
-            await self._exit_stack.enter_async_context(
-                sse_client(
-                    url=self.config.url,
-                    headers=self.config.headers or None,
-                )
+        # sse_client timeout controls the initial HTTP connection
+        # handshake (default 5s). sse_read_timeout controls how
+        # long to wait for each SSE event (default 300s). We
+        # apply the per-server timeout to both when configured.
+        timeout = self.config.timeout
+        read_stream, write_stream = await self._exit_stack.enter_async_context(
+            sse_client(
+                url=self.config.url,
+                headers=self.config.headers or None,
+                # MCP SDK default: 5s for initial HTTP connection handshake.
+                timeout=float(timeout) if timeout is not None else 5,
+                # MCP SDK default: 300s (5 min) for SSE event read.
+                sse_read_timeout=float(timeout) if timeout is not None else 300,
             )
         )
         return read_stream, write_stream
@@ -520,12 +515,8 @@ class McpTool(Tool):
                 "name": self._tool_def.name,
                 # OpenAI tool schema requires description to be
                 # a string, not None.
-                "description": (
-                    self._tool_def.description or ""
-                ),
-                "parameters": (
-                    self._tool_def.inputSchema
-                ),
+                "description": (self._tool_def.description or ""),
+                "parameters": (self._tool_def.inputSchema),
             },
         }
 
@@ -542,11 +533,7 @@ class McpTool(Tool):
         :returns: The tool result as a string.
         """
         parsed = json.loads(arguments) if arguments else {}
-        return _run_async(
-            self._connection.call_tool(
-                self.name, parsed
-            )
-        )
+        return _run_async(self._connection.call_tool(self.name, parsed))
 
 
 # Exception types that indicate a dead/broken connection

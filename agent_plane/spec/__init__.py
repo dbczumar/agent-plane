@@ -8,11 +8,13 @@ from agent_plane.spec.parser import parse
 from agent_plane.spec.tar_utils import ExtractionError, extract_safe
 from agent_plane.spec.types import (
     AgentSpec,
+    ExecutionConfig,
     InteractionConfig,
     LLMConfig,
     LocalToolInfo,
     MCPServerConfig,
     ModalityConfig,
+    RetryConfig,
     SkillSpec,
     ToolsConfig,
 )
@@ -20,12 +22,14 @@ from agent_plane.spec.validator import ValidationResult, validate
 
 __all__ = [
     "AgentSpec",
+    "ExecutionConfig",
     "ExtractionError",
     "InteractionConfig",
     "LLMConfig",
     "LocalToolInfo",
     "MCPServerConfig",
     "ModalityConfig",
+    "RetryConfig",
     "SkillSpec",
     "ToolsConfig",
     "ValidationResult",

@@ -101,6 +101,7 @@ class VertexAdapter(GeminiAdapter):
         extra: dict[str, Any],
         *,
         connection_params: dict[str, str] | None = None,
+        timeout: int | None = None,
     ) -> dict[str, Any] | Iterator[dict[str, Any]]:
         """
         Send a request to Vertex AI.
@@ -112,6 +113,8 @@ class VertexAdapter(GeminiAdapter):
         :param extra: Additional kwargs.
         :param connection_params: Required. Must contain
             ``"project"`` + ``"location"`` or ``"base_url"``.
+        :param timeout: Request timeout in seconds. ``None`` uses
+            the module default.
         :returns: Chat Completions response dict or chunk iterator.
         :raises AgentPlaneError: If ``connection_params`` is missing or
             lacks required keys.
@@ -124,6 +127,7 @@ class VertexAdapter(GeminiAdapter):
             stream,
             extra,
             connection_params=resolved_params,
+            timeout=timeout,
         )
 
 

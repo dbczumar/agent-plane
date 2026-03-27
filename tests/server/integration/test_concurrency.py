@@ -53,11 +53,14 @@ async def test_steering_delivers_to_running_workflow(
     - try_deliver fails to insert the message
     - Steering returns a different response ID (new task)
     - Steered message not persisted in conversation items
-    - Workflow makes an extra LLM call on steered input
+    - Workflow does not continue with steered message (missing
+      second LLM call)
     """
     await create_test_agent(client)
 
     call_1 = mock_llm.add_call(text="First response", block=True)
+    # Second call: workflow continues with steered context
+    mock_llm.add_call(text="Steered response")
 
     first = await create_test_response(client, input_text="Hello")
     first_id = first.body["id"]
@@ -85,7 +88,7 @@ async def test_steering_delivers_to_running_workflow(
     assert "Hello" in user_texts
     assert "Change direction" in user_texts
 
-    # Release: workflow completes normally
+    # Release: workflow continues with steered message, then completes
     call_1.release()
 
     for _ in range(50):
@@ -94,10 +97,10 @@ async def test_steering_delivers_to_running_workflow(
             break
 
     assert resp.json()["status"] == "completed"
-    # Steering does NOT trigger a second LLM call — steered
-    # messages have response_id == task_id, so the workflow's
-    # filter (ci.response_id != task_id) excludes them.
-    assert mock_llm.call_count == 1
+    # Steering triggers a second LLM call: the workflow detects
+    # the steered message in close_inbox and continues the agent
+    # loop with the updated conversation history.
+    assert mock_llm.call_count == 2
 
 
 async def test_steering_preserves_position_order(
@@ -118,10 +121,13 @@ async def test_steering_preserves_position_order(
     - Position collision (steered and assistant at same pos)
     - Wrong ordering (assistant before steered message)
     - Steered message lost (not in items at all)
+    - Follow-up assistant response missing after steering
     """
     await create_test_agent(client)
 
     call_1 = mock_llm.add_call(text="The answer", block=True)
+    # Follow-up call after steering is detected
+    mock_llm.add_call(text="Follow-up answer")
 
     first = await create_test_response(
         client,
@@ -140,7 +146,8 @@ async def test_steering_preserves_position_order(
         previous_response_id=first_id,
     )
 
-    # Release: workflow persists assistant at next position
+    # Release: workflow persists first assistant, detects
+    # steered message, continues with second LLM call
     call_1.release()
 
     for _ in range(50):
@@ -149,20 +156,23 @@ async def test_steering_preserves_position_order(
             break
     assert resp.json()["status"] == "completed"
 
-    # Verify position ordering: user, steered, assistant
+    # Verify position ordering: user, steered, assistant,
+    # follow-up assistant (from steering continuation)
     items_resp = await client.get(
         f"/v1/conversations/{conv_id}/items",
         params={"limit": 100},
     )
     items = items_resp.json()["data"]
 
-    assert len(items) == 3, f"Expected 3 items, got {len(items)}"
+    assert len(items) == 4, f"Expected 4 items, got {len(items)}: {items}"
     assert items[0]["role"] == "user"
     assert items[0]["content"][0]["text"] == "Question 1"
     assert items[1]["role"] == "user"
     assert items[1]["content"][0]["text"] == "Steering message"
     assert items[2]["role"] == "assistant"
     assert items[2]["content"][0]["text"] == "The answer"
+    assert items[3]["role"] == "assistant"
+    assert items[3]["content"][0]["text"] == "Follow-up answer"
 
 
 async def test_multiple_steering_messages_while_blocked(
@@ -182,14 +192,16 @@ async def test_multiple_steering_messages_while_blocked(
     - Position collision between two steered messages
     - Second try_deliver fails (inbox closed prematurely)
     - Messages persisted out of order
-    - Workflow makes extra LLM calls for steered messages
+    - Workflow does not continue with steered messages
     """
     await create_test_agent(client)
 
     call_1 = mock_llm.add_call(
-        text="Final answer",
+        text="First answer",
         block=True,
     )
+    # Follow-up call after both steered messages are detected
+    mock_llm.add_call(text="Final answer")
 
     first = await create_test_response(
         client,
@@ -217,7 +229,8 @@ async def test_multiple_steering_messages_while_blocked(
     )
     assert steer_2.body["id"] == first_id
 
-    # Release: workflow completes
+    # Release: workflow persists first answer, detects
+    # both steered messages, continues with second LLM call
     call_1.release()
 
     for _ in range(50):
@@ -226,14 +239,17 @@ async def test_multiple_steering_messages_while_blocked(
             break
     assert resp.json()["status"] == "completed"
 
-    # Verify all 4 items in position order
+    # Verify all 5 items: user, 2 steered, first assistant,
+    # follow-up assistant
     items_resp = await client.get(
         f"/v1/conversations/{conv_id}/items",
         params={"limit": 100},
     )
     items = items_resp.json()["data"]
 
-    assert len(items) == 4, f"Expected 4 items (user + 2 steered + assistant), got {len(items)}"
+    assert len(items) == 5, (
+        f"Expected 5 items (user + 2 steered + 2 assistant), got {len(items)}: {items}"
+    )
     assert items[0]["role"] == "user"
     assert items[0]["content"][0]["text"] == "Original question"
     assert items[1]["role"] == "user"
@@ -241,10 +257,97 @@ async def test_multiple_steering_messages_while_blocked(
     assert items[2]["role"] == "user"
     assert items[2]["content"][0]["text"] == "Clarification B"
     assert items[3]["role"] == "assistant"
-    assert items[3]["content"][0]["text"] == "Final answer"
+    assert items[3]["content"][0]["text"] == "First answer"
+    assert items[4]["role"] == "assistant"
+    assert items[4]["content"][0]["text"] == "Final answer"
 
-    # Only 1 LLM call — steered messages don't trigger loops
-    assert mock_llm.call_count == 1
+    # 2 LLM calls: original + continuation after detecting steered messages
+    assert mock_llm.call_count == 2
+
+
+async def test_steering_during_tool_execution(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Steer a message while the workflow is executing tool calls.
+
+    Race window: the LLM returns a tool call. While the tool is
+    executing, a steered message arrives via try_deliver with a
+    position interleaved among the tool call items. After tool
+    execution, the workflow must detect the steered message and
+    include it in the next LLM call.
+
+    Breakage this catches:
+    - Steered message lost because post-tool last_seen cursor
+      skips over interleaved positions
+    - Workflow ignores steered input during tool execution
+    - Second LLM call missing (no continuation after tools)
+    """
+    await create_test_agent(client)
+
+    # Call 1: returns a tool call (blocks so we can steer
+    # during tool execution)
+    tool_call_spec = [
+        {
+            "call_id": "call_steer_tool_1",
+            "name": "load_skill",
+            "arguments": '{"name": "nonexistent"}',
+        },
+    ]
+    call_1 = mock_llm.add_call(tool_calls=tool_call_spec, block=True)
+    # Call 2: after tool execution, the LLM is called again
+    # with tool results. This also blocks so we can steer.
+    call_2 = mock_llm.add_call(text="Post-tool answer", block=True)
+    # Call 3: continuation after steering is detected
+    mock_llm.add_call(text="Steered answer")
+
+    first = await create_test_response(
+        client,
+        input_text="Use a tool",
+    )
+    first_id = first.body["id"]
+    conv_id = first.body["conversation"]["id"]
+
+    # Gate 1: workflow is blocked before returning tool calls
+    call_1.call_event.wait(timeout=10)
+    call_1.release()
+
+    # Gate 2: tool executed, LLM called again with results,
+    # now blocked in second LLM call
+    call_2.call_event.wait(timeout=10)
+
+    # Concurrent action: steer while blocked in second LLM call
+    # (tool results are already persisted at this point)
+    steer = await create_test_response(
+        client,
+        input_text="Change direction mid-tools",
+        previous_response_id=first_id,
+    )
+    assert steer.body["id"] == first_id
+
+    # Release: second LLM call completes, workflow detects
+    # steered message, continues with third LLM call
+    call_2.release()
+
+    for _ in range(50):
+        resp = await client.get(f"/v1/responses/{first_id}")
+        if resp.json()["status"] == "completed":
+            break
+    assert resp.json()["status"] == "completed"
+
+    # Verify steered message is in the conversation
+    items_resp = await client.get(
+        f"/v1/conversations/{conv_id}/items",
+        params={"limit": 100},
+    )
+    items = items_resp.json()["data"]
+    user_texts = [i["content"][0]["text"] for i in items if i.get("role") == "user"]
+    assert "Use a tool" in user_texts
+    assert "Change direction mid-tools" in user_texts
+
+    # 3 LLM calls: tool call + post-tool + steering continuation
+    assert mock_llm.call_count == 3
 
 
 # ── Cancel Races ─────────────────────────────────────────
@@ -400,6 +503,72 @@ async def test_steering_then_cancel_preserves_message(
     )
 
 
+async def test_steering_after_inbox_closed_creates_new_task(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Steer into a completed response (inbox closed). The server
+    must create a new task instead of delivering to the old one.
+
+    Race window: the workflow has finished and closed its inbox.
+    The steering request finds the task completed, so
+    ``_attempt_steering`` skips ``try_deliver`` entirely and
+    returns the ``conversation_id`` for normal task creation.
+
+    Breakage this catches:
+    - Steering into completed task hangs or errors
+    - No new task created (steered message lost)
+    - New task uses wrong conversation (message orphaned)
+    """
+    await create_test_agent(client)
+
+    # First response: completes normally (no blocking)
+    mock_llm.add_call(text="First answer")
+    first = await create_test_response(
+        client,
+        input_text="Hello",
+    )
+    first_id = first.body["id"]
+    conv_id = first.body["conversation"]["id"]
+
+    # Wait for completion (inbox closes)
+    for _ in range(50):
+        resp = await client.get(f"/v1/responses/{first_id}")
+        if resp.json()["status"] == "completed":
+            break
+    assert resp.json()["status"] == "completed"
+
+    # Steer into the completed response — should create new task
+    mock_llm.add_call(text="Second answer")
+    second = await create_test_response(
+        client,
+        input_text="Follow-up after completion",
+        previous_response_id=first_id,
+    )
+    second_id = second.body["id"]
+
+    # Must be a NEW task (different ID)
+    assert second_id != first_id, "Steering into completed task must create a new task"
+
+    # Wait for the new task to complete
+    for _ in range(50):
+        resp = await client.get(f"/v1/responses/{second_id}")
+        if resp.json()["status"] == "completed":
+            break
+    assert resp.json()["status"] == "completed"
+
+    # Both responses share the same conversation
+    items_resp = await client.get(
+        f"/v1/conversations/{conv_id}/items",
+        params={"limit": 100},
+    )
+    items = items_resp.json()["data"]
+    user_texts = [i["content"][0]["text"] for i in items if i["role"] == "user"]
+    assert "Hello" in user_texts
+    assert "Follow-up after completion" in user_texts
+
+
 # ── Cross-Server Steering ────────────────────────────────
 #
 # These tests launch real ``ap server`` subprocesses sharing
@@ -550,6 +719,8 @@ async def _assert_cross_server_steering(
             "bundle": ("agent.tar.gz", bundle, "application/gzip"),
         },
     )
+    # Failure: server A can't register agents — infra problem,
+    # not concurrency.
     assert resp.status_code == 201
 
     # Create response on server A — workflow calls mock LLM
@@ -561,6 +732,8 @@ async def _assert_cross_server_steering(
             "background": True,
         },
     )
+    # Failure: server A can't create tasks — infra problem,
+    # not concurrency.
     assert resp.status_code == 200
     first_id = resp.json()["id"]
     conv_id = resp.json()["conversation"]["id"]
@@ -571,6 +744,9 @@ async def _assert_cross_server_steering(
         if status.json()["pending"]:
             break
         await asyncio.sleep(0.1)
+    # Failure: workflow never reached the LLM call — the agent
+    # spec's connection.base_url didn't route to the mock, or
+    # the workflow crashed before calling the LLM.
     assert status.json()["pending"], "Mock LLM never received request"
 
     # Concurrent action: steer from server B
@@ -584,6 +760,11 @@ async def _assert_cross_server_steering(
         },
     )
     assert resp.status_code == 200
+    # Failure (new ID returned): server B couldn't steer into
+    # server A's running workflow. Causes: try_deliver failed
+    # across processes (DB locking), server B saw the task as
+    # inactive (stale read from shared SQLite), or inbox was
+    # already closed.
     assert resp.json()["id"] == first_id
 
     # Release: mock LLM responds, workflow completes
@@ -595,6 +776,9 @@ async def _assert_cross_server_steering(
         if resp.json()["status"] in ("completed", "failed"):
             break
         await asyncio.sleep(0.1)
+    # Failure: workflow didn't finish after gate release — hung,
+    # crashed on the steered message, or the steering
+    # continuation's second LLM call failed.
     assert resp.json()["status"] == "completed"
 
     # Verify steered message from server B is in the conversation
@@ -603,12 +787,25 @@ async def _assert_cross_server_steering(
     )
     items = items_resp.json()["data"]
     user_texts = [i["content"][0]["text"] for i in items if i["role"] == "user"]
+    # Failure: original user message lost — fundamental store
+    # corruption.
     assert "Hello from server A" in user_texts
+    # Failure: steered message not persisted — try_deliver's
+    # cross-process transaction was lost (rolled back, or
+    # committed to a different DB connection). This is the
+    # assertion most specific to cross-server: it proves
+    # try_deliver's atomic check-and-insert works across
+    # process boundaries with SQLite's file-level locking.
     assert "Steered from server B" in user_texts
 
-    # Only 1 LLM call — steering didn't trigger a second
     stats_resp = await mock_client.get("/stats")
-    assert stats_resp.json()["request_count"] == 1
+    # Failure (== 1): steering was delivered but the workflow
+    # didn't continue — steered messages filtered out instead
+    # of triggering a follow-up LLM call.
+    # Failure (== 0): workflow never called the LLM at all.
+    # Failure (> 2): duplicate work — workflow looped more
+    # than expected.
+    assert stats_resp.json()["request_count"] == 2
 
 
 async def test_cross_server_steering_via_shared_db(

@@ -27,9 +27,7 @@ class LoadSkillTool(Tool):
             ``[SkillSpec(name="code-review", ...)]``.
         """
         self._skills = skills
-        self._skills_by_name: dict[str, SkillSpec] = {
-            s.name: s for s in skills
-        }
+        self._skills_by_name: dict[str, SkillSpec] = {s.name: s for s in skills}
 
     @property
     def name(self) -> str:
@@ -64,9 +62,7 @@ class LoadSkillTool(Tool):
                     "properties": {
                         "name": {
                             "type": "string",
-                            "description": (
-                                "The skill name to load"
-                            ),
+                            "description": ("The skill name to load"),
                         },
                     },
                     "required": ["name"],
@@ -93,10 +89,7 @@ class LoadSkillTool(Tool):
         skill = self._skills_by_name.get(skill_name)
         if skill is None:
             available = list(self._skills_by_name.keys())
-            return (
-                f"Error: skill {skill_name!r} not found. "
-                f"Available skills: {available}"
-            )
+            return f"Error: skill {skill_name!r} not found. Available skills: {available}"
         resources = list_skill_resources(skill)
         return _format_skill_content(skill, resources)
 

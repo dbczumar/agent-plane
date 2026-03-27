@@ -28,9 +28,7 @@ class ReadSkillFileTool(Tool):
 
         :param skills: Parsed skills from the agent spec.
         """
-        self._skills_by_name: dict[str, SkillSpec] = {
-            s.name: s for s in skills
-        }
+        self._skills_by_name: dict[str, SkillSpec] = {s.name: s for s in skills}
 
     @property
     def name(self) -> str:
@@ -62,10 +60,7 @@ class ReadSkillFileTool(Tool):
                     "properties": {
                         "skill_name": {
                             "type": "string",
-                            "description": (
-                                "Name of the skill whose "
-                                "file to read"
-                            ),
+                            "description": ("Name of the skill whose file to read"),
                         },
                         "path": {
                             "type": "string",
@@ -97,9 +92,7 @@ class ReadSkillFileTool(Tool):
         args: dict[str, str] = json.loads(arguments)
         skill_name = args.get("skill_name")
         if skill_name is None:
-            return (
-                "Error: missing required 'skill_name' argument"
-            )
+            return "Error: missing required 'skill_name' argument"
         rel_path = args.get("path")
         if rel_path is None:
             return "Error: missing required 'path' argument"
@@ -107,15 +100,9 @@ class ReadSkillFileTool(Tool):
         skill = self._skills_by_name.get(skill_name)
         if skill is None:
             available = list(self._skills_by_name.keys())
-            return (
-                f"Error: skill {skill_name!r} not found. "
-                f"Available skills: {available}"
-            )
+            return f"Error: skill {skill_name!r} not found. Available skills: {available}"
         if skill.skill_dir is None:
-            return (
-                "Error: skill has no directory on disk "
-                "(loaded from in-memory config)."
-            )
+            return "Error: skill has no directory on disk (loaded from in-memory config)."
         return _read_file_safely(skill.skill_dir, rel_path)
 
 

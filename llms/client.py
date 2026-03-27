@@ -40,6 +40,7 @@ class _ResponsesNamespace:
         reasoning: dict[str, str] | None = None,
         stream: bool = False,
         connection_params: dict[str, str] | None = None,
+        timeout: int | None = None,
         **kwargs: Any,
     ) -> Response | Iterator[ResponseStreamEvent]:
         """
@@ -62,6 +63,8 @@ class _ResponsesNamespace:
             OpenAI-compatible providers, or
             ``{"aws_region": "us-west-2"}`` for Bedrock.
             ``None`` uses the adapter's default credentials.
+        :param timeout: Request timeout in seconds. ``None`` uses
+            the adapter's default (120s non-streaming, 300s streaming).
         :param kwargs: Additional provider-specific kwargs (e.g.
             ``temperature``, ``max_tokens``).
         :returns: A :class:`Response` when ``stream=False``, or an
@@ -82,6 +85,7 @@ class _ResponsesNamespace:
                 reasoning=reasoning,
                 stream=stream,
                 connection_params=connection_params,
+                timeout=timeout,
                 **kwargs,
             )
 
@@ -99,6 +103,7 @@ class _ResponsesNamespace:
                 True,
                 extra,
                 connection_params=connection_params,
+                timeout=timeout,
             )
             assert not isinstance(chunks, dict)
             return chat_stream_to_response_events(chunks, model=routed.model)
@@ -110,6 +115,7 @@ class _ResponsesNamespace:
             False,
             extra,
             connection_params=connection_params,
+            timeout=timeout,
         )
         assert isinstance(result, dict)
         return chat_response_to_response(result)

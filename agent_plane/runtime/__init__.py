@@ -9,11 +9,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from agent_plane.runtime import _globals
+from agent_plane.runtime.caps import RuntimeCaps
 
 if TYPE_CHECKING:
     from agent_plane.runtime.agent_cache import AgentCache
-    from agent_plane.runtime.tool_manager import ToolManager
     from agent_plane.stores import AgentStore, ConversationStore, TaskStore
+    from agent_plane.tools import ToolManager
 
 
 def init(
@@ -22,6 +23,7 @@ def init(
     task_store: TaskStore,
     agent_store: AgentStore,
     agent_cache: AgentCache,
+    caps: RuntimeCaps | None = None,
 ) -> None:
     """
     Initialize the runtime with store references.
@@ -35,12 +37,15 @@ def init(
         CRUD operations on registered agents.
     :param agent_cache: The AgentCache instance for
         loading and caching parsed agent specs.
+    :param caps: Operator-configured execution ceiling.
+        ``None`` uses :class:`RuntimeCaps` defaults.
     """
     _globals.init(
         conversation_store=conversation_store,
         task_store=task_store,
         agent_store=agent_store,
         agent_cache=agent_cache,
+        caps=caps,
     )
 
 
@@ -125,3 +130,13 @@ def set_tool_manager(mgr: ToolManager | None) -> None:
         ``finally`` block after the workflow completes).
     """
     _globals._tool_manager_var.set(mgr)
+
+
+def get_caps() -> RuntimeCaps:
+    """
+    Return the runtime caps set during :func:`init`.
+
+    :returns: The :class:`RuntimeCaps` instance. Always
+        non-None (defaults are used if none were provided).
+    """
+    return _globals._caps

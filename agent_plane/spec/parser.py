@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -78,7 +79,7 @@ def parse(root: Path) -> AgentSpec:
     )
 
 
-def _parse_llm(raw: dict[str, object] | None) -> LLMConfig | None:
+def _parse_llm(raw: dict[str, Any] | None) -> LLMConfig | None:
     """
     Parse the ``llm:`` block from config.yaml into an
     :class:`LLMConfig`.
@@ -118,7 +119,7 @@ def _parse_llm(raw: dict[str, object] | None) -> LLMConfig | None:
 
 
 def _parse_interaction(
-    raw: dict[str, object] | None,
+    raw: dict[str, Any] | None,
 ) -> InteractionConfig:
     """
     Parse the ``interaction:`` block from config.yaml into an
@@ -149,7 +150,7 @@ def _parse_interaction(
 
 
 def _parse_tools_config(
-    raw: dict[str, object] | None,
+    raw: dict[str, Any] | None,
 ) -> ToolsConfig:
     """
     Parse the ``tools:`` block from config.yaml into a
@@ -167,14 +168,14 @@ def _parse_tools_config(
     timeout = int(raw["timeout"]) if "timeout" in raw else 60
     retry = _parse_retry(raw.get("retry"))
     return ToolsConfig(
-        agents=raw.get("agents", []),  # type: ignore[arg-type]
+        agents=raw.get("agents", []),
         timeout=timeout,
         retry=retry,
     )
 
 
 def _parse_retry(
-    raw: dict[str, object] | None,
+    raw: dict[str, Any] | None,
 ) -> RetryConfig:
     """
     Parse a ``retry:`` block into a :class:`RetryConfig`.
@@ -196,7 +197,7 @@ def _parse_retry(
 
 
 def _parse_execution(
-    raw: dict[str, object] | None,
+    raw: dict[str, Any] | None,
 ) -> ExecutionConfig:
     """
     Parse the ``execution:`` block into an :class:`ExecutionConfig`.

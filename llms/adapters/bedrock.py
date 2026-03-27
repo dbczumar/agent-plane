@@ -74,6 +74,7 @@ class BedrockAdapter(BaseAdapter):
         extra: dict[str, Any],
         *,
         connection_params: dict[str, str] | None = None,
+        timeout: int | None = None,
     ) -> dict[str, Any] | Iterator[dict[str, Any]]:
         """
         Send a request via Bedrock Converse API.
@@ -87,6 +88,8 @@ class BedrockAdapter(BaseAdapter):
         :param connection_params: Per-call overrides. Supported keys:
             ``"aws_region"``, ``"aws_access_key_id"``,
             ``"aws_secret_access_key"``, ``"aws_session_token"``.
+        :param timeout: Not used by Bedrock (boto3 manages its own
+            timeouts). Accepted for interface compatibility.
         :returns: Chat Completions response dict or chunk iterator.
         """
         converse_kwargs = _build_converse_kwargs(messages, model, tools, extra)

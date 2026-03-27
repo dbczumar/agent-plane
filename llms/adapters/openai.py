@@ -112,6 +112,7 @@ class OpenAICompatibleAdapter(BaseAdapter):
         extra: dict[str, Any],
         *,
         connection_params: dict[str, str] | None = None,
+        timeout: int | None = None,
     ) -> dict[str, Any] | Iterator[dict[str, Any]]:
         """
         Send a Chat Completions request to the provider.
@@ -123,6 +124,8 @@ class OpenAICompatibleAdapter(BaseAdapter):
         :param extra: Additional kwargs.
         :param connection_params: Per-call overrides. Supported keys:
             ``"api_key"``, ``"base_url"``.
+        :param timeout: Request timeout in seconds. ``None`` uses
+            the module default.
         :returns: Response dict or iterator of chunk dicts.
         """
         params = connection_params or {}
@@ -132,14 +135,17 @@ class OpenAICompatibleAdapter(BaseAdapter):
         headers = self._build_headers(api_key_override=params.get("api_key"))
 
         if stream:
-            return self._stream_request(url, headers, payload)
-        return self._send_request(url, headers, payload)
+            effective_timeout = timeout if timeout is not None else _STREAM_TIMEOUT
+            return self._stream_request(url, headers, payload, effective_timeout)
+        effective_timeout = timeout if timeout is not None else _REQUEST_TIMEOUT
+        return self._send_request(url, headers, payload, effective_timeout)
 
     def _send_request(
         self,
         url: str,
         headers: dict[str, str],
         payload: dict[str, Any],
+        timeout: int = _REQUEST_TIMEOUT,
     ) -> dict[str, Any]:
         """
         Send a non-streaming HTTP POST and return the JSON response.
@@ -147,10 +153,11 @@ class OpenAICompatibleAdapter(BaseAdapter):
         :param url: The full endpoint URL.
         :param headers: HTTP headers.
         :param payload: JSON payload.
+        :param timeout: Request timeout in seconds, e.g. ``120``.
         :returns: Parsed JSON response dict.
         :raises httpx.HTTPStatusError: On non-2xx status.
         """
-        with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
+        with httpx.Client(timeout=timeout) as client:
             resp = client.post(url, headers=headers, json=payload)
             resp.raise_for_status()
             result: dict[str, Any] = resp.json()
@@ -161,6 +168,7 @@ class OpenAICompatibleAdapter(BaseAdapter):
         url: str,
         headers: dict[str, str],
         payload: dict[str, Any],
+        timeout: int = _STREAM_TIMEOUT,
     ) -> Iterator[dict[str, Any]]:
         """
         Send a streaming HTTP POST and yield parsed SSE data chunks.
@@ -168,9 +176,10 @@ class OpenAICompatibleAdapter(BaseAdapter):
         :param url: The full endpoint URL.
         :param headers: HTTP headers.
         :param payload: JSON payload with ``stream: true``.
+        :param timeout: Request timeout in seconds, e.g. ``300``.
         :returns: Iterator of parsed Chat Completions chunk dicts.
         """
-        with httpx.Client(timeout=_STREAM_TIMEOUT) as client:
+        with httpx.Client(timeout=timeout) as client:
             with client.stream("POST", url, headers=headers, json=payload) as resp:
                 resp.raise_for_status()
                 for line in resp.iter_lines():
@@ -375,6 +384,7 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         reasoning: dict[str, str] | None,
         stream: bool,
         connection_params: dict[str, str] | None = None,
+        timeout: int | None = None,
         **kwargs: Any,
     ) -> Response | Iterator[ResponseStreamEvent]:
         """
@@ -419,8 +429,10 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         headers = self._build_headers(api_key_override=params.get("api_key"))
 
         if stream:
-            return self._stream_responses(url, headers, payload)
-        resp_data = self._send_request(url, headers, payload)
+            effective_to = timeout if timeout is not None else _STREAM_TIMEOUT
+            return self._stream_responses(url, headers, payload, effective_to)
+        effective_to = timeout if timeout is not None else _REQUEST_TIMEOUT
+        resp_data = self._send_request(url, headers, payload, effective_to)
         return _parse_responses_response(resp_data)
 
     def _stream_responses(
@@ -428,6 +440,7 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         url: str,
         headers: dict[str, str],
         payload: dict[str, Any],
+        timeout: int = _STREAM_TIMEOUT,
     ) -> Iterator[ResponseStreamEvent]:
         """
         Stream the Responses API and yield typed
@@ -439,11 +452,12 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         :param url: The ``/v1/responses`` endpoint URL.
         :param headers: HTTP headers including Authorization.
         :param payload: The request payload with ``stream: true``.
+        :param timeout: Request timeout in seconds, e.g. ``300``.
         :yields: :class:`ResponseStreamEvent` instances.
         """
         current_event: str | None = None
         buf = ""
-        with httpx.Client(timeout=_STREAM_TIMEOUT) as client:
+        with httpx.Client(timeout=timeout) as client:
             with client.stream("POST", url, headers=headers, json=payload) as resp:
                 resp.raise_for_status()
                 for chunk in resp.iter_bytes():

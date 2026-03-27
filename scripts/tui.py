@@ -2,11 +2,12 @@
 """Textual-based chat TUI for agent-plane.
 
 Usage:
-    python scripts/tui.py <API_KEY>
-    python scripts/tui.py $(cat /tmp/mykey)
+    python scripts/tui.py <agent-dir-or-tarball>
+    python scripts/tui.py ./my-agent/
+    python scripts/tui.py ./my-agent.tar.gz
 
-Starts a temporary server, deploys an example agent, and opens
-an interactive chat TUI with streaming responses, markdown
+Starts a temporary server, deploys the agent, and opens an
+interactive chat TUI with streaming responses, markdown
 rendering, and steering support.
 """
 
@@ -15,6 +16,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import pathlib
 import signal
 import subprocess
 import sys
@@ -26,7 +28,7 @@ from dataclasses import dataclass
 import httpx
 from rich.markup import escape
 from rich.text import Text
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
@@ -36,58 +38,87 @@ from textual.widgets import Footer, Header, Input, Static
 
 PORT = 18400
 BASE_URL = f"http://127.0.0.1:{PORT}"
-AGENT_NAME = "chat-agent"
-MODEL = "o4-mini"
-CONNECTION: dict[str, str] | None = None
-SYSTEM_INSTRUCTIONS = "You are a helpful assistant. Be concise but thorough."
+# Set by main() after parsing the agent's config.yaml.
+AGENT_NAME: str = "agent"
 
 
 # ── Agent bundle ──────────────────────────────────────
 
 
-def _add_tar_file(
-    tf: tarfile.TarFile,
-    name: str,
-    data: bytes,
-) -> None:
+def _load_agent_bundle(path: str) -> bytes:
     """
-    Add a file to the tarball.
+    Load an agent bundle from a directory or tarball path.
 
-    :param tf: Open tarfile to add the file to.
-    :param name: Path within the tarball.
-    :param data: Raw file content bytes.
-    """
-    info = tarfile.TarInfo(name=name)
-    info.size = len(data)
-    tf.addfile(info, io.BytesIO(data))
+    If *path* is a directory, creates a ``.tar.gz`` from its
+    contents. If *path* is already a tarball, reads it as-is.
 
-
-def make_agent_bundle() -> bytes:
-    """
-    Create an agent tarball with system instructions.
-
+    :param path: Filesystem path to an agent directory or
+        ``.tar.gz`` file.
     :returns: Gzipped tar bytes ready for upload.
+    :raises SystemExit: If the path doesn't exist or has no
+        ``config.yaml``.
     """
-    connection_lines = ""
-    if CONNECTION:
-        connection_lines = "  connection:\n"
-        for k, v in CONNECTION.items():
-            connection_lines += f"    {k}: {v}\n"
+    from pathlib import Path
 
-    config_yaml = f"""\
-spec_version: 1
-name: {AGENT_NAME}
-llm:
-  model: {MODEL}
-  reasoning_effort: high
-{connection_lines}instructions: |
-  {SYSTEM_INSTRUCTIONS}
-""".encode()
+    p = Path(path)
+    if not p.exists():
+        print(f"Error: path not found: {path}")
+        sys.exit(1)
 
+    if p.is_file():
+        return p.read_bytes()
+
+    # Directory — bundle into a tarball
+    if not (p / "config.yaml").exists():
+        print(f"Error: no config.yaml in {path}")
+        sys.exit(1)
+
+    return _tar_directory(p)
+
+
+def _tar_directory(root: pathlib.Path) -> bytes:
+    """
+    Create a ``.tar.gz`` from an agent image directory.
+
+    :param root: Path to the agent directory containing
+        ``config.yaml`` and optional ``skills/``, ``tools/``,
+        etc.
+    :returns: Gzipped tar bytes.
+    """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        _add_tar_file(tf, "config.yaml", config_yaml)
+        for file_path in sorted(root.rglob("*")):
+            if file_path.is_file():
+                arcname = str(file_path.relative_to(root))
+                tf.add(str(file_path), arcname=arcname)
     return buf.getvalue()
+
+
+def _extract_agent_name(bundle: bytes) -> str:
+    """
+    Read the agent name from ``config.yaml`` inside a tarball.
+
+    :param bundle: Gzipped tar bytes.
+    :returns: The agent name string.
+    :raises SystemExit: If ``config.yaml`` is missing or has
+        no ``name`` field.
+    """
+    import yaml  # type: ignore[import-untyped]
+
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tf:
+        for member in tf.getmembers():
+            if member.name == "config.yaml" or member.name.endswith("/config.yaml"):
+                f = tf.extractfile(member)
+                if f is None:
+                    continue
+                config = yaml.safe_load(f.read())
+                name = config.get("name")
+                if not isinstance(name, str):
+                    print("Error: config.yaml missing 'name' field")
+                    sys.exit(1)
+                return name
+    print("Error: no config.yaml found in bundle")
+    sys.exit(1)
 
 
 # ── Server lifecycle ──────────────────────────────────
@@ -180,7 +211,7 @@ class UserMessage(Static):
 
     DEFAULT_CSS = """
     UserMessage {
-        margin: 0 0 0 0;
+        margin: 1 0 0 0;
         color: $text;
     }
     """
@@ -196,7 +227,7 @@ class AssistantMessage(Static):
 
     DEFAULT_CSS = """
     AssistantMessage {
-        margin: 0 0 0 0;
+        margin: 0 0 1 0;
         color: $text;
     }
     """
@@ -209,7 +240,7 @@ class SystemInfo(Static):
 
     DEFAULT_CSS = """
     SystemInfo {
-        margin: 0;
+        margin: 0 0 0 2;
         color: $text-muted;
     }
     """
@@ -228,7 +259,6 @@ class ChatApp(App[None]):
     """
 
     TITLE = "agent-plane"
-    SUB_TITLE = f"{AGENT_NAME} ({MODEL})"
 
     CSS = """
     Screen {
@@ -247,11 +277,30 @@ class ChatApp(App[None]):
         max-height: 5;
         margin: 0 1;
     }
+
+    Collapsible {
+        margin: 0 0 0 2;
+        padding: 0;
+    }
+
+    Collapsible CollapsibleTitle {
+        color: $text-muted;
+    }
+
+    Collapsible:focus-within CollapsibleTitle {
+        color: $accent;
+    }
+
+    Collapsible Contents {
+        padding: 0 0 0 2;
+    }
     """
 
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit"),
         Binding("ctrl+l", "clear_log", "Clear"),
+        Binding("ctrl+r", "toggle_reasoning", "Reasoning"),
+        Binding("escape", "toggle_browse", "Browse", show=False),
     ]
 
     def __init__(
@@ -285,13 +334,12 @@ class ChatApp(App[None]):
 
     def on_mount(self) -> None:
         """Focus the input on startup and show welcome."""
+        self.sub_title = AGENT_NAME
         scroll = self.query_one("#chat-scroll", VerticalScroll)
         scroll.mount(
             SystemInfo(
                 Text.from_markup(
-                    f"[dim]Agent [bold]{AGENT_NAME}[/bold] ready "
-                    f"· model [bold]{MODEL}[/bold] "
-                    f"· type below to chat[/dim]"
+                    f"[dim]Agent [bold]{AGENT_NAME}[/bold] ready · type below to chat[/dim]"
                 )
             )
         )
@@ -315,8 +363,11 @@ class ChatApp(App[None]):
         if self._streaming and self._current_response_id is not None:
             self._send_steering(text)
             scroll.mount(
-                SystemInfo(
-                    Text.from_markup(f"[dim italic]steered: {escape(text[:80])}[/dim italic]")
+                UserMessage(
+                    Text.from_markup(
+                        f"[bold cyan]you>[/bold cyan] [dim italic](steering)[/dim italic]"
+                        f" {escape(text)}"
+                    )
                 )
             )
             scroll.scroll_end()
@@ -361,18 +412,24 @@ class ChatApp(App[None]):
         try:
             await _run_sse_stream(self, scroll, live, acc, body)
         except httpx.HTTPStatusError as exc:
-            live.update(
+            current = self._live_widget or live
+            current.update(
                 Text.from_markup(
                     f"[bold red]Error {exc.response.status_code}:"
                     f"[/bold red] {escape(exc.response.text[:200])}"
                 )
             )
         except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
-            live.update(
+            current = self._live_widget or live
+            current.update(
                 Text.from_markup(f"[bold red]Connection error:[/bold red] {escape(str(exc))}")
             )
         finally:
             self._streaming = False
+            # Remove trailing placeholder widget if it never got content
+            final = self._live_widget
+            if final is not None and not acc.had_text:
+                final.remove()
             self._live_widget = None
             if self._current_response_id is not None:
                 self._previous_response_id = self._current_response_id
@@ -407,6 +464,72 @@ class ChatApp(App[None]):
         scroll = self.query_one("#chat-scroll", VerticalScroll)
         scroll.remove_children()
 
+    def action_toggle_reasoning(self) -> None:
+        """Toggle all reasoning/summary collapsibles (Ctrl+R)."""
+        from textual.widgets import Collapsible
+
+        for c in self.query(Collapsible):
+            c.collapsed = not c.collapsed
+
+    def action_toggle_browse(self) -> None:
+        """
+        Toggle between input mode and browse mode (Escape).
+
+        In browse mode, Up/Down navigates collapsibles and
+        Enter toggles them. Escape returns to input mode.
+        """
+        from textual.widgets import Collapsible
+
+        inp = self.query_one("#user-input", Input)
+        if self.focused is inp:
+            # Enter browse mode: focus the last collapsible
+            collapsibles = list(self.query(Collapsible))
+            if collapsibles:
+                collapsibles[-1].focus()
+        else:
+            # Return to input mode
+            inp.focus()
+
+    def on_key(self, event: events.Key) -> None:
+        """
+        Handle arrow keys and Enter in browse mode.
+
+        When a ``Collapsible`` is focused, Up/Down moves between
+        collapsibles and Enter toggles the focused one. Any other
+        key returns focus to the input.
+
+        :param event: The key event.
+        """
+        from textual.widgets import Collapsible
+
+        focused = self.focused
+        if not isinstance(focused, Collapsible):
+            return
+
+        collapsibles = list(self.query(Collapsible))
+        if not collapsibles:
+            return
+
+        if event.key == "up":
+            event.prevent_default()
+            idx = _index_of(collapsibles, focused)
+            if idx > 0:
+                collapsibles[idx - 1].focus()
+                collapsibles[idx - 1].scroll_visible()
+        elif event.key == "down":
+            event.prevent_default()
+            idx = _index_of(collapsibles, focused)
+            if idx < len(collapsibles) - 1:
+                collapsibles[idx + 1].focus()
+                collapsibles[idx + 1].scroll_visible()
+        elif event.key == "enter":
+            event.prevent_default()
+            focused.collapsed = not focused.collapsed
+        elif event.key != "escape":
+            # Any other key returns to input
+            event.prevent_default()
+            self.query_one("#user-input", Input).focus()
+
     def on_unmount(self) -> None:
         """Shut down the server on exit."""
         self._server_proc.send_signal(signal.SIGINT)
@@ -416,7 +539,27 @@ class ChatApp(App[None]):
             self._server_proc.kill()
 
 
+def _index_of(
+    widgets: list[object],
+    target: object,
+) -> int:
+    """
+    Find the index of ``target`` in ``widgets``.
+
+    :param widgets: List of widgets to search.
+    :param target: The widget to find.
+    :returns: Index of target, or 0 if not found.
+    """
+    for i, w in enumerate(widgets):
+        if w is target:
+            return i
+    return 0
+
+
 # ── SSE streaming ─────────────────────────────────────
+
+
+_DEBUG_SSE = os.environ.get("DEBUG_SSE") == "1"
 
 
 async def _run_sse_stream(
@@ -430,7 +573,8 @@ async def _run_sse_stream(
     Open an SSE connection and dispatch events.
 
     Updates the live ``AssistantMessage`` widget on each text
-    delta for real-time streaming output.
+    delta for real-time streaming output. Set ``DEBUG_SSE=1``
+    to log all event types to ``/tmp/tui-sse.log``.
 
     :param app: The ChatApp instance.
     :param scroll: The scrollable container.
@@ -438,6 +582,7 @@ async def _run_sse_stream(
     :param acc: The stream accumulator.
     :param body: The request body for ``/v1/responses``.
     """
+    debug_file = open("/tmp/tui-sse.log", "a") if _DEBUG_SSE else None  # noqa: SIM115
     async with httpx.AsyncClient(timeout=120.0) as client:
         async with client.stream(
             "POST",
@@ -460,7 +605,12 @@ async def _run_sse_stream(
                             current_event = None
                             continue
                         data = json.loads(data_str)
-                        _handle_sse(app, scroll, live, current_event, data, acc)
+                        if debug_file is not None:
+                            debug_file.write(f"{current_event}: {data_str[:200]}\n")
+                            debug_file.flush()
+                        # Rebind: _handle_sse mounts a new widget after
+                        # each finalized message (e.g. steering follow-up).
+                        live = _handle_sse(app, scroll, live, current_event, data, acc)
                         current_event = None
                     elif line == "":
                         current_event = None
@@ -473,7 +623,7 @@ def _handle_sse(
     event_type: str,
     data: dict[str, object],
     acc: _StreamAccumulator,
-) -> None:
+) -> AssistantMessage:
     """
     Dispatch a single SSE event.
 
@@ -481,12 +631,17 @@ def _handle_sse(
     streaming. Reasoning, tool calls, and completion events
     mount new widgets or finalize the live widget.
 
+    Returns the current live widget — may be a newly mounted
+    widget if the previous message was finalized (e.g. during
+    steering, where multiple messages arrive on one stream).
+
     :param app: The ChatApp instance.
     :param scroll: The scrollable container.
     :param live: The live assistant message widget.
     :param event_type: SSE event name.
     :param data: Parsed JSON payload.
     :param acc: The stream accumulator.
+    :returns: The active live widget (same or new).
     """
     if event_type == "response.created":
         _extract_response_id(data, app)
@@ -520,6 +675,17 @@ def _handle_sse(
         if isinstance(delta, str):
             acc.in_summary = True
             acc.summary += delta
+            # Stream summary tokens visibly — for models like o4-mini,
+            # the summary IS the only reasoning content available.
+            label = "thinking" if not acc.reasoning else "summarizing"
+            live.update(
+                Text.from_markup(
+                    f"[bold green]assistant>[/bold green]"
+                    f" [dim yellow]{label}…[/dim yellow]\n"
+                    f"[dim yellow]{escape(acc.summary[-200:])}[/dim yellow]"
+                )
+            )
+            scroll.scroll_end()
 
     elif event_type == "response.output_text.delta":
         delta = data.get("delta")
@@ -533,10 +699,12 @@ def _handle_sse(
             scroll.scroll_end()
 
     elif event_type == "response.output_item.done":
-        _handle_item_done(app, scroll, live, data, acc)
+        live = _handle_item_done(app, scroll, live, data, acc)
 
     elif event_type == "response.completed":
         _extract_response_id(data, app)
+
+    return live
 
 
 def _extract_response_id(
@@ -562,31 +730,43 @@ def _handle_item_done(
     live: AssistantMessage,
     data: dict[str, object],
     acc: _StreamAccumulator,
-) -> None:
+) -> AssistantMessage:
     """
     Handle a completed output item.
 
     For messages: finalize the live widget with the full
-    content including any reasoning sections. For tool calls
-    and results: mount new SystemInfo widgets.
+    content including any reasoning sections, then mount a
+    fresh widget for any subsequent message (e.g. from
+    steering). For tool calls and results: mount new
+    SystemInfo widgets.
 
     :param app: The ChatApp instance.
     :param scroll: The scrollable container.
     :param live: The live assistant message widget.
     :param data: The output_item.done payload.
     :param acc: The stream accumulator.
+    :returns: The active live widget (same or new).
     """
     item = data.get("item")
     if not isinstance(item, dict):
-        return
+        return live
 
     item_type = item.get("type")
     if item_type == "message":
         _finalize_message(scroll, live, item, acc)
+        # Mount a fresh widget for any subsequent message on
+        # the same stream (e.g. steered follow-up).
+        new_live = AssistantMessage(
+            Text.from_markup("[bold green]assistant>[/bold green] [dim]…[/dim]")
+        )
+        scroll.mount(new_live)
+        app._live_widget = new_live
+        return new_live
     elif item_type == "function_call":
-        _mount_tool_call(scroll, item)
+        _mount_tool_call(scroll, item, before=live)
     elif item_type == "function_call_output":
-        _mount_tool_result(scroll, item)
+        _mount_tool_result(scroll, item, before=live)
+    return live
 
 
 def _finalize_message(
@@ -598,48 +778,81 @@ def _finalize_message(
     """
     Finalize the live assistant widget with completed content.
 
-    Builds a Rich Text with optional reasoning/summary sections
-    above the main text, then calls ``live.update()`` to set
-    the final content.
+    Mounts reasoning/summary as collapsed ``Collapsible``
+    widgets above the answer, then updates the live widget
+    with the final text.
 
     :param scroll: The scrollable container.
     :param live: The live assistant message widget.
     :param item: The message output item dict.
     :param acc: The stream accumulator.
     """
-    parts: list[str] = []
+    from textual.widgets import Collapsible
 
+    # Mount collapsible sections before the live answer widget
     if acc.reasoning:
-        parts.append("[cyan]── reasoning ──────────────────[/cyan]")
-        parts.append(f"[dim cyan]{escape(acc.reasoning)}[/dim cyan]")
-
+        scroll.mount(
+            Collapsible(
+                Static(Text.from_markup(f"[dim cyan]{escape(acc.reasoning)}[/dim cyan]")),
+                title="reasoning",
+                collapsed=True,
+            ),
+            before=live,
+        )
     if acc.summary:
-        parts.append("[yellow]── reasoning summary ──────────[/yellow]")
-        parts.append(f"[dim italic yellow]{escape(acc.summary)}[/dim italic yellow]")
+        scroll.mount(
+            Collapsible(
+                Static(
+                    Text.from_markup(
+                        f"[dim italic yellow]{escape(acc.summary)}[/dim italic yellow]"
+                    )
+                ),
+                title="reasoning summary",
+                collapsed=True,
+            ),
+            before=live,
+        )
 
-    if acc.reasoning or acc.summary:
-        parts.append("[dim]── answer ─────────────────────[/dim]")
-
-    # Get the final text content
-    final_text = acc.text
-    if not acc.had_text:
-        # Fallback: extract from the full content
-        content = item.get("content", [])
-        if isinstance(content, list):
-            text_parts: list[str] = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "output_text":
-                    t = block.get("text")
-                    if isinstance(t, str):
-                        text_parts.append(t)
-            final_text = "".join(text_parts)
-
-    parts.append(f"[bold green]assistant>[/bold green] {escape(final_text)}")
-
-    live.update(Text.from_markup("\n".join(parts)))
+    final_text = _extract_final_text(acc, item)
+    live.update(Text.from_markup(f"[bold green]assistant>[/bold green] {escape(final_text)}"))
     scroll.scroll_end()
 
-    # Reset for next message in multi-output turns
+    _reset_accumulator(acc)
+
+
+def _extract_final_text(
+    acc: _StreamAccumulator,
+    item: dict[str, object],
+) -> str:
+    """
+    Get the final text content from the accumulator or item.
+
+    :param acc: The stream accumulator.
+    :param item: The message output item dict.
+    :returns: The final text string.
+    """
+    if acc.had_text:
+        return acc.text
+
+    # Fallback: extract from the full content payload
+    content = item.get("content", [])
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "output_text":
+                t = block.get("text")
+                if isinstance(t, str):
+                    text_parts.append(t)
+        return "".join(text_parts)
+    return acc.text
+
+
+def _reset_accumulator(acc: _StreamAccumulator) -> None:
+    """
+    Reset accumulator for the next message in multi-output turns.
+
+    :param acc: The stream accumulator to reset.
+    """
     acc.text = ""
     acc.reasoning = ""
     acc.summary = ""
@@ -651,53 +864,57 @@ def _finalize_message(
 def _mount_tool_call(
     scroll: VerticalScroll,
     item: dict[str, object],
+    before: Static | None = None,
 ) -> None:
     """
     Mount a tool call widget in the chat scroll.
 
     :param scroll: The scrollable container.
     :param item: The function_call output item dict.
+    :param before: If provided, mount the widget before this
+        widget in the DOM (keeps tool calls above the live
+        assistant widget).
     """
     name = item.get("name", "?")
     args = item.get("arguments", "")
-    scroll.mount(
-        SystemInfo(
-            Text.from_markup(
-                f"[bold green]── tool call"
-                f" ──────────────────[/bold green]\n"
-                f"  [green]{escape(str(name))}"
-                f"({escape(str(args)[:200])})[/green]"
-            )
-        )
+    widget = SystemInfo(
+        Text.from_markup(f"[green]▸ {escape(str(name))}({escape(str(args)[:120])})[/green]")
     )
+    if before is not None:
+        scroll.mount(widget, before=before)
+    else:
+        scroll.mount(widget)
     scroll.scroll_end()
 
 
 def _mount_tool_result(
     scroll: VerticalScroll,
     item: dict[str, object],
+    before: Static | None = None,
 ) -> None:
     """
-    Mount a tool result widget in the chat scroll.
+    Mount a tool result in a collapsed ``Collapsible``.
 
     :param scroll: The scrollable container.
     :param item: The function_call_output item dict.
+    :param before: If provided, mount the widget before this
+        widget in the DOM (keeps tool results above the live
+        assistant widget).
     """
+    from textual.widgets import Collapsible
+
     output = str(item.get("output", ""))
-    display = output[:300]
-    if len(output) > 300:
-        display += "…"
-    scroll.mount(
-        SystemInfo(
-            Text.from_markup(
-                f"[dim green]── tool result"
-                f" ────────────────[/dim green]\n"
-                f"  [dim green]{escape(display)}[/dim green]\n"
-                f"[dim green]─────────────────────────"
-                f"──────[/dim green]"
-            )
-        )
+    # Show first line as the collapsible title
+    first_line = output.split("\n", 1)[0][:80]
+    widget = Collapsible(
+        Static(Text.from_markup(f"[dim]{escape(output)}[/dim]")),
+        title=f"result: {first_line}",
+        collapsed=True,
     )
+    if before is not None:
+        scroll.mount(widget, before=before)
+    else:
+        scroll.mount(widget)
     scroll.scroll_end()
 
 
@@ -706,22 +923,49 @@ def _mount_tool_result(
 
 def main() -> None:
     """
-    Start server, deploy agent, launch TUI.
+    Start server, deploy agent from directory or tarball, launch TUI.
     """
-    global CONNECTION
+    global AGENT_NAME
     if len(sys.argv) < 2:
-        print("Usage: python scripts/tui.py <API_KEY>")
-        print("       python scripts/tui.py $(cat /tmp/mykey)")
+        print("Usage: python scripts/tui.py <agent-dir-or-tarball>")
+        print()
+        print("  agent-dir-or-tarball  Path to an agent image directory")
+        print("                        (containing config.yaml) or a")
+        print("                        .tar.gz bundle.")
+        print()
+        print("Examples:")
+        print("  python scripts/tui.py ./my-agent/")
+        print("  python scripts/tui.py ./my-agent.tar.gz")
         sys.exit(1)
 
-    api_key = sys.argv[1].strip()
-    CONNECTION = {"api_key": api_key}
+    agent_path = sys.argv[1]
+    bundle = _load_agent_bundle(agent_path)
+    AGENT_NAME = _extract_agent_name(bundle)
 
+    server_proc = _start_server()
+    try:
+        wait_for_server(server_proc)
+        with httpx.Client() as client:
+            agent_id = register_agent(client, bundle)
+    except Exception:
+        server_proc.kill()
+        raise
+
+    app = ChatApp(server_proc=server_proc, agent_id=agent_id)
+    app.run()
+
+
+def _start_server() -> subprocess.Popen[bytes]:
+    """
+    Launch a temporary agent-plane server.
+
+    :returns: The server subprocess.
+    """
     tmpdir = tempfile.mkdtemp(prefix="agent-plane-tui-")
     db_uri = f"sqlite:///{tmpdir}/chat.db"
     art_loc = f"{tmpdir}/artifacts"
 
-    server_proc = subprocess.Popen(
+    return subprocess.Popen(
         [
             sys.executable,
             "-m",
@@ -740,19 +984,6 @@ def main() -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-
-    try:
-        wait_for_server(server_proc)
-        client = httpx.Client()
-        bundle = make_agent_bundle()
-        agent_id = register_agent(client, bundle)
-        client.close()
-    except Exception:
-        server_proc.kill()
-        raise
-
-    app = ChatApp(server_proc=server_proc, agent_id=agent_id)
-    app.run()
 
 
 if __name__ == "__main__":
