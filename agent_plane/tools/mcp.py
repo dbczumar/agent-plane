@@ -17,6 +17,7 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import random
 import threading
 from collections.abc import Callable, Coroutine
 from contextlib import AsyncExitStack
@@ -38,7 +39,7 @@ from mcp.shared.message import SessionMessage
 from mcp.types import CONNECTION_CLOSED, CallToolResult, ContentBlock, TextContent
 from mcp.types import Tool as McpToolDef
 
-from agent_plane.spec.types import MCPServerConfig
+from agent_plane.spec.types import MCPServerConfig, RetryConfig
 from agent_plane.tools.base import Tool
 
 _T = TypeVar("_T")
@@ -54,6 +55,17 @@ _logger = logging.getLogger(__name__)
 # Maximum time to wait for the background event loop thread
 # to stop during shutdown, in seconds.
 _LOOP_STOP_TIMEOUT_SECONDS = 5
+
+# Default retry policy for MCP connection-level reconnection
+# (transport died, server crashed). Separate from the tool-level
+# retry in workflow.py, which handles call timeouts. These
+# defaults give a flaky server ~6s to restart (1s + 2s + 4s
+# backoff with jitter across 3 reconnect attempts).
+_MCP_RECONNECT_DEFAULTS = RetryConfig(
+    max_attempts=3,
+    backoff_base=1.0,
+    backoff_max=10.0,
+)
 
 
 class EventLoopThread:
@@ -271,9 +283,11 @@ class McpServerConnection:
         Invoke a tool on this MCP server.
 
         If the call fails due to a dead connection (server
-        process crashed, transport dropped), attempts one
-        reconnect and retries. Permanent errors (invalid args,
-        tool not found) are not retried.
+        process crashed, transport dropped), reconnects with
+        exponential backoff and retries. The retry policy is
+        taken from ``config.retry`` (falling back to
+        ``_MCP_RECONNECT_DEFAULTS``). Permanent errors (invalid
+        args, tool not found) are not retried.
 
         :param name: The tool name as returned by discovery.
         :param arguments: The tool arguments dict (already parsed
@@ -287,18 +301,13 @@ class McpServerConnection:
                 f"MCP server {self.config.name!r} has no live "
                 f"session — call connect() before call_tool()"
             )
-        try:
-            return await self._invoke_tool(name, arguments)
-        except Exception as exc:
-            if not _is_connection_error(exc):
-                raise
-            _logger.warning(
-                "MCP server %r: connection lost during tool call %r, reconnecting",
-                self.config.name,
-                name,
-            )
-            await self._reconnect()
-            return await self._invoke_tool(name, arguments)
+        retry = self.config.retry or _MCP_RECONNECT_DEFAULTS
+        return await _call_tool_with_reconnect(
+            conn=self,
+            name=name,
+            arguments=arguments,
+            retry=retry,
+        )
 
     async def _invoke_tool(
         self,
@@ -628,6 +637,76 @@ def _is_connection_error(exc: BaseException) -> bool:
     if isinstance(exc, McpError):
         return exc.error.code == CONNECTION_CLOSED
     return False
+
+
+def _backoff_delay(attempt: int, retry: RetryConfig) -> float:
+    """
+    Compute the backoff delay for a reconnect attempt.
+
+    Uses exponential backoff with jitter (50–100% of the computed
+    delay) capped at ``retry.backoff_max``.
+
+    :param attempt: Zero-based retry index (0 = first retry).
+    :param retry: Retry config with ``backoff_base`` and
+        ``backoff_max``.
+    :returns: Sleep duration in seconds.
+    """
+    delay = min(
+        retry.backoff_base ** (attempt + 1),
+        retry.backoff_max,
+    )
+    return delay * random.uniform(0.5, 1.0)
+
+
+async def _call_tool_with_reconnect(
+    conn: McpServerConnection,
+    name: str,
+    arguments: dict[str, Any],  # JSON values — see call_tool
+    retry: RetryConfig,
+) -> str:
+    """
+    Invoke a tool, reconnecting with backoff on connection errors.
+
+    On a connection-level failure (dead transport, server crash),
+    reconnects and retries up to ``retry.max_attempts - 1`` times
+    with exponential backoff. Permanent errors (invalid args, tool
+    not found) are raised immediately without retrying.
+
+    :param conn: The MCP server connection to invoke on.
+    :param name: The tool name as returned by discovery.
+    :param arguments: The tool arguments dict.
+    :param retry: Retry policy controlling max attempts, backoff
+        base, and backoff cap.
+    :returns: The formatted tool result string.
+    """
+    last_exc: Exception | None = None
+
+    for attempt in range(retry.max_attempts):
+        try:
+            return await conn._invoke_tool(name, arguments)
+        except Exception as exc:
+            if not _is_connection_error(exc):
+                raise
+            last_exc = exc
+            # Last attempt — don't reconnect, just raise.
+            if attempt + 1 >= retry.max_attempts:
+                break
+            delay = _backoff_delay(attempt, retry)
+            _logger.warning(
+                "MCP server %r: connection lost during tool call "
+                "%r (attempt %d/%d), reconnecting in %.1fs",
+                conn.config.name,
+                name,
+                attempt + 1,
+                retry.max_attempts,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            await conn._reconnect()
+
+    # All attempts exhausted — re-raise the last connection error.
+    assert last_exc is not None
+    raise last_exc
 
 
 def _format_call_result(result: CallToolResult) -> str:

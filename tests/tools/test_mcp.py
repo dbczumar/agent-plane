@@ -15,10 +15,12 @@ from cachetools import TTLCache
 from mcp.shared.exceptions import McpError
 from mcp.types import CONNECTION_CLOSED, ErrorData, ImageContent, TextContent
 
-from agent_plane.spec.types import MCPServerConfig
+from agent_plane.spec.types import MCPServerConfig, RetryConfig
 from agent_plane.tools.mcp import (
+    _MCP_RECONNECT_DEFAULTS,
     McpServerConnection,
     McpTool,
+    _backoff_delay,
     _cache_key,
     _discovery_cache,
     _format_call_result,
@@ -610,6 +612,39 @@ def test_is_connection_error_value_error() -> None:
     assert _is_connection_error(ValueError("bad")) is False
 
 
+# ── _backoff_delay ────────────────────────────────────────
+
+
+def test_backoff_delay_increases_with_attempt() -> None:
+    """
+    ``_backoff_delay`` increases with each attempt (exponential
+    backoff) and applies jitter (0.5–1.0x).
+    """
+    retry = RetryConfig(backoff_base=2.0, backoff_max=30.0)
+    # Attempt 0: base^1 = 2.0, with jitter [1.0, 2.0]
+    delay_0 = _backoff_delay(0, retry)
+    assert 1.0 <= delay_0 <= 2.0
+
+    # Attempt 1: base^2 = 4.0, with jitter [2.0, 4.0]
+    delay_1 = _backoff_delay(1, retry)
+    assert 2.0 <= delay_1 <= 4.0
+
+    # Attempt 2: base^3 = 8.0, with jitter [4.0, 8.0]
+    delay_2 = _backoff_delay(2, retry)
+    assert 4.0 <= delay_2 <= 8.0
+
+
+def test_backoff_delay_capped_at_max() -> None:
+    """
+    ``_backoff_delay`` never exceeds ``backoff_max`` (before
+    jitter).
+    """
+    retry = RetryConfig(backoff_base=10.0, backoff_max=5.0)
+    # 10^(0+1) = 10, capped to 5.0, jitter [2.5, 5.0]
+    delay = _backoff_delay(0, retry)
+    assert delay <= 5.0
+
+
 # ── Reconnection on server death ─────────────────────────
 
 
@@ -617,8 +652,7 @@ def test_is_connection_error_value_error() -> None:
 async def test_call_tool_reconnects_on_connection_error() -> None:
     """
     When a tool call fails with a connection error, the
-    connection is torn down, re-established, and the call
-    is retried exactly once.
+    connection reconnects with backoff and retries.
     """
     config = _make_stdio_config()
 
@@ -639,8 +673,10 @@ async def test_call_tool_reconnects_on_connection_error() -> None:
 
         # Patch _reconnect to re-establish the mock session
         # (in production this opens a new transport).
+        # Patch asyncio.sleep to avoid real delays in tests.
         with patch.object(conn, "_reconnect", new_callable=AsyncMock) as mock_reconnect:
-            result = await conn.call_tool("test_tool", {"query": "hi"})
+            with patch("agent_plane.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
+                result = await conn.call_tool("test_tool", {"query": "hi"})
 
         assert result == "recovered"
         mock_reconnect.assert_awaited_once()
@@ -674,26 +710,159 @@ async def test_call_tool_does_not_reconnect_on_tool_error() -> None:
 
 
 @pytest.mark.asyncio()
-async def test_call_tool_propagates_if_retry_fails() -> None:
+async def test_call_tool_exhausts_all_retries_then_raises() -> None:
     """
-    If the retry after reconnect also fails, the error is
-    propagated to the caller.
+    When all reconnect attempts fail, the last connection
+    error is propagated to the caller.
     """
-    config = _make_stdio_config()
+    # Use a config with exactly 3 max_attempts so we
+    # expect 3 invoke calls total (1 initial + 2 retries).
+    config = MCPServerConfig(
+        name="test-retry-exhaust",
+        transport="stdio",
+        command="echo",
+        retry=RetryConfig(
+            max_attempts=3,
+            backoff_base=1.0,
+            backoff_max=10.0,
+        ),
+    )
 
     with _mock_mcp_transport() as mock_session:
         conn = McpServerConnection(config=config)
         await conn.connect()
 
-        # Both calls fail with connection errors.
         mock_session.call_tool.side_effect = [
-            EOFError("server died"),
-            EOFError("server died again"),
+            EOFError("attempt 1"),
+            EOFError("attempt 2"),
+            EOFError("attempt 3"),
         ]
 
         with patch.object(conn, "_reconnect", new_callable=AsyncMock):
-            with pytest.raises(EOFError, match="died again"):
-                await conn.call_tool("test_tool", {"query": "hi"})
+            with patch("agent_plane.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(EOFError, match="attempt 3"):
+                    await conn.call_tool("test_tool", {"query": "hi"})
+
+        # 3 invoke calls, 2 reconnects (no reconnect after last failure).
+        assert mock_session.call_tool.await_count == 3
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_uses_config_retry_policy() -> None:
+    """
+    ``call_tool()`` uses the per-server ``config.retry`` when
+    set, rather than the module-level default.
+    """
+    # Only 2 attempts — should fail after 2 invoke calls.
+    config = MCPServerConfig(
+        name="test-custom-retry",
+        transport="stdio",
+        command="echo",
+        retry=RetryConfig(
+            max_attempts=2,
+            backoff_base=0.5,
+            backoff_max=5.0,
+        ),
+    )
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        mock_session.call_tool.side_effect = [
+            EOFError("attempt 1"),
+            EOFError("attempt 2"),
+        ]
+
+        with patch.object(conn, "_reconnect", new_callable=AsyncMock):
+            with patch("agent_plane.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(EOFError, match="attempt 2"):
+                    await conn.call_tool("test_tool", {"query": "hi"})
+
+        assert mock_session.call_tool.await_count == 2
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_sleeps_between_retries() -> None:
+    """
+    ``call_tool()`` sleeps with backoff between reconnect
+    attempts. Verifies that ``asyncio.sleep`` is called with
+    increasing delays.
+    """
+    config = MCPServerConfig(
+        name="test-backoff",
+        transport="stdio",
+        command="echo",
+        retry=RetryConfig(
+            max_attempts=3,
+            backoff_base=2.0,
+            backoff_max=30.0,
+        ),
+    )
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="ok")]
+        ok_result.isError = False
+
+        mock_session.call_tool.side_effect = [
+            EOFError("attempt 1"),
+            EOFError("attempt 2"),
+            ok_result,
+        ]
+
+        with patch.object(conn, "_reconnect", new_callable=AsyncMock):
+            with patch(
+                "agent_plane.tools.mcp.asyncio.sleep",
+                new_callable=AsyncMock,
+            ) as mock_sleep:
+                result = await conn.call_tool("test_tool", {"query": "hi"})
+
+        assert result == "ok"
+        # Two sleeps: before retry 1 and before retry 2.
+        assert mock_sleep.await_count == 2
+        # Delays should increase (backoff_base=2.0: 2^1, 2^2).
+        # Jitter applies 0.5–1.0x, so delay 1 is in [1.0, 2.0],
+        # delay 2 is in [2.0, 4.0].
+        delay_1 = mock_sleep.await_args_list[0].args[0]
+        delay_2 = mock_sleep.await_args_list[1].args[0]
+        assert 1.0 <= delay_1 <= 2.0
+        assert 2.0 <= delay_2 <= 4.0
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_default_retry_has_three_attempts() -> None:
+    """
+    When ``config.retry`` is ``None``, ``call_tool()`` falls
+    back to ``_MCP_RECONNECT_DEFAULTS`` which allows 3 attempts.
+    """
+    # No retry config — should use default (3 attempts).
+    config = MCPServerConfig(
+        name="test-default-retry",
+        transport="stdio",
+        command="echo",
+        # retry defaults to None
+    )
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        mock_session.call_tool.side_effect = [
+            EOFError("attempt 1"),
+            EOFError("attempt 2"),
+            EOFError("attempt 3"),
+        ]
+
+        with patch.object(conn, "_reconnect", new_callable=AsyncMock):
+            with patch("agent_plane.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(EOFError, match="attempt 3"):
+                    await conn.call_tool("test_tool", {"query": "hi"})
+
+        assert mock_session.call_tool.await_count == _MCP_RECONNECT_DEFAULTS.max_attempts
 
 
 # ── Timeout propagation ──────────────────────────────────
@@ -1228,7 +1397,8 @@ async def test_http_reconnect_on_connection_error() -> None:
         ]
 
         with patch.object(conn, "_reconnect", new_callable=AsyncMock) as mock_reconnect:
-            result = await conn.call_tool("http_tool", {"query": "retry"})
+            with patch("agent_plane.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
+                result = await conn.call_tool("http_tool", {"query": "retry"})
 
     assert result == "recovered via HTTP"
     mock_reconnect.assert_awaited_once()
