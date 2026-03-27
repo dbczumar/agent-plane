@@ -628,7 +628,6 @@ class McpServerConnection:
             ``SessionMessage``.
         """
         assert self._exit_stack is not None
-        assert self.config.url is not None
         # sse_client timeout controls the initial HTTP connection
         # handshake (default 5s). sse_read_timeout controls how
         # long to wait for each SSE event (default 300s). We

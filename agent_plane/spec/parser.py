@@ -447,11 +447,17 @@ def _discover_mcp_servers(
                 f"{transport!r} — only 'http' is supported: {yaml_file}",
                 code=ErrorCode.INVALID_INPUT,
             )
+        url = raw.get("url")
+        if url is None:
+            raise AgentPlaneError(
+                f"MCP server {name!r} missing required field 'url': {yaml_file}",
+                code=ErrorCode.INVALID_INPUT,
+            )
         servers.append(
             MCPServerConfig(
                 name=str(name),
                 description=raw.get("description"),
-                url=raw.get("url"),
+                url=str(url),
                 headers=_expand_env_vars(raw.get("headers", {})),
                 timeout=int(raw["timeout"]) if "timeout" in raw else None,
                 retry=_parse_retry(raw["retry"]) if "retry" in raw else None,

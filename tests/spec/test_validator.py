@@ -147,13 +147,6 @@ def test_mcp_http_valid() -> None:
     assert result.valid
 
 
-def test_mcp_missing_url() -> None:
-    spec = _minimal_spec(mcp_servers=[MCPServerConfig(name="bad")])
-    result = validate(spec)
-    assert not result.valid
-    assert any("url" in e.path for e in result.errors)
-
-
 def test_duplicate_mcp_names() -> None:
     spec = _minimal_spec(
         mcp_servers=[
@@ -198,16 +191,19 @@ def test_sub_agent_reference_missing() -> None:
 
 
 def test_multiple_errors_reported() -> None:
-    """Validator reports all errors, not just the first."""
+    """
+    Validator reports all errors, not just the first.
+
+    Three violations: spec_version != 1, skill name not lowercase,
+    and skill description exceeds 1024 chars.
+    """
     spec = _minimal_spec(
         spec_version=99,
         skills=[
             SkillSpec(name="BAD", description="x" * 2000, content="."),
         ],
-        mcp_servers=[
-            MCPServerConfig(name="bad"),
-        ],
     )
     result = validate(spec)
     assert not result.valid
+    # spec_version error + skill name pattern error + skill description length error
     assert len(result.errors) >= 3

@@ -171,11 +171,6 @@ def _validate_mcp_servers(spec: AgentSpec, result: ValidationResult) -> None:
     seen_names: set[str] = set()
     for i, mcp in enumerate(spec.mcp_servers):
         prefix = f"mcp_servers[{i}]"
-        # URL is required — the parser already rejects non-HTTP
-        # transports, so every MCPServerConfig that reaches here
-        # is HTTP.
-        if not mcp.url:
-            result.add(f"{prefix}.url", "required for MCP server")
         # Duplicate names
         if mcp.name in seen_names:
             result.add(f"{prefix}.name", f"duplicate MCP server name: {mcp.name!r}")

@@ -584,6 +584,29 @@ def test_mcp_env_expansion_mixed_set_and_unset_raises(
         parse(agent_dir)
 
 
+# ── MCP required field validation ─────────────────────
+
+
+def test_mcp_missing_url_raises(agent_dir: Path) -> None:
+    """
+    Parser rejects an MCP config with ``transport: http`` but no
+    ``url`` field.
+
+    :param agent_dir: Temporary agent directory with minimal
+        ``config.yaml``.
+    """
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "no-url-server",
+        "transport": "http",
+        # url intentionally omitted
+    }
+    (mcp_dir / "no_url.yaml").write_text(yaml.dump(mcp_config))
+    with pytest.raises(AgentPlaneError, match="missing required field 'url'"):
+        parse(agent_dir)
+
+
 # ── Timeout / retry / execution parsing ────────────────
 
 

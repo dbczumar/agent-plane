@@ -214,7 +214,21 @@ headers:                      # optional headers
   Authorization: Bearer ${API_KEY}
 ```
 
-**Required fields:** `name`, `url`
+**Required fields:** `name`, `transport`, `url`
+
+**Optional fields:**
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `description` | string | *(none)* | Human-readable summary |
+| `headers` | map | `{}` | HTTP headers; supports `${ENV_VAR}` expansion |
+| `timeout` | int (seconds) | *(see below)* | Per-tool timeout override; `None` inherits `tools.timeout` |
+| `retry` | object | *(see below)* | Per-tool retry override; `None` inherits `tools.retry` |
+
+**Timeout defaults:** When `timeout` is omitted (or `None`), the MCP SDK
+defaults apply: **5 seconds** for the initial HTTP connection handshake and
+**300 seconds (5 minutes)** for each SSE event read. Setting an explicit
+`timeout` overrides both values to the same number of seconds.
 
 **Security note — SSRF risk:** The agent-plane server makes outbound HTTP
 requests to the configured `url`. There is currently no application-level
