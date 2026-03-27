@@ -123,7 +123,9 @@ def _resolve_file_id_block(
     ``image_url`` containing a ``data:`` URI.
 
     For all other block types (``input_file``, future types):
-    replaces ``file_id`` with ``file_data`` (raw base64 string).
+    replaces ``file_id`` with ``file_data`` containing a ``data:``
+    URI (e.g. ``"data:application/pdf;base64,..."``).  Provider
+    adapters parse the URI to extract the media type and payload.
 
     :param block: A content block dict containing ``file_id``,
         e.g. ``{"type": "input_image", "file_id": "file_abc123"}``.

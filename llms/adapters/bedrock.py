@@ -298,15 +298,18 @@ def _translate_part_to_converse(part: dict[str, Any]) -> dict[str, Any]:
 
     if part_type == "input_file":
         # file_data is a data: URI (e.g. "data:application/pdf;base64,...").
+        # content_resolver guarantees this format; fail loud if violated.
         file_uri = parse_data_uri(part["file_data"])
-        media_type = file_uri.media_type if file_uri else "application/octet-stream"
-        data = file_uri.data if file_uri else part["file_data"]
+        if file_uri is None:
+            raise ValueError(
+                f"input_file file_data must be a data: URI, got: {part['file_data'][:80]!r}"
+            )
         # MIME types are always type/subtype per RFC 2045.
-        fmt = media_type.split("/")[-1]
+        fmt = file_uri.media_type.split("/")[-1]
         result: dict[str, Any] = {
             "document": {
                 "format": fmt,
-                "source": {"bytes": data},
+                "source": {"bytes": file_uri.data},
             },
         }
         if filename := part.get("filename"):
