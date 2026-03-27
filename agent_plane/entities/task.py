@@ -70,6 +70,10 @@ class Task:
         ``{"code": "server_error", "message": "..."}``.
     :param incomplete_details: Details on why the task is incomplete,
         e.g. ``{"reason": "max_output_tokens"}``.
+    :param tools: Client-specified tool dicts (OpenAI format with
+        ``agent_plane`` extension) supplied at request time. Restored
+        from DBOS workflow inputs on recovery. ``None`` means no
+        client tools were supplied.
     """
 
     id: str
@@ -93,3 +97,6 @@ class Task:
     usage: dict[str, Any] | None = None
     error: dict[str, str] | None = None
     incomplete_details: dict[str, str] | None = None
+    # Client-specified tool dicts (OpenAI format with agent_plane extension).
+    # Restored from DBOS workflow inputs on recovery; None = no client tools.
+    tools: list[dict[str, Any]] | None = None

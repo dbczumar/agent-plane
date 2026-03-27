@@ -34,6 +34,7 @@ from agent_plane.server.schemas import (
     Usage,
 )
 from agent_plane.stores import AgentStore, ConversationStore, TaskStore
+from agent_plane.tools.client_specified import parse_callback_tool_specs
 
 
 def _build_response_object(task: Task) -> ResponseObject:
@@ -314,6 +315,7 @@ def _start_task(
     task: Task,
     req: CreateResponseRequest,
     task_store: TaskStore,
+    tools: list[dict[str, Any]] | None,
 ) -> None:
     """
     Start the DBOS workflow for a previously created task and
@@ -323,16 +325,21 @@ def _start_task(
     :param req: The incoming create-response request (provides
         ``instructions`` and ``reasoning``).
     :param task_store: Store used to launch the DBOS workflow.
+    :param tools: Validated client-specified tool dicts to pass
+        as workflow inputs, or ``None`` if the request had no
+        client tools.
     """
     task_store.start(
         task.id,
         instructions=req.instructions,
         reasoning=req.reasoning,
+        tools=tools,
     )
     # Set workflow inputs on the task entity for the initial response.
     # Subsequent get() calls restore them from DBOS workflow inputs.
     task.instructions = req.instructions
     task.reasoning = req.reasoning
+    task.tools = tools
 
 
 @dataclass
@@ -652,6 +659,17 @@ def create_responses_router(
                 code=ErrorCode.INVALID_INPUT,
             )
 
+        # -- Validate and parse client-specified tools --
+        client_tools: list[dict[str, Any]] | None = None
+        if req.tools:
+            try:
+                # Validate structure upfront; parse_callback_tool_specs
+                # raises ValueError on malformed entries.
+                parse_callback_tool_specs(req.tools)
+            except ValueError as exc:
+                raise AgentPlaneError(str(exc), code=ErrorCode.INVALID_INPUT)
+            client_tools = req.tools
+
         content = _normalize_input(req.input)
 
         result = await _resolve_conversation(req, content, task_store, conversation_store)
@@ -678,7 +696,7 @@ def create_responses_router(
             # every event the workflow produces.
             _live_register(task.id, asyncio.get_running_loop())
 
-        _start_task(task, req, task_store)
+        _start_task(task, req, task_store, client_tools)
 
         # -- background=true, stream=false: return immediately --
         if req.background and not req.stream:

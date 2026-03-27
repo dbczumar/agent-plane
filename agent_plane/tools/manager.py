@@ -20,6 +20,7 @@ from agent_plane.tools.builtins import (
     ReadSkillFileTool,
     any_skill_has_resources,
 )
+from agent_plane.tools.client_specified import CallbackTool, CallbackToolSpec
 from agent_plane.tools.mcp import (
     EventLoopThread,
     McpServerConnection,
@@ -33,28 +34,38 @@ class ToolManager:
     """
     Registry-based tool manager for a single workflow execution.
 
-    Tools are registered at init time (built-in skill tools) and
-    at ``start()`` time (MCP tools discovered from configured
-    servers). Dispatch is via ``self._tools[name].invoke(arguments)``
-    — no hardcoded if/elif chains.
+    Tools are registered at init time (built-in skill tools and
+    client-specified callback tools) and at ``start()`` time (MCP
+    tools discovered from configured servers). Dispatch is via
+    ``self._tools[name].invoke(arguments)`` — no hardcoded if/elif
+    chains.
 
     Owns a persistent :class:`EventLoopThread` for MCP operations.
     MCP sessions are bound to the event loop they were created on,
     so ``connect()``, ``call_tool()``, and ``close()`` must all
     run on the same loop.
 
-    Registers:
+    Registers at init:
     - ``load_skill`` (if the agent has skills)
     - ``read_skill_file`` (if any skill has bundled resources)
+    - One :class:`CallbackTool` per entry in ``client_tool_specs``
+
+    Registers at ``start()``:
     - MCP tools discovered from ``mcp_servers`` in the agent spec
 
     Not yet implemented:
     - Local tool execution (Python / TypeScript)
     """
 
-    def __init__(self, spec: AgentSpec, work_dir: Path) -> None:
+    def __init__(
+        self,
+        spec: AgentSpec,
+        work_dir: Path,
+        client_tool_specs: list[CallbackToolSpec] | None = None,
+    ) -> None:
         """
-        Initialize the tool manager and register built-in tools.
+        Initialize the tool manager and register built-in and
+        client-specified tools.
 
         MCP tools are not registered until ``start()`` is called.
 
@@ -63,6 +74,11 @@ class ToolManager:
         :param work_dir: Path to the extracted agent image
             directory on disk, used as the working directory
             for local tool execution.
+        :param client_tool_specs: Optional list of
+            :class:`CallbackToolSpec` objects supplied by the API
+            caller at request time, e.g.
+            ``[CallbackToolSpec(name="get_weather", ...)]``.
+            ``None`` and ``[]`` are equivalent (no client tools).
         """
         self._spec = spec
         self._work_dir = work_dir
@@ -71,6 +87,7 @@ class ToolManager:
         self._mcp_connections: list[McpServerConnection] = []
         self._loop_thread: EventLoopThread | None = None
         self._register_skill_tools()
+        self._register_client_tools(client_tool_specs or [])
 
     def _register_skill_tools(self) -> None:
         """
@@ -86,6 +103,29 @@ class ToolManager:
         if any_skill_has_resources(self._spec.skills):
             read_tool = ReadSkillFileTool(self._spec.skills)
             self._tools[read_tool.name] = read_tool
+
+    def _register_client_tools(
+        self,
+        specs: list[CallbackToolSpec],
+    ) -> None:
+        """
+        Register client-specified callback tools.
+
+        If a client tool name collides with an already-registered
+        tool (e.g. a built-in skill tool), the client tool wins
+        and a warning is logged.
+
+        :param specs: List of :class:`CallbackToolSpec` objects to
+            register, e.g.
+            ``[CallbackToolSpec(name="get_weather", ...)]``.
+        """
+        for spec in specs:
+            if spec.name in self._tools:
+                _logger.warning(
+                    "Client-specified tool %r shadows existing tool — overwriting",
+                    spec.name,
+                )
+            self._tools[spec.name] = CallbackTool(spec)
 
     def start(self) -> None:
         """
@@ -151,7 +191,10 @@ class ToolManager:
         servers still proceed.
         """
         for config in self._spec.mcp_servers:
-            conn = McpServerConnection(config=config)
+            conn = McpServerConnection(
+                config=config,
+                work_dir=self._work_dir,
+            )
             try:
                 tools = await conn.connect()
             except Exception:

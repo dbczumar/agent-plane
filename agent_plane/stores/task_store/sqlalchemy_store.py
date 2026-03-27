@@ -134,12 +134,13 @@ def _apply_workflow_status(task: Task, wf_status: WorkflowStatus) -> Task:
     # wf_status.status is a plain string (e.g. "SUCCESS", "PENDING")
     task.status = _map_dbos_status(str(wf_status.status))
 
-    # Restore instructions and reasoning from DBOS workflow inputs.
+    # Restore instructions, reasoning, and tools from DBOS workflow inputs.
     # These are passed as kwargs to start_workflow() and stored by DBOS.
     if wf_status.input is not None:
         kwargs: dict[str, Any] = wf_status.input.get("kwargs", {})
         task.instructions = kwargs.get("instructions")
         task.reasoning = kwargs.get("reasoning")
+        task.tools = kwargs.get("tools")
 
     if task.status == TaskStatus.COMPLETED and wf_status.output is not None:
         # The workflow returns {"task_id": ..., "output": [...], ...}
@@ -271,6 +272,7 @@ class SqlAlchemyTaskStore(TaskStore):
         task_id: str,
         instructions: str | None = None,
         reasoning: dict[str, str] | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> None:
         """
         Begin execution of a previously created task.
@@ -285,6 +287,10 @@ class SqlAlchemyTaskStore(TaskStore):
             instructions override.
         :param reasoning: Optional reasoning configuration,
             e.g. ``{"effort": "medium"}``.
+        :param tools: Optional list of client-specified tool dicts
+            (OpenAI format with ``agent_plane`` extension). Passed
+            through to the workflow as a DBOS input kwarg so they
+            are checkpointed and restored on recovery.
         :raises LookupError: If the task does not exist.
         """
         with self._session() as session:
@@ -312,6 +318,7 @@ class SqlAlchemyTaskStore(TaskStore):
                     previous_response_id=previous_response_id,
                     instructions=instructions,
                     reasoning=reasoning,
+                    tools=tools,
                 )
         except Exception:
             # Compensating transaction: delete the orphaned task row

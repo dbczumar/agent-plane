@@ -14,6 +14,7 @@ from agent_plane.spec.types import (
     SkillSpec,
 )
 from agent_plane.tools import ToolManager
+from agent_plane.tools.client_specified import CallbackToolSpec
 from agent_plane.tools.mcp import clear_discovery_cache
 
 
@@ -368,6 +369,146 @@ def test_shutdown_safe_without_start(
     spec = _make_spec()
     mgr = ToolManager(spec, work_dir)
     mgr.shutdown()
+
+
+# ── Client-specified tools ────────────────────────────────
+
+
+def _make_callback_spec(name: str, url: str = "https://example.com/tool") -> CallbackToolSpec:
+    """
+    Build a minimal :class:`CallbackToolSpec` for use in manager tests.
+
+    :param name: Tool function name, e.g. ``"get_weather"``.
+    :param url: Callback URL. Defaults to a placeholder.
+    :returns: A :class:`CallbackToolSpec` with an empty schema and
+        no headers.
+    """
+    return CallbackToolSpec(
+        name=name,
+        schema={
+            "type": "function",
+            "function": {"name": name, "description": "A test tool.", "parameters": {}},
+        },
+        callback_url=url,
+    )
+
+
+def test_client_tools_registered_in_schemas(
+    work_dir: Path,
+) -> None:
+    """
+    Client-specified tools appear in get_tool_schemas() alongside
+    built-in tools without calling start().
+
+    A failure here means the LLM never sees client tools — the
+    client_tool_specs constructor arg is not being wired up.
+    """
+    spec = _make_spec()
+    mgr = ToolManager(
+        spec,
+        work_dir,
+        client_tool_specs=[
+            _make_callback_spec("get_weather"),
+            _make_callback_spec("send_email"),
+        ],
+    )
+
+    schemas = mgr.get_tool_schemas()
+    names = [s["function"]["name"] for s in schemas]
+
+    # Both client tools appear in schemas — 2 registered, 2 returned
+    assert len(schemas) == 2, (
+        f"Expected 2 schemas (2 client tools), got {len(schemas)}. "
+        "If 0, client_tool_specs are not being registered."
+    )
+    assert "get_weather" in names
+    assert "send_email" in names
+
+
+def test_client_tool_callable_via_call_tool(
+    work_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ToolManager.call_tool dispatches to CallbackTool.invoke for
+    client-specified tools, making a real HTTP callback.
+
+    Verifies the dispatch chain: call_tool -> registry lookup ->
+    CallbackTool.invoke -> httpx.post.
+    """
+
+    spec = _make_spec()
+    mgr = ToolManager(
+        spec,
+        work_dir,
+        client_tool_specs=[_make_callback_spec("get_weather", "https://cb.example.com/tool")],
+    )
+
+    mock_response = MagicMock()
+    mock_response.text = "Sunny, 65°F"
+    mock_response.raise_for_status = MagicMock()
+
+    monkeypatch.setattr(
+        "agent_plane.tools.client_specified.httpx.post", lambda *a, **kw: mock_response
+    )
+
+    result = mgr.call_tool("get_weather", json.dumps({"city": "Portland"}))
+
+    # Result is the callback response text — proves dispatch reached CallbackTool
+    assert result == "Sunny, 65°F", (
+        f"Expected callback response text, got {result!r}. "
+        "If 'Error: tool not found', client tools are not registered in the manager."
+    )
+
+
+def test_client_tool_shadows_skill_tool(
+    work_dir: Path,
+    skill_no_resources: SkillSpec,
+) -> None:
+    """
+    A client tool with the same name as a skill tool overwrites the
+    skill tool (last registered wins, with a warning).
+
+    This ensures the override behavior is intentional — clients can
+    replace spec-defined tools at request time.
+    """
+    spec = _make_spec(skills=[skill_no_resources])
+    mgr = ToolManager(
+        spec,
+        work_dir,
+        # 'load_skill' is the built-in skill tool name
+        client_tool_specs=[_make_callback_spec("load_skill")],
+    )
+
+    schemas = mgr.get_tool_schemas()
+    # Only one 'load_skill' — client version overwrote built-in
+    names = [s["function"]["name"] for s in schemas]
+    assert names.count("load_skill") == 1, (
+        f"Expected exactly one 'load_skill' (client overwrite), got {names.count('load_skill')}."
+    )
+
+    # The registered tool is the client's CallbackTool, not LoadSkillTool
+    from agent_plane.tools.client_specified import CallbackTool
+
+    assert isinstance(mgr._tools["load_skill"], CallbackTool), (
+        "Expected CallbackTool after client override, "
+        f"got {type(mgr._tools['load_skill']).__name__}."
+    )
+
+
+def test_client_tools_none_equivalent_to_empty(
+    work_dir: Path,
+) -> None:
+    """
+    Passing client_tool_specs=None and client_tool_specs=[] produce
+    the same result: no client tools registered.
+    """
+    spec = _make_spec()
+    mgr_none = ToolManager(spec, work_dir, client_tool_specs=None)
+    mgr_empty = ToolManager(spec, work_dir, client_tool_specs=[])
+
+    assert mgr_none.get_tool_schemas() == []
+    assert mgr_empty.get_tool_schemas() == []
 
 
 def test_mcp_duplicate_tool_name_last_wins(

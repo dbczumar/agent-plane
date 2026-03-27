@@ -82,6 +82,7 @@ class TaskStore(ABC):
         task_id: str,
         instructions: str | None = None,
         reasoning: dict[str, str] | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> None:
         """
         Begin execution of a previously created task.
@@ -92,9 +93,9 @@ class TaskStore(ABC):
         "in_progress". The task must exist and be in "queued"
         status.
 
-        ``instructions`` and ``reasoning`` are passed directly to
-        the DBOS workflow as inputs (stored by DBOS, not in the
-        tasks table).
+        ``instructions``, ``reasoning``, and ``tools`` are passed
+        directly to the DBOS workflow as inputs (stored by DBOS,
+        not in the tasks table).
 
         Enforces the task/workflow invariant via a compensating
         transaction: if the DBOS workflow fails to start, the task
@@ -106,6 +107,13 @@ class TaskStore(ABC):
             instructions override.
         :param reasoning: Optional reasoning configuration,
             e.g. ``{"effort": "medium"}``.
+        :param tools: Optional list of client-specified tool dicts
+            in OpenAI function format extended with ``agent_plane``
+            callback metadata. Each entry must include
+            ``agent_plane.callback.url``. ``None`` and ``[]`` are
+            equivalent (no client tools), e.g.
+            ``[{"type": "function", "function": {...},
+            "agent_plane": {"callback": {"url": "..."}}}]``.
         """
         ...
 

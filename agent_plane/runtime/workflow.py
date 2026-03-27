@@ -44,6 +44,10 @@ from agent_plane.spec import AgentSpec
 from agent_plane.spec.types import LLMConfig, RetryConfig, ToolsConfig
 from agent_plane.stores import ConversationStore, TaskStore
 from agent_plane.tools import ToolManager
+from agent_plane.tools.client_specified import (
+    CallbackToolSpec,
+    parse_callback_tool_specs,
+)
 from llms import Client as LLMClient
 from llms.errors import PermanentLLMError, RetryableLLMError
 from llms.types import (
@@ -1273,6 +1277,7 @@ def agent_execution_workflow(
     previous_response_id: str | None = None,
     instructions: str | None = None,
     reasoning: dict[str, str] | None = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     The real agent execution loop.
@@ -1282,9 +1287,8 @@ def agent_execution_workflow(
     LLM produces a final text response or we hit the iteration
     limit.
 
-    ``previous_response_id`` and ``reasoning`` are not used by
-    the loop but must be in the signature — DBOS checkpoints
-    all workflow inputs and restores them on recovery.
+    ``previous_response_id``, ``reasoning``, and ``tools`` are
+    stored by DBOS and restored on crash recovery.
     ``task_store.get()`` reads them back for the API response.
 
     :param agent_id: Unique agent identifier, e.g.
@@ -1299,6 +1303,13 @@ def agent_execution_workflow(
     :param reasoning: Optional reasoning configuration dict,
         e.g. ``{"effort": "high"}``. Stored by DBOS for
         recovery; not yet consumed by the loop.
+    :param tools: Optional list of client-specified tool dicts
+        (OpenAI format with ``agent_plane`` extension). Each
+        entry must include ``agent_plane.callback.url``.
+        Stored by DBOS for recovery. ``None`` and ``[]`` are
+        equivalent (no client tools), e.g.
+        ``[{"type": "function", "function": {...},
+        "agent_plane": {"callback": {"url": "..."}}}]``.
     :returns: A result dict with ``"task_id"``,
         ``"status"``, and ``"output"`` keys.
     """
@@ -1324,7 +1335,8 @@ def agent_execution_workflow(
                 },
             }
 
-        tool_mgr = ToolManager(spec, work_dir)
+        client_tool_specs: list[CallbackToolSpec] = parse_callback_tool_specs(tools or [])
+        tool_mgr = ToolManager(spec, work_dir, client_tool_specs=client_tool_specs)
         set_tool_manager(tool_mgr)
 
         return _run_agent_loop(

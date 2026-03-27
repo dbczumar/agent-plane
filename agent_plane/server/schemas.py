@@ -244,8 +244,16 @@ class CreateResponseRequest(BaseModel):
         dropped.
     :param top_p: Ignored — agent controls this. Silently
         dropped.
-    :param tools: Ignored — agent controls this. Silently
-        dropped.
+    :param tools: Optional list of client-specified tools in OpenAI
+        function format extended with an ``agent_plane`` key. Each
+        entry must include ``agent_plane.callback.url`` — an HTTP
+        endpoint the runtime will POST to when the LLM invokes that
+        tool. Returns 400 if any entry is malformed or missing the
+        callback URL, e.g.
+        ``[{"type": "function", "function": {"name": "get_weather",
+        "description": "...", "parameters": {...}},
+        "agent_plane": {"callback": {"url": "https://...",
+        "headers": {"Authorization": "Bearer tok"}}}}]``.
     :param tool_choice: Ignored — agent controls this. Silently
         dropped.
     :param max_output_tokens: Ignored — agent controls this.
