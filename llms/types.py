@@ -10,7 +10,28 @@ and ``.arguments`` attributes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+@dataclass
+class RetryConfig:
+    """
+    Retry policy for LLM calls.
+
+    :param max_attempts: Total attempts including the first call.
+        ``3`` means up to 2 retries, e.g. ``3``.
+    :param backoff_base: Base delay in seconds for exponential
+        backoff, e.g. ``2.0``.
+    :param backoff_max: Maximum delay between retries in seconds,
+        e.g. ``30.0``.
+    :param status_codes: HTTP status codes that trigger a retry.
+        Timeouts always trigger a retry regardless of this list.
+    """
+
+    max_attempts: int = 3
+    backoff_base: float = 2.0
+    backoff_max: float = 30.0
+    status_codes: list[int] = field(default_factory=lambda: [429, 500, 502, 503])
 
 
 @dataclass

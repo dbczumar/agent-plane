@@ -5,8 +5,13 @@ routes to provider adapters.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from typing import Any
+import logging
+import random
+import time
+from collections.abc import Callable, Iterator
+from typing import Any, TypeVar
+
+import httpx
 
 from llms._responses_to_chat import (
     chat_response_to_response,
@@ -15,8 +20,13 @@ from llms._responses_to_chat import (
 )
 from llms.adapters import get_adapter
 from llms.adapters.openai import OpenAIAdapter
+from llms.errors import LLMErrorDetail, PermanentLLMError, RetryableLLMError
 from llms.routing import parse_model_string
-from llms.types import Response, ResponseStreamEvent
+from llms.types import Response, ResponseStreamEvent, RetryConfig
+
+_logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 class _ResponsesNamespace:
@@ -41,6 +51,7 @@ class _ResponsesNamespace:
         stream: bool = False,
         connection_params: dict[str, str] | None = None,
         timeout: int | None = None,
+        retry: RetryConfig | None = None,
         **kwargs: Any,
     ) -> Response | Iterator[ResponseStreamEvent]:
         """
@@ -65,11 +76,62 @@ class _ResponsesNamespace:
             ``None`` uses the adapter's default credentials.
         :param timeout: Request timeout in seconds. ``None`` uses
             the adapter's default (120s non-streaming, 300s streaming).
+        :param retry: Retry policy for transient failures (timeouts,
+            rate limits). ``None`` disables client-level retries.
+            Useful for standalone calls outside the workflow engine.
         :param kwargs: Additional provider-specific kwargs (e.g.
             ``temperature``, ``max_tokens``).
         :returns: A :class:`Response` when ``stream=False``, or an
             iterator of :data:`ResponseStreamEvent` when
             ``stream=True``.
+        :raises PermanentLLMError: On non-retryable errors.
+        :raises RetryableLLMError: When all retry attempts are
+            exhausted.
+        """
+
+        def call_fn() -> Response | Iterator[ResponseStreamEvent]:
+            return self._do_create(
+                input=input,
+                instructions=instructions,
+                model=model,
+                tools=tools,
+                reasoning=reasoning,
+                stream=stream,
+                connection_params=connection_params,
+                timeout=timeout,
+                **kwargs,
+            )
+
+        if retry is None:
+            return call_fn()
+        return _execute_with_retry(call_fn, retry)
+
+    def _do_create(
+        self,
+        *,
+        input: list[dict[str, Any]],
+        instructions: str | None,
+        model: str,
+        tools: list[dict[str, Any]] | None,
+        reasoning: dict[str, str] | None,
+        stream: bool,
+        connection_params: dict[str, str] | None,
+        timeout: int | None,
+        **kwargs: Any,
+    ) -> Response | Iterator[ResponseStreamEvent]:
+        """
+        Route the LLM call to the appropriate provider adapter.
+
+        :param input: Responses API input items.
+        :param instructions: System instructions string.
+        :param model: Provider-prefixed model string.
+        :param tools: Tool schemas or ``None``.
+        :param reasoning: Reasoning config or ``None``.
+        :param stream: Enable streaming.
+        :param connection_params: Connection overrides or ``None``.
+        :param timeout: Timeout in seconds or ``None``.
+        :param kwargs: Additional provider-specific kwargs.
+        :returns: Response or streaming event iterator.
         """
         routed = parse_model_string(model)
         adapter = get_adapter(routed.provider)
@@ -119,6 +181,93 @@ class _ResponsesNamespace:
         )
         assert isinstance(result, dict)
         return chat_response_to_response(result)
+
+
+def _execute_with_retry(
+    call_fn: Callable[[], _T],
+    retry_config: RetryConfig,
+) -> _T:
+    """
+    Execute ``call_fn`` with retry on transient failures.
+
+    Standalone retry logic for the LLM client — no SSE events
+    or workflow dependencies. For use in scripts, notebooks, and
+    other contexts outside the agent workflow engine.
+
+    :param call_fn: Zero-argument callable that performs the LLM
+        call.
+    :param retry_config: Retry policy (max_attempts, backoff, etc.).
+    :returns: The successful result from ``call_fn``.
+    :raises PermanentLLMError: On non-retryable errors.
+    :raises RetryableLLMError: When all retry attempts are exhausted.
+    """
+    last_error: RetryableLLMError | None = None
+
+    for attempt in range(retry_config.max_attempts):
+        try:
+            return call_fn()
+        except (PermanentLLMError, RetryableLLMError):
+            raise
+        except Exception as exc:
+            classified = _classify_error(exc, retry_config.status_codes)
+            if isinstance(classified, PermanentLLMError):
+                raise classified from exc
+            last_error = classified
+            if attempt + 1 < retry_config.max_attempts:
+                _backoff_sleep(attempt, retry_config)
+
+    assert last_error is not None
+    raise last_error
+
+
+def _classify_error(
+    exc: Exception,
+    retryable_status_codes: list[int],
+) -> RetryableLLMError | PermanentLLMError:
+    """
+    Classify an exception as retryable or permanent.
+
+    :param exc: The exception raised by the adapter.
+    :param retryable_status_codes: HTTP status codes configured
+        as retryable, e.g. ``[429, 500, 502, 503]``.
+    :returns: A classified LLM error.
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return RetryableLLMError(
+            f"LLM request timed out: {exc}",
+            code="timeout",
+            detail=LLMErrorDetail(),
+        )
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        detail = LLMErrorDetail(status_code=status)
+        msg = f"LLM returned HTTP {status}"
+        if status in retryable_status_codes:
+            return RetryableLLMError(msg, code=str(status), detail=detail)
+        return PermanentLLMError(msg, code=str(status), detail=detail)
+    return PermanentLLMError(
+        f"LLM call failed: {exc}",
+        code="connection_error",
+        detail=LLMErrorDetail(),
+    )
+
+
+def _backoff_sleep(attempt: int, config: RetryConfig) -> None:
+    """
+    Sleep with exponential backoff and jitter.
+
+    :param attempt: Zero-based attempt index (0 = first attempt).
+    :param config: Retry policy with backoff parameters.
+    """
+    delay = min(config.backoff_base**attempt, config.backoff_max)
+    delay *= random.uniform(0.5, 1.0)
+    _logger.info(
+        "LLM retry %d/%d after %.1fs",
+        attempt + 2,
+        config.max_attempts,
+        delay,
+    )
+    time.sleep(delay)
 
 
 class Client:
