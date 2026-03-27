@@ -33,11 +33,24 @@ class WebSearchGoogleTool(Tool):
     """
     Web search via Google Custom Search API.
 
-    Requires ``GOOGLE_SEARCH_API_KEY`` and
-    ``GOOGLE_SEARCH_ENGINE_ID`` environment variables.
-    Returns formatted search results with titles, URLs,
-    and snippets.
+    API key and engine ID can be provided via the spec config
+    block or via ``GOOGLE_SEARCH_API_KEY`` and
+    ``GOOGLE_SEARCH_ENGINE_ID`` environment variables (spec
+    config takes precedence).
+
+    :param config: Tool-specific config from the agent spec,
+        e.g. ``{"api_key": "AIza...", "engine_id": "abc123"}``.
     """
+
+    def __init__(self, config: dict[str, str] | None = None) -> None:
+        """
+        Create a new Google Custom Search tool.
+
+        :param config: Optional spec-level config with
+            ``api_key`` and ``engine_id`` keys. Falls back to
+            environment variables when not provided.
+        """
+        self._config = config or {}
 
     @property
     def name(self) -> str:
@@ -86,23 +99,32 @@ class WebSearchGoogleTool(Tool):
         query = parsed.get("query")
         if not query:
             return "Error: 'query' parameter is required"
-        return _search_google(query)
+        return _search_google(query, self._config)
 
 
-def _search_google(query: str) -> str:
+def _search_google(
+    query: str,
+    config: dict[str, str],
+) -> str:
     """
     Call the Google Custom Search API and format results.
 
     :param query: The search query string.
+    :param config: Spec-level config; checked for ``api_key``
+        and ``engine_id`` before falling back to env vars.
     :returns: Formatted results or an error message.
     """
-    api_key = os.environ.get("GOOGLE_SEARCH_API_KEY")
-    engine_id = os.environ.get("GOOGLE_SEARCH_ENGINE_ID")
+    api_key = config.get("api_key") or os.environ.get(
+        "GOOGLE_SEARCH_API_KEY",
+    )
+    engine_id = config.get("engine_id") or os.environ.get(
+        "GOOGLE_SEARCH_ENGINE_ID",
+    )
     if not api_key or not engine_id:
         return (
-            "Error: GOOGLE_SEARCH_API_KEY and "
-            "GOOGLE_SEARCH_ENGINE_ID environment variables "
-            "are required for web_search_google."
+            "Error: api_key and engine_id must be provided in "
+            "the spec config or via GOOGLE_SEARCH_API_KEY and "
+            "GOOGLE_SEARCH_ENGINE_ID environment variables."
         )
     try:
         resp = httpx.get(

@@ -22,7 +22,18 @@ class WebSearchOpenAITool(Tool):
     The schema is ``{"type": "web_search_preview"}`` — not a
     function definition. OpenAI handles execution server-side;
     ``invoke()`` should never be called.
+
+    :param config: Unused — OpenAI web search needs no config
+        (uses the LLM API key).
     """
+
+    def __init__(self, config: dict[str, str] | None = None) -> None:
+        """
+        Create a new OpenAI web search passthrough tool.
+
+        :param config: Unused — accepted for interface
+            consistency with other built-in tools.
+        """
 
     @property
     def name(self) -> str:

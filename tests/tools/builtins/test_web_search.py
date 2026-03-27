@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,7 +17,6 @@ from agent_plane.tools.builtins.web_search_openai import (
 from agent_plane.tools.builtins.web_search_perplexity import (
     WebSearchPerplexityTool,
 )
-
 
 # ── Registry ─────────────────────────────────────────
 
@@ -41,8 +39,7 @@ def test_get_builtin_tool_returns_correct_type(
     """
     tool = get_builtin_tool(name)
     assert isinstance(tool, expected_type), (
-        f"Expected {expected_type.__name__} for {name!r}, "
-        f"got {type(tool).__name__}."
+        f"Expected {expected_type.__name__} for {name!r}, got {type(tool).__name__}."
     )
 
 
@@ -103,16 +100,17 @@ def test_google_schema_is_function() -> None:
     assert "query" in func["parameters"]["required"]
 
 
-def test_google_invoke_missing_env_vars() -> None:
+def test_google_invoke_missing_keys() -> None:
     """
-    Google tool returns a clear error when env vars are missing.
+    Google tool returns a clear error when neither spec config
+    nor env vars provide the required keys.
     """
     tool = WebSearchGoogleTool()
     with patch.dict("os.environ", {}, clear=True):
         result = tool.invoke(json.dumps({"query": "test"}))
-    assert "GOOGLE_SEARCH_API_KEY" in result, (
-        f"Expected env var error message, got: {result!r}"
-    )
+    # Error message mentions both spec config and env var paths.
+    assert "api_key" in result, f"Expected key error message, got: {result!r}"
+    assert "engine_id" in result, f"Expected engine_id in error, got: {result!r}"
 
 
 def test_google_invoke_missing_query() -> None:
@@ -155,8 +153,7 @@ def test_google_invoke_formats_results() -> None:
     }
     with (
         patch.dict("os.environ", env, clear=True),
-        patch("agent_plane.tools.builtins.web_search_google.httpx.get")
-        as mock_get,
+        patch("agent_plane.tools.builtins.web_search_google.httpx.get") as mock_get,
     ):
         mock_get.return_value = fake_response
         result = tool.invoke(json.dumps({"query": "python"}))
@@ -184,8 +181,7 @@ def test_google_invoke_empty_results() -> None:
     }
     with (
         patch.dict("os.environ", env, clear=True),
-        patch("agent_plane.tools.builtins.web_search_google.httpx.get")
-        as mock_get,
+        patch("agent_plane.tools.builtins.web_search_google.httpx.get") as mock_get,
     ):
         mock_get.return_value = fake_response
         result = tool.invoke(json.dumps({"query": "python"}))
@@ -209,16 +205,17 @@ def test_perplexity_schema_is_function() -> None:
     assert "query" in func["parameters"]["required"]
 
 
-def test_perplexity_invoke_missing_env_var() -> None:
+def test_perplexity_invoke_missing_key() -> None:
     """
-    Perplexity tool returns a clear error when API key is missing.
+    Perplexity tool returns a clear error when neither spec
+    config nor env var provides the API key.
     """
     tool = WebSearchPerplexityTool()
     with patch.dict("os.environ", {}, clear=True):
         result = tool.invoke(json.dumps({"query": "test"}))
-    assert "PERPLEXITY_API_KEY" in result, (
-        f"Expected env var error message, got: {result!r}"
-    )
+    # Error message mentions both spec config and env var paths.
+    assert "api_key" in result, f"Expected key error message, got: {result!r}"
+    assert "PERPLEXITY_API_KEY" in result, f"Expected env var name in error, got: {result!r}"
 
 
 def test_perplexity_invoke_missing_query() -> None:
@@ -260,9 +257,7 @@ def test_perplexity_invoke_with_citations() -> None:
             {"PERPLEXITY_API_KEY": "fake-key"},
             clear=True,
         ),
-        patch(
-            "agent_plane.tools.builtins.web_search_perplexity.httpx.post"
-        ) as mock_post,
+        patch("agent_plane.tools.builtins.web_search_perplexity.httpx.post") as mock_post,
     ):
         mock_post.return_value = fake_response
         result = tool.invoke(json.dumps({"query": "what is python"}))
@@ -292,9 +287,7 @@ def test_perplexity_invoke_no_citations() -> None:
             {"PERPLEXITY_API_KEY": "fake-key"},
             clear=True,
         ),
-        patch(
-            "agent_plane.tools.builtins.web_search_perplexity.httpx.post"
-        ) as mock_post,
+        patch("agent_plane.tools.builtins.web_search_perplexity.httpx.post") as mock_post,
     ):
         mock_post.return_value = fake_response
         result = tool.invoke(json.dumps({"query": "simple question"}))
@@ -319,11 +312,104 @@ def test_perplexity_invoke_empty_response() -> None:
             {"PERPLEXITY_API_KEY": "fake-key"},
             clear=True,
         ),
-        patch(
-            "agent_plane.tools.builtins.web_search_perplexity.httpx.post"
-        ) as mock_post,
+        patch("agent_plane.tools.builtins.web_search_perplexity.httpx.post") as mock_post,
     ):
         mock_post.return_value = fake_response
         result = tool.invoke(json.dumps({"query": "test"}))
 
     assert result == "No answer returned."
+
+
+# ── Spec-level config ───────────────────────────────
+
+
+def test_google_uses_spec_config_over_env() -> None:
+    """
+    Google tool prefers api_key/engine_id from spec config
+    over environment variables.
+    """
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"items": []}
+
+    # Spec config provides keys; env has different values.
+    tool = WebSearchGoogleTool(
+        config={
+            "api_key": "spec-key",
+            "engine_id": "spec-engine",
+        }
+    )
+    env = {
+        "GOOGLE_SEARCH_API_KEY": "env-key",
+        "GOOGLE_SEARCH_ENGINE_ID": "env-engine",
+    }
+    with (
+        patch.dict("os.environ", env, clear=True),
+        patch(
+            "agent_plane.tools.builtins.web_search_google.httpx.get",
+        ) as mock_get,
+    ):
+        mock_get.return_value = fake_response
+        tool.invoke(json.dumps({"query": "test"}))
+
+    # Verify the HTTP call used spec config keys, not env keys.
+    call_kwargs = mock_get.call_args
+    params = call_kwargs.kwargs["params"]
+    assert params["key"] == "spec-key", f"Expected spec config api_key, got {params['key']!r}"
+    assert params["cx"] == "spec-engine", f"Expected spec config engine_id, got {params['cx']!r}"
+
+
+def test_perplexity_uses_spec_config_over_env() -> None:
+    """
+    Perplexity tool prefers api_key from spec config over
+    environment variable.
+    """
+    fake_response = MagicMock()
+    fake_response.json.return_value = {
+        "choices": [{"message": {"content": "answer"}}],
+    }
+
+    tool = WebSearchPerplexityTool(config={"api_key": "spec-pplx"})
+    with (
+        patch.dict(
+            "os.environ",
+            {"PERPLEXITY_API_KEY": "env-pplx"},
+            clear=True,
+        ),
+        patch(
+            "agent_plane.tools.builtins.web_search_perplexity.httpx.post",
+        ) as mock_post,
+    ):
+        mock_post.return_value = fake_response
+        tool.invoke(json.dumps({"query": "test"}))
+
+    # Verify the HTTP call used spec config key, not env key.
+    call_kwargs = mock_post.call_args
+    headers = call_kwargs.kwargs["headers"]
+    assert headers["Authorization"] == "Bearer spec-pplx", (
+        f"Expected spec config api_key in header, got {headers['Authorization']!r}"
+    )
+
+
+def test_get_builtin_tool_passes_config() -> None:
+    """
+    ``get_builtin_tool`` passes the config dict through to
+    the tool constructor.
+    """
+    config = {"api_key": "test-key", "engine_id": "test-engine"}
+    tool = get_builtin_tool("web_search_google", config=config)
+    assert isinstance(tool, WebSearchGoogleTool)
+    # Config is stored and accessible for invoke().
+    # Verify by checking it doesn't error with missing env vars
+    # when config provides the keys.
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"items": []}
+    with (
+        patch.dict("os.environ", {}, clear=True),
+        patch(
+            "agent_plane.tools.builtins.web_search_google.httpx.get",
+        ) as mock_get,
+    ):
+        mock_get.return_value = fake_response
+        result = tool.invoke(json.dumps({"query": "test"}))
+    # Should succeed (no error) because config provided the keys.
+    assert result == "No results found."

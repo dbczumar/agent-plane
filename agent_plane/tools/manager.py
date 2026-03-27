@@ -111,17 +111,18 @@ class ToolManager:
         """
         Register built-in tools declared in ``tools.builtins``.
 
-        Each name in the list is looked up in the built-in registry.
+        Each entry is looked up in the built-in registry and
+        instantiated with its spec-level config (API keys, etc.).
         Unrecognized names are logged as warnings and skipped.
         """
-        for name in self._spec.tools.builtins:
-            tool = get_builtin_tool(name)
+        for entry in self._spec.tools.builtins:
+            tool = get_builtin_tool(entry.name, config=entry.config)
             if tool is None:
                 _logger.warning(
                     "Unknown built-in tool %r — skipping. "
                     "Available: web_search_openai, web_search_google, "
                     "web_search_perplexity",
-                    name,
+                    entry.name,
                 )
                 continue
             self._tools[tool.name] = tool

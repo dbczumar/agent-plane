@@ -119,24 +119,31 @@ needed.
 
 ### `tools.builtins`
 
-Enables built-in tools provided by agent-plane. Each entry is a string matching
-a registered built-in tool name:
+Enables built-in tools provided by agent-plane. Each entry is either a plain
+string (tool name, no config needed) or a dict with `name` and tool-specific
+config fields (API keys, engine IDs, etc.):
 
 ```yaml
 tools:
   builtins:
-    - web_search_openai      # OpenAI native web search (passthrough)
-    - web_search_google       # Google Custom Search API
-    - web_search_perplexity   # Perplexity AI search
+    - web_search_openai                    # string — no config needed
+    - name: web_search_google              # dict — with config
+      api_key: ${GOOGLE_SEARCH_API_KEY}
+      engine_id: ${GOOGLE_SEARCH_ENGINE_ID}
+    - name: web_search_perplexity
+      api_key: ${PERPLEXITY_API_KEY}
 ```
+
+Keys can be hardcoded or use `${ENV_VAR}` references. When config fields are
+omitted, tools fall back to reading from environment variables.
 
 **Available built-in tools:**
 
-| Name | Provider | Type | Env Vars Required |
+| Name | Provider | Type | Config Fields |
 |---|---|---|---|
 | `web_search_openai` | OpenAI | Passthrough (provider-native) | None (uses LLM API key) |
-| `web_search_google` | Google | Function (server-executed) | `GOOGLE_SEARCH_API_KEY`, `GOOGLE_SEARCH_ENGINE_ID` |
-| `web_search_perplexity` | Perplexity | Function (server-executed) | `PERPLEXITY_API_KEY` |
+| `web_search_google` | Google | Function (server-executed) | `api_key`, `engine_id` |
+| `web_search_perplexity` | Perplexity | Function (server-executed) | `api_key` |
 
 **Passthrough vs function tools**: `web_search_openai` sends
 `{"type": "web_search_preview"}` directly to the OpenAI Responses API — the LLM

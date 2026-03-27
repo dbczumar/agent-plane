@@ -12,6 +12,7 @@ import yaml
 from agent_plane.errors import AgentPlaneError, ErrorCode
 from agent_plane.spec.types import (
     AgentSpec,
+    BuiltinToolConfig,
     ExecutionConfig,
     InteractionConfig,
     LLMConfig,
@@ -177,12 +178,60 @@ def _parse_tools_config(
         return ToolsConfig()
     timeout = int(raw["timeout"]) if "timeout" in raw else 60
     retry = _parse_retry(raw.get("retry"))
+    builtins = _parse_builtin_tools(raw.get("builtins", []))
     return ToolsConfig(
         agents=raw.get("agents", []),
-        builtins=raw.get("builtins", []),
+        builtins=builtins,
         timeout=timeout,
         retry=retry,
     )
+
+
+def _parse_builtin_tools(
+    raw: list[str | dict[str, Any]],
+) -> list[BuiltinToolConfig]:
+    """
+    Parse the ``tools.builtins`` list into
+    :class:`BuiltinToolConfig` objects.
+
+    Each entry is either a plain string (tool name with no config)
+    or a dict with a ``name`` key and tool-specific config fields::
+
+        builtins:
+          - web_search_openai
+          - name: web_search_google
+            api_key: ${GOOGLE_SEARCH_API_KEY}
+            engine_id: ${GOOGLE_SEARCH_ENGINE_ID}
+
+    :param raw: The raw ``builtins`` list from config.yaml.
+    :returns: A list of :class:`BuiltinToolConfig` instances.
+    :raises AgentPlaneError: If a dict entry is missing ``name``.
+    """
+    result: list[BuiltinToolConfig] = []
+    for entry in raw:
+        if isinstance(entry, str):
+            result.append(BuiltinToolConfig(name=entry))
+        elif isinstance(entry, dict):
+            name = entry.get("name")
+            if not name:
+                raise AgentPlaneError(
+                    "Each dict entry in tools.builtins must have a 'name' field.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            # Everything except 'name' is tool-specific config.
+            config = {str(k): str(v) for k, v in entry.items() if k != "name"}
+            result.append(
+                BuiltinToolConfig(
+                    name=str(name),
+                    config=config,
+                )
+            )
+        else:
+            raise AgentPlaneError(
+                f"tools.builtins entries must be strings or dicts, got {type(entry).__name__}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+    return result
 
 
 def _parse_retry(

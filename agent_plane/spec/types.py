@@ -148,6 +148,23 @@ class InteractionConfig:
 
 
 @dataclass
+class BuiltinToolConfig:
+    """
+    Configuration for a single built-in tool declared in
+    ``tools.builtins``.
+
+    :param name: The registered tool name, e.g.
+        ``"web_search_google"``.
+    :param config: Tool-specific key-value pairs, e.g.
+        ``{"api_key": "AIza...", "engine_id": "abc123"}``.
+        Empty when the tool needs no configuration.
+    """
+
+    name: str
+    config: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class ToolsConfig:
     """
     Declared tool references from config.yaml.
@@ -155,9 +172,10 @@ class ToolsConfig:
     :param agents: Names of sub-agents this agent can delegate to,
         e.g. ``["summarizer", "code-reviewer"]``. Each name must
         match a directory under ``agents/``.
-    :param builtins: Names of built-in tools to enable, e.g.
-        ``["web_search_openai", "web_search_google"]``. Each name
-        must match a registered built-in tool in the runtime.
+    :param builtins: Built-in tools to enable, e.g.
+        ``[BuiltinToolConfig(name="web_search_openai")]``. Each
+        entry carries the tool name and optional config fields
+        (API keys, engine IDs, etc.).
     :param timeout: Default timeout in seconds for all tool calls,
         e.g. ``60``. Individual tools can override this.
     :param retry: Default retry policy for all tool calls.
@@ -165,7 +183,7 @@ class ToolsConfig:
     """
 
     agents: list[str] = field(default_factory=list)
-    builtins: list[str] = field(default_factory=list)
+    builtins: list[BuiltinToolConfig] = field(default_factory=list)
     timeout: int = 60
     retry: RetryConfig = field(
         default_factory=lambda: RetryConfig(

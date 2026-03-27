@@ -39,8 +39,23 @@ class WebSearchPerplexityTool(Tool):
     an online model that performs grounded web search. Returns
     the answer text with source citations.
 
-    Requires the ``PERPLEXITY_API_KEY`` environment variable.
+    API key can be provided via the spec config block or via
+    the ``PERPLEXITY_API_KEY`` environment variable (spec config
+    takes precedence).
+
+    :param config: Tool-specific config from the agent spec,
+        e.g. ``{"api_key": "pplx-..."}``.
     """
+
+    def __init__(self, config: dict[str, str] | None = None) -> None:
+        """
+        Create a new Perplexity web search tool.
+
+        :param config: Optional spec-level config with an
+            ``api_key`` key. Falls back to environment variable
+            when not provided.
+        """
+        self._config = config or {}
 
     @property
     def name(self) -> str:
@@ -89,21 +104,29 @@ class WebSearchPerplexityTool(Tool):
         query = parsed.get("query")
         if not query:
             return "Error: 'query' parameter is required"
-        return _search_perplexity(query)
+        return _search_perplexity(query, self._config)
 
 
-def _search_perplexity(query: str) -> str:
+def _search_perplexity(
+    query: str,
+    config: dict[str, str],
+) -> str:
     """
     Call the Perplexity Chat Completions API with an online model.
 
     :param query: The search query string.
+    :param config: Spec-level config; checked for ``api_key``
+        before falling back to the env var.
     :returns: The answer text with citations, or an error message.
     """
-    api_key = os.environ.get("PERPLEXITY_API_KEY")
+    api_key = config.get("api_key") or os.environ.get(
+        "PERPLEXITY_API_KEY",
+    )
     if not api_key:
         return (
-            "Error: PERPLEXITY_API_KEY environment variable "
-            "is required for web_search_perplexity."
+            "Error: api_key must be provided in the spec "
+            "config or via PERPLEXITY_API_KEY environment "
+            "variable."
         )
     try:
         resp = httpx.post(
@@ -144,8 +167,6 @@ def _format_response(data: dict[str, Any]) -> str:
     # Perplexity includes citation URLs in the response metadata.
     citations = data.get("citations", [])
     if citations:
-        citation_lines = [
-            f"[{i + 1}] {url}" for i, url in enumerate(citations)
-        ]
+        citation_lines = [f"[{i + 1}] {url}" for i, url in enumerate(citations)]
         content += "\n\nSources:\n" + "\n".join(citation_lines)
     return content

@@ -680,6 +680,94 @@ def test_parse_tools_global_timeout_and_retry(tmp_path: Path) -> None:
     assert spec.tools.retry.max_attempts == 4
 
 
+def test_parse_builtins_string_entries(tmp_path: Path) -> None:
+    """Plain string entries in tools.builtins produce BuiltinToolConfig
+    with empty config dicts."""
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": ["web_search_openai", "web_search_google"],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    # Two entries parsed, both with empty config.
+    assert len(spec.tools.builtins) == 2
+    assert spec.tools.builtins[0].name == "web_search_openai"
+    assert spec.tools.builtins[0].config == {}
+    assert spec.tools.builtins[1].name == "web_search_google"
+    assert spec.tools.builtins[1].config == {}
+
+
+def test_parse_builtins_dict_entries(tmp_path: Path) -> None:
+    """Dict entries in tools.builtins carry tool-specific config."""
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                {
+                    "name": "web_search_google",
+                    "api_key": "AIza-test",
+                    "engine_id": "eng-123",
+                },
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert len(spec.tools.builtins) == 1
+    entry = spec.tools.builtins[0]
+    assert entry.name == "web_search_google"
+    # Config contains all keys except 'name'.
+    assert entry.config == {
+        "api_key": "AIza-test",
+        "engine_id": "eng-123",
+    }
+
+
+def test_parse_builtins_mixed_entries(tmp_path: Path) -> None:
+    """tools.builtins supports a mix of strings and dicts."""
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                "web_search_openai",
+                {
+                    "name": "web_search_perplexity",
+                    "api_key": "pplx-test",
+                },
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert len(spec.tools.builtins) == 2
+    # First entry: string → no config.
+    assert spec.tools.builtins[0].name == "web_search_openai"
+    assert spec.tools.builtins[0].config == {}
+    # Second entry: dict → has config.
+    assert spec.tools.builtins[1].name == "web_search_perplexity"
+    assert spec.tools.builtins[1].config == {"api_key": "pplx-test"}
+
+
+def test_parse_builtins_dict_missing_name(tmp_path: Path) -> None:
+    """Dict entry without 'name' raises AgentPlaneError."""
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                {"api_key": "orphan-key"},
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(AgentPlaneError, match="name"):
+        parse(tmp_path)
+
+
 def test_parse_execution_config(tmp_path: Path) -> None:
     """Execution block with explicit timeout and max_iterations."""
     config = {
