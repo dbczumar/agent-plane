@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import io
+import tarfile
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
 
-from agent_plane.cli import _expand_config_env_vars, _resolve_bundle_env_vars
+from agent_plane.cli import (
+    _bundle,
+    _expand_config_env_vars,
+    _resolve_bundle_env_vars,
+)
 from agent_plane.errors import AgentPlaneError
 
 
@@ -249,3 +255,196 @@ def test_resolve_bundle_missing_env_var_raises(
 
     with pytest.raises(AgentPlaneError, match="NONEXISTENT_DEPLOY_KEY"):
         _resolve_bundle_env_vars(tmp_path)
+
+
+# ── _bundle integration tests ──────────────────────────
+
+
+def _extract_yaml_from_bundle(
+    bundle_bytes: bytes,
+    arcname: str,
+) -> dict[str, Any]:
+    """
+    Extract and parse a YAML file from a tar.gz bundle.
+
+    :param bundle_bytes: The gzipped tarball bytes.
+    :param arcname: The archive member name, e.g.
+        ``"config.yaml"`` or ``"tools/mcp/github.yaml"``.
+    :returns: The parsed YAML content as a dict.
+    """
+    with tarfile.open(fileobj=io.BytesIO(bundle_bytes), mode="r:gz") as tf:
+        member = tf.getmember(arcname)
+        extracted = tf.extractfile(member)
+        assert extracted is not None, f"Expected {arcname!r} to be a regular file in the bundle"
+        return yaml.safe_load(extracted.read())
+
+
+def test_bundle_resolves_config_env_vars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_bundle`` produces a tarball where ``config.yaml`` has
+    ``${VAR}`` references replaced with resolved values.
+
+    Verifies the end-to-end path: write agent dir with env var
+    refs → call ``_bundle`` → extract tarball → assert resolved.
+    """
+    monkeypatch.setenv("BUNDLE_LLM_KEY", "sk-live-abc123")
+    monkeypatch.setenv("BUNDLE_PPLX_KEY", "pplx-live-xyz")
+    _write_config(
+        tmp_path,
+        {
+            "spec_version": 1,
+            "name": "env-test-agent",
+            "llm": {
+                "model": "openai/gpt-4o",
+                "connection": {"api_key": "${BUNDLE_LLM_KEY}"},
+            },
+            "tools": {
+                "builtins": [
+                    "web_search_openai",
+                    {
+                        "name": "web_search_perplexity",
+                        "api_key": "${BUNDLE_PPLX_KEY}",
+                    },
+                ],
+            },
+        },
+    )
+
+    bundle_bytes = _bundle(tmp_path)
+    parsed = _extract_yaml_from_bundle(bundle_bytes, "config.yaml")
+
+    # LLM connection key must be resolved — if still "${BUNDLE_LLM_KEY}",
+    # the server would receive an unresolved reference it can't expand.
+    assert parsed["llm"]["connection"]["api_key"] == "sk-live-abc123", (
+        "LLM api_key should be resolved in the bundle tarball"
+    )
+    # Builtin tool config key must be resolved.
+    perplexity_entry = parsed["tools"]["builtins"][1]
+    assert perplexity_entry["api_key"] == "pplx-live-xyz", (
+        "Builtin tool api_key should be resolved in the bundle tarball"
+    )
+    assert perplexity_entry["name"] == "web_search_perplexity", (
+        "Builtin tool name must be preserved after expansion"
+    )
+    # String entries pass through unchanged.
+    assert parsed["tools"]["builtins"][0] == "web_search_openai", (
+        "String builtin entries should be unchanged in the bundle"
+    )
+    # Non-secret fields survive bundling.
+    assert parsed["name"] == "env-test-agent"
+    assert parsed["llm"]["model"] == "openai/gpt-4o"
+
+
+def test_bundle_resolves_mcp_header_env_vars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_bundle`` produces a tarball where MCP server YAML files
+    have ``${VAR}`` references in headers replaced with resolved
+    values.
+    """
+    monkeypatch.setenv("BUNDLE_GH_TOKEN", "ghp-secret-tok")
+    _write_config(tmp_path, {"spec_version": 1, "name": "mcp-agent"})
+    _write_mcp_config(
+        tmp_path,
+        "github",
+        {
+            "name": "github",
+            "transport": "http",
+            "url": "http://localhost:9000/mcp",
+            "headers": {"Authorization": "Bearer ${BUNDLE_GH_TOKEN}"},
+        },
+    )
+
+    bundle_bytes = _bundle(tmp_path)
+    parsed = _extract_yaml_from_bundle(bundle_bytes, "tools/mcp/github.yaml")
+
+    # Header must be resolved — an unresolved "${BUNDLE_GH_TOKEN}"
+    # would cause MCP auth failures on the server.
+    assert parsed["headers"]["Authorization"] == "Bearer ghp-secret-tok", (
+        "MCP header env var should be resolved in the bundle tarball"
+    )
+    # Non-header fields survive bundling.
+    assert parsed["name"] == "github"
+    assert parsed["url"] == "http://localhost:9000/mcp"
+
+
+def test_bundle_no_env_vars_preserves_files(
+    tmp_path: Path,
+) -> None:
+    """
+    ``_bundle`` produces a valid tarball even when no env vars
+    need expansion — files are included as-is.
+    """
+    _write_config(
+        tmp_path,
+        {
+            "spec_version": 1,
+            "name": "plain-agent",
+            "llm": {"model": "openai/gpt-4o"},
+        },
+    )
+
+    bundle_bytes = _bundle(tmp_path)
+    parsed = _extract_yaml_from_bundle(bundle_bytes, "config.yaml")
+
+    # Config content should be preserved exactly.
+    assert parsed["name"] == "plain-agent"
+    assert parsed["llm"]["model"] == "openai/gpt-4o"
+
+
+def test_bundle_passthrough_existing_tarball(
+    tmp_path: Path,
+) -> None:
+    """
+    ``_bundle`` returns the raw bytes of an existing ``.tar.gz``
+    file without modification (env var expansion only applies to
+    directories).
+    """
+    # Build a tarball with an unresolved env var reference.
+    config_bytes = yaml.dump(
+        {
+            "spec_version": 1,
+            "llm": {"connection": {"api_key": "${SHOULD_NOT_EXPAND}"}},
+        }
+    ).encode()
+    tarball_path = tmp_path / "agent.tar.gz"
+    with tarfile.open(tarball_path, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(config_bytes)
+        tf.addfile(info, io.BytesIO(config_bytes))
+
+    bundle_bytes = _bundle(tarball_path)
+
+    # Passthrough: bytes must match the original file exactly.
+    assert bundle_bytes == tarball_path.read_bytes(), (
+        "Existing tarball should be returned as-is without expansion"
+    )
+
+
+def test_bundle_missing_env_var_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_bundle`` raises ``AgentPlaneError`` when the agent
+    directory contains an unresolvable ``${VAR}`` reference.
+    """
+    monkeypatch.delenv("NONEXISTENT_BUNDLE_KEY", raising=False)
+    _write_config(
+        tmp_path,
+        {
+            "spec_version": 1,
+            "llm": {
+                "model": "openai/gpt-4o",
+                "connection": {"api_key": "${NONEXISTENT_BUNDLE_KEY}"},
+            },
+        },
+    )
+
+    with pytest.raises(AgentPlaneError, match="NONEXISTENT_BUNDLE_KEY"):
+        _bundle(tmp_path)
