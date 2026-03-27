@@ -886,6 +886,129 @@ async def test_steering_during_llm_with_client_tool_persists_steered_message(
     assert "The weather result was 72F sunny" in user_texts
 
 
+async def test_client_tool_continuation_with_function_call_output(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    When the client sends ``function_call_output`` items as input
+    (continuing after a client-side tool call), the LLM receives
+    the tool outputs in the correct Responses API format and
+    produces a final text response.
+
+    This is the full round-trip: LLM returns function_call →
+    client executes tool → client sends function_call_output →
+    LLM sees tool result in history → LLM responds with text.
+
+    Without _split_input_to_items, the function_call_output items
+    are incorrectly wrapped in a user message, causing a 400 error
+    from the LLM because it sees a broken user message where tool
+    results should be.
+    """
+    await create_test_agent(client)
+
+    # Turn 1: LLM invokes a client-side tool.
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_weather_1",
+                "name": "get_weather",
+                "arguments": '{"city": "SF"}',
+            },
+        ],
+    )
+    turn_1 = await create_test_response(
+        client,
+        input_text="What is the weather?",
+        tools=[_WEATHER_TOOL],
+    )
+    turn_1_id = turn_1.body["id"]
+    body_1 = await _wait_for_completion(client, turn_1_id)
+    # Turn 1 completes with the function_call (not executed).
+    assert body_1["status"] == "completed", (
+        f"Turn 1 should complete with function_call; got {body_1['status']}"
+    )
+
+    # Turn 2: Client sends the tool result back as input.
+    # The LLM should see the function_call_output in its
+    # history and respond with text.
+    call_2 = mock_llm.add_call(text="The weather in SF is 72F sunny.")
+    turn_2 = await create_test_response(
+        client,
+        # function_call_output items as input — this is what
+        # the TUI / client.py sends after executing tools locally.
+        input_text=[
+            {
+                "type": "function_call_output",
+                "call_id": "call_weather_1",
+                "output": "72 degrees, sunny",
+            },
+        ],
+        previous_response_id=turn_1_id,
+        tools=[_WEATHER_TOOL],
+    )
+    turn_2_id = turn_2.body["id"]
+
+    body_2 = await _wait_for_completion(client, turn_2_id)
+    # If _split_input_to_items is broken, the LLM gets a 400
+    # and this status is "failed".
+    assert body_2["status"] == "completed", (
+        f"Turn 2 should complete after receiving tool results; "
+        f"got {body_2['status']}. If 'failed', the "
+        f"function_call_output was likely wrapped in a user "
+        f"message instead of being persisted as a separate "
+        f"function_call_output item."
+    )
+
+    # Verify the LLM received the tool output in its history.
+    assert call_2.received_kwargs is not None, (
+        "Second LLM call was never made — the workflow did "
+        "not start or crashed before reaching the LLM."
+    )
+    llm_input_str = str(call_2.received_kwargs["input"])
+    # The tool result text must appear in the LLM prompt,
+    # proving it was persisted as a function_call_output item
+    # (not buried inside a user message where _extract_text
+    # would discard it).
+    assert "72 degrees, sunny" in llm_input_str, (
+        "Tool result must appear in the LLM prompt. If missing, "
+        "the function_call_output was persisted as a user message "
+        "and _extract_text stripped the non-text content."
+    )
+
+    # Verify conversation items have the correct types.
+    conv_id = turn_1.body["conversation"]["id"]
+    items = await _get_items(client, conv_id)
+    types = [i["type"] for i in items]
+
+    # Expected sequence:
+    # [user("What is the weather?"),
+    #  function_call(get_weather),
+    #  function_call_output(call_weather_1),  ← from client input
+    #  message(assistant: "72F sunny")]
+    assert types.count("function_call_output") == 1, (
+        f"Expected 1 function_call_output from the client's "
+        f"tool result; got {types.count('function_call_output')}. "
+        f"If 0, the output was persisted as a user message "
+        f"instead. Types: {types}"
+    )
+
+    # The function_call_output must have the correct call_id.
+    fco = [i for i in items if i["type"] == "function_call_output"]
+    assert fco[0]["call_id"] == "call_weather_1", (
+        f"function_call_output call_id should be 'call_weather_1'; got '{fco[0]['call_id']}'"
+    )
+    assert fco[0]["output"] == "72 degrees, sunny", (
+        "function_call_output should contain the tool result"
+    )
+
+    # 2 LLM calls: turn 1 (returns tool call) + turn 2 (after
+    # receiving tool result, returns text).
+    assert mock_llm.call_count == 2, (
+        f"Expected 2 LLM calls (one per turn); got {mock_llm.call_count}."
+    )
+
+
 # ── Error Handling ───────────────────────────────────────
 
 

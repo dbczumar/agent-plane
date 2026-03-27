@@ -1,0 +1,11 @@
+spec_version: 1
+
+name: coder
+description: A coding assistant that uses client-side tools for file operations, search, shell access, and code intelligence.
+
+llm:
+  model: gpt-5.4
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+instructions: AGENTS.md

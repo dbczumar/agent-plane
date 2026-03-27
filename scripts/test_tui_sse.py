@@ -163,9 +163,9 @@ def _stream_and_print(agent_name: str, message: str) -> bool:
     body = {"model": agent_name, "input": message, "stream": True}
     timeout = httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"SENDING: {message!r}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     event_count = 0
     current_event: str | None = None
@@ -211,9 +211,9 @@ def _stream_and_print(agent_name: str, message: str) -> bool:
                         current_event = None
 
     # Summary
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("STREAM SUMMARY")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"  Total events: {event_count}")
     print(f"  [DONE] received: {saw_done}")
     print(f"  Text deltas: {len(text_deltas)}")

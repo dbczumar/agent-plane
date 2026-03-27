@@ -9,6 +9,8 @@ import httpx
 import pytest
 from httpx_sse import aconnect_sse
 
+from agent_plane.entities import FunctionCallOutputData, MessageData
+from agent_plane.server.routes.responses import _split_input_to_items
 from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import create_test_agent, create_test_response
 
@@ -462,3 +464,126 @@ async def test_response_output_shape(client: httpx.AsyncClient) -> None:
     assert msg["content"][0]["type"] == "output_text"
     assert isinstance(msg["content"][0]["text"], str)
     assert len(msg["content"][0]["text"]) > 0
+
+
+# ── _split_input_to_items unit tests ─────────────────────
+
+
+def test_split_input_plain_text_produces_user_message() -> None:
+    """
+    Plain text input (normalized to ``input_text`` blocks) produces
+    a single user message item with the text content.
+    """
+    content = [{"type": "input_text", "text": "Hello"}]
+    items = _split_input_to_items(content, response_id="resp_1")
+
+    # Exactly 1 item: user message.
+    assert len(items) == 1, f"Plain text input should produce 1 item; got {len(items)}"
+    assert items[0].type == "message"
+    assert isinstance(items[0].data, MessageData)
+    assert items[0].data.role == "user"
+    assert items[0].data.content == content
+    assert items[0].response_id == "resp_1"
+
+
+def test_split_input_function_call_output_produces_fco_item() -> None:
+    """
+    When input contains only ``function_call_output`` blocks, they
+    are persisted as separate ``FunctionCallOutputData`` items — NOT
+    wrapped in a user message.
+
+    This is the bug that caused the 400 error: without splitting,
+    the LLM received a user message containing function_call_output
+    dicts instead of proper tool result items.
+    """
+    content = [
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "72 degrees, sunny",
+        },
+    ]
+    items = _split_input_to_items(content, response_id="resp_2")
+
+    # Exactly 1 item: function_call_output (no user message).
+    assert len(items) == 1, (
+        f"Expected 1 function_call_output item; got {len(items)}. "
+        f"If 0, the output was dropped. If more, a spurious user "
+        f"message was created for the empty message_blocks list."
+    )
+    assert items[0].type == "function_call_output"
+    assert isinstance(items[0].data, FunctionCallOutputData)
+    assert items[0].data.call_id == "call_1"
+    assert items[0].data.output == "72 degrees, sunny"
+    assert items[0].response_id == "resp_2"
+
+
+def test_split_input_mixed_separates_text_and_fco() -> None:
+    """
+    When input contains both ``input_text`` and
+    ``function_call_output`` blocks, text goes into a user
+    message and tool outputs become separate items. The user
+    message appears first (before function_call_output items).
+    """
+    content = [
+        {"type": "input_text", "text": "Here are the results:"},
+        {
+            "type": "function_call_output",
+            "call_id": "call_a",
+            "output": "result A",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_b",
+            "output": "result B",
+        },
+    ]
+    items = _split_input_to_items(content, response_id="resp_3")
+
+    # 3 items: 1 user message + 2 function_call_outputs.
+    assert len(items) == 3, f"Expected 3 items (1 message + 2 fco); got {len(items)}"
+
+    # First item: user message with only the text block.
+    assert items[0].type == "message"
+    assert isinstance(items[0].data, MessageData)
+    assert items[0].data.content == [
+        {"type": "input_text", "text": "Here are the results:"},
+    ], "User message should contain only the input_text block"
+
+    # Items 1 and 2: function_call_output items in order.
+    assert items[1].type == "function_call_output"
+    assert isinstance(items[1].data, FunctionCallOutputData)
+    assert items[1].data.call_id == "call_a"
+    assert items[1].data.output == "result A"
+
+    assert items[2].type == "function_call_output"
+    assert isinstance(items[2].data, FunctionCallOutputData)
+    assert items[2].data.call_id == "call_b"
+    assert items[2].data.output == "result B"
+
+
+def test_split_input_multiple_fco_no_text() -> None:
+    """
+    Multiple ``function_call_output`` blocks with no text produces
+    only function_call_output items — no empty user message.
+    """
+    content = [
+        {
+            "type": "function_call_output",
+            "call_id": "call_x",
+            "output": "result X",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_y",
+            "output": "result Y",
+        },
+    ]
+    items = _split_input_to_items(content, response_id="resp_4")
+
+    # 2 items, no user message (message_blocks is empty).
+    assert len(items) == 2, (
+        f"Expected 2 function_call_output items; got {len(items)}. "
+        f"If 3, an empty user message was created."
+    )
+    assert all(i.type == "function_call_output" for i in items)

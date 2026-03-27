@@ -13,7 +13,13 @@ from agent_plane.runtime.caps import RuntimeCaps
 
 if TYPE_CHECKING:
     from agent_plane.runtime.agent_cache import AgentCache
-    from agent_plane.stores import AgentStore, ConversationStore, TaskStore
+    from agent_plane.stores import (
+        AgentStore,
+        ArtifactStore,
+        ConversationStore,
+        FileStore,
+        TaskStore,
+    )
     from agent_plane.tools import ToolManager
 
 
@@ -23,6 +29,8 @@ def init(
     task_store: TaskStore,
     agent_store: AgentStore,
     agent_cache: AgentCache,
+    file_store: FileStore | None = None,
+    artifact_store: ArtifactStore | None = None,
     caps: RuntimeCaps | None = None,
 ) -> None:
     """
@@ -37,6 +45,12 @@ def init(
         CRUD operations on registered agents.
     :param agent_cache: The AgentCache instance for
         loading and caching parsed agent specs.
+    :param file_store: The FileStore instance for file
+        metadata lookups during content resolution.
+        ``None`` disables multimodal file_id resolution.
+    :param artifact_store: The ArtifactStore instance for
+        fetching file binary content during resolution.
+        ``None`` disables multimodal file_id resolution.
     :param caps: Operator-configured execution ceiling.
         ``None`` uses :class:`RuntimeCaps` defaults.
     """
@@ -45,6 +59,8 @@ def init(
         task_store=task_store,
         agent_store=agent_store,
         agent_cache=agent_cache,
+        file_store=file_store,
+        artifact_store=artifact_store,
         caps=caps,
     )
 
@@ -89,6 +105,32 @@ def get_agent_store() -> AgentStore:
     if store is None:
         raise RuntimeError("runtime not initialized — call init() first")
     return store
+
+
+def get_file_store() -> FileStore | None:
+    """
+    Return the FileStore instance, or ``None`` if not configured.
+
+    Returns ``None`` (rather than raising) because file_store is
+    optional — multimodal file_id resolution is simply skipped
+    when no file store is available.
+
+    :returns: The FileStore set during :func:`init`, or ``None``.
+    """
+    return _globals._file_store
+
+
+def get_artifact_store() -> ArtifactStore | None:
+    """
+    Return the ArtifactStore instance, or ``None`` if not configured.
+
+    Returns ``None`` (rather than raising) because artifact_store
+    is optional — multimodal file_id resolution is simply skipped
+    when no artifact store is available.
+
+    :returns: The ArtifactStore set during :func:`init`, or ``None``.
+    """
+    return _globals._artifact_store
 
 
 def get_agent_cache() -> AgentCache:

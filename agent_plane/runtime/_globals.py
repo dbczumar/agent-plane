@@ -13,13 +13,21 @@ from agent_plane.runtime.caps import RuntimeCaps
 
 if TYPE_CHECKING:
     from agent_plane.runtime.agent_cache import AgentCache
-    from agent_plane.stores import AgentStore, ConversationStore, TaskStore
+    from agent_plane.stores import (
+        AgentStore,
+        ArtifactStore,
+        ConversationStore,
+        FileStore,
+        TaskStore,
+    )
     from agent_plane.tools import ToolManager
 
 _conversation_store: ConversationStore | None = None
 _task_store: TaskStore | None = None
 _agent_store: AgentStore | None = None
 _agent_cache: AgentCache | None = None
+_file_store: FileStore | None = None
+_artifact_store: ArtifactStore | None = None
 _caps: RuntimeCaps = RuntimeCaps()
 
 # Per-workflow tool manager. ContextVar ensures thread-safe isolation —
@@ -37,6 +45,8 @@ def init(
     task_store: TaskStore,
     agent_store: AgentStore,
     agent_cache: AgentCache,
+    file_store: FileStore | None = None,
+    artifact_store: ArtifactStore | None = None,
     caps: RuntimeCaps | None = None,
 ) -> None:
     """
@@ -51,12 +61,22 @@ def init(
         operations on registered agents.
     :param agent_cache: The AgentCache instance for loading
         and caching parsed agent specs.
+    :param file_store: The FileStore instance for file
+        metadata lookups during content resolution.
+        ``None`` disables multimodal file_id resolution.
+    :param artifact_store: The ArtifactStore instance for
+        fetching file binary content during content
+        resolution. ``None`` disables multimodal file_id
+        resolution.
     :param caps: Operator-configured execution ceiling.
         ``None`` uses :class:`RuntimeCaps` defaults.
     """
-    global _conversation_store, _task_store, _agent_store, _agent_cache, _caps
+    global _conversation_store, _task_store, _agent_store  # noqa: PLW0603
+    global _agent_cache, _file_store, _artifact_store, _caps  # noqa: PLW0603
     _conversation_store = conversation_store
     _task_store = task_store
     _agent_store = agent_store
     _agent_cache = agent_cache
+    _file_store = file_store
+    _artifact_store = artifact_store
     _caps = caps if caps is not None else RuntimeCaps()

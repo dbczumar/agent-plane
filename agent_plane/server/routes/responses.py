@@ -15,6 +15,7 @@ from starlette.responses import StreamingResponse
 from agent_plane.entities import (
     ACTIVE_STATUSES,
     TERMINAL_STATUSES,
+    FunctionCallOutputData,
     MessageData,
     NewConversationItem,
     Task,
@@ -268,8 +269,14 @@ def _create_task(
     conversation_store: ConversationStore,
 ) -> Task:
     """
-    Create a new task and append the user message to the
+    Create a new task and append the user input to the
     conversation.
+
+    Input content blocks are split by type:
+    ``function_call_output`` items are persisted as their own
+    conversation items (so the LLM sees them in Responses API
+    format). All other blocks (``input_text``, etc.) are
+    grouped into a single user message.
 
     Does NOT start the workflow -- the caller must call
     :func:`_start_task` separately. This split allows the
@@ -284,7 +291,8 @@ def _create_task(
         task for stable API responses, e.g.
         ``"research-agent"``.
     :param content: Normalized user input content blocks,
-        e.g. ``[{"type": "input_text", "text": "..."}]``.
+        e.g. ``[{"type": "input_text", "text": "..."}]``
+        or ``[{"type": "function_call_output", ...}]``.
     :param task_store: Store for task creation.
     :param conversation_store: Store for appending conversation
         items.
@@ -298,17 +306,58 @@ def _create_task(
         previous_response_id=req.previous_response_id,
         background=req.background,
     )
-    conversation_store.append(
-        conversation_id,
-        [
+    items = _split_input_to_items(content, task.id)
+    conversation_store.append(conversation_id, items)
+    return task
+
+
+def _split_input_to_items(
+    content: list[dict[str, Any]],
+    response_id: str,
+) -> list[NewConversationItem]:
+    """
+    Split input content blocks into typed conversation items.
+
+    ``function_call_output`` blocks become their own items so
+    the LLM receives them in Responses API format (matching
+    prior ``function_call`` items). All other blocks are grouped
+    into a single user message.
+
+    :param content: Normalized input content blocks from the
+        API request.
+    :param response_id: Task/response ID to tag items with.
+    :returns: A list of ``NewConversationItem`` in the order
+        they should be appended.
+    """
+    message_blocks: list[dict[str, Any]] = []
+    items: list[NewConversationItem] = []
+
+    for block in content:
+        if block.get("type") == "function_call_output":
+            items.append(
+                NewConversationItem(
+                    type="function_call_output",
+                    response_id=response_id,
+                    data=FunctionCallOutputData(
+                        call_id=block["call_id"],
+                        output=block["output"],
+                    ),
+                )
+            )
+        else:
+            message_blocks.append(block)
+
+    if message_blocks:
+        items.insert(
+            0,
             NewConversationItem(
                 type="message",
-                response_id=task.id,
-                data=MessageData(role="user", content=content),
-            )
-        ],
-    )
-    return task
+                response_id=response_id,
+                data=MessageData(role="user", content=message_blocks),
+            ),
+        )
+
+    return items
 
 
 def _start_task(

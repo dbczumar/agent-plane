@@ -95,8 +95,15 @@ def history_to_input_items(
     for item in items:
         if item.type == "message":
             assert isinstance(item.data, MessageData)
-            text = _extract_text(item.data.content)
-            result.append({"role": item.data.role, "content": text})
+            # Pass content blocks through as-is. After
+            # resolve_content_references(), all file_id refs are
+            # already resolved to inline content.
+            result.append(
+                {
+                    "role": item.data.role,
+                    "content": item.data.content,
+                }
+            )
 
         elif item.type == "function_call":
             assert isinstance(item.data, FunctionCallData)

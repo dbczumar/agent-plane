@@ -126,6 +126,8 @@ def server(
         task_store=task_store,
         agent_store=agent_store,
         agent_cache=agent_cache,
+        file_store=file_store,
+        artifact_store=artifact_store,
         caps=caps,
     )
 

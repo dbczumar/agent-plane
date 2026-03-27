@@ -49,6 +49,12 @@ PORT = 18400
 BASE_URL = f"http://127.0.0.1:{PORT}"
 # Set by main() after parsing the agent's config.yaml.
 AGENT_NAME: str = "agent"
+# Maximum number of child widgets in the chat scroll before
+# old widgets are pruned to prevent Textual DOM slowdown.
+_MAX_SCROLL_WIDGETS: int = 200
+# Maximum characters to store in a tool-result Collapsible.
+# Even collapsed, large Static widgets slow the DOM.
+_MAX_TOOL_RESULT_DISPLAY: int = 4000
 
 
 # ── Agent bundle ──────────────────────────────────────
@@ -528,6 +534,10 @@ class ChatApp(App[None]):
             if self._current_response_id is not None:
                 self._previous_response_id = self._current_response_id
 
+            # Prune old widgets to prevent DOM slowdown in
+            # long conversations with many tool calls.
+            _prune_old_widgets(scroll)
+
             # If no client-side tool calls pending, we're done.
             if not acc.pending_tool_calls or self._tool_set is None:
                 # Clean up the status widget if finalization ran.
@@ -537,7 +547,8 @@ class ChatApp(App[None]):
 
             # Execute tools locally and send results back.
             current_input = await self._execute_pending_tools(
-                scroll, acc.pending_tool_calls,
+                scroll,
+                acc.pending_tool_calls,
             )
 
     def _build_request_body(
@@ -595,11 +606,13 @@ class ChatApp(App[None]):
             output = self._tool_set.execute_tool(name, arguments)
             # Display result in TUI.
             _mount_tool_result(scroll, {"output": output})
-            results.append({
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": output,
-            })
+            results.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output,
+                }
+            )
         return results
 
     def _save_and_exit(self) -> None:
@@ -713,6 +726,36 @@ class ChatApp(App[None]):
             self._server_proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self._server_proc.kill()
+
+
+def _prune_old_widgets(scroll: VerticalScroll) -> None:
+    """
+    Remove old widgets when the scroll container exceeds the cap.
+
+    Keeps the most recent widgets and removes the oldest ones
+    to prevent Textual DOM slowdown in long conversations.
+    Inserts a "[earlier messages pruned]" marker at the top.
+
+    :param scroll: The scrollable chat container.
+    """
+    children = list(scroll.children)
+    if len(children) <= _MAX_SCROLL_WIDGETS:
+        return
+    # Remove the oldest widgets, keeping the most recent ones.
+    to_remove = len(children) - _MAX_SCROLL_WIDGETS
+    for child in children[:to_remove]:
+        child.remove()
+    # Add a marker so the user knows messages were pruned.
+    if scroll.children:
+        first = scroll.children[0]
+        # Only add marker if one isn't already there.
+        if not (
+            isinstance(first, SystemInfo) and "[earlier messages pruned]" in str(first.renderable)
+        ):
+            scroll.mount(
+                SystemInfo(Text.from_markup("[dim italic][earlier messages pruned][/dim italic]")),
+                before=first,
+            )
 
 
 def _index_of(
@@ -1041,6 +1084,65 @@ def _handle_item_done(
     return live
 
 
+def _truncate_for_display(text: str) -> str:
+    """
+    Truncate text to ``_MAX_TOOL_RESULT_DISPLAY`` for DOM storage.
+
+    :param text: The raw text to truncate.
+    :returns: Truncated text with a marker if it exceeded the limit.
+    """
+    if len(text) <= _MAX_TOOL_RESULT_DISPLAY:
+        return text
+    return text[:_MAX_TOOL_RESULT_DISPLAY] + "\n… [truncated]"
+
+
+def _mount_reasoning_collapsibles(
+    scroll: VerticalScroll,
+    acc: _StreamAccumulator,
+    before: AssistantMessage,
+) -> None:
+    """
+    Mount reasoning and summary collapsibles before the text widget.
+
+    Content is truncated to prevent large DOM nodes from slowing
+    Textual rendering.
+
+    :param scroll: The scrollable container.
+    :param acc: The stream accumulator with reasoning/summary text.
+    :param before: The text widget to mount collapsibles before.
+    """
+    from textual.widgets import Collapsible
+
+    if acc.reasoning:
+        scroll.mount(
+            Collapsible(
+                Static(
+                    Text.from_markup(
+                        f"[dim cyan]{escape(_truncate_for_display(acc.reasoning))}[/dim cyan]"
+                    )
+                ),
+                title="reasoning",
+                collapsed=True,
+            ),
+            before=before,
+        )
+    if acc.summary:
+        scroll.mount(
+            Collapsible(
+                Static(
+                    Text.from_markup(
+                        "[dim italic yellow]"
+                        f"{escape(_truncate_for_display(acc.summary))}"
+                        "[/dim italic yellow]"
+                    )
+                ),
+                title="reasoning summary",
+                collapsed=True,
+            ),
+            before=before,
+        )
+
+
 def _finalize_message(
     scroll: VerticalScroll,
     live: AssistantMessage,
@@ -1068,7 +1170,6 @@ def _finalize_message(
     :param item: The message output item dict.
     :param acc: The stream accumulator.
     """
-    from textual.widgets import Collapsible
 
     # Keep the status widget as the "assistant>" header.
     _wlog("UPDATE", "AssistantMessage", "status → assistant>")
@@ -1083,29 +1184,7 @@ def _finalize_message(
         scroll.mount(text_widget)
         _wlog("MOUNT", "AssistantMessage", f"final_text(new): {final_text[:80]}")
 
-    # Mount reasoning/summary collapsibles BEFORE the text widget.
-    if acc.reasoning:
-        scroll.mount(
-            Collapsible(
-                Static(Text.from_markup(f"[dim cyan]{escape(acc.reasoning)}[/dim cyan]")),
-                title="reasoning",
-                collapsed=True,
-            ),
-            before=text_widget,
-        )
-    if acc.summary:
-        scroll.mount(
-            Collapsible(
-                Static(
-                    Text.from_markup(
-                        f"[dim italic yellow]{escape(acc.summary)}[/dim italic yellow]"
-                    )
-                ),
-                title="reasoning summary",
-                collapsed=True,
-            ),
-            before=text_widget,
-        )
+    _mount_reasoning_collapsibles(scroll, acc, text_widget)
 
     # Update text widget with final content (no "assistant>" prefix —
     # the status widget above already shows the header).
@@ -1206,11 +1285,16 @@ def _mount_tool_result(
     """
     from textual.widgets import Collapsible
 
-    output = str(item.get("output", ""))
+    # Tool output may be absent if the tool produced no stdout/stderr.
+    raw_output = item.get("output")
+    output = str(raw_output) if raw_output is not None else "(no output)"
+    # Truncate content stored in the DOM — even collapsed,
+    # large Static widgets slow Textual rendering.
+    display_output = _truncate_for_display(output)
     # Show first line as the collapsible title
     first_line = output.split("\n", 1)[0][:80]
     widget = Collapsible(
-        Static(Text.from_markup(f"[dim]{escape(output)}[/dim]")),
+        Static(Text.from_markup(f"[dim]{escape(display_output)}[/dim]")),
         title=f"result: {first_line}",
         collapsed=True,
     )
@@ -1309,10 +1393,7 @@ def _print_usage() -> None:
     """
     Print CLI usage information and exit.
     """
-    print(
-        "Usage: python scripts/tui.py <agent-dir-or-tarball>"
-        " [--tools NAME] [--auto-send MSG]"
-    )
+    print("Usage: python scripts/tui.py <agent-dir-or-tarball> [--tools NAME] [--auto-send MSG]")
     print()
     print("  agent-dir-or-tarball  Path to an agent image directory")
     print("                        (containing config.yaml) or a")
