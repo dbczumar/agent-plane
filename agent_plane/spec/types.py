@@ -219,11 +219,26 @@ class MCPServerConfig:
     name: str
     description: str | None = None
     url: str | None = None
-    headers: dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict, repr=False)
     # Per-tool timeout/retry overrides. None = inherit from
     # tools.timeout / tools.retry.
     timeout: int | None = None
     retry: RetryConfig | None = None
+
+    def __repr__(self) -> str:
+        """
+        String representation that redacts header values.
+
+        Header keys are shown but values are replaced with
+        ``"[REDACTED]"`` to prevent credential leakage in
+        logs and exception tracebacks.
+        """
+        redacted = {k: "[REDACTED]" for k in self.headers} if self.headers else {}
+        return (
+            f"MCPServerConfig(name={self.name!r}, url={self.url!r}, "
+            f"headers={redacted!r}, timeout={self.timeout!r}, "
+            f"retry={self.retry!r})"
+        )
 
 
 @dataclass

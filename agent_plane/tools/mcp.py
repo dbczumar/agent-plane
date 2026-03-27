@@ -854,11 +854,18 @@ class McpTool(Tool):
         ``McpServerConnection.call_tool()`` async method via
         the persistent event loop provided at construction.
 
+        If the LLM sends malformed JSON, returns an error string
+        so the LLM can retry — does not crash the workflow.
+
         :param arguments: JSON-encoded arguments string from
-            the LLM.
-        :returns: The tool result as a string.
+            the LLM, e.g. ``'{"path": "."}'``.
+        :returns: The tool result as a string, or an error
+            message if arguments are not valid JSON.
         """
-        parsed = json.loads(arguments) if arguments else {}
+        try:
+            parsed = json.loads(arguments) if arguments else {}
+        except json.JSONDecodeError as exc:
+            return f"Invalid JSON arguments: {exc}"
         return self._run_sync(self._connection.call_tool(self.name, parsed))
 
 

@@ -350,6 +350,102 @@ def test_mcp_tool_invoke_delegates_to_run_sync() -> None:
     mock_run_sync.assert_called_once()
 
 
+def test_mcp_tool_invoke_returns_error_on_invalid_json() -> None:
+    """
+    McpTool.invoke returns an error string (not raises) when the
+    LLM sends malformed JSON arguments.
+
+    If this crashed with JSONDecodeError instead of returning an
+    error string, the workflow would abort instead of letting the
+    LLM retry with corrected arguments.
+    """
+    tool_def = _make_mcp_tool_def("search")
+    conn = McpServerConnection(config=_make_http_config())
+    mock_run_sync = MagicMock(return_value="should not be called")
+    tool = McpTool(
+        tool_def=tool_def,
+        connection=conn,
+        run_sync=mock_run_sync,
+    )
+
+    result = tool.invoke("not valid json {{{")
+
+    # Error message returned to the LLM, not an exception.
+    # If this were a JSONDecodeError instead of a string, the
+    # workflow would crash instead of letting the LLM retry.
+    assert "Invalid JSON arguments" in result
+    # run_sync must not be called — error caught before dispatch
+    mock_run_sync.assert_not_called()
+
+
+def test_mcp_tool_invoke_empty_string_parses_as_empty_dict() -> None:
+    """
+    Empty-string arguments parse as ``{}`` so tools with no
+    required parameters can be called without arguments.
+    """
+    tool_def = _make_mcp_tool_def("list_directory")
+    conn = McpServerConnection(config=_make_http_config())
+    mock_run_sync = MagicMock(return_value="ok")
+    tool = McpTool(
+        tool_def=tool_def,
+        connection=conn,
+        run_sync=mock_run_sync,
+    )
+
+    result = tool.invoke("")
+
+    assert result == "ok"
+    # Exactly one dispatch — empty string parsed as {} successfully.
+    # If parsing failed, run_sync would not be called.
+    mock_run_sync.assert_called_once()
+
+
+def test_mcp_server_config_repr_redacts_headers() -> None:
+    """
+    MCPServerConfig.__repr__ replaces header values with
+    ``[REDACTED]`` so credentials don't leak in logs or
+    exception tracebacks.
+
+    If the real Authorization token appeared in repr, it would
+    be captured by ``_logger.exception()`` in manager.py when
+    MCP connections fail.
+    """
+    config = MCPServerConfig(
+        name="secret-svc",
+        url="http://example.com/sse",
+        headers={
+            "Authorization": "Bearer sk-SUPER-SECRET-TOKEN",
+            "X-Custom": "also-secret",
+        },
+    )
+    r = repr(config)
+
+    # Header keys are visible (useful for debugging which headers are set)
+    assert "Authorization" in r
+    assert "X-Custom" in r
+    # Actual secret values must NOT appear
+    assert "sk-SUPER-SECRET-TOKEN" not in r
+    assert "also-secret" not in r
+    # Redaction marker is present
+    assert "[REDACTED]" in r
+    # Non-sensitive fields are still visible
+    assert "secret-svc" in r
+    assert "http://example.com/sse" in r
+
+
+def test_mcp_server_config_repr_empty_headers() -> None:
+    """
+    Repr works correctly when there are no headers — no crash,
+    no ``[REDACTED]`` in the output.
+    """
+    config = MCPServerConfig(name="plain", url="http://localhost/sse")
+    r = repr(config)
+
+    assert "plain" in r
+    assert "http://localhost/sse" in r
+    assert "[REDACTED]" not in r
+
+
 # ── _normalize_input_schema ───────────────────────────────
 
 
