@@ -289,7 +289,7 @@ The validator (`validator.py`) enforces:
 - Skill `name` in frontmatter must match the directory name
 - Skill `name`: max 64 chars, pattern `[a-z0-9-]+`
 - Skill `description`: max 1024 chars
-- MCP configs must have `url` (only HTTP transport is supported)
+- MCP configs must have `transport: http` and a non-empty `url` (presence checked, not format)
 - No duplicate skill names across `skills/`
 - No duplicate tool names across `tools/mcp/`, `tools/python/`, and
   `tools/typescript/`

@@ -21,6 +21,7 @@ from agent_plane.tools.mcp import (
     _CIRCUIT_BREAKER_COOLDOWN_SECONDS,
     _CIRCUIT_BREAKER_THRESHOLD,
     _MCP_RECONNECT_DEFAULTS,
+    EventLoopThread,
     McpServerConnection,
     McpServerDisabledError,
     McpTool,
@@ -1978,3 +1979,98 @@ async def test_call_tool_resets_breaker_on_success() -> None:
         assert conn._breaker.consecutive_failures == 0
 
     await conn.close()
+
+
+# ── Circuit breaker half-open atomic gate ─────────────────
+
+
+def test_circuit_breaker_half_open_clears_tripped_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Entering half-open state clears ``_tripped_at`` so that
+    concurrent callers see CLOSED (not half-open) and don't
+    also enter the probe path.
+
+    :param monkeypatch: Pytest monkeypatch for time.monotonic.
+    """
+    import time as time_module
+
+    breaker = _CircuitBreaker(failure_threshold=2, cooldown_seconds=10.0)
+    breaker.record_failure("test-server")
+    breaker.record_failure("test-server")
+    assert breaker.is_tripped is True
+
+    # Advance time past the cooldown.
+    original_monotonic = time_module.monotonic
+    monkeypatch.setattr(
+        time_module,
+        "monotonic",
+        lambda: original_monotonic() + 15.0,
+    )
+
+    # First pre_call enters half-open and clears the tripped state.
+    breaker.pre_call("test-server")
+    # Breaker should no longer report as tripped — a concurrent
+    # caller sees CLOSED, not half-open.
+    assert breaker.is_tripped is False
+    # Second pre_call should not raise (sees CLOSED state).
+    breaker.pre_call("test-server")
+
+
+# ── EventLoopThread ──────────────────────────────────────
+
+
+def test_event_loop_thread_stop_logs_warning_on_join_timeout(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    If the background thread does not exit within the join
+    timeout, ``stop()`` logs a warning and skips ``loop.close()``
+    to avoid undefined behavior on a still-running loop.
+
+    :param caplog: Pytest fixture that captures log records.
+    :param monkeypatch: Pytest monkeypatch for the timeout constant.
+    """
+    # Use a short timeout so the test doesn't block.
+    monkeypatch.setattr("agent_plane.tools.mcp._LOOP_STOP_TIMEOUT_SECONDS", 0.1)
+
+    elt = EventLoopThread()
+    # Replace the thread's join to simulate a stuck thread: after
+    # join() returns, is_alive() still reports True.
+    original_join = elt._thread.join
+
+    def _fake_join(timeout: float | None = None) -> None:
+        """
+        Simulate a thread that ignores the join timeout.
+
+        :param timeout: Ignored — the thread stays alive.
+        """
+        original_join(timeout=0.01)
+
+    monkeypatch.setattr(elt._thread, "join", _fake_join)
+    monkeypatch.setattr(elt._thread, "is_alive", lambda: True)
+
+    with caplog.at_level(logging.WARNING, logger="agent_plane.tools.mcp"):
+        elt.stop()
+
+    # Warning should mention the timeout.
+    warning_msgs = [r.message for r in caplog.records if "did not stop" in r.message]
+    assert len(warning_msgs) == 1, f"Expected 1 warning, got {len(warning_msgs)}"
+    # loop.close() should NOT have been called (skipped for stuck thread).
+    assert not elt._loop.is_closed()
+
+    # Cleanup: actually stop the loop so the daemon thread exits.
+    if elt._loop.is_running():
+        elt._loop.call_soon_threadsafe(elt._loop.stop)
+
+
+def test_event_loop_thread_stop_closes_loop_on_clean_exit() -> None:
+    """
+    Normal ``stop()`` closes the event loop when the thread
+    exits cleanly within the timeout.
+    """
+    elt = EventLoopThread()
+    elt.stop()
+    assert elt._loop.is_closed()

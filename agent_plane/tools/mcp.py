@@ -169,9 +169,11 @@ class _CircuitBreaker:
                 consecutive_failures=self._consecutive_failures,
                 cooldown_remaining=self.cooldown_seconds - elapsed,
             )
-        # Half-open: cooldown elapsed, allow one probe attempt.
-        # The caller will record_success() or record_failure()
-        # after the probe completes.
+        # Half-open: cooldown elapsed, allow exactly one probe.
+        # Clear _tripped_at so concurrent callers see CLOSED and
+        # don't also enter the probe path. If the probe fails,
+        # record_failure() will re-trip the breaker.
+        self._tripped_at = None
 
     def record_success(self) -> None:
         """
@@ -273,11 +275,19 @@ class EventLoopThread:
         """
         Stop the event loop and join the background thread.
 
-        Safe to call multiple times.
+        Safe to call multiple times. Logs a warning if the thread
+        does not exit within the timeout.
         """
         if self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=_LOOP_STOP_TIMEOUT_SECONDS)
+        if self._thread.is_alive():
+            _logger.warning(
+                "EventLoopThread did not stop within %.1fs — "
+                "a coroutine may be stuck; skipping loop.close()",
+                _LOOP_STOP_TIMEOUT_SECONDS,
+            )
+            return
         if not self._loop.is_closed():
             self._loop.close()
 
@@ -490,7 +500,8 @@ class McpServerConnection:
         :param arguments: The tool arguments dict.
         :returns: The formatted tool result string.
         """
-        assert self._session is not None
+        if self._session is None:
+            raise RuntimeError("MCP session not initialized — call connect() first")
         result = await self._session.call_tool(name=name, arguments=arguments)
         return _format_call_result(result)
 
@@ -558,8 +569,8 @@ class McpServerConnection:
             )
             return cached
 
-        # Guaranteed by _open_session() which runs before this.
-        assert self._session is not None
+        if self._session is None:
+            raise RuntimeError("MCP session not initialized — call connect() first")
         tools_result = await self._session.list_tools()
         self._discovered_tools = tools_result.tools
         self._update_cache(tools_result.tools)
@@ -632,7 +643,8 @@ class McpServerConnection:
             anyio memory object streams parameterized over
             ``SessionMessage``.
         """
-        assert self._exit_stack is not None
+        if self._exit_stack is None:
+            raise RuntimeError("MCP exit stack not initialized — call connect() first")
         # sse_client timeout controls the initial HTTP connection
         # handshake (default 5s). sse_read_timeout controls how
         # long to wait for each SSE event (default 300s). We
