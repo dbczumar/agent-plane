@@ -19,6 +19,7 @@ import json
 import logging
 import random
 import threading
+import time
 from collections.abc import Callable, Coroutine
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -66,6 +67,165 @@ _MCP_RECONNECT_DEFAULTS = RetryConfig(
     backoff_base=1.0,
     backoff_max=10.0,
 )
+
+# Circuit breaker: trips after this many consecutive exhausted
+# call_tool invocations (each of which already retried
+# max_attempts reconnections). 5 failures × 3 reconnects each
+# = 15 total reconnect attempts before the breaker trips.
+_CIRCUIT_BREAKER_THRESHOLD = 5
+
+# Seconds to wait after tripping before allowing a single
+# half-open probe. Long enough that a restarting server has
+# time to come back; short enough that recovery isn't delayed
+# excessively.
+_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 30.0
+
+
+class McpServerDisabledError(Exception):
+    """
+    Raised when the circuit breaker has tripped for an MCP server.
+
+    Indicates that the server has failed too many consecutive times
+    and is temporarily disabled. The caller should not retry
+    immediately — the breaker will automatically allow a probe
+    after the cooldown period elapses.
+
+    :param server_name: The MCP server name, e.g. ``"github"``.
+    :param consecutive_failures: How many consecutive call_tool
+        invocations have failed, e.g. ``5``.
+    :param cooldown_remaining: Seconds until the next probe is
+        allowed, e.g. ``22.5``.
+    """
+
+    def __init__(
+        self,
+        server_name: str,
+        consecutive_failures: int,
+        cooldown_remaining: float,
+    ) -> None:
+        """
+        :param server_name: The MCP server name, e.g. ``"github"``.
+        :param consecutive_failures: Number of consecutive failures
+            that triggered the breaker.
+        :param cooldown_remaining: Seconds remaining in the cooldown
+            period before a probe is allowed.
+        """
+        self.server_name = server_name
+        self.consecutive_failures = consecutive_failures
+        self.cooldown_remaining = cooldown_remaining
+        super().__init__(
+            f"MCP server {server_name!r} is temporarily disabled "
+            f"after {consecutive_failures} consecutive failures. "
+            f"Will allow a probe in {cooldown_remaining:.0f}s."
+        )
+
+
+@dataclass
+class _CircuitBreaker:
+    """
+    Per-server circuit breaker that trips after repeated failures.
+
+    Tracks consecutive ``call_tool`` failures (where each call has
+    already exhausted its reconnect retries). After
+    ``failure_threshold`` consecutive failures, the breaker trips
+    and rejects calls immediately for ``cooldown_seconds``. After
+    the cooldown, one probe call is allowed (half-open state): if
+    it succeeds, the breaker resets; if it fails, it re-trips.
+
+    Three states:
+
+    - **CLOSED**: Normal operation — calls proceed.
+    - **OPEN**: Tripped — calls fail immediately with
+      :class:`McpServerDisabledError`.
+    - **HALF-OPEN**: Cooldown elapsed — one probe call allowed.
+
+    :param failure_threshold: Number of consecutive failures before
+        tripping, e.g. ``5``.
+    :param cooldown_seconds: Seconds to stay open before allowing
+        a half-open probe, e.g. ``30.0``.
+    """
+
+    failure_threshold: int
+    cooldown_seconds: float
+    _consecutive_failures: int = field(default=0, init=False, repr=False)
+    _tripped_at: float | None = field(default=None, init=False, repr=False)
+
+    def pre_call(self, server_name: str) -> None:
+        """
+        Check whether a call is allowed.
+
+        In CLOSED state, always allows. In OPEN state, raises
+        :class:`McpServerDisabledError`. In HALF-OPEN state
+        (cooldown elapsed), allows one probe call.
+
+        :param server_name: The MCP server name for error messages,
+            e.g. ``"github"``.
+        :raises McpServerDisabledError: If the breaker is OPEN.
+        """
+        if self._tripped_at is None:
+            return
+        elapsed = time.monotonic() - self._tripped_at
+        if elapsed < self.cooldown_seconds:
+            raise McpServerDisabledError(
+                server_name=server_name,
+                consecutive_failures=self._consecutive_failures,
+                cooldown_remaining=self.cooldown_seconds - elapsed,
+            )
+        # Half-open: cooldown elapsed, allow one probe attempt.
+        # The caller will record_success() or record_failure()
+        # after the probe completes.
+
+    def record_success(self) -> None:
+        """
+        Reset the breaker after a successful call.
+
+        Clears the failure counter and un-trips the breaker,
+        returning to CLOSED state.
+        """
+        self._consecutive_failures = 0
+        self._tripped_at = None
+
+    def record_failure(self) -> None:
+        """
+        Record a failed call and trip if threshold reached.
+
+        Increments the consecutive failure counter. If the counter
+        reaches ``failure_threshold``, trips the breaker by
+        recording the current monotonic time.
+        """
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self.failure_threshold:
+            self._tripped_at = time.monotonic()
+            _logger.warning(
+                "Circuit breaker tripped after %d consecutive failures — disabling for %.0fs",
+                self._consecutive_failures,
+                self.cooldown_seconds,
+            )
+
+    @property
+    def consecutive_failures(self) -> int:
+        """
+        Current consecutive failure count.
+
+        :returns: Number of consecutive failures since the last
+            success or reset.
+        """
+        return self._consecutive_failures
+
+    @property
+    def is_tripped(self) -> bool:
+        """
+        Whether the breaker is currently in OPEN state.
+
+        Returns ``True`` only if tripped AND cooldown has not
+        elapsed (i.e. not yet half-open).
+
+        :returns: ``True`` if the breaker is open and blocking
+            calls.
+        """
+        if self._tripped_at is None:
+            return False
+        return (time.monotonic() - self._tripped_at) < self.cooldown_seconds
 
 
 class EventLoopThread:
@@ -251,6 +411,16 @@ class McpServerConnection:
     _session: ClientSession | None = field(default=None, init=False, repr=False)
     _exit_stack: AsyncExitStack | None = field(default=None, init=False, repr=False)
     _discovered_tools: list[McpToolDef] = field(default_factory=list, init=False, repr=False)
+    _breaker: _CircuitBreaker = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """
+        Initialize the circuit breaker with module-level defaults.
+        """
+        self._breaker = _CircuitBreaker(
+            failure_threshold=_CIRCUIT_BREAKER_THRESHOLD,
+            cooldown_seconds=_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+        )
 
     async def connect(self) -> list[McpToolDef]:
         """
@@ -282,12 +452,12 @@ class McpServerConnection:
         """
         Invoke a tool on this MCP server.
 
-        If the call fails due to a dead connection (server
-        process crashed, transport dropped), reconnects with
-        exponential backoff and retries. The retry policy is
-        taken from ``config.retry`` (falling back to
-        ``_MCP_RECONNECT_DEFAULTS``). Permanent errors (invalid
-        args, tool not found) are not retried.
+        Checks the circuit breaker before attempting the call.
+        If the breaker is tripped (too many consecutive failures),
+        raises :class:`McpServerDisabledError` immediately. On
+        success, resets the breaker. On failure (after exhausting
+        reconnect retries), records the failure — tripping the
+        breaker if the threshold is reached.
 
         :param name: The tool name as returned by discovery.
         :param arguments: The tool arguments dict (already parsed
@@ -295,19 +465,28 @@ class McpServerConnection:
         :returns: The tool result as a string. For multi-content
             results, text blocks are joined with newlines.
         :raises RuntimeError: If ``connect()`` has not been called.
+        :raises McpServerDisabledError: If the circuit breaker is
+            tripped.
         """
         if self._session is None:
             raise RuntimeError(
                 f"MCP server {self.config.name!r} has no live "
                 f"session — call connect() before call_tool()"
             )
+        self._breaker.pre_call(self.config.name)
         retry = self.config.retry or _MCP_RECONNECT_DEFAULTS
-        return await _call_tool_with_reconnect(
-            conn=self,
-            name=name,
-            arguments=arguments,
-            retry=retry,
-        )
+        try:
+            result = await _call_tool_with_reconnect(
+                conn=self,
+                name=name,
+                arguments=arguments,
+                retry=retry,
+            )
+        except Exception:
+            self._breaker.record_failure()
+            raise
+        self._breaker.record_success()
+        return result
 
     async def _invoke_tool(
         self,

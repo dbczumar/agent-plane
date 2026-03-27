@@ -17,11 +17,15 @@ from mcp.types import CONNECTION_CLOSED, ErrorData, ImageContent, TextContent
 
 from agent_plane.spec.types import MCPServerConfig, RetryConfig
 from agent_plane.tools.mcp import (
+    _CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+    _CIRCUIT_BREAKER_THRESHOLD,
     _MCP_RECONNECT_DEFAULTS,
     McpServerConnection,
+    McpServerDisabledError,
     McpTool,
     _backoff_delay,
     _cache_key,
+    _CircuitBreaker,
     _collect_problematic_keywords,
     _discovery_cache,
     _format_call_result,
@@ -1678,5 +1682,241 @@ async def test_http_connect_uses_cache() -> None:
     # Session opened (for invocation), but list_tools skipped.
     captured.mock_session.initialize.assert_awaited_once()
     captured.mock_session.list_tools.assert_not_awaited()
+
+    await conn.close()
+
+
+# ── Circuit breaker ──────────────────────────────────────────
+
+
+def test_circuit_breaker_allows_calls_when_closed() -> None:
+    """
+    A fresh breaker in CLOSED state allows calls without raising.
+    """
+    breaker = _CircuitBreaker(failure_threshold=3, cooldown_seconds=10.0)
+    # Should not raise.
+    breaker.pre_call("test-server")
+
+
+def test_circuit_breaker_trips_after_threshold_failures() -> None:
+    """
+    The breaker trips after ``failure_threshold`` consecutive
+    failures and blocks subsequent calls.
+    """
+    breaker = _CircuitBreaker(failure_threshold=3, cooldown_seconds=60.0)
+    for _ in range(3):
+        breaker.record_failure()
+
+    assert breaker.is_tripped is True
+    with pytest.raises(McpServerDisabledError) as exc_info:
+        breaker.pre_call("my-server")
+    assert exc_info.value.server_name == "my-server"
+    assert exc_info.value.consecutive_failures == 3
+
+
+def test_circuit_breaker_does_not_trip_below_threshold() -> None:
+    """
+    Fewer failures than the threshold do not trip the breaker.
+    """
+    breaker = _CircuitBreaker(failure_threshold=5, cooldown_seconds=10.0)
+    for _ in range(4):
+        breaker.record_failure()
+
+    assert breaker.is_tripped is False
+    # Should not raise.
+    breaker.pre_call("test-server")
+
+
+def test_circuit_breaker_resets_on_success() -> None:
+    """
+    A successful call resets the failure counter and un-trips
+    the breaker.
+    """
+    breaker = _CircuitBreaker(failure_threshold=3, cooldown_seconds=60.0)
+    for _ in range(3):
+        breaker.record_failure()
+    assert breaker.is_tripped is True
+
+    breaker.record_success()
+    assert breaker.is_tripped is False
+    assert breaker.consecutive_failures == 0
+    # Should not raise after reset.
+    breaker.pre_call("test-server")
+
+
+def test_circuit_breaker_half_open_after_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    After the cooldown period elapses, the breaker enters
+    half-open state and allows one probe call.
+    """
+    import time as time_module
+
+    breaker = _CircuitBreaker(failure_threshold=2, cooldown_seconds=10.0)
+    breaker.record_failure()
+    breaker.record_failure()
+    assert breaker.is_tripped is True
+
+    # Advance time past the cooldown.
+    original_monotonic = time_module.monotonic
+    monkeypatch.setattr(
+        time_module,
+        "monotonic",
+        lambda: original_monotonic() + 15.0,
+    )
+
+    # Cooldown elapsed — half-open state allows one probe.
+    assert breaker.is_tripped is False
+    breaker.pre_call("test-server")  # Should not raise.
+
+
+def test_circuit_breaker_re_trips_on_half_open_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    If the half-open probe fails, the breaker re-trips.
+    """
+    import time as time_module
+
+    breaker = _CircuitBreaker(failure_threshold=2, cooldown_seconds=10.0)
+    breaker.record_failure()
+    breaker.record_failure()
+
+    # Advance time past the cooldown.
+    original_monotonic = time_module.monotonic
+    monkeypatch.setattr(
+        time_module,
+        "monotonic",
+        lambda: original_monotonic() + 15.0,
+    )
+
+    # Half-open probe allowed.
+    breaker.pre_call("test-server")
+    # Probe fails — re-trip.
+    breaker.record_failure()
+    assert breaker.is_tripped is True
+
+
+def test_circuit_breaker_cooldown_remaining_in_error() -> None:
+    """
+    The ``McpServerDisabledError`` includes the approximate
+    cooldown remaining.
+    """
+    breaker = _CircuitBreaker(failure_threshold=1, cooldown_seconds=30.0)
+    breaker.record_failure()
+
+    with pytest.raises(McpServerDisabledError) as exc_info:
+        breaker.pre_call("test-server")
+    # Cooldown just started, so remaining should be close to 30s.
+    assert exc_info.value.cooldown_remaining > 25.0
+
+
+def test_circuit_breaker_failure_count_resets_on_success() -> None:
+    """
+    Interspersed successes prevent the breaker from tripping.
+    """
+    breaker = _CircuitBreaker(failure_threshold=3, cooldown_seconds=10.0)
+    breaker.record_failure()
+    breaker.record_failure()
+    # Success resets the counter.
+    breaker.record_success()
+    breaker.record_failure()
+    breaker.record_failure()
+    # Only 2 consecutive failures — not at threshold.
+    assert breaker.is_tripped is False
+
+
+def test_circuit_breaker_default_constants() -> None:
+    """
+    Module-level circuit breaker constants have expected values.
+    """
+    assert _CIRCUIT_BREAKER_THRESHOLD == 5
+    assert _CIRCUIT_BREAKER_COOLDOWN_SECONDS == 30.0
+
+
+@pytest.mark.asyncio
+async def test_call_tool_trips_breaker_after_repeated_failures() -> None:
+    """
+    ``McpServerConnection.call_tool()`` records failures in the
+    circuit breaker. After ``failure_threshold`` exhausted
+    invocations, subsequent calls raise ``McpServerDisabledError``.
+    """
+    config = _make_stdio_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+        # Override breaker threshold to 2 for a quick test.
+        conn._breaker = _CircuitBreaker(
+            failure_threshold=2,
+            cooldown_seconds=60.0,
+        )
+
+        mock_session.call_tool = AsyncMock(side_effect=EOFError("dead"))
+
+        with patch.object(conn, "_reconnect", new_callable=AsyncMock):
+            with patch("agent_plane.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
+                # First call: exhausts retries, records failure.
+                with pytest.raises(EOFError):
+                    await conn.call_tool("my_tool", {"x": 1})
+
+                # Second call: exhausts retries, trips breaker.
+                with pytest.raises(EOFError):
+                    await conn.call_tool("my_tool", {"x": 1})
+
+        # Third call: breaker is tripped, fails immediately.
+        with pytest.raises(McpServerDisabledError) as exc_info:
+            await conn.call_tool("my_tool", {"x": 1})
+        assert exc_info.value.server_name == config.name
+        assert exc_info.value.consecutive_failures == 2
+
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_call_tool_resets_breaker_on_success() -> None:
+    """
+    A successful ``call_tool()`` resets the circuit breaker so
+    that prior failures don't accumulate across successes.
+    """
+    config = _make_stdio_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+        conn._breaker = _CircuitBreaker(
+            failure_threshold=2,
+            cooldown_seconds=60.0,
+        )
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="ok")]
+        ok_result.isError = False
+
+        # 3 fails then 1 success (reconnect retries 3 per call).
+        mock_session.call_tool = AsyncMock(
+            side_effect=[
+                EOFError("dead"),
+                EOFError("dead"),
+                EOFError("dead"),
+                EOFError("dead"),
+                EOFError("dead"),
+                ok_result,
+            ]
+        )
+
+        with patch.object(conn, "_reconnect", new_callable=AsyncMock):
+            with patch("agent_plane.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
+                # First invocation: all 3 retries fail → failure (count=1).
+                with pytest.raises(EOFError):
+                    await conn.call_tool("my_tool", {})
+
+                # Second invocation: 3rd retry succeeds → reset.
+                result = await conn.call_tool("my_tool", {})
+                assert result == "ok"
+
+        # Breaker should be reset — no accumulated failures.
+        assert conn._breaker.consecutive_failures == 0
 
     await conn.close()
