@@ -36,6 +36,10 @@ locally or on a server. Test with the same code path production uses. The
 agent definition is simple enough to edit in a text editor; the runtime
 behind it is production-grade.
 
+## Demo
+
+https://github.com/user-attachments/assets/419c9951-c05b-451f-9914-892c156acba0
+
 ## Quick Start
 
 The `examples/` directory has ready-to-run agents and a terminal frontend that

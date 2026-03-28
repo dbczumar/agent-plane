@@ -824,7 +824,7 @@ def _handle_final_response(
         when late messages arrived and the caller should
         continue the loop.
     """
-    _logger.info(
+    _logger.warning(
         "[STEER-DEBUG] _handle_final_response: task=%s last_seen=%s",
         task_id, last_seen,
     )
@@ -855,12 +855,12 @@ def _handle_final_response(
         conversation_id,
         last_seen,
     )
-    _logger.info(
+    _logger.warning(
         "[STEER-DEBUG] close_inbox returned %d items, persisted %d items",
         len(late), len(persisted),
     )
     for ci in late:
-        _logger.info(
+        _logger.warning(
             "[STEER-DEBUG]   late item: id=%s type=%s role=%s",
             ci.id, ci.type,
             ci.data.role if hasattr(ci.data, "role") else "N/A",
@@ -873,7 +873,7 @@ def _handle_final_response(
     # response_id as the running task) are preserved.
     own_ids = {ci.id for ci in persisted}
     steered = [ci for ci in late if ci.id not in own_ids]
-    _logger.info(
+    _logger.warning(
         "[STEER-DEBUG] after filtering: %d steered items",
         len(steered),
     )
@@ -1517,7 +1517,7 @@ def _run_agent_loop(
         _emit_native_tool_items(task_id, llm_resp, output_items)
 
         has_tools = _has_tool_calls(llm_resp)
-        _logger.info(
+        _logger.warning(
             "[STEER-DEBUG] iteration: has_tool_calls=%s last_seen=%s "
             "history_len=%d",
             has_tools, last_seen, len(history),
