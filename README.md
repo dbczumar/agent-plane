@@ -5,10 +5,13 @@ A control *plane* and runtime for agents — and the *runway* that helps them ta
 markdown, skills, tools, sub-agents — and go from development to production
 in a couple of commands.
 
-Agent Plane handles the hard parts: durable execution, multi-provider LLM
-routing, streaming, tool isolation, sub-agent orchestration, and an
-OpenAI-compatible API. You focus on the agent — its instructions, skills,
-and tools. Iterate on those, and Agent Plane runs it.
+Agent Plane handles the hard parts: the agent loop, durable execution,
+multi-provider LLM routing, streaming, multimodal input, file management,
+conversation management, context compaction, memory, tool isolation,
+sub-agent orchestration, an openresponses-compatible API, and more.
+
+You focus on the agent — its instructions, skills, and tools. Iterate on those,
+and Agent Plane takes care of running your agent in production.
 
 ## Why
 
