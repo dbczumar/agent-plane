@@ -1,7 +1,7 @@
 spec_version: 1
 
 name: archer
-description: A sharp, pragmatic senior engineer who pairs with you to write better code.
+description: A sharp, resourceful research assistant that investigates topics and explains concepts.
 
 llm:
   model: o4-mini
