@@ -824,10 +824,6 @@ def _handle_final_response(
         when late messages arrived and the caller should
         continue the loop.
     """
-    _logger.warning(
-        "[STEER-DEBUG] _handle_final_response: task=%s last_seen=%s",
-        task_id, last_seen,
-    )
     # ── Step 1: Persist first ──────────────────────────────
     # Commit the assistant message BEFORE checking the inbox.
     # Tokens were already streamed to SSE consumers, so this
@@ -850,65 +846,83 @@ def _handle_final_response(
     # the LLM was streaming — those messages have positions
     # between last_seen and the assistant message we just
     # persisted.
-    late = task_store.close_inbox(
+    steered = _check_steering_inbox(
         task_id,
         conversation_id,
         last_seen,
+        persisted,
+        task_store,
     )
-    _logger.warning(
-        "[STEER-DEBUG] close_inbox returned %d items, persisted %d items",
-        len(late), len(persisted),
-    )
-    for ci in late:
-        _logger.warning(
-            "[STEER-DEBUG]   late item: id=%s type=%s role=%s",
-            ci.id, ci.type,
-            ci.data.role if hasattr(ci.data, "role") else "N/A",
-        )
-
-    # Filter out items we just persisted — close_inbox
-    # returns ALL items newer than last_seen, including the
-    # assistant message we committed in step 1. Exclude by
-    # ID so steered user messages (which share the same
-    # response_id as the running task) are preserved.
-    own_ids = {ci.id for ci in persisted}
-    steered = [ci for ci in late if ci.id not in own_ids]
-    _logger.warning(
-        "[STEER-DEBUG] after filtering: %d steered items",
-        len(steered),
-    )
-
     if steered:
-        # ── Step 3a: Late messages arrived ─────────────────
-        # Add the persisted assistant response first (it
-        # answers the original input), then the steered user
-        # messages (new input for the next iteration). This
-        # matches conversational order.
+        # Late messages arrived during the LLM call. Add the
+        # persisted assistant response first (it answers the
+        # original input), then the steered user messages (new
+        # input for the next iteration). This matches
+        # conversational order.
         history.extend(persisted)
         history.extend(steered)
-        # The persisted assistant message has the highest
-        # store position (appended AFTER steered messages
-        # arrived during streaming). Use its ID as the
-        # cursor so _sync_history doesn't re-fetch it.
         return _SteeringRetry(last_seen=persisted[-1].id)
 
-    # ── Step 3b: No late messages — close inbox and finish ──
-    # The first close_inbox call found items (our own persisted
-    # output), so the inbox is still open. Call again with the
-    # persisted item's ID so close_inbox sees zero new items
-    # and atomically sets inbox_closed=True. This prevents
-    # try_deliver from injecting orphaned messages after we
-    # return "completed".
-    task_store.close_inbox(
+    # ── Step 3: Close inbox ────────────────────────────────
+    # Step 2 found only our own persisted items, so the inbox
+    # is still open. Call close_inbox with the persisted
+    # item's cursor. A steering message could arrive between
+    # steps 2 and 3, so we must check the return value: if
+    # close_inbox returns items, a late message snuck in.
+    final_late = task_store.close_inbox(
         task_id,
         conversation_id,
         persisted[-1].id,
     )
+    if final_late:
+        # A steering message arrived between steps 2 and 3.
+        # The inbox is still open (close_inbox returned items
+        # instead of closing). Retry the loop.
+        history.extend(persisted)
+        history.extend(final_late)
+        return _SteeringRetry(last_seen=persisted[-1].id)
+
     return _AgentLoopResult(
         status="completed",
         output=output_items,
         completed_at=int(time.time()),
     )
+
+
+def _check_steering_inbox(
+    task_id: str,
+    conversation_id: str,
+    last_seen: str | None,
+    persisted: list[ConversationItem],
+    task_store: TaskStore,
+) -> list[ConversationItem]:
+    """
+    Check for steered messages that arrived during the LLM call.
+
+    Calls ``close_inbox`` with the pre-LLM cursor to detect
+    messages delivered between the LLM call start and the
+    assistant message persist. Filters out our own persisted
+    items so only genuine steered user messages are returned.
+
+    :param task_id: The task identifier, e.g. ``"task_abc123"``.
+    :param conversation_id: The conversation ID, e.g.
+        ``"conv_abc123"``.
+    :param last_seen: Cursor from before the LLM call — the
+        ID of the last item the agent had seen.
+    :param persisted: Items we just persisted (the assistant
+        message). Used to filter out own items from the
+        close_inbox return value.
+    :param task_store: The TaskStore for inbox operations.
+    :returns: List of steered conversation items (may be
+        empty if no steering messages arrived).
+    """
+    late = task_store.close_inbox(
+        task_id,
+        conversation_id,
+        last_seen,
+    )
+    own_ids = {ci.id for ci in persisted}
+    return [ci for ci in late if ci.id not in own_ids]
 
 
 def _build_function_call_items(
@@ -1516,13 +1530,7 @@ def _run_agent_loop(
         # output before handling function calls or final response.
         _emit_native_tool_items(task_id, llm_resp, output_items)
 
-        has_tools = _has_tool_calls(llm_resp)
-        _logger.warning(
-            "[STEER-DEBUG] iteration: has_tool_calls=%s last_seen=%s "
-            "history_len=%d",
-            has_tools, last_seen, len(history),
-        )
-        if not has_tools:
+        if not _has_tool_calls(llm_resp):
             result = _handle_final_response(
                 task_id,
                 conversation_id,

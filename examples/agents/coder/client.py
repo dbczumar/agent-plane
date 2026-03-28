@@ -403,7 +403,10 @@ def _execute_edit(args: dict[str, Any]) -> str:
     if count == 0:
         return f"Error: old_string not found in {file_path}"
     if not replace_all and count > 1:
-        return f"Error: old_string appears {count} times (expected 1). Use replace_all=true or provide more context."
+        return (
+            f"Error: old_string appears {count} times (expected 1). "
+            "Use replace_all=true or provide more context."
+        )
     result = text.replace(old, new) if replace_all else text.replace(old, new, 1)
     file_path.write_text(result)
     replacements = count if replace_all else 1
