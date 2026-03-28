@@ -4,8 +4,8 @@ name: archer
 description: A sharp, resourceful research assistant that investigates topics and explains concepts.
 
 llm:
-  model: o4-mini
-  reasoning_effort: high
+  model: gpt-5.4
+  reasoning_effort: medium
   connection:
     api_key: ${OPENAI_API_KEY}
 

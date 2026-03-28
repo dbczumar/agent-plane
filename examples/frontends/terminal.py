@@ -56,6 +56,18 @@ _MAX_SCROLL_WIDGETS: int = 200
 # Maximum characters to store in a tool-result Collapsible.
 # Even collapsed, large Static widgets slow the DOM.
 _MAX_TOOL_RESULT_DISPLAY: int = 4000
+# Provider-native tool output types rendered in the TUI.
+_NATIVE_TOOL_TYPES: frozenset[str] = frozenset(
+    {
+        "web_search_call",
+        "file_search_call",
+        "code_interpreter_call",
+        "computer_call",
+        "image_generation_call",
+        "mcp_call",
+        "mcp_list_tools",
+    }
+)
 # File extensions recognized as images for inline display.
 _IMAGE_EXTENSIONS: frozenset[str] = frozenset(
     {
@@ -1416,6 +1428,8 @@ def _handle_item_done(
             acc.pending_tool_calls.append(item)
     elif item_type == "function_call_output":
         _mount_tool_result(scroll, item)
+    elif item_type in _NATIVE_TOOL_TYPES:
+        _mount_native_tool(scroll, item)
     return live
 
 
@@ -1640,6 +1654,57 @@ def _mount_tool_result(
         scroll.mount(widget)
         _wlog("MOUNT", "Collapsible", f"tool_result: {first_line}")
     scroll.scroll_end()
+
+
+def _mount_native_tool(
+    scroll: VerticalScroll,
+    item: dict[str, object],
+) -> None:
+    """
+    Mount a provider-native tool call widget (e.g. web search).
+
+    :param scroll: The scrollable container.
+    :param item: The native tool output item dict, e.g.
+        ``{"type": "web_search_call", "status": "completed",
+        "action": {"type": "search", "query": "..."}}``.
+    """
+    item_type = item.get("type", "unknown")
+    label = _format_native_tool_label(item_type, item)
+    widget = SystemInfo(
+        Text.from_markup(f"[cyan]▸ {escape(label)}[/cyan]")
+    )
+    scroll.mount(widget)
+    _wlog("MOUNT", "SystemInfo", f"native_tool: {label}")
+    scroll.scroll_end()
+
+
+def _format_native_tool_label(
+    item_type: str,
+    item: dict[str, object],
+) -> str:
+    """
+    Build a human-readable label for a native tool output item.
+
+    :param item_type: The item type, e.g. ``"web_search_call"``.
+    :param item: The full item dict.
+    :returns: A short label string for display.
+    """
+    if item_type == "web_search_call":
+        action = item.get("action")
+        if isinstance(action, dict):
+            action_type = action.get("type", "")
+            if action_type == "search":
+                query = action.get("query", "")
+                return f"web search: {str(query)[:100]}"
+            elif action_type == "open_page":
+                url = action.get("url", "")
+                return f"web open: {str(url)[:100]}"
+            elif action_type == "find_in_page":
+                return "web find in page"
+        return "web search"
+    # Generic label for other native tool types.
+    display_name = item_type.replace("_", " ")
+    return f"{display_name}"
 
 
 # ── Entry point ───────────────────────────────────────
