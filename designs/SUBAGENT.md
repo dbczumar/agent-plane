@@ -32,7 +32,7 @@ Phase 2 design.
 | `Tool` ABC | `tools/base.py:25` | `name`, `get_schema()`, `invoke()` |
 | `ToolManager` registry | `tools/manager.py:60` | `dict[str, Tool]` dispatch |
 | `task_store.start()` | `stores/task_store` | Launch DBOS workflow for a task |
-| `task_store.wait()` | `stores/task_store` | Block until task reaches terminal state |
+| `task_store.wait()` | `stores/task_store` | Block until task reaches terminal state (async; CollectTool uses sync DBOS handles instead) |
 
 ### What's missing
 
@@ -72,8 +72,8 @@ Parent LLM → continues with collected results
 - Sub-agents use `_run_agent_loop()` — the same agent loop as top-level
   tasks (single execution path, no separate sub-agent loop)
 - Parent blocks on `collect_sub_agents`, not on individual sub-agents
-- Tasks are marked with a `spawned_sub_agent` flag (extension point
-  for Phase 2 client-side tool support)
+- Spawned tasks have `parent_task_id` set (identifies them as
+  sub-agents; extension point for Phase 2 client-side tool support)
 
 **Phase 1 limitation:** no client-side tools. Sub-agents can only use
 server-side tools (MCP, skills, builtins). Client-side tools are
@@ -133,16 +133,20 @@ Sub-agents are nested `AgentSpec` objects inside the parent's
 the DBOS workflow boundary requires serializable inputs (you can't pass
 a Python object).
 
-Solution: `task_store.start()` accepts an optional `sub_agent_name`
-kwarg. The workflow receives `(agent_id, sub_agent_name)`:
+Solution: the workflow reads its own task row to determine if it's a
+sub-agent. If `parent_task_id` is set, the task is a spawned
+sub-agent — the workflow uses the existing `agent_name` column (which
+holds the sub-agent name, e.g. `"researcher"`) to extract the
+sub-agent spec from the parent's `spec.sub_agents`:
 
 ```python
 # In agent_execution_workflow:
 loaded = get_agent_cache().load(agent_id)
-if sub_agent_name is not None:
-    # Resolve nested sub-agent spec from parent
+task = get_task_store().get(task_id)
+if task.parent_task_id is not None:
+    # Spawned sub-agent: extract spec by agent_name
     sub_specs = {sa.name: sa for sa in loaded.spec.sub_agents}
-    spec = sub_specs[sub_agent_name]
+    spec = sub_specs[task.agent_name]
 else:
     spec = loaded.spec
 ```
@@ -155,10 +159,60 @@ same mechanism works: pass the root `agent_id` + the child's name,
 load parent, extract child. No need for path-style lookups because
 each level's `spec.sub_agents` is the full recursive tree.
 
-`sub_agent_name` is also persisted on the task row (new column). This
-serves double duty: the workflow uses it for spec loading, and
-`CollectTool` reads it via `task_store.get()` to populate the
-`agent_name` field in collect results.
+No new workflow parameters are needed — the workflow discovers its
+sub-agent status from the task row. `SpawnTool` sets `agent_name` to
+the sub-agent name and `parent_task_id` to the parent's task ID at
+creation time.
+
+### Schema change: `parent_task_id`
+
+One new nullable column on the task table:
+
+- **`parent_task_id: String | None, FK → tasks.id`** — the task that
+  spawned this sub-agent. `NULL` for top-level tasks.
+
+This single column replaces what was originally three proposed columns:
+- **Spec loading**: workflow checks `parent_task_id IS NOT NULL`, then
+  uses existing `agent_name` to extract the sub-agent spec.
+- **Spawn tree tracing**: clients reconstruct the parent→child
+  relationship via `GET /v1/responses/{id}`.
+- **Phase 2 detection**: `POST /v1/responses` checks
+  `parent_task_id IS NOT NULL` to decide whether to deliver tool
+  results to the inbox instead of creating a new task.
+
+Backward-compatible — nullable, so existing tasks are unaffected.
+
+### Store access in tools
+
+`SpawnTool` and `CollectTool` need access to `task_store` and
+`conversation_store` at invoke time. Rather than passing stores as
+constructor parameters, tools call runtime getters inside `invoke()`:
+`get_task_store()` and `get_conversation_store()`. This matches the
+existing pattern — the workflow uses `get_agent_cache()` the same way.
+Stores are module-level singletons initialized at server startup, so
+the getters are a dict lookup.
+
+### CollectTool uses sync DBOS primitives
+
+`CollectTool.invoke()` is sync (matching the `Tool.invoke()` ABC).
+`task_store.wait()` is async (designed for the FastAPI API layer).
+CollectTool bypasses `task_store.wait()` and uses sync DBOS primitives
+directly: `retrieve_workflow(task_id)` → `handle.get_result()`. Both
+are sync and block the DBOS workflow thread until the sub-agent
+workflow completes. This is the correct pattern inside a DBOS workflow.
+
+### `task_store.wait()` gets a timeout parameter
+
+`task_store.wait()` currently blocks indefinitely. Add
+`timeout: float | None = None`. If the deadline expires before the
+workflow completes, `wait()` returns the task in its current
+(non-terminal) state instead of raising. `CollectTool` uses this to
+implement partial results: completed sub-agents return their output,
+timed-out sub-agents return an error string.
+
+The sync DBOS equivalent (`handle.get_result()`) also needs a timeout
+path — either a timeout param or a polling loop with `DBOS.sleep()`
+and a deadline check.
 
 ### Sub-agent gets its own ToolManager
 
@@ -267,10 +321,12 @@ lays the groundwork:
 - Spawned sub-agents use `_run_agent_loop()` (the real agent loop),
   not a separate code path — Phase 2 adds a park branch in
   `_handle_tool_calls()` without touching `collect_sub_agents` or `spawn_sub_agents`
-- Tasks are marked with `spawned_sub_agent` flag — Phase 2 uses this
-  for the `POST /v1/responses` inbox delivery branch
-- `collect_sub_agents` uses `task_store.wait(task_id)` — this doesn't change in
-  Phase 2 because the sub-agent workflow stays alive while parked
+- Tasks have `parent_task_id` set — Phase 2 uses
+  `parent_task_id IS NOT NULL` for the `POST /v1/responses` inbox
+  delivery branch
+- `collect_sub_agents` uses sync DBOS `handle.get_result()` — this
+  doesn't change in Phase 2 because the sub-agent workflow stays
+  alive while parked
 
 ---
 
@@ -393,6 +449,18 @@ agent_plane/
     manager.py         # MODIFY — register spawn/collect tools
   spec/
     validator.py       # MODIFY — require llm on callable sub-agents
+  db/
+    db_models.py       # MODIFY — add parent_task_id column to SqlTask
+  entities/
+    task.py            # MODIFY — add parent_task_id field to Task
+  stores/
+    task_store/
+      abstract_store.py  # MODIFY — add parent_task_id to create()
+      sqlalchemy_store.py # MODIFY — add parent_task_id to create(),
+                         #           add timeout to wait()
+  runtime/
+    workflow.py        # MODIFY — sub-agent spec resolution via
+                       #           parent_task_id + agent_name
 ```
 
 ---
@@ -427,14 +495,16 @@ class SpawnTool(Tool):
         # 2. Parse arguments: list of {name, input} dicts
         # 3. For each agent:
         #    a. Validate name is in sub_specs
-        #    b. Create conversation via conv_store.create_conversation()
+        #    b. Create conversation via get_conversation_store()
         #    c. Append user input message
-        #    d. Create task via task_store.create()
+        #    d. Create task via get_task_store().create()
         #       - agent_id = parent_agent_id (root registered agent)
-        #       - Mark task with spawned_sub_agent=True
-        #    e. task_store.start(task_id, sub_agent_name=name)
-        #       Workflow loads parent spec via agent_cache, extracts
-        #       sub-agent by name from spec.sub_agents
+        #       - agent_name = sub-agent name (e.g. "researcher")
+        #       - parent_task_id = self.parent_task_id
+        #    e. task_store.start(task_id)
+        #       Workflow reads its own task row, sees parent_task_id
+        #       is set, uses agent_name to extract sub-agent spec
+        #       from parent's spec.sub_agents
         #
         # NOTE: Steps 3b-3e are not transactional. A crash between
         # create and start leaves an orphaned QUEUED task. This is
@@ -464,10 +534,13 @@ class CollectTool(Tool):
         # 2. Calculate effective timeout:
         #    min(explicit_timeout, remaining_parent_execution_time)
         # 3. For each task_id:
-        #    a. task_store.wait(task_id, timeout=remaining)
-        #    b. task_store.get(task_id) → extract final output text
+        #    a. retrieve_workflow(task_id) → handle
+        #    b. handle.get_result(timeout=remaining)
+        #       (sync DBOS primitive — blocks workflow thread)
+        #    c. get_task_store().get(task_id) → extract final output
+        #       text from task.output (type == "output_text" items)
         # 4. Return JSON with results (status + output per task)
-        # 5. Timed-out tasks get status: "incomplete"
+        # 5. Timed-out tasks get error string as output
         ...
 ```
 
@@ -625,7 +698,7 @@ The parent's next LLM turn calls `collect_sub_agents`:
 ```
 
 `CollectTool.invoke()`:
-1. Calls `task_store.wait()` for each task ID
+1. Calls sync DBOS `retrieve_workflow()` + `handle.get_result()` per task
 2. Extracts final output text from each completed task
 3. Returns:
    ```json
@@ -653,12 +726,13 @@ incorporates the researcher's findings and the critic's feedback.
 1. `tools/builtins/spawn.py` — `SpawnTool` + `CollectTool`
 2. `tools/manager.py` — add `_register_sub_agent_tools()`, add
    `parent_task_id`, `sub_agent_depth`, and `agent_id` parameters
-3. Wire `SpawnTool` to create tasks via `task_store`
-   - Mark tasks with `spawned_sub_agent=True` flag
+3. Wire `SpawnTool` to create tasks via `get_task_store()`
+   - Set `parent_task_id` to parent's task ID
+   - Set `agent_name` to sub-agent name
    - Spawned sub-agents use `_run_agent_loop()` (single execution path)
    - Filter out client-side tools from sub-agent ToolManager
-4. Wire `CollectTool` to wait via `task_store.wait()` and extract
-   results
+4. Wire `CollectTool` to wait via sync DBOS `handle.get_result()`
+   and extract results
 5. Update `ToolManager` construction sites (workflow.py)
 6. Tests: spawn creates tasks, collect waits and returns results,
    timeout handling, depth limit
@@ -676,23 +750,24 @@ incorporates the researcher's findings and the critic's feedback.
 3. Integration test: collect with timeout, partial results
 4. Integration test: depth limit exceeded → error string
 5. Verify sub-agent conversations persisted in store
-6. Verify `spawned_sub_agent` flag is set on tasks
+6. Verify `parent_task_id` is set on spawned tasks
 
 #### Phase 1 extension points for Phase 2
 
 These are laid in Phase 1 but not used until Phase 2:
 
-- **`spawned_sub_agent` flag on tasks** — `SpawnTool` sets this at
-  creation. Phase 2 uses it in the `POST /v1/responses` endpoint to
-  detect parked sub-agents and deliver tool results to the inbox
-  instead of creating a new task.
+- **`parent_task_id` on tasks** — `SpawnTool` sets this at creation.
+  Phase 2 uses `parent_task_id IS NOT NULL` in the
+  `POST /v1/responses` endpoint to detect spawned sub-agents and
+  deliver tool results to the inbox instead of creating a new task.
 - **`_run_agent_loop()` as single execution path** — spawned sub-agents
   use the real agent loop. Phase 2 adds a park branch inside
   `_handle_tool_calls()` when client-side tools are detected and the
-  task has `spawned_sub_agent=True`. No new loop needed.
-- **`collect_sub_agents` uses `task_store.wait()`** — this call doesn't change in
-  Phase 2. When a sub-agent parks for client tools, its workflow stays
-  alive, so `wait()` still blocks until the workflow truly completes.
+  task has `parent_task_id IS NOT NULL`. No new loop needed.
+- **`collect_sub_agents` uses sync DBOS `handle.get_result()`** — this
+  call doesn't change in Phase 2. When a sub-agent parks for client
+  tools, its workflow stays alive, so `get_result()` still blocks
+  until the workflow truly completes.
 - **Client-side tool filtering is one line** — Phase 2 removes the
   filter and adds the park logic. No other changes to `ToolManager` or
   tool registration.
@@ -704,12 +779,13 @@ See `SUBAGENT_WORKFLOW.md` for the full design. Summary of changes:
 1. **Remove client-side tool filter** from sub-agent ToolManager setup
    (one-line change)
 2. **Add park branch in `_handle_tool_calls()`** — when the task has
-   `spawned_sub_agent=True` and client-side tools are detected, park
-   the workflow instead of completing the response
+   `parent_task_id IS NOT NULL` and client-side tools are detected,
+   park the workflow instead of completing the response
 3. **Add `tool_result_inbox` table** — new database table for client
    tool result delivery (no migration of existing tables)
-4. **Add branch in `POST /v1/responses`** — check `spawned_sub_agent`
-   flag + parked status; deliver to inbox instead of creating new task
+4. **Add branch in `POST /v1/responses`** — check
+   `parent_task_id IS NOT NULL` + parked status; deliver to inbox
+   instead of creating new task
 5. Tests: spawned sub-agent with client-side tool, multi-round parking,
    parallel sub-agents with independent client tools
 
@@ -718,7 +794,7 @@ See `SUBAGENT_WORKFLOW.md` for the full design. Summary of changes:
 ## Verification (Phase 1)
 
 1. **Unit tests**: `SpawnTool` creates tasks correctly with
-   `spawned_sub_agent=True`, returns task IDs
+   `parent_task_id` set, returns task IDs
 2. **Unit tests**: `CollectTool` waits and returns results, timeout
    returns partial results
 3. **Unit tests**: spawn depth limit — exceeded returns error string
@@ -728,7 +804,7 @@ See `SUBAGENT_WORKFLOW.md` for the full design. Summary of changes:
 6. **Integration tests**: full workflow with parent spawning sub-agent
    via `ControllableMockClient` — verify parent receives sub-agent
    output via collect
-7. **Extension point test**: verify `spawned_sub_agent` flag is set on
+7. **Extension point test**: verify `parent_task_id` is set on
    tasks created by `SpawnTool`
 
 ---
@@ -757,8 +833,9 @@ changes to how DBOS manages workflow threads.
 - **Client-side tools in spawned sub-agents (Phase 2)** — the full
   design is in `SUBAGENT_WORKFLOW.md`. Requires: tool result inbox
   table, park branch in `_handle_tool_calls()`, delivery branch in
-  `POST /v1/responses`. Phase 1 lays extension points (spawned flag,
-  single agent loop, `collect_sub_agents` via `wait()`) so Phase 2 is additive.
+  `POST /v1/responses`. Phase 1 lays extension points (`parent_task_id`,
+  single agent loop, `collect_sub_agents` via DBOS handles) so Phase 2
+  is additive.
 - **Shared conversation mode** — allow a sub-agent to see the parent's
   conversation history (opt-in via spec). Useful for "advisor" patterns
   where the sub-agent needs full context.

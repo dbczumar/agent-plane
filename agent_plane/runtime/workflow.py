@@ -56,6 +56,8 @@ from llms.errors import PermanentLLMError, RetryableLLMError
 from llms.types import (
     FunctionCallOutput,
     MessageOutput,
+    NativeToolOutput,
+    NativeToolOutputAddedEvent,
     ResponseCompletedEvent,
     ResponseReasoningStartedEvent,
     ResponseReasoningSummaryTextDeltaEvent,
@@ -273,17 +275,22 @@ def _build_responses_args(
 
 def _response_to_dict(resp: LLMResponse) -> dict[str, Any]:
     """
-    Extract text and tool calls from a Responses API ``Response``
-    object into a JSON-serializable dict.
+    Extract text, tool calls, and native tool items from a
+    Responses API ``Response`` into a JSON-serializable dict.
 
     :param resp: A completed ``llms.types.Response`` object from
         ``client.responses.create(stream=False)``.
     :returns: A dict with ``"model"`` (str or None), ``"text"``
-        (str or None), and ``"tool_calls"`` (list of
-        ``{"call_id", "name", "arguments"}`` dicts).
+        (str or None), ``"tool_calls"`` (list of
+        ``{"call_id", "name", "arguments"}`` dicts), and
+        ``"native_tool_items"`` (list of raw dicts for
+        provider-native tools like ``web_search_call``).
     """
     text: str | None = None
     tool_calls: list[dict[str, Any]] = []
+    # Raw dicts for provider-native tool outputs (e.g. web_search_call).
+    # These are not dispatched locally — they flow through to the client.
+    native_tool_items: list[dict[str, Any]] = []
 
     for item in resp.output:
         if isinstance(item, MessageOutput):
@@ -299,8 +306,15 @@ def _response_to_dict(resp: LLMResponse) -> dict[str, Any]:
                     "arguments": item.arguments,
                 }
             )
+        elif isinstance(item, NativeToolOutput):
+            native_tool_items.append(item.data)
 
-    return {"model": resp.model, "text": text, "tool_calls": tool_calls}
+    return {
+        "model": resp.model,
+        "text": text,
+        "tool_calls": tool_calls,
+        "native_tool_items": native_tool_items,
+    }
 
 
 # ── DBOS-checkpointed steps ──────────────────────────────
@@ -495,6 +509,11 @@ def _accumulate_stream(
                 task_id,
                 {"type": _REASONING_SUMMARY_EVENT, "delta": event.delta},
             )
+        elif isinstance(event, NativeToolOutputAddedEvent):
+            _write_output(
+                task_id,
+                {"type": "response.output_item.done", "item": event.item},
+            )
         elif isinstance(event, ResponseCompletedEvent):
             completed_response = event.response
 
@@ -503,7 +522,12 @@ def _accumulate_stream(
 
     # Stream completed without a response.completed event (e.g. error).
     # Return an empty response so the loop can handle it gracefully.
-    return {"model": None, "text": None, "tool_calls": []}
+    return {
+        "model": None,
+        "text": None,
+        "tool_calls": [],
+        "native_tool_items": [],
+    }
 
 
 @step()
@@ -648,6 +672,38 @@ def fetch_all_items(
         # Advance cursor to the last item of this page
         cursor = page.last_id
     return all_items
+
+
+def _emit_native_tool_items(
+    task_id: str,
+    llm_resp: dict[str, Any],
+    output_items: list[dict[str, Any]],
+) -> None:
+    """
+    Append provider-native tool output items to *output_items*
+    and stream them to SSE consumers.
+
+    Native tool items (e.g. ``web_search_call``) are executed
+    server-side by the LLM provider. They are included in the
+    API response output but NOT persisted to the conversation
+    store (they are ephemeral provider-specific items).
+
+    :param task_id: The task identifier, e.g. ``"task_abc123"``.
+    :param llm_resp: The LLM response dict from
+        :func:`_response_to_dict`.
+    :param output_items: Mutable list of API-format output dicts
+        (modified in-place).
+    """
+    for item_dict in llm_resp.get("native_tool_items", []):
+        output_items.append(item_dict)
+        _write_output(
+            task_id,
+            {
+                "type": "response.output_item.done",
+                "item": item_dict,
+                "output_index": len(output_items) - 1,
+            },
+        )
 
 
 # ── Extracted helpers ─────────────────────────────────────
@@ -1437,6 +1493,10 @@ def _run_agent_loop(
             tool_schemas,
             content_cache,
         )
+
+        # Emit provider-native tool items (e.g. web_search_call) to
+        # output before handling function calls or final response.
+        _emit_native_tool_items(task_id, llm_resp, output_items)
 
         if not _has_tool_calls(llm_resp):
             result = _handle_final_response(

@@ -11,6 +11,7 @@ and ``.arguments`` attributes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -80,6 +81,40 @@ class FunctionCallOutput:
     type: str = "function_call"
 
 
+# OpenAI-native tool types that are executed server-side and
+# passed through to the client without local dispatch.
+NATIVE_TOOL_OUTPUT_TYPES: frozenset[str] = frozenset(
+    {
+        "web_search_call",
+        "file_search_call",
+        "code_interpreter_call",
+        "computer_call",
+        "image_generation_call",
+        "mcp_call",
+        "mcp_list_tools",
+    }
+)
+
+
+@dataclass
+class NativeToolOutput:
+    """
+    A provider-native tool output item passed through as a raw dict.
+
+    Native tools (e.g. ``web_search_call``, ``file_search_call``)
+    are executed server-side by the LLM provider. Agent-plane does
+    not dispatch them locally — they flow through to the client.
+
+    :param data: The full raw dict from the Responses API,
+        e.g. ``{"type": "web_search_call", "id": "ws_abc",
+        "status": "completed"}``.
+    """
+
+    # Any: native tool output dicts are heterogeneous and
+    # provider-defined — we pass them through without parsing.
+    data: dict[str, Any]
+
+
 @dataclass
 class Usage:
     """
@@ -100,14 +135,16 @@ class Response:
     """
     A completed LLM response.
 
-    :param output: List of output items — ``MessageOutput`` and/or
-        ``FunctionCallOutput`` instances.
+    :param output: List of output items — ``MessageOutput``,
+        ``FunctionCallOutput``, or ``NativeToolOutput`` instances.
+        Native tool outputs are provider-executed items (e.g.
+        ``web_search_call``) passed through as raw dicts.
     :param model: The model identifier that produced the response,
         e.g. ``"claude-sonnet-4-20250514"``.
     :param usage: Token usage information, or ``None`` if unavailable.
     """
 
-    output: list[MessageOutput | FunctionCallOutput]
+    output: list[MessageOutput | FunctionCallOutput | NativeToolOutput]
     model: str
     usage: Usage | None = None
 
@@ -173,6 +210,24 @@ class ResponseReasoningStartedEvent:
 
 
 @dataclass
+class NativeToolOutputAddedEvent:
+    """
+    Emitted when a provider-native tool output item completes
+    during streaming (e.g. ``web_search_call``).
+
+    :param item: The full raw dict from the Responses API,
+        e.g. ``{"type": "web_search_call", "id": "ws_abc",
+        "status": "completed"}``.
+    :param type: Always ``"response.output_item.done"``.
+    """
+
+    # Any: native tool output dicts are heterogeneous and
+    # provider-defined — we pass them through without parsing.
+    item: dict[str, Any]
+    type: str = "response.output_item.done"
+
+
+@dataclass
 class ResponseCompletedEvent:
     """
     Emitted when the full response is complete.
@@ -191,5 +246,6 @@ ResponseStreamEvent = (
     | ResponseReasoningTextDeltaEvent
     | ResponseReasoningSummaryTextDeltaEvent
     | ResponseReasoningStartedEvent
+    | NativeToolOutputAddedEvent
     | ResponseCompletedEvent
 )

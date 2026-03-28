@@ -16,8 +16,11 @@ import httpx
 from agent_plane.errors import AgentPlaneError, ErrorCode
 from llms.adapters.base import BaseAdapter
 from llms.types import (
+    NATIVE_TOOL_OUTPUT_TYPES,
     FunctionCallOutput,
     MessageOutput,
+    NativeToolOutput,
+    NativeToolOutputAddedEvent,
     OutputText,
     Response,
     ResponseCompletedEvent,
@@ -273,21 +276,24 @@ def _to_responses_tools(
 
 def _parse_responses_output(
     output_items: list[dict[str, Any]],
-) -> list[MessageOutput | FunctionCallOutput]:
+) -> list[MessageOutput | FunctionCallOutput | NativeToolOutput]:
     """
     Convert Responses API output items to ``llms.types`` output objects.
 
-    Skips ``reasoning`` items — only ``message`` and ``function_call``
-    items are returned.
+    Skips ``reasoning`` items. ``message`` and ``function_call``
+    items are parsed into typed objects. Provider-native tool items
+    (e.g. ``web_search_call``) are wrapped in :class:`NativeToolOutput`
+    and passed through as raw dicts.
 
     :param output_items: List of output item dicts from the Responses
         API response, e.g. the ``response.output`` list.
-    :returns: List of :class:`MessageOutput` and/or
-        :class:`FunctionCallOutput` instances.
+    :returns: List of :class:`MessageOutput`, :class:`FunctionCallOutput`,
+        and/or :class:`NativeToolOutput` instances.
     """
-    output: list[MessageOutput | FunctionCallOutput] = []
+    output: list[MessageOutput | FunctionCallOutput | NativeToolOutput] = []
     for item in output_items:
-        if item.get("type") == "message":
+        item_type = item.get("type")
+        if item_type == "message":
             parts = [
                 OutputText(text=p["text"])
                 for p in item.get("content", [])
@@ -295,7 +301,7 @@ def _parse_responses_output(
             ]
             if parts:
                 output.append(MessageOutput(content=parts))
-        elif item.get("type") == "function_call":
+        elif item_type == "function_call":
             output.append(
                 FunctionCallOutput(
                     call_id=item["call_id"],
@@ -303,6 +309,8 @@ def _parse_responses_output(
                     arguments=item["arguments"],
                 )
             )
+        elif item_type in NATIVE_TOOL_OUTPUT_TYPES:
+            output.append(NativeToolOutput(data=item))
     return output
 
 
@@ -354,8 +362,14 @@ def _parse_responses_event(
     if event_type == "response.reasoning_text.delta":
         return ResponseReasoningTextDeltaEvent(delta=data["delta"])
     if event_type == "response.output_item.added":
-        if data.get("item", {}).get("type") == "reasoning":
+        item = data.get("item", {})
+        item_type = item.get("type")
+        if item_type == "reasoning":
             return ResponseReasoningStartedEvent()
+    if event_type == "response.output_item.done":
+        item = data.get("item", {})
+        if item.get("type") in NATIVE_TOOL_OUTPUT_TYPES:
+            return NativeToolOutputAddedEvent(item=item)
     if event_type == "response.completed":
         return ResponseCompletedEvent(response=_parse_responses_response(data["response"]))
     return None

@@ -15,6 +15,7 @@ from typing import Any
 from llms.types import (
     FunctionCallOutput,
     MessageOutput,
+    NativeToolOutput,
     OutputText,
     Response,
     ResponseCompletedEvent,
@@ -209,7 +210,7 @@ def chat_response_to_response(
     :returns: A :class:`Response` with ``output``, ``model``, and
         ``usage``.
     """
-    output: list[MessageOutput | FunctionCallOutput] = []
+    output: list[MessageOutput | FunctionCallOutput | NativeToolOutput] = []
     choice = chat_dict["choices"][0]
     message = choice["message"]
 
@@ -319,7 +320,7 @@ def chat_stream_to_response_events(
             usage_dict = chunk["usage"]
 
     # Assemble the final Response
-    output: list[MessageOutput | FunctionCallOutput] = []
+    output: list[MessageOutput | FunctionCallOutput | NativeToolOutput] = []
     if accumulated_text:
         output.append(MessageOutput(content=[OutputText(text=accumulated_text)]))
     for _idx in sorted(tool_calls_by_index):
