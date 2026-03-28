@@ -293,9 +293,7 @@ def register_agent(client: httpx.Client, bundle: bytes) -> str:
                 return agent["id"]
         raise RuntimeError("Agent exists but not found in list")
     if resp.is_error:
-        raise RuntimeError(
-            f"Agent upload failed ({resp.status_code}): {resp.text}"
-        )
+        raise RuntimeError(f"Agent upload failed ({resp.status_code}): {resp.text}")
     return resp.json()["id"]
 
 
@@ -1670,9 +1668,7 @@ def _mount_native_tool(
     """
     item_type = item.get("type", "unknown")
     label = _format_native_tool_label(item_type, item)
-    widget = SystemInfo(
-        Text.from_markup(f"[cyan]▸ {escape(label)}[/cyan]")
-    )
+    widget = SystemInfo(Text.from_markup(f"[cyan]▸ {escape(label)}[/cyan]"))
     scroll.mount(widget)
     _wlog("MOUNT", "SystemInfo", f"native_tool: {label}")
     scroll.scroll_end()
@@ -1793,7 +1789,9 @@ def _print_usage() -> None:
     """
     Print CLI usage information and exit.
     """
-    print("Usage: python terminal.py <agent-dir-or-tarball> [--client-tools NAME] [--auto-send MSG]")
+    print(
+        "Usage: python terminal.py <agent-dir-or-tarball> [--client-tools NAME] [--auto-send MSG]"
+    )
     print()
     print("  agent-dir-or-tarball  Path to an agent image directory")
     print("                        (containing config.yaml) or a")
