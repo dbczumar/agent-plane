@@ -317,35 +317,6 @@ async def test_create_response_conversation_mismatch(
     assert "does not belong" in resp.json()["error"]["message"]
 
 
-async def test_steering_try_deliver(
-    client: httpx.AsyncClient,
-    mock_llm: ControllableMockClient,
-) -> None:
-    """
-    When previous_response_id points to an active task, the server
-    delivers the message to the running agent's inbox and returns
-    the existing in-progress response.
-    """
-    await create_test_agent(client)
-
-    # Block the LLM call so the first task stays active
-    mock_llm.add_call(block=True)
-    first = await create_test_response(client, input_text="Turn 1")
-    first_id = first.body["id"]
-    assert first.body["status"] == "queued"
-
-    # Second request targets the active task — should deliver and
-    # return the existing response rather than creating a new one.
-    second = await create_test_response(
-        client,
-        input_text="Steer this",
-        previous_response_id=first_id,
-    )
-    assert second.status_code == 200
-    # Returns the SAME response (steering, not a new task)
-    assert second.body["id"] == first_id
-
-
 async def test_background_streaming_queued_event(
     client: httpx.AsyncClient,
 ) -> None:

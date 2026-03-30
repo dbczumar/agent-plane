@@ -64,6 +64,14 @@ class MockCall:
     :param stream_tokens: If ``True``, yield individual text delta
         events before the completed event. If ``False``, yield only
         the completed event.
+    :param exception: If set, ``create()`` raises this exception
+        instead of returning a response. Used to simulate retryable
+        LLM errors (e.g. ``httpx.HTTPStatusError`` with 429).
+    :param received_kwargs: Populated by the mock when this call is
+        consumed. Contains the kwargs passed to
+        ``responses.create()`` so tests can inspect what the LLM
+        received (e.g. ``input``, ``instructions``, ``model``).
+        ``None`` until the call is executed.
     """
 
     text: str = "Hello from the test agent."
@@ -71,6 +79,7 @@ class MockCall:
     block_before_response: threading.Event | None = None
     call_event: threading.Event = field(default_factory=threading.Event)
     stream_tokens: bool = False
+    exception: Exception | None = None
     # Populated by the mock when this call is consumed. Contains
     # the kwargs passed to responses.create() so tests can inspect
     # what the LLM received (e.g. the input/history).
@@ -156,6 +165,7 @@ class ControllableMockClient:
         block: bool = False,
         stream_tokens: bool = False,
         tool_calls: list[dict[str, str]] | None = None,
+        exception: Exception | None = None,
     ) -> MockCall:
         """
         Enqueue a configured call.
@@ -169,6 +179,9 @@ class ControllableMockClient:
         :param tool_calls: If provided, the response contains
             function calls instead of text. Each dict must have
             ``"call_id"``, ``"name"``, and ``"arguments"`` keys.
+        :param exception: If provided, ``create()`` raises this
+            instead of returning. Use with ``httpx.HTTPStatusError``
+            to simulate retryable LLM errors.
         :returns: The ``MockCall`` for synchronization.
         """
         call = MockCall(
@@ -176,6 +189,7 @@ class ControllableMockClient:
             tool_calls=tool_calls,
             block_before_response=threading.Event() if block else None,
             stream_tokens=stream_tokens,
+            exception=exception,
         )
         self._calls.append(call)
         return call
@@ -258,6 +272,9 @@ class _MockResponsesNamespace:
         # Optionally block until the test releases us
         if call.block_before_response is not None:
             call.block_before_response.wait()
+        # Raise configured exception (simulates retryable LLM errors)
+        if call.exception is not None:
+            raise call.exception
 
         stream = kwargs.get("stream", False)
         if stream:

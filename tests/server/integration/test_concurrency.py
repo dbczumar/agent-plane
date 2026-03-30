@@ -18,6 +18,7 @@ import socket
 import subprocess
 import sys
 import tarfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,14 @@ import httpx
 import pytest
 import yaml
 
+from agent_plane.entities.conversation import (
+    ConversationItem,
+    MessageData,
+    NewConversationItem,
+)
+from agent_plane.stores.task_store.sqlalchemy_store import (
+    SqlAlchemyTaskStore,
+)
 from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import (
     create_test_agent,
@@ -348,6 +357,665 @@ async def test_steering_during_tool_execution(
 
     # 3 LLM calls: tool call + post-tool + steering continuation
     assert mock_llm.call_count == 3
+
+
+async def test_steer_during_handle_final_response_creates_new_task(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+    task_store: SqlAlchemyTaskStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Steer arrives while _handle_final_response is closing the inbox.
+
+    Simulates the archer deep-research scenario: the LLM call for
+    the first steer's continuation completes, _handle_final_response
+    closes the inbox, and the second steer arrives moments later.
+    Because inbox_closed is already True, try_deliver fails and the
+    route creates a new task (status "queued").
+
+    This is NOT a bug — it's the expected behavior when steering
+    arrives after the workflow completes. The test documents this
+    edge case and verifies the new task correctly continues the
+    conversation.
+
+    Breakage this catches:
+    - New task for late steer doesn't share the conversation
+    - New task doesn't include the steered message in history
+    - Server errors when steering into a just-completed task
+    """
+    await create_test_agent(client)
+
+    call_1 = mock_llm.add_call(text="Monkey answer", block=True)
+    # Second call: leopard continuation
+    mock_llm.add_call(text="Leopard answer")
+    # Third call: moose gets its own task (new workflow)
+    mock_llm.add_call(text="Moose answer")
+
+    first = await create_test_response(
+        client,
+        input_text="Research monkeys",
+    )
+    first_id = first.body["id"]
+    conv_id = first.body["conversation"]["id"]
+
+    # Gate: workflow blocked in LLM call 1
+    call_1.call_event.wait(timeout=10)
+
+    # Steer A: leopard delivered during LLM call 1
+    steer_a = await create_test_response(
+        client,
+        input_text="Research leopards instead",
+        previous_response_id=first_id,
+    )
+    assert steer_a.body["id"] == first_id
+
+    # Release LLM call 1 → _SteeringRetry → LLM call 2 →
+    # completes (no blocking) → inbox closes
+    call_1.release()
+    for _ in range(50):
+        resp = await client.get(f"/v1/responses/{first_id}")
+        if resp.json()["status"] == "completed":
+            break
+    assert resp.json()["status"] == "completed"
+
+    # Steer B: moose arrives AFTER the task completed.
+    # try_deliver will fail (inbox closed), creating a new task.
+    steer_b = await create_test_response(
+        client,
+        input_text="Research moose instead",
+        previous_response_id=first_id,
+    )
+    moose_id = steer_b.body["id"]
+    # New task created — different ID from the original
+    assert moose_id != first_id, (
+        "Moose steer should have created a new task (original "
+        "task already completed with inbox closed)"
+    )
+
+    # The new task shares the SAME conversation
+    assert steer_b.body["conversation"]["id"] == conv_id, (
+        "New task must continue in the same conversation"
+    )
+
+    # Wait for moose task to complete
+    for _ in range(50):
+        resp = await client.get(f"/v1/responses/{moose_id}")
+        if resp.json()["status"] == "completed":
+            break
+    assert resp.json()["status"] == "completed"
+
+    # All messages are in the shared conversation
+    items_resp = await client.get(
+        f"/v1/conversations/{conv_id}/items",
+        params={"limit": 100},
+    )
+    items = items_resp.json()["data"]
+    user_texts = [i["content"][0]["text"] for i in items if i["role"] == "user"]
+    assert "Research monkeys" in user_texts
+    assert "Research leopards instead" in user_texts
+    assert "Research moose instead" in user_texts
+
+
+async def test_chained_steering_across_iterations(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Three-turn chained steering: original → steer A → steer B.
+
+    Reproduces: user sends request, steers once (during LLM call 1),
+    then steers again (during LLM call 2). Both steers must deliver
+    to the SAME task (same response ID), and all three topics must
+    appear in the conversation with the agent addressing each via
+    a separate LLM call.
+
+    Race window: each steer arrives while the workflow is blocked
+    in a different LLM call. The workflow detects each steered
+    message in _handle_final_response and continues the loop.
+
+    Breakage this catches:
+    - Second steer creates a new task instead of delivering to
+      the existing one (inbox prematurely closed)
+    - Second steered message not detected (skipped by cursor)
+    - Workflow completes after 2 LLM calls instead of 3
+    """
+    await create_test_agent(client)
+
+    # 3 blocking LLM calls: original, steer A continuation,
+    # steer B continuation
+    call_1 = mock_llm.add_call(text="Monkey answer", block=True)
+    call_2 = mock_llm.add_call(text="Leopard answer", block=True)
+    call_3 = mock_llm.add_call(text="Moose answer", block=True)
+
+    first = await create_test_response(
+        client,
+        input_text="Research monkeys",
+    )
+    first_id = first.body["id"]
+    conv_id = first.body["conversation"]["id"]
+
+    # Gate 1: workflow blocked in LLM call 1
+    call_1.call_event.wait(timeout=10)
+
+    # Steer A: deliver "leopard" while LLM call 1 is in progress
+    steer_a = await create_test_response(
+        client,
+        input_text="Research leopards instead",
+        previous_response_id=first_id,
+    )
+    # Must return the SAME response (steered, not new task)
+    assert steer_a.body["id"] == first_id, (
+        "First steer created a new task instead of delivering to the running workflow"
+    )
+
+    # Release LLM call 1 → _handle_final_response detects
+    # leopard → _SteeringRetry → loop continues → LLM call 2
+    call_1.release()
+    call_2.call_event.wait(timeout=10)
+
+    # Steer B: deliver "moose" while LLM call 2 is in progress.
+    # This is the critical test: the inbox must still be open
+    # after the first _SteeringRetry.
+    steer_b = await create_test_response(
+        client,
+        input_text="Research moose instead",
+        previous_response_id=first_id,
+    )
+    # KEY ASSERTION: second steer must also return the same
+    # response ID. If it returns a different ID, the inbox was
+    # prematurely closed after the first steering cycle.
+    assert steer_b.body["id"] == first_id, (
+        f"Second steer created a new task ({steer_b.body['id']}) "
+        f"instead of delivering to {first_id} — inbox was "
+        f"prematurely closed after the first steering cycle"
+    )
+
+    # Release LLM call 2 → detects moose → _SteeringRetry →
+    # LLM call 3
+    call_2.release()
+    call_3.call_event.wait(timeout=10)
+
+    # Release LLM call 3 → completes
+    call_3.release()
+
+    for _ in range(50):
+        resp = await client.get(f"/v1/responses/{first_id}")
+        if resp.json()["status"] == "completed":
+            break
+    assert resp.json()["status"] == "completed"
+
+    # Verify all 6 items: 3 user messages + 3 assistant responses
+    items_resp = await client.get(
+        f"/v1/conversations/{conv_id}/items",
+        params={"limit": 100},
+    )
+    items = items_resp.json()["data"]
+    user_texts = [i["content"][0]["text"] for i in items if i["role"] == "user"]
+    assistant_texts = [i["content"][0]["text"] for i in items if i["role"] == "assistant"]
+    assert "Research monkeys" in user_texts
+    assert "Research leopards instead" in user_texts
+    assert "Research moose instead" in user_texts
+    assert "Monkey answer" in assistant_texts
+    assert "Leopard answer" in assistant_texts
+    assert "Moose answer" in assistant_texts
+
+    # 3 LLM calls: original + 2 steering continuations
+    assert mock_llm.call_count == 3, (
+        f"Expected 3 LLM calls (original + 2 steering continuations), got {mock_llm.call_count}"
+    )
+
+
+async def test_steering_between_persist_and_close_inbox(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+    task_store: SqlAlchemyTaskStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Steering message arrives between Step 2 (_check_steering_inbox)
+    and Step 3 (close_inbox with persisted cursor) in
+    _handle_final_response.
+
+    Race window: _check_steering_inbox returns empty (no steered
+    messages detected). Between that return and the second
+    close_inbox call, a steering message is delivered via
+    try_deliver. The second close_inbox must detect it and trigger
+    _SteeringRetry.
+
+    Before the fix: the second close_inbox return value was
+    ignored, so the workflow completed after 1 LLM call without
+    ever addressing the late steering message.
+
+    After the fix: the second close_inbox return value is checked,
+    _SteeringRetry fires, and a second LLM call processes the
+    steered message.
+
+    Breakage this catches:
+    - Second close_inbox return value ignored (the exact bug)
+    - Late steering message silently dropped
+    - Workflow completes without addressing steered input
+    """
+    await create_test_agent(client)
+
+    call_1 = mock_llm.add_call(text="First response", block=True)
+    # Second LLM call: the steering continuation. Named so we can
+    # inspect received_kwargs to verify the steered message was
+    # included in the LLM input.
+    call_2 = mock_llm.add_call(text="Steered response")
+
+    first = await create_test_response(
+        client,
+        input_text="Hello",
+    )
+    first_id = first.body["id"]
+    conv_id = first.body["conversation"]["id"]
+
+    # Gate: workflow is inside the LLM call
+    call_1.call_event.wait(timeout=10)
+
+    # NOTE: Monkeypatching _check_steering_inbox (a private function)
+    # is necessary because the race window between Step 2 and Step 3
+    # in _handle_final_response is sub-millisecond and cannot be
+    # triggered through public APIs alone. This is the same pattern
+    # used by the test fixtures to monkeypatch _get_llm_client.
+    import agent_plane.runtime.workflow as workflow_mod
+
+    original_check = workflow_mod._check_steering_inbox
+    injected = threading.Event()
+
+    def check_then_inject(
+        t_id: str,
+        c_id: str,
+        last_seen: str | None,
+        persisted: list[ConversationItem],
+        ts: SqlAlchemyTaskStore,
+    ) -> list[ConversationItem]:
+        """
+        Run the real _check_steering_inbox, then inject a
+        steering message before returning.
+
+        :param t_id: Task ID.
+        :param c_id: Conversation ID.
+        :param last_seen: Pre-LLM cursor.
+        :param persisted: Items just persisted.
+        :param ts: The TaskStore.
+        :returns: Result from original check (empty list).
+        """
+        result = original_check(
+            t_id,
+            c_id,
+            last_seen,
+            persisted,
+            ts,
+        )
+        # Inject exactly once: on the first call within
+        # _handle_final_response (the no-tool-calls path).
+        if not injected.is_set():
+            injected.set()
+            steering_item = NewConversationItem(
+                type="message",
+                response_id=t_id,
+                data=MessageData(
+                    role="user",
+                    content=[
+                        {
+                            "type": "input_text",
+                            "text": "Late steering",
+                        }
+                    ],
+                ),
+            )
+            delivered = task_store.try_deliver(
+                t_id,
+                c_id,
+                steering_item,
+            )
+            assert delivered, (
+                "try_deliver returned False — inbox was already closed before the injection point"
+            )
+        return result
+
+    monkeypatch.setattr(
+        workflow_mod,
+        "_check_steering_inbox",
+        check_then_inject,
+    )
+
+    # Release: workflow enters _handle_final_response, Step 2
+    # finds nothing, injection delivers steering message, Step 3
+    # must detect it.
+    call_1.release()
+
+    for _ in range(50):
+        resp = await client.get(f"/v1/responses/{first_id}")
+        if resp.json()["status"] == "completed":
+            break
+    assert resp.json()["status"] == "completed"
+
+    # Verify the late steering message is in the conversation
+    items_resp = await client.get(
+        f"/v1/conversations/{conv_id}/items",
+        params={"limit": 100},
+    )
+    items = items_resp.json()["data"]
+    user_texts = [i["content"][0]["text"] for i in items if i["role"] == "user"]
+    assert "Hello" in user_texts
+    assert "Late steering" in user_texts, (
+        "Late steering message was delivered but not found in "
+        "conversation items — it was silently dropped"
+    )
+
+    # KEY ASSERTION 1: 2 LLM calls prove the workflow retried.
+    # Before the fix: 1 call (second close_inbox return ignored,
+    # workflow completed without addressing the steering message).
+    # After the fix: 2 calls (second close_inbox detected the
+    # message, returned _SteeringRetry, agent loop continued).
+    assert mock_llm.call_count == 2, (
+        f"Expected 2 LLM calls (original + steering continuation)"
+        f", got {mock_llm.call_count}. If 1, the second "
+        f"close_inbox return value is being ignored."
+    )
+
+    # KEY ASSERTION 2: The second LLM call's input includes the
+    # late steering message. This proves _SteeringRetry extended
+    # history with the steered content, not just retried blindly.
+    assert call_2.received_kwargs is not None, "Second LLM call was never made"
+    llm_input = str(call_2.received_kwargs["input"])
+    assert "Late steering" in llm_input, (
+        f"Second LLM call input does not contain the steered "
+        f"message — _SteeringRetry fired but history was not "
+        f"extended with the late message. Input: {llm_input}"
+    )
+
+
+async def test_steering_during_streaming_processed_after_complete(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Steering delivered during a streaming LLM call (simulating
+    native tools like web_search_openai) is processed after the
+    stream completes.
+
+    Race window: the LLM is streaming tokens (stream_tokens=True).
+    A steered message arrives via try_deliver while the workflow is
+    inside _accumulate_stream. Because _accumulate_stream has no
+    mid-stream inbox check, the steering message sits in the inbox
+    until the stream finishes and _handle_final_response runs.
+
+    This documents the architectural limitation that caused the
+    archer deep-research bug: native tool streams cannot be
+    interrupted by steering. The message is eventually processed
+    (not lost) but only after the entire stream completes.
+
+    Breakage this catches:
+    - Steering message lost during streaming (never detected)
+    - _handle_final_response fails to detect messages delivered
+      during a streaming (vs non-streaming) LLM call
+    - Second LLM call missing after streaming + steering
+    """
+    await create_test_agent(client)
+
+    # stream_tokens=True: the mock yields individual word deltas
+    # before the completed event, simulating a streaming LLM call
+    # with intermediate events (like native tool output).
+    call_1 = mock_llm.add_call(
+        text="Deep research results about monkeys",
+        block=True,
+        stream_tokens=True,
+    )
+    # Steering continuation: the second LLM call after steering
+    # is detected in _handle_final_response.
+    call_2 = mock_llm.add_call(text="Leopard research results")
+
+    first = await create_test_response(
+        client,
+        input_text="Research monkeys",
+    )
+    first_id = first.body["id"]
+    conv_id = first.body["conversation"]["id"]
+
+    # Gate: workflow is blocked before the stream starts
+    call_1.call_event.wait(timeout=10)
+
+    # Concurrent action: steer while workflow is blocked.
+    # In production, this would arrive mid-stream (during
+    # _accumulate_stream). Here, the steer is delivered before
+    # the stream starts — functionally equivalent because
+    # _accumulate_stream never checks the inbox regardless.
+    steer = await create_test_response(
+        client,
+        input_text="Switch to leopards",
+        previous_response_id=first_id,
+    )
+    assert steer.body["id"] == first_id
+
+    # Release: stream runs to completion (all tokens emitted),
+    # then _handle_final_response detects the steered message
+    # and triggers _SteeringRetry.
+    call_1.release()
+
+    for _ in range(50):
+        resp = await client.get(f"/v1/responses/{first_id}")
+        if resp.json()["status"] == "completed":
+            break
+    assert resp.json()["status"] == "completed"
+
+    # Verify steering message is in conversation
+    items_resp = await client.get(
+        f"/v1/conversations/{conv_id}/items",
+        params={"limit": 100},
+    )
+    items = items_resp.json()["data"]
+    user_texts = [i["content"][0]["text"] for i in items if i["role"] == "user"]
+    assert "Research monkeys" in user_texts
+    assert "Switch to leopards" in user_texts
+
+    # 2 LLM calls: streaming call + steering continuation.
+    # The streaming path (stream_tokens=True) is handled
+    # identically to non-streaming for steering detection.
+    assert mock_llm.call_count == 2, (
+        f"Expected 2 LLM calls (streaming + steering continuation), got {mock_llm.call_count}"
+    )
+
+    # Second LLM call received the steered message in its input
+    assert call_2.received_kwargs is not None, "Second LLM call was never made"
+    llm_input = str(call_2.received_kwargs["input"])
+    assert "Switch to leopards" in llm_input, (
+        f"Second LLM call input does not contain the steered "
+        f"message — steering was detected but history was not "
+        f"extended. Input: {llm_input}"
+    )
+
+
+async def test_steering_during_llm_retry(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Steering delivered while the LLM call is being retried after
+    a transient error (HTTP 429).
+
+    Race window: the first LLM attempt fails with a retryable
+    error. execute_with_retry sleeps (mocked to zero) and retries.
+    During the retry's blocking gate, a steering message arrives
+    via try_deliver. The retry succeeds, and the steering message
+    is detected in _handle_final_response.
+
+    Breakage this catches:
+    - Steering message lost during retry window
+    - Retry mechanism interferes with inbox state
+    - _handle_final_response doesn't run after a retried call
+    - Steered message not included in the steering continuation
+    """
+    await create_test_agent(client)
+
+    # Skip backoff sleep so tests don't wait 2+ seconds.
+    # The steering mechanism is orthogonal to sleep duration.
+    monkeypatch.setattr(
+        "agent_plane.runtime.llm_retry.time.sleep",
+        lambda _: None,
+    )
+
+    # Call 1: raises HTTP 429 — classified as retryable.
+    # execute_with_retry catches it, emits retry event, retries.
+    fake_request = httpx.Request("POST", "http://test/v1/responses")
+    fake_response = httpx.Response(429, request=fake_request)
+    retryable_error = httpx.HTTPStatusError(
+        "Rate limited",
+        request=fake_request,
+        response=fake_response,
+    )
+    # Error call — not referenced directly; consumed by the retry loop
+    mock_llm.add_call(exception=retryable_error)
+    # Call 2: retry succeeds, blocks so we can inject a steer.
+    call_2 = mock_llm.add_call(
+        text="Retry succeeded",
+        block=True,
+        stream_tokens=True,
+    )
+    # Call 3: steering continuation after _SteeringRetry.
+    call_3 = mock_llm.add_call(text="Steered response")
+
+    first = await create_test_response(
+        client,
+        input_text="Hello",
+    )
+    first_id = first.body["id"]
+    conv_id = first.body["conversation"]["id"]
+
+    # Gate: call_1 fires and raises immediately. execute_with_retry
+    # retries → call_2 fires and blocks.
+    call_2.call_event.wait(timeout=10)
+
+    # Concurrent action: steer while the retry is blocked in
+    # the LLM call.
+    steer = await create_test_response(
+        client,
+        input_text="Change topic",
+        previous_response_id=first_id,
+    )
+    assert steer.body["id"] == first_id
+
+    # Release: retry completes, _handle_final_response detects
+    # the steered message, triggers _SteeringRetry → call_3.
+    call_2.release()
+
+    for _ in range(50):
+        resp = await client.get(f"/v1/responses/{first_id}")
+        if resp.json()["status"] == "completed":
+            break
+    assert resp.json()["status"] == "completed"
+
+    # Verify steering message is in conversation
+    items_resp = await client.get(
+        f"/v1/conversations/{conv_id}/items",
+        params={"limit": 100},
+    )
+    items = items_resp.json()["data"]
+    user_texts = [i["content"][0]["text"] for i in items if i["role"] == "user"]
+    assert "Hello" in user_texts
+    assert "Change topic" in user_texts
+
+    # 3 mock invocations: error (call_1) + retry success (call_2)
+    # + steering continuation (call_3). The agent loop made 2
+    # logical LLM calls (the retry is internal to the @step).
+    assert mock_llm.call_count == 3, (
+        f"Expected 3 mock invocations (error + retry + steering "
+        f"continuation), got {mock_llm.call_count}"
+    )
+
+    # Third call received the steered message
+    assert call_3.received_kwargs is not None, "Steering continuation call was never made"
+    llm_input = str(call_3.received_kwargs["input"])
+    assert "Change topic" in llm_input, (
+        f"Steering continuation did not receive the steered "
+        f"message in its input. Input: {llm_input}"
+    )
+
+
+async def test_foreground_steering_returns_immediately(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    A foreground (background=false) steering request returns the
+    existing in-progress response immediately without blocking.
+
+    All other steering tests use background=true. This verifies
+    that the route layer short-circuits on successful steering
+    regardless of the background flag — _attempt_steering returns
+    a ResponseObject before the background/stream branching logic.
+
+    Race window: workflow is blocked in the LLM call. The
+    foreground steering request hits _attempt_steering, which
+    calls try_deliver (succeeds because inbox is open) and
+    returns the existing ResponseObject. The route returns it
+    immediately — no blocking wait.
+
+    Breakage this catches:
+    - Foreground steering enters _handle_blocking_wait (hangs)
+    - Foreground steering creates a new task instead of delivering
+    - Route layer checks background flag before _attempt_steering
+    """
+    await create_test_agent(client)
+
+    call_1 = mock_llm.add_call(text="First response", block=True)
+    # Steering continuation after _SteeringRetry
+    mock_llm.add_call(text="Steered response")
+
+    # First request: background=true to get ID immediately
+    first = await create_test_response(
+        client,
+        input_text="Hello",
+    )
+    first_id = first.body["id"]
+    conv_id = first.body["conversation"]["id"]
+
+    # Gate: workflow blocked in LLM call
+    call_1.call_event.wait(timeout=10)
+
+    # Concurrent action: steer with background=false.
+    # This MUST return immediately (not block until completion).
+    steer = await create_test_response(
+        client,
+        input_text="Foreground steer",
+        previous_response_id=first_id,
+        background=False,
+    )
+    # Returns the SAME in-progress response — steering delivered,
+    # not a new blocking task.
+    assert steer.body["id"] == first_id
+    assert steer.body["status"] in ("queued", "in_progress"), (
+        f"Foreground steer should return the existing active "
+        f"response, got status={steer.body['status']}"
+    )
+
+    # Release and verify completion
+    call_1.release()
+
+    for _ in range(50):
+        resp = await client.get(f"/v1/responses/{first_id}")
+        if resp.json()["status"] == "completed":
+            break
+    assert resp.json()["status"] == "completed"
+
+    # Verify steered message persisted and processed
+    items_resp = await client.get(
+        f"/v1/conversations/{conv_id}/items",
+        params={"limit": 100},
+    )
+    items = items_resp.json()["data"]
+    user_texts = [i["content"][0]["text"] for i in items if i["role"] == "user"]
+    assert "Hello" in user_texts
+    assert "Foreground steer" in user_texts
+
+    # 2 LLM calls: original + steering continuation
+    assert mock_llm.call_count == 2, (
+        f"Expected 2 LLM calls (original + steering continuation), got {mock_llm.call_count}"
+    )
 
 
 # ── Cancel Races ─────────────────────────────────────────
