@@ -382,22 +382,26 @@ class SqlAlchemyTaskStore(TaskStore):
 
     def get_sync(self, task_id: str) -> Task | None:
         """
-        Synchronous DB-only read of a task row.
+        Synchronous read of a task, enriched with runtime state.
 
-        Returns the task entity **without** DBOS workflow enrichment.
-        Used by DBOS workflow code and tool implementations that
-        run inside an event loop and cannot call async methods.
+        Equivalent to :meth:`get` but callable from synchronous
+        contexts (workflow code, tool implementations) where
+        ``await`` is not available.
 
         :param task_id: Unique task identifier,
             e.g. ``"task_abc123"``.
-        :returns: The :class:`Task` snapshot, or ``None`` if the
-            task does not exist.
+        :returns: The enriched :class:`Task` snapshot, or ``None``
+            if the task does not exist.
         """
         with self._session() as session:
             row = session.get(SqlTask, task_id)
             if row is None:
                 return None
-            return _to_entity(row)
+            task = _to_entity(row)
+        wf_status: WorkflowStatus | None = get_workflow_status(task_id)
+        if wf_status is not None:
+            _apply_workflow_status(task, wf_status)
+        return task
 
     async def wait(self, task_id: str, timeout: float | None = None) -> Task:
         """

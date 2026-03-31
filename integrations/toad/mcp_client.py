@@ -7,7 +7,6 @@ discovers tools via ``tools/list``, and executes them via
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
 from contextlib import AsyncExitStack
@@ -48,15 +47,9 @@ class McpConnection:
 
     server_params: StdioServerParameters
     server_name: str
-    _session: ClientSession | None = field(
-        default=None, repr=False
-    )
-    _exit_stack: AsyncExitStack | None = field(
-        default=None, repr=False
-    )
-    _tools: list[ToolSchema] = field(
-        default_factory=list, repr=False
-    )
+    _session: ClientSession | None = field(default=None, repr=False)
+    _exit_stack: AsyncExitStack | None = field(default=None, repr=False)
+    _tools: list[ToolSchema] = field(default_factory=list, repr=False)
 
     async def connect(self) -> list[ToolSchema]:
         """Start the MCP server subprocess and discover tools.
@@ -72,9 +65,7 @@ class McpConnection:
         )
         await self._session.initialize()
         result = await self._session.list_tools()
-        self._tools = [
-            _mcp_tool_to_schema(tool) for tool in result.tools
-        ]
+        self._tools = [_mcp_tool_to_schema(tool) for tool in result.tools]
         log.info(
             "MCP server %s: discovered %d tools",
             self.server_name,
@@ -82,9 +73,7 @@ class McpConnection:
         )
         return self._tools
 
-    async def call_tool(
-        self, name: str, arguments: dict[str, Any]
-    ) -> str:
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         """Execute a tool call on this MCP server.
 
         :param name: Tool name to invoke.
@@ -93,12 +82,8 @@ class McpConnection:
         :raises RuntimeError: If not connected.
         """
         if self._session is None:
-            raise RuntimeError(
-                f"MCP server {self.server_name!r} not connected"
-            )
-        result: CallToolResult = await self._session.call_tool(
-            name, arguments
-        )
+            raise RuntimeError(f"MCP server {self.server_name!r} not connected")
+        result: CallToolResult = await self._session.call_tool(name, arguments)
         return _extract_text(result)
 
     async def close(self) -> None:
@@ -135,7 +120,8 @@ def _mcp_tool_to_schema(tool: Any) -> ToolSchema:
             "function": {
                 "name": tool.name,
                 "description": tool.description or "",
-                "parameters": tool.inputSchema or {
+                "parameters": tool.inputSchema
+                or {
                     "type": "object",
                     "properties": {},
                 },

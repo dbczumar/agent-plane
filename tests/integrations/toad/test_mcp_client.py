@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from mcp.client.stdio import StdioServerParameters
-
 from integrations.toad.mcp_client import (
-    ToolSchema,
     _extract_text,
     _mcp_tool_to_schema,
     parse_mcp_server_params,

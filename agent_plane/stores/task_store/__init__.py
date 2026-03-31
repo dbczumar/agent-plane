@@ -160,18 +160,16 @@ class TaskStore(ABC):
     @abstractmethod
     def get_sync(self, task_id: str) -> Task | None:
         """
-        Synchronous, DB-only read of a task row.
+        Synchronous equivalent of :meth:`get`.
 
-        Returns the task entity **without** runtime execution state
-        enrichment (status/output from the execution engine). This
-        is sufficient when callers only need persisted fields like
-        ``root_task_id`` or ``agent_name``, and is safe to call
-        from synchronous contexts (workflow code, tool
-        implementations) where ``await`` is not available.
+        Returns the fully enriched task (DB state + runtime
+        execution state). Safe to call from synchronous contexts
+        (workflow code, tool implementations) where ``await`` is
+        not available.
 
         :param task_id: Unique task identifier,
             e.g. ``"task_abc123"``.
-        :returns: The :class:`Task` snapshot, or ``None``.
+        :returns: The enriched :class:`Task` snapshot, or ``None``.
         """
         ...
 
