@@ -1369,6 +1369,9 @@ async def test_patch_response_not_found(
         json={"tool_results": [{"call_id": "c1", "output": "x"}]},
     )
     assert resp.status_code == 404
+    body = resp.json()
+    assert body["error"]["code"] == "not_found"
+    assert "not found" in body["error"]["message"].lower()
 
 
 async def test_patch_response_call_id_not_found(
@@ -1549,10 +1552,24 @@ async def test_spawn_sub_agent_creates_child_task(
     assert result.body["status"] == "completed"
     assert result.body["model"] == "orchestrator"
 
-    # The parent's output should contain the final text message
+    # The parent's output should contain the final text message with one of the
+    # mock LLM's responses, proving data traversed the full pipeline. The parent
+    # and sub-agent workflows run concurrently and share a FIFO mock queue, so
+    # either mock text may end up as the parent's final output depending on
+    # thread scheduling.
+    expected_texts = {
+        "Python 3.14 introduces JIT compilation.",
+        "Based on research: Python 3.14 has JIT.",
+    }
     output = result.body["output"]
     text_items = [item for item in output if item.get("type") == "message"]
     assert len(text_items) >= 1, f"Expected at least one message in output, got: {output}"
+    final_msg = text_items[-1]
+    assert final_msg["role"] == "assistant"
+    actual_texts = {c.get("text") for c in final_msg["content"]}
+    assert actual_texts & expected_texts, (
+        f"Expected one of {expected_texts} in final message, got: {final_msg['content']}"
+    )
 
     # Verify mock LLM was called at least 3 times:
     # 1 = parent spawn, 2 = sub-agent, 3 = parent final
