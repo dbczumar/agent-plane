@@ -588,17 +588,16 @@ def _replay_function_call_item(
         ``name``, and ``arguments`` fields.
     :returns: Single ``tool_call`` update.
     """
-    # call_id, name, arguments are required per API.md item schema
+    # call_id, name are required per API.md item schema
     call_id = str(item["call_id"])
     name = str(item["name"])
-    arguments = str(item["arguments"])
     return [
         {
             "sessionUpdate": "tool_call",
             "toolCallId": call_id,
             "title": name,
+            "kind": "other",
             "status": "completed",
-            "tool": {"name": name, "parameters": arguments},
         }
     ]
 
@@ -620,7 +619,12 @@ def _replay_function_call_output_item(
             "sessionUpdate": "tool_call_update",
             "toolCallId": call_id,
             "status": "completed",
-            "content": {"type": "text", "text": output},
+            "content": [
+                {
+                    "type": "content",
+                    "content": {"type": "text", "text": output},
+                }
+            ],
         }
     ]
 
@@ -819,10 +823,15 @@ async def _execute_and_patch_tools(
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": call_id,
                     "status": "completed",
-                    "content": {
-                        "type": "text",
-                        "text": output,
-                    },
+                    "content": [
+                        {
+                            "type": "content",
+                            "content": {
+                                "type": "text",
+                                "text": output,
+                            },
+                        }
+                    ],
                 },
             },
         )

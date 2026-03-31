@@ -81,11 +81,8 @@ def test_function_call_item_done_produces_tool_call(
     assert update["sessionUpdate"] == "tool_call"
     assert update["toolCallId"] == "call_abc"
     assert update["title"] == "search.web"
-    assert update["status"] == "running"
-    tool = update["tool"]
-    assert isinstance(tool, dict)
-    assert tool["name"] == "search.web"
-    assert tool["parameters"] == '{"query": "test"}'
+    assert update["kind"] == "other"
+    assert update["status"] == "in_progress"
 
 
 def test_function_call_output_produces_tool_call_update(
@@ -107,9 +104,11 @@ def test_function_call_output_produces_tool_call_update(
     assert update["sessionUpdate"] == "tool_call_update"
     assert update["toolCallId"] == "call_abc"
     assert update["status"] == "completed"
-    content = update["content"]
-    assert isinstance(content, dict)
-    assert content["text"] == '{"results": [1, 2]}'
+    content_list = update["content"]
+    assert isinstance(content_list, list)
+    assert len(content_list) == 1
+    assert content_list[0]["type"] == "content"
+    assert content_list[0]["content"]["text"] == '{"results": [1, 2]}'
 
 
 def test_response_completed_captures_response_id(
@@ -338,6 +337,7 @@ def test_native_tool_item_produces_completed_tool_call(
     assert update["sessionUpdate"] == "tool_call"
     assert update["toolCallId"] == "ws_123"
     assert update["title"] == "web_search_call"
+    assert update["kind"] == "other"
     assert update["status"] == "completed"
 
 

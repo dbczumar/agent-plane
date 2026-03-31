@@ -176,11 +176,8 @@ def _on_item_done(translator: EventTranslator, data: dict[str, object]) -> list[
                 "sessionUpdate": "tool_call",
                 "toolCallId": call_id,
                 "title": name,
-                "status": "running",
-                "tool": {
-                    "name": name,
-                    "parameters": arguments,
-                },
+                "kind": "other",
+                "status": "in_progress",
             }
         )
     elif item_type == "function_call_output":
@@ -213,7 +210,12 @@ def _on_function_call_output_item(
             "sessionUpdate": "tool_call_update",
             "toolCallId": call_id,
             "status": "completed",
-            "content": {"type": "text", "text": output},
+            "content": [
+                {
+                    "type": "content",
+                    "content": {"type": "text", "text": output},
+                }
+            ],
         }
     ]
 
@@ -423,13 +425,8 @@ def _on_native_tool_item(
             "sessionUpdate": "tool_call",
             "toolCallId": call_id,
             "title": item_type,
+            "kind": "other",
             "status": "completed",
-            "tool": {
-                "name": item_type,
-                # Native tools have no user-visible parameters;
-                # ACP requires a string value here.
-                "parameters": "",
-            },
         }
     ]
 

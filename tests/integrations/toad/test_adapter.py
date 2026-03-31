@@ -334,6 +334,7 @@ def test_replay_function_call_item() -> None:
     assert len(updates) == 1
     assert updates[0]["sessionUpdate"] == "tool_call"
     assert updates[0]["toolCallId"] == "call_1"
+    assert updates[0]["kind"] == "other"
     # Replayed tool calls show as completed (historical)
     assert updates[0]["status"] == "completed"
 
@@ -348,7 +349,9 @@ def test_replay_function_call_output_item() -> None:
     updates = _replay_item(item)
     assert len(updates) == 1
     assert updates[0]["sessionUpdate"] == "tool_call_update"
-    assert updates[0]["content"]["text"] == "search results here"
+    content_list = updates[0]["content"]
+    assert isinstance(content_list, list)
+    assert content_list[0]["content"]["text"] == "search results here"
 
 
 def test_replay_reasoning_item() -> None:
