@@ -318,27 +318,42 @@ def test_response_retry_emits_thought_chunk(
     assert "Attempt 2 of 3" in content["text"]
 
 
-def test_native_tool_item_produces_completed_tool_call(
+def test_native_tool_item_produces_call_and_update(
     translator: EventTranslator,
 ) -> None:
-    """Native tool items (web_search_call) produce completed tool_call."""
+    """Native tool items produce both tool_call and tool_call_update."""
     updates = translator.translate(
         "response.output_item.done",
         {
             "item": {
                 "type": "web_search_call",
                 "id": "ws_123",
-                "query": "test search",
+                "search_results": [
+                    {
+                        "title": "Example",
+                        "url": "https://example.com",
+                        "snippet": "A test result",
+                    }
+                ],
             }
         },
     )
-    assert len(updates) == 1
-    update = updates[0]
-    assert update["sessionUpdate"] == "tool_call"
+    # Should emit both a tool_call and a tool_call_update
+    assert len(updates) == 2
+    call = updates[0]
+    assert call["sessionUpdate"] == "tool_call"
+    assert call["toolCallId"] == "ws_123"
+    assert call["title"] == "Web Search"
+    assert call["kind"] == "fetch"
+    assert call["status"] == "completed"
+    update = updates[1]
+    assert update["sessionUpdate"] == "tool_call_update"
     assert update["toolCallId"] == "ws_123"
-    assert update["title"] == "web_search_call"
-    assert update["kind"] == "other"
-    assert update["status"] == "completed"
+    content_list = update["content"]
+    assert isinstance(content_list, list)
+    text = content_list[0]["content"]["text"]
+    assert "Example" in text
+    assert "https://example.com" in text
 
 
 def test_response_failed_captures_conversation_id(

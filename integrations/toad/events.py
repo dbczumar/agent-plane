@@ -407,28 +407,96 @@ def _on_response_retry(
 def _on_native_tool_item(
     item: dict[str, object],
 ) -> list[dict[str, object]]:
-    """Emit a completed ``tool_call`` for a native tool item.
+    """Emit a ``tool_call`` + ``tool_call_update`` for a native tool.
 
     Native tools (e.g. ``web_search_call``, ``file_search_call``)
     are not function_call/function_call_output — they are
     platform-provided tool invocations that complete inline.
+    Emits both the call and an update with content so Toad can
+    display the output when expanded.
 
     :param item: The completed item dict from the SSE payload.
-    :returns: Single ``tool_call`` update with ``"completed"``
-        status.
+    :returns: A ``tool_call`` and ``tool_call_update`` pair.
     """
     item_type = str(item.get("type", ""))
     # Use item id as toolCallId; fall back to type for uniqueness
     call_id = str(item.get("id", item_type))
+    content_text = _extract_native_tool_content(item)
     return [
         {
             "sessionUpdate": "tool_call",
             "toolCallId": call_id,
-            "title": item_type,
-            "kind": "other",
+            "title": _humanize_tool_type(item_type),
+            "kind": "fetch",
             "status": "completed",
-        }
+        },
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": call_id,
+            "status": "completed",
+            "content": [
+                {
+                    "type": "content",
+                    "content": {"type": "text", "text": content_text},
+                }
+            ],
+        },
     ]
+
+
+def _extract_native_tool_content(
+    item: dict[str, object],
+) -> str:
+    """Extract displayable content from a native tool item.
+
+    Handles ``web_search_call`` (has ``search_results`` list)
+    and falls back to a JSON summary for unknown types.
+
+    :param item: The native tool item dict.
+    :returns: A human-readable text summary of the tool output.
+    """
+    import json as _json
+
+    # web_search_call has a "search_results" field
+    results = item.get("search_results")
+    if isinstance(results, list):
+        lines: list[str] = []
+        for result in results:
+            if isinstance(result, dict):
+                title = result.get("title", "")
+                url = result.get("url", "")
+                snippet = result.get("snippet", "")
+                lines.append(f"- [{title}]({url})")
+                if snippet:
+                    lines.append(f"  {snippet}")
+        if lines:
+            return "\n".join(lines)
+    # file_search_call has "results" with file references
+    file_results = item.get("results")
+    if isinstance(file_results, list):
+        lines = []
+        for result in file_results:
+            if isinstance(result, dict):
+                filename = result.get("filename", "")
+                text = result.get("text", "")
+                lines.append(f"- {filename}: {text[:200]}")
+        if lines:
+            return "\n".join(lines)
+    # Fallback: show key fields as text
+    skip_keys = {"type", "id", "status"}
+    summary = {k: v for k, v in item.items() if k not in skip_keys}
+    if summary:
+        return _json.dumps(summary, indent=2, default=str)
+    return f"({item.get('type', 'unknown')} completed)"
+
+
+def _humanize_tool_type(item_type: str) -> str:
+    """Convert an item type like ``web_search_call`` to a title.
+
+    :param item_type: The raw item type string.
+    :returns: A human-readable title, e.g. ``"Web Search"``.
+    """
+    return item_type.replace("_call", "").replace("_", " ").title()
 
 
 # Map of agent-plane SSE event type -> handler function.
