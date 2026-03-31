@@ -121,6 +121,13 @@ Check each file against this checklist:
       code reimplementing store-level validation).
     - Exposing internal state or implementation details through a
       public interface.
+    - **Bypassing store interfaces to query the database directly.**
+      Never import DB models (`SqlTask`, `SqlConversation`, etc.) or
+      call `store._session()` from code outside the store
+      implementation. If the store interface is missing a method you
+      need, add it to the abstract base class and implement it — don't
+      work around the gap with raw SQL. This breaks if we ever swap
+      store backends.
     If a needed abstraction doesn't exist, create it rather than
     working around the gap.
 

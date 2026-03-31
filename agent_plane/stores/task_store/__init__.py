@@ -159,6 +159,24 @@ class TaskStore(ABC):
         ...
 
     @abstractmethod
+    def get_sync(self, task_id: str) -> Task | None:
+        """
+        Synchronous variant of :meth:`get` for use inside DBOS
+        workflows and tool implementations where an event loop is
+        already running.
+
+        Returns the task entity from the database **without** DBOS
+        workflow enrichment (status/output from the DBOS runtime).
+        This is sufficient when callers only need DB-persisted
+        fields like ``root_task_id`` or ``agent_name``.
+
+        :param task_id: Unique task identifier,
+            e.g. ``"task_abc123"``.
+        :returns: The :class:`Task` snapshot, or ``None``.
+        """
+        ...
+
+    @abstractmethod
     async def wait(self, task_id: str, timeout: float | None = None) -> Task:
         """
         Await until the task reaches a terminal state and return

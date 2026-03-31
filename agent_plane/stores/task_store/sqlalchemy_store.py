@@ -380,6 +380,25 @@ class SqlAlchemyTaskStore(TaskStore):
             task = _to_entity(row)
         return await _enrich_from_dbos(task)
 
+    def get_sync(self, task_id: str) -> Task | None:
+        """
+        Synchronous DB-only read of a task row.
+
+        Returns the task entity **without** DBOS workflow enrichment.
+        Used by DBOS workflow code and tool implementations that
+        run inside an event loop and cannot call async methods.
+
+        :param task_id: Unique task identifier,
+            e.g. ``"task_abc123"``.
+        :returns: The :class:`Task` snapshot, or ``None`` if the
+            task does not exist.
+        """
+        with self._session() as session:
+            row = session.get(SqlTask, task_id)
+            if row is None:
+                return None
+            return _to_entity(row)
+
     async def wait(self, task_id: str, timeout: float | None = None) -> Task:
         """
         Await until the task reaches a terminal state and return

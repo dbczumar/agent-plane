@@ -479,17 +479,11 @@ def _resolve_agent_name(task_id: str) -> str:
         e.g. ``"task_child1"``.
     :returns: The agent name, or ``"unknown"`` if not found.
     """
-    from agent_plane.db.db_models import SqlTask
     from agent_plane.runtime import get_task_store
 
-    task_store = get_task_store()
-    # SqlAlchemyTaskStore exposes _session for internal use.
-    # CollectTool is infrastructure code in the same package.
-    with task_store._session() as session:  # type: ignore[attr-defined]
-        row = session.get(SqlTask, task_id)
-        if row is not None:
-            agent_name: str = row.agent_name
-            return agent_name
+    task = get_task_store().get_sync(task_id)
+    if task is not None:
+        return task.agent_name
     return "unknown"
 
 

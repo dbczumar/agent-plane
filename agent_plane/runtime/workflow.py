@@ -566,15 +566,11 @@ def _maybe_inject_spawn_args(
 
     # Determine root_task_id: propagate from parent if set,
     # otherwise this task IS the root.
-    from agent_plane.db.db_models import SqlTask
-
-    task_store = get_task_store()
-    with task_store._session() as session:  # type: ignore[attr-defined]
-        row = session.get(SqlTask, task_id)
-        if row is not None and row.root_task_id is not None:
-            args["root_task_id"] = row.root_task_id
-        else:
-            args["root_task_id"] = task_id
+    task = get_task_store().get_sync(task_id)
+    if task is not None and task.root_task_id is not None:
+        args["root_task_id"] = task.root_task_id
+    else:
+        args["root_task_id"] = task_id
 
     args["agent_id"] = agent_id
     return json.dumps(args)
@@ -1726,27 +1722,18 @@ def _resolve_spec(
         sub-agent name recorded on the task is not found in the
         spec tree.
     """
-    task_store = get_task_store()
+    task = get_task_store().get_sync(task_id)
+    if task is None:
+        raise LookupError(f"task {task_id!r} not found")
 
-    # Read the task row to check if this is a sub-agent.
-    # Uses a sync DB read (create/close_inbox are also sync).
-    with task_store._session() as session:  # type: ignore[attr-defined]
-        from agent_plane.db.db_models import SqlTask
-
-        row = session.get(SqlTask, task_id)
-        if row is None:
-            raise LookupError(f"task {task_id!r} not found")
-        root_task_id = row.root_task_id
-        agent_name = row.agent_name
-
-    if root_task_id is None:
+    if task.root_task_id is None:
         # Top-level task — this workflow IS the root agent
         return root_spec
 
     # Sub-agent — find spec by agent_name in the tree
-    sub_spec = _find_sub_agent_spec(root_spec, agent_name)
+    sub_spec = _find_sub_agent_spec(root_spec, task.agent_name)
     if sub_spec is None:
-        raise LookupError(f"sub-agent {agent_name!r} not found in spec tree")
+        raise LookupError(f"sub-agent {task.agent_name!r} not found in spec tree")
     return sub_spec
 
 
