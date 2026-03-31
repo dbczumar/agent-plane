@@ -222,40 +222,54 @@ async def test_create_response_with_instructions(
 
 async def test_create_response_with_reasoning(
     client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
 ) -> None:
-    """Reasoning config is returned on creation and survives a GET round-trip."""
+    """Per-request reasoning persists and propagates to the LLM call."""
     await create_test_agent(client)
+    mock_llm.add_call(text="Reasoned response.")
     reasoning = {"effort": "high"}
-    result = await create_test_response(client, reasoning=reasoning)
+    result = await create_test_response(client, reasoning=reasoning, background=False)
     assert result.body["reasoning"] == reasoning
 
     # Verify reasoning survives a GET round-trip
     resp = await client.get(f"/v1/responses/{result.body['id']}")
     assert resp.json()["reasoning"] == reasoning
 
+    # Verify the LLM actually received the reasoning parameter
+    assert mock_llm.call_count == 1
+    received = mock_llm.get_call(0).received_kwargs
+    assert received is not None
+    llm_reasoning = received.get("reasoning")
+    assert llm_reasoning is not None, "per-request reasoning must propagate to the LLM call"
+    assert llm_reasoning["effort"] == "high"
+    assert "summary" in llm_reasoning
+
 
 async def test_agent_reasoning_effort_reaches_llm(
     client: httpx.AsyncClient,
     mock_llm: ControllableMockClient,
 ) -> None:
-    """Agent spec reasoning_effort propagates to the LLM call.
+    """Agent spec reasoning_effort propagates to the LLM call,
+    and per-request reasoning overrides it.
 
-    Deploys an agent with ``reasoning_effort: high`` in its LLM
-    config and verifies the LLM receives
-    ``reasoning={"effort": "high", "summary": "detailed"}``.
+    1. Deploys agent with ``reasoning_effort: medium``
+    2. Verifies the LLM receives ``reasoning.effort == "medium"``
+    3. Sends a second request with ``reasoning: {effort: "low"}``
+    4. Verifies the LLM receives ``reasoning.effort == "low"``
+       (per-request overrides agent spec)
     """
     import io
     import tarfile
 
     import yaml
 
-    # Deploy agent with reasoning_effort in its spec
+    # Deploy agent with reasoning_effort: medium in its spec
     config = {
         "spec_version": 1,
         "name": "reasoning-agent",
         "llm": {
             "model": "reasoning-agent",
-            "reasoning_effort": "high",
+            "reasoning_effort": "medium",
         },
     }
     config_bytes = yaml.dump(config).encode()
@@ -276,7 +290,8 @@ async def test_agent_reasoning_effort_reaches_llm(
     )
     assert resp.status_code == 201
 
-    mock_llm.add_call(text="Deep thought.")
+    # --- Call 1: spec-level reasoning_effort = medium ---
+    mock_llm.add_call(text="Medium thought.")
     result = await create_test_response(
         client,
         model="reasoning-agent",
@@ -284,7 +299,7 @@ async def test_agent_reasoning_effort_reaches_llm(
     )
     assert result.body["status"] == "completed"
 
-    # Verify the LLM received the reasoning parameter
+    # LLM should receive effort="medium" from the agent spec
     assert mock_llm.call_count == 1
     received = mock_llm.get_call(0).received_kwargs
     assert received is not None
@@ -293,20 +308,29 @@ async def test_agent_reasoning_effort_reaches_llm(
         "reasoning_effort from agent spec must propagate to "
         "the LLM call as the 'reasoning' parameter"
     )
-    assert llm_reasoning["effort"] == "high"
-    # summary="detailed" enables reasoning summary streaming
+    assert llm_reasoning["effort"] == "medium"
     assert llm_reasoning["summary"] == "detailed"
 
-    # Verify the LLM actually received the reasoning parameter
-    assert mock_llm.call_count == 1
-    received = mock_llm.get_call(0).received_kwargs
-    assert received is not None
-    llm_reasoning = received.get("reasoning")
-    assert llm_reasoning is not None
-    # effort from the request is forwarded; summary is added by the
-    # workflow to enable reasoning summary streaming events
-    assert llm_reasoning["effort"] == "high"
-    assert "summary" in llm_reasoning
+    # --- Call 2: per-request reasoning overrides to low ---
+    mock_llm.add_call(text="Quick thought.")
+    result2 = await create_test_response(
+        client,
+        model="reasoning-agent",
+        reasoning={"effort": "low"},
+        background=False,
+    )
+    assert result2.body["status"] == "completed"
+
+    # LLM should receive effort="low" — per-request overrides spec
+    assert mock_llm.call_count == 2
+    received2 = mock_llm.get_call(1).received_kwargs
+    assert received2 is not None
+    llm_reasoning2 = received2.get("reasoning")
+    assert llm_reasoning2 is not None, (
+        "per-request reasoning must override agent spec reasoning_effort"
+    )
+    assert llm_reasoning2["effort"] == "low"
+    assert llm_reasoning2["summary"] == "detailed"
 
 
 async def test_create_response_with_previous_response_id(

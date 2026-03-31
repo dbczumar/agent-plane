@@ -6,7 +6,6 @@ All durably checkpointed for crash recovery.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from collections.abc import Iterator
@@ -47,6 +46,7 @@ from agent_plane.spec import AgentSpec
 from agent_plane.spec.types import LLMConfig, RetryConfig, ToolsConfig
 from agent_plane.stores import ConversationStore, TaskStore
 from agent_plane.tools import ToolManager
+from agent_plane.tools.base import ToolContext
 from agent_plane.tools.client_specified import (
     ClientSideToolSpec,
     parse_client_side_tool_specs,
@@ -237,6 +237,38 @@ class _ResponsesCallArgs:
 
     kwargs: dict[str, Any]
     reasoning: dict[str, str] | None
+
+
+def _apply_request_reasoning(
+    llm_config: LLMConfig,
+    reasoning: dict[str, str] | None,
+) -> LLMConfig:
+    """Merge per-request reasoning into the agent's LLM config.
+
+    When the request includes ``reasoning.effort``, it overrides
+    the agent spec's ``reasoning_effort`` in ``extra``. Returns
+    a new :class:`LLMConfig` with the merged extra dict — the
+    original is not mutated.
+
+    :param llm_config: The agent spec's LLM config.
+    :param reasoning: Per-request reasoning dict, e.g.
+        ``{"effort": "high"}``, or ``None``.
+    :returns: A (possibly new) :class:`LLMConfig` with the
+        merged reasoning effort.
+    """
+    if reasoning is None:
+        return llm_config
+    effort = reasoning.get("effort")
+    if effort is None:
+        return llm_config
+    merged_extra = {**llm_config.extra, "reasoning_effort": effort}
+    return LLMConfig(
+        model=llm_config.model,
+        extra=merged_extra,
+        connection=llm_config.connection,
+        timeout=llm_config.timeout,
+        retry=llm_config.retry,
+    )
 
 
 def _build_responses_args(
@@ -529,55 +561,10 @@ def _accumulate_stream(
     }
 
 
-def _maybe_inject_spawn_args(
-    tool_name: str,
-    arguments: str,
-    task_id: str,
-    agent_id: str,
-) -> str:
-    """
-    Inject server-side context into ``spawn_sub_agents`` arguments.
-
-    For ``spawn_sub_agents`` calls, injects ``root_task_id`` and
-    ``agent_id`` into the arguments JSON. These fields are
-    invisible to the LLM — the agent loop adds them before
-    dispatch. For all other tools, returns arguments unchanged.
-
-    ``root_task_id`` propagation: if the current task already has
-    a ``root_task_id`` (it's a sub-agent itself), that value is
-    propagated. Otherwise, the current task's own ID is used as
-    the root. This ensures ``root_task_id`` always points to the
-    original top-level task regardless of nesting depth.
-
-    :param tool_name: The tool function name, e.g.
-        ``"spawn_sub_agents"``.
-    :param arguments: JSON-encoded arguments from the LLM.
-    :param task_id: The current task/workflow ID,
-        e.g. ``"task_abc123"``.
-    :param agent_id: The registered agent ID,
-        e.g. ``"ag_xyz789"``.
-    :returns: The (possibly augmented) arguments string.
-    """
-    if tool_name != "spawn_sub_agents":
-        return arguments
-
-    args = json.loads(arguments)
-
-    # Determine root_task_id: propagate from parent if set,
-    # otherwise this task IS the root.
-    task = get_task_store().get_sync(task_id)
-    if task is not None and task.root_task_id is not None:
-        args["root_task_id"] = task.root_task_id
-    else:
-        args["root_task_id"] = task_id
-
-    args["agent_id"] = agent_id
-    return json.dumps(args)
-
-
 @step()
 def _call_tool(
     task_id: str,
+    agent_id: str,
     tool_name: str,
     arguments: str,
     timeout: int,
@@ -587,6 +574,10 @@ def _call_tool(
     Route a tool call to the current workflow's ToolManager
     with timeout enforcement and retry.
 
+    Constructs a :class:`ToolContext` from the serializable
+    ``task_id`` and ``agent_id`` parameters so the context
+    survives DBOS replay.
+
     Retries are handled inside this ``@step`` boundary so they
     don't cause duplicate checkpoints. On exhausted retries,
     an error string is returned (not raised) so the LLM can
@@ -594,6 +585,8 @@ def _call_tool(
 
     :param task_id: The task identifier for SSE event emission,
         e.g. ``"task_abc123"``.
+    :param agent_id: The registered agent ID,
+        e.g. ``"ag_xyz789"``.
     :param tool_name: The tool function name, e.g.
         ``"load_skill"``.
     :param arguments: JSON-encoded arguments string from the
@@ -604,9 +597,10 @@ def _call_tool(
         if all retries are exhausted.
     """
     mgr = get_tool_manager()
+    ctx = ToolContext(task_id=task_id, agent_id=agent_id)
     return execute_tool_with_retry(
         tool_name=tool_name,
-        call_fn=lambda: mgr.call_tool(tool_name, arguments),
+        call_fn=lambda: mgr.call_tool(tool_name, arguments, ctx),
         timeout=timeout,
         retry_config=retry_config,
         on_event=lambda event: _write_output(task_id, event),
@@ -1031,22 +1025,17 @@ def _execute_tools(
     :param output_items: Mutable list of API-format output
         dicts. Extended in place.
     :param conv_store: The ConversationStore for persistence.
-    :param agent_id: The registered agent ID for sub-agent
-        argument injection, e.g. ``"ag_abc123"``.
+    :param agent_id: The registered agent ID, passed through
+        to :class:`ToolContext`, e.g. ``"ag_abc123"``.
     :returns: The ID of the last persisted tool output item.
     """
     last_seen: str | None = None
     for tc in tool_calls:
-        arguments = _maybe_inject_spawn_args(
-            tc.name,
-            tc.arguments,
-            task_id,
-            agent_id,
-        )
         result = _call_tool(
             task_id,
+            agent_id,
             tc.name,
-            arguments,
+            tc.arguments,
             tools_config.timeout,
             tools_config.retry,
         )
@@ -1147,8 +1136,8 @@ def _handle_tool_calls(
     :param llm_resp: The LLM response dict containing tool calls.
     :param agent_name: The agent's registered name, e.g.
         ``"research-agent"``.
-    :param agent_id: The registered agent ID for sub-agent
-        argument injection, e.g. ``"ag_abc123"``.
+    :param agent_id: The registered agent ID, passed through
+        to :class:`ToolContext`, e.g. ``"ag_abc123"``.
     :param tools_config: The agent's global tools config with
         default timeout and retry policy.
     :param history: Mutable conversation history. Extended in place
@@ -1517,6 +1506,7 @@ def _run_agent_loop(
     agent_id: str,
     instructions: str | None,
     tool_mgr: ToolManager,
+    reasoning: dict[str, str] | None = None,
 ) -> _AgentLoopResult:
     """
     Core agent loop: load history, call LLM, dispatch to
@@ -1536,6 +1526,10 @@ def _run_agent_loop(
     :param instructions: Optional per-request instructions
         to include in the system message.
     :param tool_mgr: The ToolManager for this workflow.
+    :param reasoning: Optional per-request reasoning config,
+        e.g. ``{"effort": "high"}``. When provided, the
+        ``effort`` value overrides the agent spec's
+        ``reasoning_effort``.
     :returns: A :class:`_AgentLoopResult` describing the
         terminal state of the loop.
     """
@@ -1548,7 +1542,7 @@ def _run_agent_loop(
     output_items: list[dict[str, Any]] = []
     # spec.llm is guaranteed non-None — checked by caller
     assert spec.llm is not None
-    llm_config = spec.llm
+    llm_config = _apply_request_reasoning(spec.llm, reasoning)
     tools_config = spec.tools
     # Per-task cache for resolved file_id → base64 content.
     # Shared across iterations so the same file is fetched and
@@ -1765,8 +1759,9 @@ def agent_execution_workflow(
     :param instructions: Optional per-request instructions
         to include in the system message.
     :param reasoning: Optional reasoning configuration dict,
-        e.g. ``{"effort": "high"}``. Persisted for recovery;
-        not yet consumed by the loop.
+        e.g. ``{"effort": "high"}``. When provided, the
+        ``effort`` value overrides the agent spec's
+        ``reasoning_effort`` for this execution.
     :param tools: Optional list of client-specified tool dicts in
         standard OpenAI function format. When the LLM invokes one,
         the ``function_call`` output items are returned to the caller
@@ -1818,6 +1813,7 @@ def agent_execution_workflow(
             agent_id,
             instructions,
             tool_mgr,
+            reasoning=reasoning,
         )
         return result.to_dict(task_id)
     except Exception:
