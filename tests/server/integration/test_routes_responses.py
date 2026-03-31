@@ -57,9 +57,14 @@ async def test_create_response_foreground(client: httpx.AsyncClient) -> None:
     assert len(msg["content"][0]["text"]) > 0
 
 
-async def test_create_response_streaming(client: httpx.AsyncClient) -> None:
+async def test_create_response_streaming(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
     """stream=True returns SSE events in the correct sequence."""
     await create_test_agent(client)
+    # stream_tokens=True so the workflow emits text delta events
+    mock_llm.add_call(text="Hello world", stream_tokens=True)
 
     events: list[tuple[str, dict[str, Any] | str]] = []
     async with aconnect_sse(
@@ -98,10 +103,27 @@ async def test_create_response_streaming(client: httpx.AsyncClient) -> None:
     assert msg["type"] == "message"
     assert msg["role"] == "assistant"
 
-    # At least one output_item.done event with the assistant message
-    item_done_events = [e for e in events if e[0] == "response.output_item.done"]
+    # Text delta events were emitted during streaming
+    text_deltas = [
+        e for e in events
+        if e[0] == "response.output_text.delta"
+    ]
+    assert len(text_deltas) >= 1
+    # Each delta has a non-empty string
+    for _, delta_data in text_deltas:
+        assert isinstance(delta_data["delta"], str)
+        assert len(delta_data["delta"]) > 0
+    # Concatenated deltas contain the full mock text
+    # (tokenizer may add trailing whitespace)
+    full_text = "".join(d[1]["delta"] for d in text_deltas)
+    assert "Hello world" in full_text
+
+    # output_item.done event has the assistant message
+    item_done_events = [
+        e for e in events
+        if e[0] == "response.output_item.done"
+    ]
     assert len(item_done_events) >= 1
-    # The item contains the actual assistant message content
     done_item = item_done_events[0][1]["item"]
     assert done_item["type"] == "message"
     assert done_item["role"] == "assistant"
