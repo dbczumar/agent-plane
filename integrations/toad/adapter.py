@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -49,6 +50,9 @@ class SessionState:
     tool_schemas: list[dict[str, object]] = field(default_factory=list)
     # Lookup from tool name to the MCP connection that owns it
     _tool_to_connection: dict[str, McpConnection] = field(default_factory=dict)
+    # Tool results from the last tool execution round, sent as
+    # function_call_output input blocks in the continuation request
+    _last_tool_results: list[dict[str, str]] = field(default_factory=list)
 
 
 def create_adapter(
@@ -66,6 +70,8 @@ def create_adapter(
     """
     rpc = Server()
     sessions: dict[str, SessionState] = {}
+    # Stored from initialize handshake, used when creating sessions
+    client_capabilities: dict[str, object] = {}
     client = httpx.AsyncClient(
         base_url=server_url,
         timeout=httpx.Timeout(
@@ -88,6 +94,9 @@ def create_adapter(
             "clientCapabilities": {...}, "clientInfo": {...}}``.
         :returns: Protocol version and agent capabilities.
         """
+        caps = params.get("clientCapabilities", {})
+        if isinstance(caps, dict):
+            client_capabilities.update(caps)
         return {
             "protocolVersion": _PROTOCOL_VERSION,
             "agentCapabilities": {
@@ -125,6 +134,9 @@ def create_adapter(
         # cwd is required by ACP session/new spec
         cwd = str(params["cwd"])
         session = SessionState(cwd=cwd)
+        # Register built-in tools from capabilities captured
+        # during the initialize handshake
+        _register_builtin_tools(session, client_capabilities)
         # Connect to MCP servers and discover tools
         mcp_servers_raw = params.get("mcpServers", [])
         if isinstance(mcp_servers_raw, list):
@@ -745,9 +757,21 @@ def _build_continuation_payload(
     :param session: Session with updated response_id and tools.
     :returns: A payload dict for the next ``POST /v1/responses``.
     """
+    # Include tool results as function_call_output input blocks
+    # so agent-plane persists them and the LLM sees them.
+    input_blocks: list[dict[str, object]] = []
+    for result in session._last_tool_results:
+        input_blocks.append(
+            {
+                "type": "function_call_output",
+                "call_id": result["call_id"],
+                "output": result["output"],
+            }
+        )
+    session._last_tool_results = []
     payload: dict[str, object] = {
         "model": agent_name,
-        "input": [],
+        "input": input_blocks,
         "stream": True,
         "store": True,
     }
@@ -779,13 +803,13 @@ async def _execute_and_patch_tools(
     :param pending: List of dicts with ``call_id``, ``name``,
         ``arguments`` for each pending call.
     """
-    tool_results: list[dict[str, str]] = []
+    session._last_tool_results = []
     for call in pending:
         call_id = call["call_id"]
         name = call["name"]
         arguments_str = call["arguments"]
         output = await _execute_single_tool(session, name, arguments_str)
-        tool_results.append({"call_id": call_id, "output": output})
+        session._last_tool_results.append({"call_id": call_id, "output": output})
         # Notify Toad that the tool call completed
         await rpc.notify(
             "session/update",
@@ -802,13 +826,6 @@ async def _execute_and_patch_tools(
                 },
             },
         )
-    # PATCH results back to agent-plane
-    resp_id = session.translator.last_response_id
-    if resp_id is not None and tool_results:
-        await client.patch(
-            f"/v1/responses/{resp_id}",
-            json={"tool_results": tool_results},
-        )
 
 
 async def _execute_single_tool(
@@ -816,21 +833,28 @@ async def _execute_single_tool(
     name: str,
     arguments_str: str,
 ) -> str:
-    """Execute one tool call via the session's MCP connections.
+    """Execute one tool call via builtins or MCP connections.
 
-    :param session: Session with ``_tool_to_connection`` lookup.
+    Checks built-in tools first (filesystem, shell), then falls
+    back to MCP connections.
+
+    :param session: Session with tool lookup state.
     :param name: Tool name to invoke.
     :param arguments_str: JSON-encoded arguments string.
     :returns: Tool output string, or error message if execution
         fails.
     """
-    connection = session._tool_to_connection.get(name)
-    if connection is None:
-        return f"[Error] Tool {name!r} not found in MCP servers"
     try:
         arguments = json.loads(arguments_str)
     except json.JSONDecodeError:
         arguments = {}
+    # Check built-in tools first
+    if name in _BUILTIN_TOOL_EXECUTORS:
+        return await _BUILTIN_TOOL_EXECUTORS[name](session, arguments)
+    # Fall back to MCP connections
+    connection = session._tool_to_connection.get(name)
+    if connection is None:
+        return f"[Error] Tool {name!r} not available"
     try:
         return await connection.call_tool(name, arguments)
     except Exception as exc:
@@ -877,3 +901,242 @@ async def _connect_mcp_servers(
                 server_name,
                 exc,
             )
+
+
+# ── Built-in tool schemas (filesystem + shell) ─────────────────
+
+
+_READ_FILE_SCHEMA: dict[str, object] = {
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "description": (
+            "Read the contents of a text file from the local "
+            "filesystem. Returns the file content as a string."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute or relative file path",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+}
+
+_WRITE_FILE_SCHEMA: dict[str, object] = {
+    "type": "function",
+    "function": {
+        "name": "write_file",
+        "description": (
+            "Write content to a text file on the local filesystem. "
+            "Creates the file if it does not exist, overwrites if "
+            "it does."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute or relative file path",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The text content to write",
+                },
+            },
+            "required": ["path", "content"],
+        },
+    },
+}
+
+_LIST_DIR_SCHEMA: dict[str, object] = {
+    "type": "function",
+    "function": {
+        "name": "list_directory",
+        "description": (
+            "List files and directories in a given path. Returns "
+            "one entry per line with type indicator (file/dir)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Directory path to list. Defaults to the session working directory."
+                    ),
+                },
+            },
+        },
+    },
+}
+
+_RUN_COMMAND_SCHEMA: dict[str, object] = {
+    "type": "function",
+    "function": {
+        "name": "run_command",
+        "description": (
+            "Execute a shell command in the session working directory. Returns stdout and stderr."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to execute",
+                },
+            },
+            "required": ["command"],
+        },
+    },
+}
+
+
+async def _exec_read_file(
+    session: SessionState,
+    arguments: dict[str, object],
+) -> str:
+    """Execute the ``read_file`` built-in tool.
+
+    :param session: The session (provides cwd for relative paths).
+    :param arguments: ``{"path": str}``.
+    :returns: File content or error message.
+    """
+    import pathlib
+
+    raw_path = str(arguments.get("path", ""))
+    path = pathlib.Path(raw_path)
+    if not path.is_absolute():
+        path = pathlib.Path(session.cwd) / path
+    try:
+        return path.read_text()
+    except OSError as exc:
+        return f"[Error] Cannot read {path}: {exc}"
+
+
+async def _exec_write_file(
+    session: SessionState,
+    arguments: dict[str, object],
+) -> str:
+    """Execute the ``write_file`` built-in tool.
+
+    :param session: The session (provides cwd for relative paths).
+    :param arguments: ``{"path": str, "content": str}``.
+    :returns: Confirmation or error message.
+    """
+    import pathlib
+
+    raw_path = str(arguments.get("path", ""))
+    content = str(arguments.get("content", ""))
+    path = pathlib.Path(raw_path)
+    if not path.is_absolute():
+        path = pathlib.Path(session.cwd) / path
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        return f"Wrote {len(content)} bytes to {path}"
+    except OSError as exc:
+        return f"[Error] Cannot write {path}: {exc}"
+
+
+async def _exec_list_directory(
+    session: SessionState,
+    arguments: dict[str, object],
+) -> str:
+    """Execute the ``list_directory`` built-in tool.
+
+    :param session: The session (provides cwd as default path).
+    :param arguments: ``{"path": str}`` (optional).
+    :returns: Directory listing or error message.
+    """
+    import pathlib
+
+    raw_path = str(arguments.get("path", session.cwd))
+    path = pathlib.Path(raw_path)
+    if not path.is_absolute():
+        path = pathlib.Path(session.cwd) / path
+    try:
+        entries: list[str] = []
+        for item in sorted(path.iterdir()):
+            kind = "dir" if item.is_dir() else "file"
+            entries.append(f"[{kind}] {item.name}")
+        return "\n".join(entries) if entries else "(empty directory)"
+    except OSError as exc:
+        return f"[Error] Cannot list {path}: {exc}"
+
+
+async def _exec_run_command(
+    session: SessionState,
+    arguments: dict[str, object],
+) -> str:
+    """Execute the ``run_command`` built-in tool.
+
+    :param session: The session (provides cwd).
+    :param arguments: ``{"command": str}``.
+    :returns: Combined stdout + stderr, or error message.
+    """
+    import asyncio
+
+    command = str(arguments.get("command", ""))
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=session.cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        output = stdout.decode(errors="replace")
+        if proc.returncode != 0:
+            output += f"\n(exit code {proc.returncode})"
+        return output
+    except asyncio.TimeoutError:
+        return "[Error] Command timed out after 30s"
+    except OSError as exc:
+        return f"[Error] Cannot run command: {exc}"
+
+
+# Maps built-in tool name -> async executor function
+_BUILTIN_TOOL_EXECUTORS: dict[
+    str,
+    Callable[
+        [SessionState, dict[str, object]],
+        Awaitable[str],
+    ],
+] = {
+    "read_file": _exec_read_file,
+    "write_file": _exec_write_file,
+    "list_directory": _exec_list_directory,
+    "run_command": _exec_run_command,
+}
+
+
+def _register_builtin_tools(
+    session: SessionState,
+    capabilities: object,
+) -> None:
+    """Register built-in tools based on client capabilities.
+
+    Checks ``clientCapabilities.fs`` and ``clientCapabilities.terminal``
+    from the ACP ``initialize`` handshake to decide which tools
+    to offer.
+
+    :param session: Session to populate with tool schemas.
+    :param capabilities: The ``clientCapabilities`` dict from
+        Toad's ``session/new`` params, or from stored init caps.
+    """
+    if not isinstance(capabilities, dict):
+        capabilities = {}
+    fs_caps = capabilities.get("fs", {})
+    if isinstance(fs_caps, dict):
+        if fs_caps.get("readTextFile"):
+            session.tool_schemas.append(_READ_FILE_SCHEMA)
+            session.tool_schemas.append(_LIST_DIR_SCHEMA)
+        if fs_caps.get("writeTextFile"):
+            session.tool_schemas.append(_WRITE_FILE_SCHEMA)
+    if capabilities.get("terminal"):
+        session.tool_schemas.append(_RUN_COMMAND_SCHEMA)
