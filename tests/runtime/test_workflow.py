@@ -292,6 +292,7 @@ def test_execution_timeout_resolution_takes_minimum(
         conversation_id="conv_001",
         spec=spec,
         agent_name="timeout-test-agent",
+        agent_id="ag_test",
         instructions=None,
         tool_mgr=_stub_tool_manager(),
     )
@@ -331,6 +332,7 @@ def test_execution_timeout_terminates_loop(
         conversation_id="conv_002",
         spec=spec,
         agent_name="timeout-test-agent",
+        agent_id="ag_test",
         instructions=None,
         tool_mgr=_stub_tool_manager(),
     )
@@ -371,6 +373,7 @@ def test_execution_timeout_emits_error_event(
         conversation_id="conv_003",
         spec=spec,
         agent_name="timeout-test-agent",
+        agent_id="ag_test",
         instructions=None,
         tool_mgr=_stub_tool_manager(),
     )
@@ -496,6 +499,7 @@ def test_execution_timeout_preserves_prior_output(
         conversation_id: str,
         llm_resp: Any,
         agent_name: str,
+        agent_id: str,
         tools_config: ToolsConfig,
         history: list[Any],
         output_items: list[dict[str, Any]],
@@ -512,6 +516,7 @@ def test_execution_timeout_preserves_prior_output(
         :param conversation_id: Conversation ID (unused).
         :param llm_resp: LLM response (unused).
         :param agent_name: Agent name (unused).
+        :param agent_id: Agent ID (unused).
         :param tools_config: Tools config (unused).
         :param history: Conversation history (unused).
         :param output_items: Mutable output list — we append
@@ -539,6 +544,7 @@ def test_execution_timeout_preserves_prior_output(
         conversation_id="conv_004",
         spec=spec,
         agent_name="timeout-test-agent",
+        agent_id="ag_test",
         instructions=None,
         tool_mgr=_stub_tool_manager(),
     )

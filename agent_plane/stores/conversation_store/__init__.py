@@ -29,11 +29,17 @@ class ConversationStore(ABC):
         self.storage_location = storage_location
 
     @abstractmethod
-    def create_conversation(self) -> Conversation:
+    def create_conversation(
+        self,
+        kind: str = "default",
+    ) -> Conversation:
         """
         Create a new conversation. Generates a unique
         conversation_id.
 
+        :param kind: Conversation type. ``"default"`` for
+            user-initiated, ``"sub_agent"`` for sub-agent
+            execution conversations.
         :returns: The newly created :class:`Conversation`.
         """
         ...
@@ -140,6 +146,7 @@ class ConversationStore(ABC):
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
+        kind: str | None = "default",
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -154,6 +161,10 @@ class ConversationStore(ABC):
         :param before: Cursor conversation ID; return conversations
             appearing before this one in sort order.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
+        :param kind: Filter to conversations of this kind. Exact
+            match. ``"default"`` returns only user-initiated.
+            ``"sub_agent"`` returns only sub-agent conversations.
+            ``None`` disables the filter and returns all.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """

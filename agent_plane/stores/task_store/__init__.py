@@ -7,8 +7,10 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from agent_plane.entities import (
+    CompletePendingToolCallResult,
     ConversationItem,
     NewConversationItem,
+    PendingToolCall,
     Task,
 )
 
@@ -44,6 +46,7 @@ class TaskStore(ABC):
         agent_name: str,
         previous_response_id: str | None = None,
         background: bool = False,
+        root_task_id: str | None = None,
     ) -> Task:
         """
         Create a new task for executing an agent in the given
@@ -71,6 +74,9 @@ class TaskStore(ABC):
             e.g. ``"resp_def456"``.
         :param background: Whether this is a background task
             (``True``) or blocking (``False``).
+        :param root_task_id: ID of the top-level task that
+            initiated this sub-agent's spawn tree. ``None``
+            for top-level tasks, e.g. ``"task_abc123"``.
         :returns: The newly created :class:`Task` with status
             ``"queued"``.
         """
@@ -153,7 +159,7 @@ class TaskStore(ABC):
         ...
 
     @abstractmethod
-    async def wait(self, task_id: str) -> Task:
+    async def wait(self, task_id: str, timeout: float | None = None) -> Task:
         """
         Await until the task reaches a terminal state and return
         the final Task.
@@ -166,7 +172,12 @@ class TaskStore(ABC):
 
         :param task_id: Unique task identifier,
             e.g. ``"task_abc123"``.
-        :returns: The final :class:`Task` in a terminal state.
+        :param timeout: Maximum seconds to wait. ``None``
+            blocks indefinitely (current behavior). If the
+            deadline expires, returns the task in its current
+            (non-terminal) state instead of raising.
+        :returns: The final :class:`Task` in a terminal state,
+            or the current state if timeout expired.
         """
         ...
 
@@ -305,5 +316,78 @@ class TaskStore(ABC):
             e.g. ``"agent_xyz789"``.
         :returns: A list of matching :class:`Task` objects,
             ordered by ``created_at`` descending.
+        """
+        ...
+
+    # ── Pending tool call methods ─────────────────────────
+
+    @abstractmethod
+    def create_pending_tool_call(
+        self,
+        call_id: str,
+        root_task_id: str,
+        task_id: str,
+    ) -> None:
+        """
+        Insert a routing entry for a tunneled client-side tool call.
+
+        Uses INSERT ON CONFLICT DO NOTHING for DBOS replay safety.
+
+        :param call_id: The tool call ID (PK),
+            e.g. ``"call_abc123"``.
+        :param root_task_id: The root task whose response output
+            contains the function_call item,
+            e.g. ``"task_root1"``.
+        :param task_id: The parked sub-agent's task ID,
+            e.g. ``"task_sub2"``.
+        """
+        ...
+
+    @abstractmethod
+    def complete_pending_tool_call(
+        self,
+        call_id: str,
+        result: str,
+    ) -> CompletePendingToolCallResult:
+        """
+        Attempt to mark a pending tool call as completed.
+
+        Checks three conditions in order:
+
+        1. Row exists? If not, returns ``NOT_FOUND``.
+        2. Row already completed? Returns ``ALREADY_COMPLETED``
+           (no-op, first writer wins).
+        3. Sub-agent task still running? If terminal, returns
+           ``SUB_AGENT_DONE`` (row is NOT updated).
+        4. Otherwise, UPDATEs to completed and returns
+           ``COMPLETED``.
+
+        :param call_id: The tool call ID,
+            e.g. ``"call_abc123"``.
+        :param result: The tool's string output from the
+            client.
+        :returns: The outcome -- caller maps to HTTP status
+            codes.
+        """
+        ...
+
+    @abstractmethod
+    def get_pending_tool_calls(
+        self,
+        task_id: str,
+        status: str | None = None,
+    ) -> list[PendingToolCall]:
+        """
+        Query pending tool calls for a task, optionally
+        filtered by status. The park loop calls this with
+        ``status="completed"`` to find delivered results.
+
+        :param task_id: The sub-agent's task ID,
+            e.g. ``"task_sub2"``.
+        :param status: Optional status filter.
+            ``"completed"`` returns only delivered results.
+            ``"action_required"`` returns only waiting calls.
+            ``None`` returns all.
+        :returns: Matching pending tool call rows.
         """
         ...

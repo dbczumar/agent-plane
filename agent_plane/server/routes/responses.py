@@ -15,6 +15,7 @@ from starlette.responses import StreamingResponse
 from agent_plane.entities import (
     ACTIVE_STATUSES,
     TERMINAL_STATUSES,
+    CompletePendingToolCallResult,
     FunctionCallOutputData,
     MessageData,
     NewConversationItem,
@@ -30,6 +31,7 @@ from agent_plane.server.schemas import (
     CreateResponseRequest,
     ErrorDetail,
     IncompleteDetails,
+    PatchResponseRequest,
     ResponseDeleted,
     ResponseObject,
     Usage,
@@ -69,6 +71,38 @@ def _build_response_object(task: Task) -> ResponseObject:
             IncompleteDetails(**task.incomplete_details) if task.incomplete_details else None
         ),
     )
+
+
+def _apply_tool_results(
+    req: PatchResponseRequest,
+    task_store: TaskStore,
+) -> None:
+    """
+    Process all tool results from a PATCH request.
+
+    Delegates to ``task_store.complete_pending_tool_call`` for
+    each result. Raises on the first ``NOT_FOUND`` or
+    ``SUB_AGENT_DONE`` outcome; ``ALREADY_COMPLETED`` is a
+    safe no-op (idempotent retry).
+
+    :param req: The PATCH request containing tool results.
+    :param task_store: Task store for pending tool call
+        operations.
+    :raises AgentPlaneError: If any ``call_id`` is not found
+        (404) or the sub-agent is no longer waiting (409).
+    """
+    for tool_result in req.tool_results:
+        outcome = task_store.complete_pending_tool_call(tool_result.call_id, tool_result.output)
+        if outcome == CompletePendingToolCallResult.NOT_FOUND:
+            raise AgentPlaneError(
+                f"Tool call {tool_result.call_id} not found.",
+                code=ErrorCode.NOT_FOUND,
+            )
+        if outcome == CompletePendingToolCallResult.SUB_AGENT_DONE:
+            raise AgentPlaneError(
+                f"Sub-agent for {tool_result.call_id} is no longer waiting for results.",
+                code=ErrorCode.CONFLICT,
+            )
 
 
 def _normalize_input(
@@ -819,6 +853,39 @@ def create_responses_router(
         if not task:
             raise AgentPlaneError("Response not found", code=ErrorCode.NOT_FOUND)
         return _build_response_object(task)
+
+    # ── PATCH /responses/{response_id} ───────────────────────────
+
+    @router.patch("/responses/{response_id}")
+    async def patch_response(response_id: str, req: PatchResponseRequest) -> ResponseObject:
+        """
+        Submit tool results for tunneled client-side tool calls.
+
+        Each ``tool_result`` in the request body maps a
+        ``call_id`` to its output string. The server routes the
+        result to the parked sub-agent via the
+        ``pending_tool_calls`` table.
+
+        :param response_id: The root response/task identifier,
+            e.g. ``"resp_abc123"``.
+        :param req: The patch request body containing tool
+            results.
+        :returns: The updated :class:`ResponseObject`.
+        :raises AgentPlaneError: On not-found or conflict.
+        """
+        task = await task_store.get(response_id)
+        if not task:
+            raise AgentPlaneError("Response not found", code=ErrorCode.NOT_FOUND)
+        # Run in thread: complete_pending_tool_call uses sync DBOS
+        # APIs (get_workflow_status) that cannot be called from an
+        # async context with a running event loop.
+        await asyncio.to_thread(_apply_tool_results, req, task_store)
+        # Re-fetch to capture any output changes from completed
+        # tool calls.
+        updated_task = await task_store.get(response_id)
+        if not updated_task:
+            raise AgentPlaneError("Response not found", code=ErrorCode.NOT_FOUND)
+        return _build_response_object(updated_task)
 
     # ── POST /responses/{response_id}/cancel ─────────────────────
 

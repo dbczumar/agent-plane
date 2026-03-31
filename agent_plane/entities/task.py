@@ -70,6 +70,9 @@ class Task:
         ``{"code": "server_error", "message": "..."}``.
     :param incomplete_details: Details on why the task is incomplete,
         e.g. ``{"reason": "max_output_tokens"}``.
+    :param root_task_id: ID of the top-level task that initiated
+        this sub-agent's spawn tree, or ``None`` for top-level
+        tasks, e.g. ``"task_abc123"``.
     :param tools: Client-specified tool dicts (OpenAI format with
         ``agent_plane`` extension) supplied at request time. Restored
         from DBOS workflow inputs on recovery. ``None`` means no
@@ -83,6 +86,7 @@ class Task:
     agent_name: str
     created_at: int
     completed_at: int | None = None
+    root_task_id: str | None = None
     # Heterogeneous output items (messages, reasoning, function_calls)
     # serialized as dicts; shape varies by item type.
     output: list[dict[str, Any]] = field(default_factory=list)

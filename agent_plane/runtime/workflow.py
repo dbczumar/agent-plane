@@ -6,6 +6,7 @@ All durably checkpointed by DBOS.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Iterator
@@ -530,6 +531,56 @@ def _accumulate_stream(
     }
 
 
+def _maybe_inject_spawn_args(
+    tool_name: str,
+    arguments: str,
+    task_id: str,
+    agent_id: str,
+) -> str:
+    """
+    Inject server-side context into ``spawn_sub_agents`` arguments.
+
+    For ``spawn_sub_agents`` calls, injects ``root_task_id`` and
+    ``agent_id`` into the arguments JSON. These fields are
+    invisible to the LLM — the agent loop adds them before
+    dispatch. For all other tools, returns arguments unchanged.
+
+    ``root_task_id`` propagation: if the current task already has
+    a ``root_task_id`` (it's a sub-agent itself), that value is
+    propagated. Otherwise, the current task's own ID is used as
+    the root. This ensures ``root_task_id`` always points to the
+    original top-level task regardless of nesting depth.
+
+    :param tool_name: The tool function name, e.g.
+        ``"spawn_sub_agents"``.
+    :param arguments: JSON-encoded arguments from the LLM.
+    :param task_id: The current task/workflow ID,
+        e.g. ``"task_abc123"``.
+    :param agent_id: The registered agent ID,
+        e.g. ``"ag_xyz789"``.
+    :returns: The (possibly augmented) arguments string.
+    """
+    if tool_name != "spawn_sub_agents":
+        return arguments
+
+    args = json.loads(arguments)
+
+    # Determine root_task_id: propagate from parent if set,
+    # otherwise this task IS the root.
+    from agent_plane.db.db_models import SqlTask
+
+    task_store = get_task_store()
+    with task_store._session() as session:  # type: ignore[attr-defined]
+        row = session.get(SqlTask, task_id)
+        if row is not None and row.root_task_id is not None:
+            args["root_task_id"] = row.root_task_id
+        else:
+            args["root_task_id"] = task_id
+
+    args["agent_id"] = agent_id
+    return json.dumps(args)
+
+
 @step()
 def _call_tool(
     task_id: str,
@@ -967,6 +1018,7 @@ def _execute_tools(
     history: list[ConversationItem],
     output_items: list[dict[str, Any]],
     conv_store: ConversationStore,
+    agent_id: str,
 ) -> str:
     """
     Execute each tool call with timeout/retry and persist output.
@@ -985,14 +1037,22 @@ def _execute_tools(
     :param output_items: Mutable list of API-format output
         dicts. Extended in place.
     :param conv_store: The ConversationStore for persistence.
+    :param agent_id: The registered agent ID for sub-agent
+        argument injection, e.g. ``"ag_abc123"``.
     :returns: The ID of the last persisted tool output item.
     """
     last_seen: str | None = None
     for tc in tool_calls:
+        arguments = _maybe_inject_spawn_args(
+            tc.name,
+            tc.arguments,
+            task_id,
+            agent_id,
+        )
         result = _call_tool(
             task_id,
             tc.name,
-            tc.arguments,
+            arguments,
             tools_config.timeout,
             tools_config.retry,
         )
@@ -1068,6 +1128,7 @@ def _handle_tool_calls(
     conversation_id: str,
     llm_resp: dict[str, Any],
     agent_name: str,
+    agent_id: str,
     tools_config: ToolsConfig,
     history: list[ConversationItem],
     output_items: list[dict[str, Any]],
@@ -1092,6 +1153,8 @@ def _handle_tool_calls(
     :param llm_resp: The LLM response dict containing tool calls.
     :param agent_name: The agent's registered name, e.g.
         ``"research-agent"``.
+    :param agent_id: The registered agent ID for sub-agent
+        argument injection, e.g. ``"ag_abc123"``.
     :param tools_config: The agent's global tools config with
         default timeout and retry policy.
     :param history: Mutable conversation history. Extended in place
@@ -1130,6 +1193,7 @@ def _handle_tool_calls(
             history,
             output_items,
             conv_store,
+            agent_id=agent_id,
         )
 
     if split.has_client:
@@ -1457,6 +1521,7 @@ def _run_agent_loop(
     conversation_id: str,
     spec: AgentSpec,
     agent_name: str,
+    agent_id: str,
     instructions: str | None,
     tool_mgr: ToolManager,
 ) -> _AgentLoopResult:
@@ -1472,6 +1537,9 @@ def _run_agent_loop(
         ``llm`` field).
     :param agent_name: The agent's registered name, e.g.
         ``"research-agent"``.
+    :param agent_id: The registered agent ID. Injected into
+        ``spawn_sub_agents`` arguments so sub-agents can load
+        the root spec, e.g. ``"ag_abc123"``.
     :param instructions: Optional per-request instructions
         to include in the system message.
     :param tool_mgr: The ToolManager for this workflow.
@@ -1564,6 +1632,7 @@ def _run_agent_loop(
             conversation_id,
             llm_resp,
             agent_name,
+            agent_id,
             tools_config,
             history,
             output_items,
@@ -1599,6 +1668,92 @@ def _run_agent_loop(
         output=output_items,
         incomplete_details={"reason": "max_iterations"},
     )
+
+
+@dataclass
+class _ResolvedSpec:
+    """
+    Result of resolving the effective spec for a workflow.
+
+    :param spec: The effective agent spec (root or sub-agent).
+    :param agent_name: The agent's display name for output items.
+    """
+
+    spec: AgentSpec
+    agent_name: str
+
+
+def _find_sub_agent_spec(
+    spec: AgentSpec,
+    name: str,
+) -> AgentSpec | None:
+    """
+    Recursively search the spec tree for a sub-agent by name.
+
+    Sub-agent names are validated to be unique across the entire
+    spec tree, so this always finds at most one match.
+
+    :param spec: The root agent spec to search.
+    :param name: The sub-agent name to find,
+        e.g. ``"researcher"``.
+    :returns: The matching sub-agent spec, or ``None`` if not
+        found.
+    """
+    for sa in spec.sub_agents:
+        if sa.name == name:
+            return sa
+        found = _find_sub_agent_spec(sa, name)
+        if found is not None:
+            return found
+    return None
+
+
+def _resolve_spec_and_name(
+    task_id: str,
+    agent_id: str,
+    root_spec: AgentSpec,
+) -> _ResolvedSpec:
+    """
+    Resolve the effective spec and agent name for a workflow.
+
+    For top-level tasks, returns the root spec and the registered
+    agent name. For sub-agent tasks (``root_task_id IS NOT NULL``),
+    finds the sub-agent spec by ``agent_name`` in the spec tree.
+
+    :param task_id: The DBOS workflow ID (== task ID),
+        e.g. ``"task_abc123"``.
+    :param agent_id: The registered agent ID,
+        e.g. ``"ag_xyz789"``.
+    :param root_spec: The root agent's parsed spec.
+    :returns: A :class:`_ResolvedSpec` with the effective spec
+        and agent name.
+    :raises LookupError: If the task row is missing or the
+        sub-agent name is not found in the spec tree.
+    """
+    task_store = get_task_store()
+
+    # Read the task row to check if this is a sub-agent.
+    # Uses a sync DB read (create/close_inbox are also sync).
+    with task_store._session() as session:  # type: ignore[attr-defined]
+        from agent_plane.db.db_models import SqlTask
+
+        row = session.get(SqlTask, task_id)
+        if row is None:
+            raise LookupError(f"task {task_id!r} not found")
+        root_task_id = row.root_task_id
+        agent_name = row.agent_name
+
+    if root_task_id is None:
+        # Top-level task — use root spec and registered name
+        agent = get_agent_store().get(agent_id)
+        name = agent.name if agent else agent_id
+        return _ResolvedSpec(spec=root_spec, agent_name=name)
+
+    # Sub-agent — find spec by agent_name in the tree
+    sub_spec = _find_sub_agent_spec(root_spec, agent_name)
+    if sub_spec is None:
+        raise LookupError(f"sub-agent {agent_name!r} not found in spec tree")
+    return _ResolvedSpec(spec=sub_spec, agent_name=agent_name)
 
 
 @workflow()
@@ -1650,10 +1805,17 @@ def agent_execution_workflow(
 
     try:
         loaded = get_agent_cache().load(agent_id)
-        spec = loaded.spec
+        root_spec = loaded.spec
 
-        agent = get_agent_store().get(agent_id)
-        agent_name = agent.name if agent else agent_id
+        # Resolve spec for sub-agents: if root_task_id is set,
+        # find the sub-agent spec by agent_name in the tree.
+        resolved = _resolve_spec_and_name(
+            task_id,
+            agent_id,
+            root_spec,
+        )
+        spec = resolved.spec
+        agent_name = resolved.agent_name
 
         if spec.llm is None:
             return _AgentLoopResult(
@@ -1661,7 +1823,7 @@ def agent_execution_workflow(
                 output=[],
                 error={
                     "code": "configuration_error",
-                    "message": "Agent spec has no LLM configuration",
+                    "message": ("Agent spec has no LLM configuration"),
                 },
             ).to_dict(task_id)
 
@@ -1678,6 +1840,7 @@ def agent_execution_workflow(
             conversation_id,
             spec,
             agent_name,
+            agent_id,
             instructions,
             tool_mgr,
         )

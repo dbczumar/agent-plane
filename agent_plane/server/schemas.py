@@ -367,3 +367,32 @@ class ResponseDeleted(BaseModel):
     id: str
     object: str = "response.deleted"
     deleted: bool = True
+
+
+class ToolResult(BaseModel):
+    """
+    A single tool result submitted by the client via PATCH.
+
+    :param call_id: The tool call ID that this result
+        corresponds to, e.g. ``"call_abc123"``.
+    :param output: The tool's string output,
+        e.g. ``'["paper1.pdf", "paper2.pdf"]'``.
+    """
+
+    call_id: str
+    output: str
+
+
+class PatchResponseRequest(BaseModel):
+    """
+    Request body for ``PATCH /v1/responses/{id}``.
+
+    Submits tool results for tunneled client-side tool calls
+    that have ``status: "action_required"`` in the response
+    output.
+
+    :param tool_results: List of tool results to submit. Each
+        entry maps a ``call_id`` to its output string.
+    """
+
+    tool_results: list[ToolResult]

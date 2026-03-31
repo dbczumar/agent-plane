@@ -172,7 +172,7 @@ def test_duplicate_tool_names_across_mcp_and_local() -> None:
 
 
 def test_sub_agent_reference_valid() -> None:
-    sub = _minimal_spec(name="helper")
+    sub = _minimal_spec(name="helper", llm=LLMConfig(model="openai/gpt-4o"))
     spec = _minimal_spec(
         tools=ToolsConfig(agents=["helper"]),
         sub_agents=[sub],

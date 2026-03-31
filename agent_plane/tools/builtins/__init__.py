@@ -24,6 +24,10 @@ from agent_plane.tools.builtins.load_skill import (
 from agent_plane.tools.builtins.read_skill_file import (
     ReadSkillFileTool,
 )
+from agent_plane.tools.builtins.spawn import (
+    CollectTool,
+    SpawnTool,
+)
 from agent_plane.tools.builtins.web_search_google import (
     WebSearchGoogleTool,
 )
@@ -35,8 +39,10 @@ from agent_plane.tools.builtins.web_search_perplexity import (
 )
 
 __all__ = [
+    "CollectTool",
     "LoadSkillTool",
     "ReadSkillFileTool",
+    "SpawnTool",
     "WebSearchGoogleTool",
     "WebSearchOpenAITool",
     "WebSearchPerplexityTool",

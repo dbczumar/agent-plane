@@ -19,9 +19,15 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from agent_plane.db.db_models import SqlConversation, SqlConversationItem, SqlTask
+from agent_plane.db.db_models import (
+    SqlConversation,
+    SqlConversationItem,
+    SqlPendingToolCall,
+    SqlTask,
+)
 from agent_plane.db.utils import (
     ensure_fts_table,
     extract_search_text,
@@ -33,12 +39,15 @@ from agent_plane.db.utils import (
     now_epoch,
 )
 from agent_plane.entities import (
+    CompletePendingToolCallResult,
     ConversationItem,
     NewConversationItem,
+    PendingToolCall,
     Task,
     TaskStatus,
     parse_item_data,
 )
+from agent_plane.entities.task import TERMINAL_STATUSES
 from agent_plane.runtime.durability import (
     SetWorkflowID,
     WorkflowHandleAsync,
@@ -46,6 +55,7 @@ from agent_plane.runtime.durability import (
     WorkflowStatusString,
     cancel_workflow_async,
     ensure_dbos,
+    get_workflow_status,
     get_workflow_status_async,
     read_stream_async,
     retrieve_workflow_async,
@@ -114,6 +124,7 @@ def _to_entity(row: SqlTask) -> Task:
         inbox_closed=row.inbox_closed,
         previous_response_id=row.previous_response_id,
         background=row.background,
+        root_task_id=row.root_task_id,
         status=TaskStatus.QUEUED,
         # instructions and reasoning are populated by _apply_workflow_status
         # from DBOS workflow inputs, not from the DB row.
@@ -235,6 +246,7 @@ class SqlAlchemyTaskStore(TaskStore):
         agent_name: str,
         previous_response_id: str | None = None,
         background: bool = False,
+        root_task_id: str | None = None,
     ) -> Task:
         """
         Create a new task in the database.
@@ -248,6 +260,8 @@ class SqlAlchemyTaskStore(TaskStore):
         :param previous_response_id: ID of the prior response
             in the thread, or ``None`` for the first turn.
         :param background: Whether this is a background task.
+        :param root_task_id: ID of the top-level task for
+            sub-agent spawns. ``None`` for top-level tasks.
         :returns: The newly created :class:`Task` with status
             ``"queued"``.
         """
@@ -260,6 +274,7 @@ class SqlAlchemyTaskStore(TaskStore):
             created_at=now_epoch(),
             inbox_closed=False,
             background=background,
+            root_task_id=root_task_id,
         )
         with self._session() as session:
             session.add(row)
@@ -365,19 +380,32 @@ class SqlAlchemyTaskStore(TaskStore):
             task = _to_entity(row)
         return await _enrich_from_dbos(task)
 
-    async def wait(self, task_id: str) -> Task:
+    async def wait(self, task_id: str, timeout: float | None = None) -> Task:
         """
         Await until the task reaches a terminal state and return
         the final :class:`Task`.
 
         :param task_id: Unique task identifier,
             e.g. ``"task_abc123"``.
-        :returns: The final :class:`Task` in a terminal state.
+        :param timeout: Maximum seconds to wait. ``None`` blocks
+            indefinitely. If the deadline expires, returns the
+            task in its current (non-terminal) state.
+        :returns: The final :class:`Task` in a terminal state,
+            or the current state if timeout expired.
         :raises LookupError: If the task does not exist after
             completion.
         """
+        import asyncio
+
         handle: WorkflowHandleAsync[dict[str, Any]] = await retrieve_workflow_async(task_id)
-        await handle.get_result()
+        try:
+            if timeout is not None:
+                await asyncio.wait_for(handle.get_result(), timeout=timeout)
+            else:
+                await handle.get_result()
+        except asyncio.TimeoutError:
+            # Deadline expired — return current (non-terminal) state
+            pass
         task = await self.get(task_id)
         if task is None:
             raise LookupError(f"task {task_id!r} not found")
@@ -602,3 +630,120 @@ class SqlAlchemyTaskStore(TaskStore):
         for t in tasks:
             enriched.append(await _enrich_from_dbos(t))
         return enriched
+
+    # ── Pending tool call helpers ─────────────────────────
+
+    def _is_sub_agent_terminal(self, task_id: str) -> bool:
+        """
+        Check whether a sub-agent's DBOS workflow has reached a
+        terminal state.
+
+        Uses the sync DBOS status API. Returns ``True`` if the
+        mapped task status is in :data:`TERMINAL_STATUSES`, or if
+        no workflow status exists (workflow never started).
+
+        :param task_id: The sub-agent's task ID,
+            e.g. ``"task_sub2"``.
+        :returns: ``True`` if terminal, ``False`` if still active.
+        """
+        wf_status: WorkflowStatus | None = get_workflow_status(task_id)
+        if wf_status is None:
+            # No workflow registered — treat as terminal (never ran).
+            return True
+        mapped = _map_dbos_status(str(wf_status.status))
+        return mapped in TERMINAL_STATUSES
+
+    # ── Pending tool call methods ─────────────────────────
+
+    def create_pending_tool_call(
+        self,
+        call_id: str,
+        root_task_id: str,
+        task_id: str,
+    ) -> None:
+        """
+        Insert a routing entry for a tunneled client-side tool
+        call. Uses ON CONFLICT DO NOTHING for DBOS replay safety.
+
+        :param call_id: The tool call ID (PK),
+            e.g. ``"call_abc123"``.
+        :param root_task_id: The root task whose response output
+            contains the function_call item.
+        :param task_id: The parked sub-agent's task ID.
+        """
+        with self._session() as session:
+            # ON CONFLICT DO NOTHING: safe for DBOS replay — if the
+            # row already exists from a previous attempt, skip it.
+            stmt = (
+                sqlite_insert(SqlPendingToolCall)
+                .values(
+                    call_id=call_id,
+                    root_task_id=root_task_id,
+                    task_id=task_id,
+                    status="action_required",
+                    result=None,
+                    created_at=now_epoch(),
+                    completed_at=None,
+                )
+                .on_conflict_do_nothing()
+            )
+            session.execute(stmt)
+
+    def complete_pending_tool_call(
+        self,
+        call_id: str,
+        result: str,
+    ) -> CompletePendingToolCallResult:
+        """
+        Attempt to mark a pending tool call as completed.
+
+        :param call_id: The tool call ID,
+            e.g. ``"call_abc123"``.
+        :param result: The tool's string output from the client.
+        :returns: The outcome enum value.
+        """
+        with self._session() as session:
+            row = session.get(SqlPendingToolCall, call_id)
+            if row is None:
+                return CompletePendingToolCallResult.NOT_FOUND
+            if row.status == "completed":
+                return CompletePendingToolCallResult.ALREADY_COMPLETED
+            # Check if sub-agent's DBOS workflow has reached a
+            # terminal state. Uses the sync DBOS API because this
+            # method is called from sync HTTP handlers.
+            if self._is_sub_agent_terminal(row.task_id):
+                return CompletePendingToolCallResult.SUB_AGENT_DONE
+            row.status = "completed"
+            row.result = result
+            row.completed_at = now_epoch()
+            return CompletePendingToolCallResult.COMPLETED
+
+    def get_pending_tool_calls(
+        self,
+        task_id: str,
+        status: str | None = None,
+    ) -> list[PendingToolCall]:
+        """
+        Query pending tool calls for a task.
+
+        :param task_id: The sub-agent's task ID.
+        :param status: Optional status filter.
+        :returns: Matching pending tool call rows.
+        """
+        with self._session() as session:
+            stmt = select(SqlPendingToolCall).where(SqlPendingToolCall.task_id == task_id)
+            if status is not None:
+                stmt = stmt.where(SqlPendingToolCall.status == status)
+            rows = list(session.execute(stmt).scalars().all())
+            return [
+                PendingToolCall(
+                    call_id=r.call_id,
+                    root_task_id=r.root_task_id,
+                    task_id=r.task_id,
+                    status=r.status,
+                    result=r.result,
+                    created_at=r.created_at,
+                    completed_at=r.completed_at,
+                )
+                for r in rows
+            ]

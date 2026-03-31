@@ -12,6 +12,7 @@ from httpx_sse import aconnect_sse
 
 from agent_plane.entities import FunctionCallOutputData, MessageData
 from agent_plane.server.routes.responses import _split_input_to_items
+from agent_plane.stores.task_store.sqlalchemy_store import SqlAlchemyTaskStore
 from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import create_test_agent, create_test_response
 
@@ -1348,3 +1349,127 @@ def _make_tiny_png() -> bytes:
 
     # PNG signature + chunks
     return b"\x89PNG\r\n\x1a\n" + ihdr + idat + iend
+
+
+# ── PATCH /responses/{id} tests ────────────────────────────────────
+
+
+async def test_patch_response_not_found(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    PATCH for a non-existent response returns 404.
+    """
+    resp = await client.patch(
+        "/v1/responses/nonexistent",
+        json={"tool_results": [{"call_id": "c1", "output": "x"}]},
+    )
+    assert resp.status_code == 404
+
+
+async def test_patch_response_call_id_not_found(
+    client: httpx.AsyncClient,
+    task_store: SqlAlchemyTaskStore,
+) -> None:
+    """
+    PATCH with a call_id that doesn't exist in pending_tool_calls
+    returns 404 with a message naming the missing call_id.
+    """
+    await create_test_agent(client)
+    result = await create_test_response(client, background=True)
+    response_id = result.body["id"]
+
+    resp = await client.patch(
+        f"/v1/responses/{response_id}",
+        json={
+            "tool_results": [
+                {"call_id": "call_ghost", "output": "irrelevant"},
+            ],
+        },
+    )
+    assert resp.status_code == 404
+    assert "call_ghost" in resp.json()["error"]["message"]
+
+
+async def test_patch_response_completes_pending_tool_call(
+    client: httpx.AsyncClient,
+    task_store: SqlAlchemyTaskStore,
+) -> None:
+    """
+    PATCH with a valid call_id transitions the pending tool call
+    to completed and returns the response.
+    """
+    await create_test_agent(client)
+    result = await create_test_response(client, background=True)
+    response_id = result.body["id"]
+
+    # Directly insert a pending tool call row for this response
+    # (simulates what the sub-agent park branch would do).
+    task_store.create_pending_tool_call(
+        call_id="call_test_1",
+        root_task_id=response_id,
+        task_id=response_id,
+    )
+
+    resp = await client.patch(
+        f"/v1/responses/{response_id}",
+        json={
+            "tool_results": [
+                {"call_id": "call_test_1", "output": "tool output"},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["id"] == response_id
+
+    # Verify the pending tool call is now completed in the store
+    rows = task_store.get_pending_tool_calls(response_id, status="completed")
+    assert len(rows) == 1, "Expected exactly 1 completed row"
+    assert rows[0].call_id == "call_test_1"
+    assert rows[0].result == "tool output"
+
+
+async def test_patch_response_idempotent(
+    client: httpx.AsyncClient,
+    task_store: SqlAlchemyTaskStore,
+) -> None:
+    """
+    Re-PATCHing the same call_id returns 200 (idempotent no-op).
+    The stored result is NOT overwritten by the second PATCH.
+    """
+    await create_test_agent(client)
+    result = await create_test_response(client, background=True)
+    response_id = result.body["id"]
+
+    task_store.create_pending_tool_call(
+        call_id="call_idem",
+        root_task_id=response_id,
+        task_id=response_id,
+    )
+
+    # First PATCH
+    resp1 = await client.patch(
+        f"/v1/responses/{response_id}",
+        json={
+            "tool_results": [
+                {"call_id": "call_idem", "output": "first"},
+            ],
+        },
+    )
+    assert resp1.status_code == 200
+
+    # Second PATCH with different output — should still succeed
+    # but the stored result remains "first" (first writer wins).
+    resp2 = await client.patch(
+        f"/v1/responses/{response_id}",
+        json={
+            "tool_results": [
+                {"call_id": "call_idem", "output": "second"},
+            ],
+        },
+    )
+    assert resp2.status_code == 200
+
+    rows = task_store.get_pending_tool_calls(response_id, status="completed")
+    assert len(rows) == 1, "Expected exactly 1 completed row"
+    assert rows[0].result == "first", "First writer wins — stored result must not be overwritten"

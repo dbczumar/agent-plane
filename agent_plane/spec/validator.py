@@ -198,20 +198,109 @@ def _validate_local_tools(spec: AgentSpec, result: ValidationResult) -> None:
         all_tool_names.add(tool.name)
 
 
-def _validate_sub_agents(spec: AgentSpec, result: ValidationResult) -> None:
+def _validate_sub_agents(
+    spec: AgentSpec,
+    result: ValidationResult,
+) -> None:
     """
-    Validate that every name in ``tools.agents`` has a
-    corresponding parsed sub-agent.
+    Validate sub-agent declarations.
+
+    Checks:
+    1. Every name in ``tools.agents`` has a corresponding parsed
+       sub-agent directory.
+    2. Callable sub-agents (referenced in ``tools.agents``) must
+       have ``llm.model`` configured.
+    3. Sub-agent names must be unique across the entire spec tree.
+    4. Agent names must not contain ``.`` (reserved as the
+       delimiter in tunneled output ``model`` fields).
 
     :param spec: The agent spec to check.
     :param result: Accumulator for any validation errors found.
     """
-    # Every name in tools.agents must have a corresponding sub-agent
-    sub_agent_names = {sa.name for sa in spec.sub_agents if sa.name is not None}
+    sub_specs = {sa.name: sa for sa in spec.sub_agents if sa.name is not None}
+
     for agent_ref in spec.tools.agents:
-        if agent_ref not in sub_agent_names:
+        sub = sub_specs.get(agent_ref)
+        if sub is None:
             result.add(
                 "tools.agents",
-                f"references sub-agent {agent_ref!r} but no matching "
-                f"directory found under agents/",
+                f"references sub-agent {agent_ref!r} but no "
+                f"matching directory found under agents/",
             )
+            continue
+        # Callable sub-agents must have llm.model
+        if sub.llm is None or not sub.llm.model:
+            result.add(
+                f"sub_agents[{agent_ref!r}].llm",
+                "callable sub-agent must have llm.model configured",
+            )
+
+    # No dots in agent names (reserved for tunneled model field)
+    _check_no_dots_in_names(spec, result)
+
+    # Unique names across the entire spec tree
+    _check_unique_sub_agent_names(spec, result)
+
+
+def _check_no_dots_in_names(
+    spec: AgentSpec,
+    result: ValidationResult,
+) -> None:
+    """
+    Validate that no agent name in the spec tree contains a dot.
+
+    The dot character is reserved as the delimiter in the
+    ``model`` field on tunneled output items (e.g.
+    ``"orchestrator.researcher"``).
+
+    :param spec: The root agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
+    if spec.name and "." in spec.name:
+        result.add(
+            "name",
+            f"agent name {spec.name!r} must not contain '.'",
+        )
+    for sa in spec.sub_agents:
+        _check_no_dots_in_names(sa, result)
+
+
+def _check_unique_sub_agent_names(
+    spec: AgentSpec,
+    result: ValidationResult,
+) -> None:
+    """
+    Validate that sub-agent names are unique across the entire
+    spec tree (not just within one level).
+
+    Flat uniqueness enables O(1) lookup by name during spec
+    loading — see designs/SUBAGENT.md.
+
+    :param spec: The root agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
+    seen: set[str] = set()
+    _collect_sub_agent_names(spec, seen, result)
+
+
+def _collect_sub_agent_names(
+    spec: AgentSpec,
+    seen: set[str],
+    result: ValidationResult,
+) -> None:
+    """
+    Recursively collect sub-agent names and flag duplicates.
+
+    :param spec: The current spec node to check.
+    :param seen: Accumulator of names seen so far.
+    :param result: Accumulator for any validation errors found.
+    """
+    for sa in spec.sub_agents:
+        if sa.name is not None:
+            if sa.name in seen:
+                result.add(
+                    f"sub_agents[{sa.name!r}]",
+                    f"duplicate sub-agent name {sa.name!r} across the spec tree",
+                )
+            seen.add(sa.name)
+        _collect_sub_agent_names(sa, seen, result)

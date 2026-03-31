@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -74,6 +74,8 @@ class SqlConversation(Base):
         created.
     :param title: Optional human-readable title for the conversation.
         ``None`` when not provided.
+    :param kind: Conversation type. ``"default"`` for user-initiated,
+        ``"sub_agent"`` for sub-agent execution conversations.
     """
 
     __tablename__ = "conversations"
@@ -81,8 +83,13 @@ class SqlConversation(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     created_at: Mapped[int] = mapped_column(Integer)
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    kind: Mapped[str] = mapped_column(String(32), default="default")
 
-    __table_args__ = (Index("ix_conversations_created_at", "created_at"),)
+    __table_args__ = (
+        CheckConstraint("kind IN ('default', 'sub_agent')", name="ck_conversations_kind"),
+        Index("ix_conversations_created_at", "created_at"),
+        Index("ix_conversations_kind", "kind"),
+    )
 
 
 class SqlTask(Base):
@@ -106,6 +113,9 @@ class SqlTask(Base):
         task-creation time.
     :param background: Whether this task runs in the background.
         Defaults to ``False``.
+    :param root_task_id: ID of the top-level task that initiated
+        this sub-agent's spawn tree, or ``None`` for top-level
+        tasks.
     """
 
     __tablename__ = "tasks"
@@ -120,11 +130,15 @@ class SqlTask(Base):
     inbox_closed: Mapped[bool] = mapped_column(Boolean, default=False)
     agent_name: Mapped[str] = mapped_column(String(256))
     background: Mapped[bool] = mapped_column(Boolean, default=False)
+    root_task_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=True
+    )
 
     __table_args__ = (
         Index("ix_tasks_conversation_id", "conversation_id"),
         Index("ix_tasks_agent_id", "agent_id"),
         Index("ix_tasks_created_at", "created_at"),
+        Index("ix_tasks_root_task_id", "root_task_id"),
     )
 
 
@@ -176,4 +190,46 @@ class SqlConversationItem(Base):
             unique=True,
         ),
         Index("ix_conversation_items_response_id", "response_id"),
+    )
+
+
+class SqlPendingToolCall(Base):
+    """
+    SQLAlchemy model for the ``pending_tool_calls`` table.
+
+    Tracks the full lifecycle of a tunneled client-side tool call --
+    from a sub-agent parking to the client delivering the result.
+
+    :param call_id: Tool call ID (PK), matches the LLM-generated
+        call ID. e.g. ``"call_abc123"``.
+    :param root_task_id: The top-level task whose response output
+        contains the ``function_call`` item.
+    :param task_id: The parked sub-agent's task ID.
+    :param status: ``"action_required"`` or ``"completed"``.
+    :param result: The tool's string output from the client.
+        ``None`` until the client PATCHes.
+    :param created_at: Unix epoch when the sub-agent parked.
+    :param completed_at: Unix epoch when the client PATCHed.
+        ``None`` until completed.
+    """
+
+    __tablename__ = "pending_tool_calls"
+
+    call_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    root_task_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("tasks.id", ondelete="CASCADE")
+    )
+    task_id: Mapped[str] = mapped_column(String(64), ForeignKey("tasks.id", ondelete="CASCADE"))
+    status: Mapped[str] = mapped_column(String(32))
+    result: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer)
+    completed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('action_required', 'completed')",
+            name="ck_pending_tool_calls_status",
+        ),
+        Index("ix_pending_tool_calls_root_task_id", "root_task_id"),
+        Index("ix_pending_tool_calls_task_id", "task_id"),
     )

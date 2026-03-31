@@ -19,11 +19,15 @@ class Conversation:
         e.g. ``"conv_abc123"``.
     :param created_at: Unix epoch timestamp of creation.
     :param title: Optional user-assigned title.
+    :param kind: Conversation type. ``"default"`` for
+        user-initiated, ``"sub_agent"`` for sub-agent
+        execution conversations.
     """
 
     id: str
     created_at: int
     title: str | None = None
+    kind: str = "default"
 
 
 # ── Conversation item data types ───────────────────────

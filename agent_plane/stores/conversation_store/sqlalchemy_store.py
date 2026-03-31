@@ -41,6 +41,7 @@ def _to_conversation(row: SqlConversation) -> Conversation:
         id=row.id,
         created_at=row.created_at,
         title=row.title,
+        kind=row.kind,
     )
 
 
@@ -112,15 +113,19 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             session.execute(stmt)
 
-    def create_conversation(self) -> Conversation:
+    def create_conversation(self, kind: str = "default") -> Conversation:
         """
         Create a new conversation in the database.
 
+        :param kind: Conversation type. ``"default"`` for
+            user-initiated, ``"sub_agent"`` for sub-agent
+            execution conversations.
         :returns: The newly created :class:`Conversation`.
         """
         row = SqlConversation(
             id=generate_conversation_id(),
             created_at=now_epoch(),
+            kind=kind,
         )
         with self._session() as session:
             session.add(row)
@@ -366,6 +371,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
+        kind: str | None = "default",
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -386,6 +392,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
             stmt = select(SqlConversation)
+            # Filter by kind when specified (None = no filter).
+            if kind is not None:
+                stmt = stmt.where(SqlConversation.kind == kind)
             if after:
                 sub = (
                     select(SqlConversation.created_at)
