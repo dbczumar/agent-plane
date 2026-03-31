@@ -1,7 +1,7 @@
 """Agent execution workflow — the core agent loop.
 
 Load agent → build prompt → call LLM → execute tools → repeat.
-All durably checkpointed by DBOS.
+All durably checkpointed for crash recovery.
 """
 
 from __future__ import annotations
@@ -90,8 +90,8 @@ def _get_llm_client() -> LLMClient:
 
 def _write_output(task_id: str, event: dict[str, Any]) -> None:
     """
-    Write an event to both DBOS (durable) and live stream
-    (real-time).
+    Write an event to both the durable stream and the live
+    (real-time) stream.
 
     :param task_id: The task identifier, e.g.
         ``"task_abc123"``.
@@ -105,7 +105,7 @@ def _write_output(task_id: str, event: dict[str, Any]) -> None:
 
 def _close_output(task_id: str) -> None:
     """
-    Close both the DBOS stream and the live stream.
+    Close both the durable stream and the live stream.
 
     :param task_id: The task identifier, e.g.
         ``"task_abc123"``.
@@ -123,7 +123,7 @@ class _AgentLoopResult:
     Typed result returned by the agent loop and all its terminal
     helper functions.
 
-    Converted to a plain JSON-serializable dict at the DBOS workflow
+    Converted to a plain JSON-serializable dict at the workflow
     boundary via :meth:`to_dict`.
 
     :param status: Terminal task status, one of ``"completed"``,
@@ -147,7 +147,7 @@ class _AgentLoopResult:
 
     def to_dict(self, task_id: str) -> dict[str, Any]:
         """
-        Convert to a JSON-serializable dict for the DBOS workflow boundary.
+        Convert to a JSON-serializable dict for the workflow return value.
 
         :param task_id: The task identifier, e.g. ``"task_abc123"``.
         :returns: A dict with ``"task_id"``, ``"status"``, ``"output"``,
@@ -192,9 +192,8 @@ class _ToolCall:
     Extracted from the raw ``llm_resp`` dict at the
     :func:`_get_tool_calls` boundary and used throughout
     the tool execution pipeline. The raw dicts remain in
-    ``llm_resp`` for DBOS checkpoint serialization; this
-    dataclass is the typed representation used by workflow
-    logic.
+    ``llm_resp`` for checkpoint serialization; this dataclass
+    is the typed representation used by workflow logic.
 
     :param call_id: The unique call ID assigned by the LLM,
         e.g. ``"call_abc123"``.
@@ -317,7 +316,7 @@ def _response_to_dict(resp: LLMResponse) -> dict[str, Any]:
     }
 
 
-# ── DBOS-checkpointed steps ──────────────────────────────
+# ── Checkpointed steps ───────────────────────────────────
 
 
 @step()
@@ -336,7 +335,7 @@ def _call_llm(
     Call the LLM via the Responses API (non-streaming) with retry.
 
     Retries are handled inside this ``@step`` boundary so they
-    don't cause duplicate DBOS checkpoints.
+    don't cause duplicate checkpoints.
 
     :param task_id: The task identifier for SSE event emission,
         e.g. ``"task_abc123"``.
@@ -406,8 +405,8 @@ def _call_llm_streaming(
     for each chunk, then returns the full accumulated response in
     the same dict format as :func:`_call_llm`.
 
-    This is a ``@step`` so the result is checkpointed by DBOS.
-    On crash recovery, DBOS returns the cached response without
+    This is a ``@step`` so the result is durably checkpointed.
+    On crash recovery the cached response is returned without
     re-executing the LLM call. Retries are internal to this step.
 
     :param task_id: The task identifier, e.g.
@@ -472,8 +471,8 @@ def _accumulate_stream(
 ) -> dict[str, Any]:
     """
     Consume a Responses API streaming response, emit text and
-    reasoning delta events via :func:`_write_output` (DBOS + live
-    stream), and return the full response dict.
+    reasoning delta events via :func:`_write_output` (durable +
+    live stream), and return the full response dict.
 
     Emitted SSE event types:
     - ``response.output_text.delta`` — visible text tokens
@@ -589,7 +588,7 @@ def _call_tool(
     with timeout enforcement and retry.
 
     Retries are handled inside this ``@step`` boundary so they
-    don't cause duplicate DBOS checkpoints. On exhausted retries,
+    don't cause duplicate checkpoints. On exhausted retries,
     an error string is returned (not raised) so the LLM can
     decide how to proceed.
 
@@ -654,7 +653,7 @@ def _get_tool_calls(
     """
     Extract the tool call list from the LLM response.
 
-    Converts raw dicts (kept in ``llm_resp`` for DBOS checkpoint
+    Converts raw dicts (kept in ``llm_resp`` for checkpoint
     serialization) into typed :class:`_ToolCall` instances for
     use in the workflow pipeline.
 
@@ -1348,10 +1347,9 @@ def _call_llm_for_iteration(
     When ``stream=True``, emits
     ``response.output_text.delta`` events for each text chunk
     via :func:`_write_output` so SSE consumers see tokens
-    incrementally. Falls back to the DBOS-checkpointed
-    ``@step`` when ``stream=False`` (used for tool-call
-    iterations where checkpointing matters more than
-    token-level output).
+    incrementally. Falls back to the checkpointed ``@step``
+    when ``stream=False`` (used for tool-call iterations where
+    checkpointing matters more than token-level output).
 
     :param task_id: The task identifier, e.g.
         ``"task_abc123"``.
@@ -1363,7 +1361,7 @@ def _call_llm_for_iteration(
     :param tool_schemas: OpenAI-format tool schemas for the
         agent's available tools.
     :param stream: If ``True``, stream tokens via SSE.
-        If ``False``, use DBOS-checkpointed non-streaming.
+        If ``False``, use checkpointed non-streaming.
     :param content_cache: Per-task cache mapping ``file_id``
         to base64-encoded content, avoiding redundant
         artifact store fetches across iterations.
@@ -1697,8 +1695,8 @@ def _resolve_spec(
     """
     Resolve the effective :class:`AgentSpec` for a workflow execution.
 
-    Every DBOS workflow runs with the root agent's spec (loaded once
-    from the bundle at workflow start). For sub-agent workflows the
+    Every workflow execution runs with the root agent's spec (loaded
+    once from the bundle at workflow start). For sub-agent workflows the
     root spec contains the full spec tree, so the sub-agent's own
     config lives inside ``root_spec.sub_agents``. This function
     determines whether the current execution is a top-level task or a
@@ -1713,7 +1711,7 @@ def _resolve_spec(
     identical to ``task.agent_name`` by construction (SpawnTool
     validates the name against the spec before creating the task).
 
-    :param task_id: The DBOS workflow ID (== task ID),
+    :param task_id: The task identifier,
         e.g. ``"task_abc123"``.
     :param root_spec: The root agent's parsed spec, which contains
         the full sub-agent spec tree.
@@ -1755,8 +1753,7 @@ def agent_execution_workflow(
     limit.
 
     ``previous_response_id``, ``reasoning``, and ``tools`` are
-    stored by DBOS and restored on crash recovery.
-    ``task_store.get()`` reads them back for the API response.
+    persisted as workflow inputs and restored on crash recovery.
 
     :param agent_id: Unique agent identifier, e.g.
         ``"ag_abc123"``.
@@ -1764,17 +1761,17 @@ def agent_execution_workflow(
         e.g. ``"conv_abc123"``.
     :param previous_response_id: The response ID of the
         previous turn, or ``None`` for the first turn.
-        Stored by DBOS for recovery; not used by the loop.
+        Persisted for recovery; not used by the loop.
     :param instructions: Optional per-request instructions
         to include in the system message.
     :param reasoning: Optional reasoning configuration dict,
-        e.g. ``{"effort": "high"}``. Stored by DBOS for
-        recovery; not yet consumed by the loop.
+        e.g. ``{"effort": "high"}``. Persisted for recovery;
+        not yet consumed by the loop.
     :param tools: Optional list of client-specified tool dicts in
         standard OpenAI function format. When the LLM invokes one,
         the ``function_call`` output items are returned to the caller
         (the response completes) rather than being executed
-        server-side. Stored by DBOS for recovery. ``None`` and ``[]``
+        server-side. Persisted for recovery. ``None`` and ``[]``
         are equivalent (no client tools), e.g.
         ``[{"type": "function", "function": {"name": "...",
         "description": "...", "parameters": {...}}}]``.

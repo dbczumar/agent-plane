@@ -85,6 +85,15 @@ def create_app(
             },
         )
 
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        """
+        Liveness check — returns 200 when the server is running.
+
+        :returns: ``{"status": "ok"}``.
+        """
+        return {"status": "ok"}
+
     app.include_router(
         create_agents_router(agent_store, task_store, artifact_store),
         prefix="/api",

@@ -19,7 +19,7 @@ class TaskStore(ABC):
     """
     Abstract base for task persistence and durable execution.
 
-    Manages the full task lifecycle: creation, DBOS-backed execution
+    Manages the full task lifecycle: creation, durable execution
     (start, stream, wait), the steering handshake (try_deliver,
     close_inbox), cancellation, and deletion.
     """
@@ -29,8 +29,8 @@ class TaskStore(ABC):
         Initialize the task store.
 
         The ``storage_location`` is a database URI. Concrete
-        implementations also initialize the DBOS durable execution
-        engine via ``ensure_dbos(storage_location)``.
+        implementations also initialize the durable execution
+        engine.
 
         :param storage_location: Database URI,
             e.g. ``"sqlite:///tasks.db"`` or
@@ -93,19 +93,20 @@ class TaskStore(ABC):
         """
         Begin execution of a previously created task.
 
-        Launches the DBOS workflow asynchronously and returns
-        immediately -- the task remains "queued" until the workflow
-        actually begins running, at which point it transitions to
-        "in_progress". The task must exist and be in "queued"
-        status.
+        Launch the workflow asynchronously and return immediately.
+
+        The task remains ``"queued"`` until the workflow actually
+        begins running, at which point it transitions to
+        ``"in_progress"``. The task must exist and be in
+        ``"queued"`` status.
 
         ``instructions``, ``reasoning``, and ``tools`` are passed
-        directly to the DBOS workflow as inputs (stored by DBOS,
-        not in the tasks table).
+        as workflow inputs (persisted for crash recovery, not in
+        the tasks table).
 
         Enforces the task/workflow invariant via a compensating
-        transaction: if the DBOS workflow fails to start, the task
-        row is deleted so neither artifact exists.
+        transaction: if the workflow fails to start, the task row
+        is deleted so neither artifact exists.
 
         :param task_id: Unique task identifier,
             e.g. ``"task_abc123"``.
@@ -131,8 +132,7 @@ class TaskStore(ABC):
         Awaits until the next event is available. The iterator ends
         when the task completes or is cancelled. Each event is a
         dict with a ``"type"`` field (e.g. ``"text_delta"``,
-        ``"tool_call"``). Backed by ``DBOS.read_stream()``. Async
-        because it long-polls for events.
+        ``"tool_call"``). Async because it long-polls for events.
 
         :param task_id: Unique task identifier,
             e.g. ``"task_abc123"``.
@@ -183,9 +183,8 @@ class TaskStore(ABC):
 
         Terminal states: completed, failed, incomplete, or
         cancelled. Used by the server for blocking mode
-        (``background=False``). Internally calls
-        ``DBOS.retrieve_workflow(task_id).get_result()``.
-        Async because it blocks until completion.
+        (``background=False``). Async because it blocks until
+        completion.
 
         :param task_id: Unique task identifier,
             e.g. ``"task_abc123"``.
@@ -263,7 +262,7 @@ class TaskStore(ABC):
         """
         Stop execution and mark the task as cancelled.
 
-        If in progress, stops the DBOS workflow and waits for the
+        If in progress, stops the workflow and waits for the
         finally block to complete (close_stream, inbox drain).
         Sets status to "cancelled". The task record is preserved
         -- :meth:`get` still works, and the response can be
@@ -283,8 +282,8 @@ class TaskStore(ABC):
         """
         Remove a task record entirely.
 
-        If in progress, stops the DBOS workflow first and waits
-        for the finally block to complete. Then deletes the record
+        If in progress, stops the workflow first and waits for
+        the finally block to complete. Then deletes the record
         -- subsequent :meth:`get` returns ``None``. Async because
         stopping an in-progress workflow may block while the
         finally block runs.
@@ -303,7 +302,7 @@ class TaskStore(ABC):
         """
         Cancel and delete all tasks matching the filter.
 
-        Delegates to :meth:`list_tasks` + :meth:`delete` so DBOS
+        Delegates to :meth:`list_tasks` + :meth:`delete` so
         workflow cleanup is honoured.
 
         :param agent_id: Optional agent ID filter,
@@ -348,7 +347,7 @@ class TaskStore(ABC):
         """
         Insert a routing entry for a tunneled client-side tool call.
 
-        Uses INSERT ON CONFLICT DO NOTHING for DBOS replay safety.
+        Uses INSERT ON CONFLICT DO NOTHING for replay safety.
 
         :param call_id: The tool call ID (PK),
             e.g. ``"call_abc123"``.
