@@ -45,11 +45,14 @@ class SessionState:
 
     cwd: str
     conversation_id: str | None = None
+    session_id: str | None = None
     translator: EventTranslator = field(default_factory=EventTranslator)
     mcp_connections: list[McpConnection] = field(default_factory=list)
     tool_schemas: list[dict[str, object]] = field(default_factory=list)
     # Lookup from tool name to the MCP connection that owns it
     _tool_to_connection: dict[str, McpConnection] = field(default_factory=dict)
+    # RPC server ref for tools that emit ACP notifications
+    _rpc: Server | None = field(default=None, repr=False)
     # Tool results from the last tool execution round, sent as
     # function_call_output input blocks in the continuation request
     _last_tool_results: list[dict[str, str]] = field(default_factory=list)
@@ -133,7 +136,7 @@ def create_adapter(
         session_id = uuid.uuid4().hex[:16]
         # cwd is required by ACP session/new spec
         cwd = str(params["cwd"])
-        session = SessionState(cwd=cwd)
+        session = SessionState(cwd=cwd, session_id=session_id, _rpc=rpc)
         # Register built-in tools from capabilities captured
         # during the initialize handshake
         _register_builtin_tools(session, client_capabilities)
@@ -1005,6 +1008,94 @@ _RUN_COMMAND_SCHEMA: dict[str, object] = {
 }
 
 
+_UPDATE_PLAN_SCHEMA: dict[str, object] = {
+    "type": "function",
+    "function": {
+        "name": "update_plan",
+        "description": (
+            "Update the visible plan shown to the user. Call this "
+            "to show your current plan of action with step status. "
+            "Each entry has content (what to do), status (pending/"
+            "in_progress/completed), and optional priority."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "entries": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "Step description",
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": [
+                                    "pending",
+                                    "in_progress",
+                                    "completed",
+                                ],
+                                "description": "Step status",
+                            },
+                            "priority": {
+                                "type": "string",
+                                "enum": ["high", "medium", "low"],
+                            },
+                        },
+                        "required": ["content", "status"],
+                    },
+                    "description": "The plan steps",
+                },
+            },
+            "required": ["entries"],
+        },
+    },
+}
+
+
+async def _exec_update_plan(
+    session: SessionState,
+    arguments: dict[str, object],
+) -> str:
+    """Execute the ``update_plan`` built-in tool.
+
+    Emits an ACP ``plan`` notification to Toad so the plan
+    sidebar updates in real time.
+
+    :param session: The session (provides _rpc and session_id).
+    :param arguments: ``{"entries": [{"content": str,
+        "status": str, "priority": str}, ...]}``.
+    :returns: Confirmation string.
+    """
+    entries = arguments.get("entries", [])
+    if not isinstance(entries, list):
+        return "[Error] entries must be a list"
+    plan_entries: list[dict[str, object]] = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            plan_entries.append(
+                {
+                    "content": str(entry.get("content", "")),
+                    "status": str(entry.get("status", "pending")),
+                    **({"priority": str(entry["priority"])} if "priority" in entry else {}),
+                }
+            )
+    if session._rpc is not None and session.session_id is not None:
+        await session._rpc.notify(
+            "session/update",
+            {
+                "sessionId": session.session_id,
+                "update": {
+                    "sessionUpdate": "plan",
+                    "entries": plan_entries,
+                },
+            },
+        )
+    return f"Plan updated ({len(plan_entries)} steps)"
+
+
 async def _exec_read_file(
     session: SessionState,
     arguments: dict[str, object],
@@ -1121,6 +1212,7 @@ _BUILTIN_TOOL_EXECUTORS: dict[
     "write_file": _exec_write_file,
     "list_directory": _exec_list_directory,
     "run_command": _exec_run_command,
+    "update_plan": _exec_update_plan,
 }
 
 
@@ -1149,3 +1241,6 @@ def _register_builtin_tools(
             session.tool_schemas.append(_WRITE_FILE_SCHEMA)
     if capabilities.get("terminal"):
         session.tool_schemas.append(_RUN_COMMAND_SCHEMA)
+    # Plan tool is always available — lets the agent show a
+    # step-by-step plan in Toad's sidebar
+    session.tool_schemas.append(_UPDATE_PLAN_SCHEMA)

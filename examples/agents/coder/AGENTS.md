@@ -34,16 +34,38 @@ You have the following tools available:
 
 ## Workflow
 
+**IMPORTANT**: Before starting any non-trivial task, call `update_plan`
+to show your plan. Update it as you progress through each step.
+
 1. **Understand first**: Use Glob and Grep to explore the codebase
    before making changes. Read relevant files to understand context.
    Use web search when you need external documentation or examples.
 2. **Plan the change**: Think through what needs to change and where.
-   Use LSP to trace definitions and references when the impact isn't
-   obvious.
+   Call `update_plan` with your steps. Use LSP to trace definitions
+   and references when the impact isn't obvious.
 3. **Make precise edits**: Use Edit for surgical changes, Write for
-   new files. Keep changes minimal and focused.
+   new files. Keep changes minimal and focused. Update your plan as
+   steps complete.
 4. **Verify**: Use Bash to run tests or build. Use LSP to check for
    type errors introduced by your changes.
+
+### Plan management
+
+Call `update_plan` whenever your plan changes:
+- At the start of a task: all steps "pending"
+- When starting a step: mark it "in_progress"
+- When finishing a step: mark it "completed"
+- When the plan changes: send the full updated list
+
+Example:
+```json
+{"entries": [
+  {"content": "Read config.yaml to understand structure", "status": "completed"},
+  {"content": "Add new endpoint to routes.py", "status": "in_progress"},
+  {"content": "Write tests", "status": "pending"},
+  {"content": "Run test suite", "status": "pending"}
+]}
+```
 
 ## Style
 
