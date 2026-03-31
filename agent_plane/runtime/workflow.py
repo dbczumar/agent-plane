@@ -22,7 +22,6 @@ from agent_plane.entities import (
 )
 from agent_plane.runtime import (
     get_agent_cache,
-    get_agent_store,
     get_artifact_store,
     get_caps,
     get_conversation_store,
@@ -1670,19 +1669,6 @@ def _run_agent_loop(
     )
 
 
-@dataclass
-class _ResolvedSpec:
-    """
-    Result of resolving the effective spec for a workflow.
-
-    :param spec: The effective agent spec (root or sub-agent).
-    :param agent_name: The agent's display name for output items.
-    """
-
-    spec: AgentSpec
-    agent_name: str
-
-
 def _find_sub_agent_spec(
     spec: AgentSpec,
     name: str,
@@ -1708,27 +1694,37 @@ def _find_sub_agent_spec(
     return None
 
 
-def _resolve_spec_and_name(
+def _resolve_spec(
     task_id: str,
-    agent_id: str,
     root_spec: AgentSpec,
-) -> _ResolvedSpec:
+) -> AgentSpec:
     """
-    Resolve the effective spec and agent name for a workflow.
+    Resolve the effective :class:`AgentSpec` for a workflow execution.
 
-    For top-level tasks, returns the root spec and the registered
-    agent name. For sub-agent tasks (``root_task_id IS NOT NULL``),
-    finds the sub-agent spec by ``agent_name`` in the spec tree.
+    Every DBOS workflow runs with the root agent's spec (loaded once
+    from the bundle at workflow start). For sub-agent workflows the
+    root spec contains the full spec tree, so the sub-agent's own
+    config lives inside ``root_spec.sub_agents``. This function
+    determines whether the current execution is a top-level task or a
+    spawned sub-agent, and returns the correct slice of the tree.
+
+    For top-level tasks (``root_task_id IS NULL``): returns
+    ``root_spec`` unchanged — the workflow *is* the root agent.
+
+    For sub-agent tasks (``root_task_id IS NOT NULL``): looks up
+    ``task.agent_name`` in the spec tree and returns the matching
+    nested :class:`AgentSpec`. The sub-agent's ``spec.name`` is
+    identical to ``task.agent_name`` by construction (SpawnTool
+    validates the name against the spec before creating the task).
 
     :param task_id: The DBOS workflow ID (== task ID),
         e.g. ``"task_abc123"``.
-    :param agent_id: The registered agent ID,
-        e.g. ``"ag_xyz789"``.
-    :param root_spec: The root agent's parsed spec.
-    :returns: A :class:`_ResolvedSpec` with the effective spec
-        and agent name.
-    :raises LookupError: If the task row is missing or the
-        sub-agent name is not found in the spec tree.
+    :param root_spec: The root agent's parsed spec, which contains
+        the full sub-agent spec tree.
+    :returns: The :class:`AgentSpec` to use for this execution.
+    :raises LookupError: If the task row is missing, or the
+        sub-agent name recorded on the task is not found in the
+        spec tree.
     """
     task_store = get_task_store()
 
@@ -1744,16 +1740,14 @@ def _resolve_spec_and_name(
         agent_name = row.agent_name
 
     if root_task_id is None:
-        # Top-level task — use root spec and registered name
-        agent = get_agent_store().get(agent_id)
-        name = agent.name if agent else agent_id
-        return _ResolvedSpec(spec=root_spec, agent_name=name)
+        # Top-level task — this workflow IS the root agent
+        return root_spec
 
     # Sub-agent — find spec by agent_name in the tree
     sub_spec = _find_sub_agent_spec(root_spec, agent_name)
     if sub_spec is None:
         raise LookupError(f"sub-agent {agent_name!r} not found in spec tree")
-    return _ResolvedSpec(spec=sub_spec, agent_name=agent_name)
+    return sub_spec
 
 
 @workflow()
@@ -1809,13 +1803,10 @@ def agent_execution_workflow(
 
         # Resolve spec for sub-agents: if root_task_id is set,
         # find the sub-agent spec by agent_name in the tree.
-        resolved = _resolve_spec_and_name(
-            task_id,
-            agent_id,
-            root_spec,
-        )
-        spec = resolved.spec
-        agent_name = resolved.agent_name
+        spec = _resolve_spec(task_id, root_spec)
+        # spec.name is None only for partially-constructed specs that
+        # haven't been registered — fall back to agent_id for display.
+        agent_name: str = spec.name or agent_id
 
         if spec.llm is None:
             return _AgentLoopResult(
