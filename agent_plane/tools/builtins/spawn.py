@@ -42,12 +42,6 @@ _DBOS_TO_RESULT_STATUS: dict[str, str] = {
     WorkflowStatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED.value: ("failed"),
 }
 
-# Module-level cache: populated by SpawnTool, read by CollectTool.
-# Both tools run within the same DBOS workflow (the parent agent).
-# On DBOS replay, tool call results are replayed from checkpoint,
-# so this cache is only read when collect actually re-executes.
-_spawned_agent_names: dict[str, str] = {}
-
 
 def _extract_output_text(output: list[dict[str, Any]]) -> str:
     """
@@ -355,8 +349,6 @@ def _invoke_spawn(
             user_input=sa_input,
             root_task_id=root_task_id,
         )
-        # Cache for CollectTool to use without DB lookup
-        _spawned_agent_names[task_id] = sa_name
         response_ids.append(task_id)
 
     return json.dumps({"response_ids": response_ids})
@@ -479,21 +471,14 @@ def _resolve_agent_name(task_id: str) -> str:
     """
     Look up the agent name for a spawned sub-agent task.
 
-    First checks the module-level cache (populated by SpawnTool).
-    Falls back to reading the task row from the database (handles
-    DBOS replay where the spawn tool result was replayed from
-    checkpoint but the cache was not repopulated).
+    Reads the task row from the database. The row is always
+    present because ``_spawn_one`` creates it before this
+    function is ever called.
 
     :param task_id: The sub-agent's task ID,
         e.g. ``"task_child1"``.
     :returns: The agent name, or ``"unknown"`` if not found.
     """
-    cached = _spawned_agent_names.get(task_id)
-    if cached is not None:
-        return cached
-
-    # Fallback: read from DB via the task store's DB session.
-    # This path only activates during DBOS replay recovery.
     from agent_plane.db.db_models import SqlTask
     from agent_plane.runtime import get_task_store
 
@@ -504,7 +489,6 @@ def _resolve_agent_name(task_id: str) -> str:
         row = session.get(SqlTask, task_id)
         if row is not None:
             agent_name: str = row.agent_name
-            _spawned_agent_names[task_id] = agent_name
             return agent_name
     return "unknown"
 

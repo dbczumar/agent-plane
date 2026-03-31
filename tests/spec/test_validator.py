@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from agent_plane.spec.types import (
     AgentSpec,
     InteractionConfig,
@@ -188,6 +190,59 @@ def test_sub_agent_reference_missing() -> None:
     result = validate(spec)
     assert not result.valid
     assert any("ghost" in e.message for e in result.errors)
+
+
+@pytest.mark.parametrize(
+    "invalid_name",
+    [
+        "has.dot",  # dot is the tunneled model field delimiter
+        "has/slash",  # slash is the litellm provider/model separator
+        "has space",  # whitespace confuses API clients and log pipelines
+        "has\ttab",  # tab is also whitespace
+        "",  # empty string has no meaningful identity
+    ],
+)
+def test_agent_name_invalid_characters(invalid_name: str) -> None:
+    """
+    Agent names with dots, slashes, whitespace, or empty string are rejected.
+
+    Each of these characters would break either the tunneled model field
+    (dots), litellm routing (slashes), or client parsing (whitespace/empty).
+    """
+    spec = _minimal_spec(name=invalid_name)
+    result = validate(spec)
+    assert not result.valid
+    assert any("name" in e.path for e in result.errors)
+
+
+@pytest.mark.parametrize(
+    "valid_name",
+    [
+        "researcher",
+        "my-agent",
+        "agent_v2",
+        "Agent123",
+        "CamelCase",
+        "a",
+    ],
+)
+def test_agent_name_valid(valid_name: str) -> None:
+    """Agent names using alphanumeric, hyphens, and underscores are accepted."""
+    spec = _minimal_spec(name=valid_name)
+    result = validate(spec)
+    assert result.valid
+
+
+def test_agent_name_invalid_in_sub_agent() -> None:
+    """Invalid name on a sub-agent (not just the root) is caught."""
+    sub = _minimal_spec(name="bad.name", llm=LLMConfig(model="openai/gpt-4o"))
+    spec = _minimal_spec(
+        tools=ToolsConfig(agents=["bad.name"]),
+        sub_agents=[sub],
+    )
+    result = validate(spec)
+    assert not result.valid
+    assert any("name" in e.path for e in result.errors)
 
 
 def test_multiple_errors_reported() -> None:

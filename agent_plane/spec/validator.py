@@ -8,6 +8,12 @@ from dataclasses import dataclass, field
 from agent_plane.spec.types import AgentSpec
 
 _SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9-]+$")
+# Agent names appear as components of the ``model`` field in API responses
+# (e.g. ``"orchestrator.researcher"``). The allowed set mirrors OpenAI model
+# name conventions: alphanumeric, hyphens, underscores only.
+# Excluded: dots (delimiter), slashes (litellm provider/model separator),
+# whitespace, and empty strings.
+_AGENT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 _SKILL_NAME_MAX_LEN = 64
 _SKILL_DESC_MAX_LEN = 1024
 _VALID_INPUT_MODALITIES = {"text", "image", "audio", "video", "file"}
@@ -235,34 +241,43 @@ def _validate_sub_agents(
                 "callable sub-agent must have llm.model configured",
             )
 
-    # No dots in agent names (reserved for tunneled model field)
-    _check_no_dots_in_names(spec, result)
+    # Agent name characters (dots, slashes, whitespace, empty)
+    _validate_agent_names(spec, result)
 
     # Unique names across the entire spec tree
     _check_unique_sub_agent_names(spec, result)
 
 
-def _check_no_dots_in_names(
+def _validate_agent_names(
     spec: AgentSpec,
     result: ValidationResult,
 ) -> None:
     """
-    Validate that no agent name in the spec tree contains a dot.
+    Validate that every agent name in the spec tree is a legal identifier.
 
-    The dot character is reserved as the delimiter in the
-    ``model`` field on tunneled output items (e.g.
-    ``"orchestrator.researcher"``).
+    Agent names appear as components of the ``model`` field in API
+    responses (e.g. ``"orchestrator.researcher"``). They must match
+    ``_AGENT_NAME_PATTERN`` (``[a-zA-Z0-9_-]+``), which enforces:
 
-    :param spec: The root agent spec to check.
+    - Non-empty — empty strings have no meaningful identity.
+    - No dots — reserved as the delimiter between parent and sub-agent
+      in the ``model`` field (e.g. ``"root.child"``).
+    - No slashes — reserved by litellm as the ``provider/model``
+      separator; a slash in a name would silently mis-route LLM calls.
+    - No whitespace — whitespace in a model identifier confuses most
+      API clients and logging pipelines.
+
+    :param spec: The root agent spec to check (recursed into sub_agents).
     :param result: Accumulator for any validation errors found.
     """
-    if spec.name and "." in spec.name:
+    if spec.name is not None and not _AGENT_NAME_PATTERN.match(spec.name):
         result.add(
             "name",
-            f"agent name {spec.name!r} must not contain '.'",
+            f"agent name {spec.name!r} must match [a-zA-Z0-9_-]+ "
+            f"(no dots, slashes, whitespace, or empty strings)",
         )
     for sa in spec.sub_agents:
-        _check_no_dots_in_names(sa, result)
+        _validate_agent_names(sa, result)
 
 
 def _check_unique_sub_agent_names(
