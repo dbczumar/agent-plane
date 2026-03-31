@@ -143,14 +143,13 @@ class TaskStore(ABC):
     @abstractmethod
     async def get(self, task_id: str) -> Task | None:
         """
-        Return a snapshot of the task's current state.
+        Return a fully enriched snapshot of the task's current state.
 
-        Output is populated only when status is "completed". For
-        all other terminal states (failed, incomplete, cancelled),
-        output is empty -- intermediate work is captured in the
-        DBOS stream, not in the task output. Returns the task
-        regardless of status. Returns ``None`` if the task does
-        not exist (deleted by user or cleaned up by system).
+        Combines persisted DB state with runtime execution state
+        (status, output) for a complete picture. Output is populated
+        only when status is ``"completed"``; for other terminal
+        states the output list is empty. Returns ``None`` if the
+        task does not exist.
 
         :param task_id: Unique task identifier,
             e.g. ``"task_abc123"``.
@@ -161,14 +160,14 @@ class TaskStore(ABC):
     @abstractmethod
     def get_sync(self, task_id: str) -> Task | None:
         """
-        Synchronous variant of :meth:`get` for use inside DBOS
-        workflows and tool implementations where an event loop is
-        already running.
+        Synchronous, DB-only read of a task row.
 
-        Returns the task entity from the database **without** DBOS
-        workflow enrichment (status/output from the DBOS runtime).
-        This is sufficient when callers only need DB-persisted
-        fields like ``root_task_id`` or ``agent_name``.
+        Returns the task entity **without** runtime execution state
+        enrichment (status/output from the execution engine). This
+        is sufficient when callers only need persisted fields like
+        ``root_task_id`` or ``agent_name``, and is safe to call
+        from synchronous contexts (workflow code, tool
+        implementations) where ``await`` is not available.
 
         :param task_id: Unique task identifier,
             e.g. ``"task_abc123"``.
