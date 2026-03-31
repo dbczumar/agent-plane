@@ -5,6 +5,7 @@ description: A coding assistant that uses client-side tools for file operations,
 
 llm:
   model: gpt-5.4
+  reasoning_effort: medium
   connection:
     api_key: ${OPENAI_API_KEY}
 
