@@ -1688,7 +1688,7 @@ def _find_spec_by_name(
     return None
 
 
-def _resolve_task_spec(
+def _resolve_agent_spec_for_task(
     task_id: str,
     root_spec: AgentSpec,
 ) -> AgentSpec:
@@ -1787,7 +1787,7 @@ def agent_execution_workflow(
 
         # Resolve spec for sub-agents: if root_task_id is set,
         # find the sub-agent spec by agent_name in the tree.
-        spec = _resolve_task_spec(task_id, root_spec)
+        spec = _resolve_agent_spec_for_task(task_id, root_spec)
         # spec.name is None only for partially-constructed specs that
         # haven't been registered — fall back to agent_id for display.
         agent_name: str = spec.name or agent_id
