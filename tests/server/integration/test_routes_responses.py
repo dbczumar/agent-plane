@@ -44,8 +44,17 @@ async def test_create_response_foreground(client: httpx.AsyncClient) -> None:
     assert result.status_code == 200
     assert result.body["status"] == "completed"
     assert isinstance(result.body["completed_at"], int)
-    assert len(result.body["output"]) > 0
     assert result.body["conversation"] is not None
+    # Verify output has a well-formed assistant message
+    output = result.body["output"]
+    assert len(output) >= 1
+    msg = output[0]
+    assert msg["type"] == "message"
+    assert msg["role"] == "assistant"
+    assert len(msg["content"]) >= 1
+    assert msg["content"][0]["type"] == "output_text"
+    assert isinstance(msg["content"][0]["text"], str)
+    assert len(msg["content"][0]["text"]) > 0
 
 
 async def test_create_response_streaming(client: httpx.AsyncClient) -> None:
@@ -83,7 +92,19 @@ async def test_create_response_streaming(client: httpx.AsyncClient) -> None:
     assert terminal_resp["status"] == "completed"
     assert terminal_resp["object"] == "response"
     assert isinstance(terminal_resp["id"], str)
+    # Output has a well-formed assistant message
     assert len(terminal_resp["output"]) >= 1
+    msg = terminal_resp["output"][0]
+    assert msg["type"] == "message"
+    assert msg["role"] == "assistant"
+
+    # At least one output_item.done event with the assistant message
+    item_done_events = [e for e in events if e[0] == "response.output_item.done"]
+    assert len(item_done_events) >= 1
+    # The item contains the actual assistant message content
+    done_item = item_done_events[0][1]["item"]
+    assert done_item["type"] == "message"
+    assert done_item["role"] == "assistant"
 
     # Last event is [DONE]
     assert events[-1] == ("done", "[DONE]")
@@ -115,7 +136,14 @@ async def test_get_response(client: httpx.AsyncClient) -> None:
     assert isinstance(body["created_at"], int)
     assert body["conversation"] is not None
     assert isinstance(body["conversation"]["id"], str)
+    # Output has a well-formed assistant message
     assert len(body["output"]) >= 1
+    msg = body["output"][0]
+    assert msg["type"] == "message"
+    assert msg["role"] == "assistant"
+    assert msg["content"][0]["type"] == "output_text"
+    assert isinstance(msg["content"][0]["text"], str)
+    assert len(msg["content"][0]["text"]) > 0
 
 
 async def test_get_response_not_found(client: httpx.AsyncClient) -> None:
@@ -153,13 +181,14 @@ async def test_cancel_completed_response(client: httpx.AsyncClient) -> None:
     # background=False so the task completes before we cancel it
     created = await create_test_response(client, background=False, stream=False)
     response_id = created.body["id"]
+    original_output = created.body["output"]
 
     resp = await client.post(f"/v1/responses/{response_id}/cancel")
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "completed"
-    # Output preserved since task was already completed
-    assert len(body["output"]) >= 1
+    # Output must be identical to the pre-cancel output
+    assert body["output"] == original_output
 
 
 async def test_cancel_active_response(
@@ -170,10 +199,13 @@ async def test_cancel_active_response(
     await create_test_agent(client)
 
     # Block the LLM call so the task stays active
-    mock_llm.add_call(block=True)
+    call = mock_llm.add_call(block=True)
     created = await create_test_response(client)
     response_id = created.body["id"]
     assert created.body["status"] == "queued"
+
+    # Wait for the LLM call to start so we know the workflow is active
+    call.call_event.wait(timeout=5)
 
     resp = await client.post(f"/v1/responses/{response_id}/cancel")
     assert resp.status_code == 200
@@ -181,6 +213,8 @@ async def test_cancel_active_response(
     assert body["status"] == "cancelled"
     # Cancelled responses have empty output
     assert body["output"] == []
+    # The blocked LLM call was the only one — no second call happened
+    assert mock_llm.call_count == 1
 
 
 async def test_cancel_response_not_found(client: httpx.AsyncClient) -> None:
@@ -199,12 +233,15 @@ async def test_create_response_unknown_model(client: httpx.AsyncClient) -> None:
 
 
 async def test_create_response_store_false(client: httpx.AsyncClient) -> None:
+    """store=False is rejected with a clear error message."""
     await create_test_agent(client)
     resp = await client.post(
         "/v1/responses",
         json={"model": "test-agent", "input": "Hi", "store": False},
     )
     assert resp.status_code == 400
+    error_msg = resp.json()["error"]["message"].lower()
+    assert "store" in error_msg
 
 
 async def test_create_response_with_instructions(
@@ -355,11 +392,24 @@ async def test_create_response_with_previous_response_id(
         client,
         input_text="Turn 2",
         previous_response_id=first_id,
+        background=False,
+        stream=False,
     )
     assert second.status_code == 200
     assert second.body["previous_response_id"] == first_id
-    # Should be in the same conversation
     assert second.body["conversation"]["id"] == conv_id
+
+    # Verify the conversation has items from both turns
+    items_resp = await client.get(f"/v1/conversations/{conv_id}/items")
+    items = items_resp.json()["data"]
+    # At minimum: user msg 1, assistant msg 1, user msg 2, assistant msg 2
+    assert len(items) >= 4
+    message_roles = [i.get("role") for i in items if i.get("type") == "message"]
+    # Alternating user/assistant across both turns
+    assert message_roles[0] == "user"
+    assert message_roles[1] == "assistant"
+    assert message_roles[2] == "user"
+    assert message_roles[3] == "assistant"
 
 
 async def test_create_response_invalid_previous_response_id(
@@ -451,6 +501,14 @@ async def test_background_streaming_queued_event(
     # background=True adds response.queued before in_progress
     assert event_types[1] == "response.queued"
     assert event_types[2] == "response.in_progress"
+
+    # Verify each lifecycle event has a well-formed response object
+    for event_type in ("response.created", "response.queued", "response.in_progress"):
+        evt = next(e[1] for e in events if e[0] == event_type)
+        assert evt["type"] == event_type
+        resp_obj = evt["response"]
+        assert isinstance(resp_obj["id"], str)
+        assert resp_obj["object"] == "response"
 
 
 async def test_fork_detection(client: httpx.AsyncClient) -> None:
@@ -1650,12 +1708,6 @@ async def test_spawn_sub_agent_creates_child_task(
     assert result.status_code == 200, f"Expected 200, got {result.status_code}: {result.body}"
     assert result.body["status"] == "completed"
     assert result.body["model"] == "orchestrator"
-
-    # DEBUG: print full output to diagnose test failures
-    import pprint
-    import sys
-
-    pprint.pprint(result.body["output"], stream=sys.stderr)
 
     # The parent's output should contain the final text message with one of the
     # mock LLM's responses, proving data traversed the full pipeline. The parent
