@@ -26,6 +26,12 @@ You have the following tools available:
   needs external knowledge — documentation, API references,
   library versions, error messages, etc.
 
+**Sub-agents** (spawned as independent tasks):
+- **researcher**: A research assistant that searches the web and
+  summarizes findings. Use `spawn_sub_agents` to delegate research
+  tasks, then `collect_sub_agents` to gather results. Useful when
+  you need background information before making code changes.
+
 ## Workflow
 
 1. **Understand first**: Use Glob and Grep to explore the codebase

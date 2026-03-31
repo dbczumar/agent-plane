@@ -530,6 +530,15 @@ def upload_agent(client: httpx.Client) -> str:
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         tf.add(bundle_dir / "config.yaml", arcname="config.yaml")
         tf.add(bundle_dir / "AGENTS.md", arcname="AGENTS.md")
+        # Include sub-agent directories if present.
+        agents_dir = bundle_dir / "agents"
+        if agents_dir.is_dir():
+            for child in sorted(agents_dir.iterdir()):
+                if (child / "config.yaml").exists():
+                    tf.add(
+                        child / "config.yaml",
+                        arcname=f"agents/{child.name}/config.yaml",
+                    )
     buf.seek(0)
     resp = client.post(
         f"{BASE_URL}/api/agents",

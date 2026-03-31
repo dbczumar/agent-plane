@@ -14,7 +14,11 @@ from agent_plane.entities import FunctionCallOutputData, MessageData
 from agent_plane.server.routes.responses import _split_input_to_items
 from agent_plane.stores.task_store.sqlalchemy_store import SqlAlchemyTaskStore
 from tests.server.conftest import ControllableMockClient
-from tests.server.helpers import create_test_agent, create_test_response
+from tests.server.helpers import (
+    build_agent_bundle,
+    create_test_agent,
+    create_test_response,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -1473,3 +1477,93 @@ async def test_patch_response_idempotent(
     rows = task_store.get_pending_tool_calls(response_id, status="completed")
     assert len(rows) == 1, "Expected exactly 1 completed row"
     assert rows[0].result == "first", "First writer wins — stored result must not be overwritten"
+
+
+# ── Multi-agent (spawn/collect) tests ──────────────────────────────
+
+
+async def test_spawn_sub_agent_creates_child_task(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+    task_store: SqlAlchemyTaskStore,
+) -> None:
+    """
+    Parent agent calls spawn_sub_agents, which creates a child
+    task that runs independently and completes. The parent then
+    receives the spawn result and produces a final response.
+
+    Verifies the full multi-agent workflow:
+    1. Parent LLM returns spawn_sub_agents tool call.
+    2. SpawnTool creates a sub-agent task+workflow.
+    3. Sub-agent's LLM call completes with text.
+    4. Parent's next LLM call includes spawn output in context.
+    5. Parent produces a final text response.
+    """
+    # Upload agent with a "researcher" sub-agent
+    bundle = build_agent_bundle(
+        name="orchestrator",
+        sub_agents=[
+            {"name": "researcher", "description": "Research helper"},
+        ],
+    )
+    resp = await client.post(
+        "/api/agents",
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert resp.status_code == 201
+
+    # Mock call 1 (parent): spawn the researcher sub-agent
+    spawn_args = json.dumps(
+        {
+            "agents": [
+                {"name": "researcher", "input": "What is Python 3.14?"},
+            ],
+        }
+    )
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_spawn_1",
+                "name": "spawn_sub_agents",
+                "arguments": spawn_args,
+            },
+        ],
+    )
+
+    # Mock call 2 (sub-agent researcher): complete with text
+    mock_llm.add_call(text="Python 3.14 introduces JIT compilation.")
+
+    # Mock call 3 (parent, after spawn result): final text
+    mock_llm.add_call(text="Based on research: Python 3.14 has JIT.")
+
+    # Create the response (foreground blocking wait)
+    result = await create_test_response(
+        client,
+        model="orchestrator",
+        input_text="Research Python 3.14 features",
+        background=False,
+        stream=False,
+    )
+
+    assert result.status_code == 200, f"Expected 200, got {result.status_code}: {result.body}"
+    assert result.body["status"] == "completed"
+    assert result.body["model"] == "orchestrator"
+
+    # The parent's output should contain the final text message
+    output = result.body["output"]
+    text_items = [item for item in output if item.get("type") == "message"]
+    assert len(text_items) >= 1, f"Expected at least one message in output, got: {output}"
+
+    # Verify mock LLM was called at least 3 times:
+    # 1 = parent spawn, 2 = sub-agent, 3 = parent final
+    assert mock_llm.call_count >= 3, (
+        f"Expected >= 3 LLM calls (parent+sub+parent), got {mock_llm.call_count}"
+    )
+
+    # Verify the sub-agent task was created with root_task_id
+    parent_task_id = result.body["id"]
+    all_tasks = await task_store.list_tasks()
+    child_tasks = [t for t in all_tasks if t.root_task_id == parent_task_id]
+    assert len(child_tasks) == 1, (
+        f"Expected 1 child task with root_task_id={parent_task_id}, got {len(child_tasks)}"
+    )

@@ -23,11 +23,21 @@ class ApiResponse:
 def build_agent_bundle(
     name: str,
     description: str | None = None,
+    sub_agents: list[dict[str, Any]] | None = None,
 ) -> bytes:
     """
     Build a minimal valid agent bundle (tar.gz) for testing.
 
-    The bundle contains a single config.yaml with the given spec fields.
+    The bundle contains a single config.yaml with the given spec
+    fields. When ``sub_agents`` is provided, each entry is added as
+    ``agents/<name>/config.yaml`` and the parent's
+    ``tools.agents`` list is populated.
+
+    :param name: Agent name, e.g. ``"test-agent"``.
+    :param description: Optional description.
+    :param sub_agents: Optional list of sub-agent config dicts.
+        Each must have at least a ``"name"`` key, e.g.
+        ``[{"name": "researcher", "description": "..."}]``.
     """
     # Any: YAML config values are heterogeneous (str, int, etc.)
     config: dict[str, Any] = {
@@ -40,6 +50,10 @@ def build_agent_bundle(
     }
     if description is not None:
         config["description"] = description
+    if sub_agents:
+        config["tools"] = {
+            "agents": [sa["name"] for sa in sub_agents],
+        }
     config_bytes = yaml.dump(config).encode()
 
     buf = io.BytesIO()
@@ -47,6 +61,21 @@ def build_agent_bundle(
         info = tarfile.TarInfo(name="config.yaml")
         info.size = len(config_bytes)
         tf.addfile(info, io.BytesIO(config_bytes))
+        # Add sub-agent config files
+        for sa in sub_agents or []:
+            sa_config: dict[str, Any] = {
+                "spec_version": 1,
+                "name": sa["name"],
+                "llm": {"model": sa["name"]},
+            }
+            if "description" in sa:
+                sa_config["description"] = sa["description"]
+            sa_bytes = yaml.dump(sa_config).encode()
+            sa_info = tarfile.TarInfo(
+                name=f"agents/{sa['name']}/config.yaml",
+            )
+            sa_info.size = len(sa_bytes)
+            tf.addfile(sa_info, io.BytesIO(sa_bytes))
     return buf.getvalue()
 
 

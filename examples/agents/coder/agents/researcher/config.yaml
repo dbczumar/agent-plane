@@ -1,0 +1,18 @@
+spec_version: 1
+
+name: researcher
+description: A research assistant that searches the web and summarizes findings on technical topics.
+
+llm:
+  model: gpt-5.4
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  builtins:
+    - web_search_openai
+
+instructions: |
+  You are a research assistant. When asked about a topic, use web search
+  to find relevant information and return a concise summary of your findings.
+  Focus on accuracy and cite your sources when possible.
