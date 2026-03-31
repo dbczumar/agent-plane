@@ -367,3 +367,53 @@ def test_replay_unknown_item_type() -> None:
     """Unknown item types produce no updates."""
     item = {"type": "some_future_type", "data": {}}
     assert _replay_item(item) == []
+
+
+@pytest.mark.asyncio
+async def test_execute_single_tool_not_found() -> None:
+    """Tool not in MCP connections returns error message."""
+    from integrations.toad.adapter import SessionState, _execute_single_tool
+
+    session = SessionState(cwd="/tmp")
+    result = await _execute_single_tool(session, "nonexistent", "{}")
+    assert "[Error]" in result
+    assert "nonexistent" in result
+
+
+@pytest.mark.asyncio
+async def test_build_continuation_payload() -> None:
+    """Continuation payload includes tools and previous_response_id."""
+    from integrations.toad.adapter import (
+        SessionState,
+        _build_continuation_payload,
+    )
+
+    session = SessionState(cwd="/tmp")
+    session.translator.last_response_id = "resp_prev"
+    session.tool_schemas = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read",
+                "parameters": {},
+            },
+        }
+    ]
+    payload = _build_continuation_payload("coder", session)
+    assert payload["model"] == "coder"
+    assert payload["previous_response_id"] == "resp_prev"
+    assert payload["tools"] == session.tool_schemas
+    assert payload["input"] == []
+    assert payload["stream"] is True
+
+
+@pytest.mark.asyncio
+async def test_create_adapter_registers_session_list_load() -> None:
+    """create_adapter registers session/list and session/load."""
+    rpc = create_adapter(
+        server_url="http://localhost:18400",
+        agent_name="test-agent",
+    )
+    assert "session/list" in rpc.handlers
+    assert "session/load" in rpc.handlers

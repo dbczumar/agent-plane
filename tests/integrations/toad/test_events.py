@@ -355,3 +355,84 @@ def test_response_failed_captures_conversation_id(
         },
     )
     assert translator.last_conversation_id == "conv_fail"
+
+
+def test_pending_client_tool_calls_detected(
+    translator: EventTranslator,
+) -> None:
+    """Function calls without matching outputs are pending client tools."""
+    # Simulate function_call streamed
+    translator.translate(
+        "response.output_item.done",
+        {
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read_file",
+                "arguments": '{"path": "/tmp/x"}',
+            }
+        },
+    )
+    # No function_call_output for call_1
+    translator.translate(
+        "response.completed",
+        {"response": {"id": "resp_1"}},
+    )
+    pending = translator.pending_client_tool_calls
+    assert len(pending) == 1
+    assert pending[0]["call_id"] == "call_1"
+    assert pending[0]["name"] == "read_file"
+    assert pending[0]["arguments"] == '{"path": "/tmp/x"}'
+
+
+def test_matched_tool_calls_not_pending(
+    translator: EventTranslator,
+) -> None:
+    """Function calls with matching outputs are not pending."""
+    translator.translate(
+        "response.output_item.done",
+        {
+            "item": {
+                "type": "function_call",
+                "call_id": "call_2",
+                "name": "web_search",
+                "arguments": '{"q": "test"}',
+            }
+        },
+    )
+    # Server-side tool — output arrives
+    translator.translate(
+        "response.output_item.done",
+        {
+            "item": {
+                "type": "function_call_output",
+                "call_id": "call_2",
+                "output": "results here",
+            }
+        },
+    )
+    translator.translate(
+        "response.completed",
+        {"response": {"id": "resp_2"}},
+    )
+    assert translator.pending_client_tool_calls == []
+
+
+def test_reset_for_prompt_clears_tool_tracking(
+    translator: EventTranslator,
+) -> None:
+    """reset_for_prompt clears seen function calls and outputs."""
+    translator.translate(
+        "response.output_item.done",
+        {
+            "item": {
+                "type": "function_call",
+                "call_id": "call_3",
+                "name": "tool_x",
+                "arguments": "{}",
+            }
+        },
+    )
+    assert len(translator.pending_client_tool_calls) == 1
+    translator.reset_for_prompt()
+    assert translator.pending_client_tool_calls == []

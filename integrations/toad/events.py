@@ -50,15 +50,38 @@ class EventTranslator:
     last_conversation_id: str | None = None
     stop_reason: str | None = None
     _pending_tool_calls: dict[str, ToolCallAccumulator] = field(default_factory=dict)
+    _seen_function_calls: dict[str, dict[str, str]] = field(default_factory=dict)
+    _seen_function_outputs: set[str] = field(default_factory=set)
 
     def reset_for_prompt(self) -> None:
         """Clear per-prompt state before a new prompt starts.
 
-        Resets ``stop_reason`` so the next prompt's terminal event
-        sets it fresh. Does not clear ``last_response_id`` or
-        ``last_conversation_id`` — those persist across prompts.
+        Resets ``stop_reason`` and tool call tracking so the next
+        prompt starts fresh. Does not clear ``last_response_id``
+        or ``last_conversation_id`` — those persist across prompts.
         """
         self.stop_reason = None
+        self._seen_function_calls.clear()
+        self._seen_function_outputs.clear()
+
+    @property
+    def pending_client_tool_calls(
+        self,
+    ) -> list[dict[str, str]]:
+        """Function calls that had no matching output in the stream.
+
+        After a response completes, any call_id in
+        ``_seen_function_calls`` but not in ``_seen_function_outputs``
+        is a client-side tool call that the adapter must execute.
+
+        :returns: List of dicts with ``call_id``, ``name``, and
+            ``arguments`` for each pending call.
+        """
+        pending: list[dict[str, str]] = []
+        for call_id, info in self._seen_function_calls.items():
+            if call_id not in self._seen_function_outputs:
+                pending.append(info)
+        return pending
 
     def translate(self, event_type: str, data: dict[str, object]) -> list[dict[str, object]]:
         """Translate one SSE event into zero or more ACP updates.
@@ -142,6 +165,12 @@ def _on_item_done(translator: EventTranslator, data: dict[str, object]) -> list[
         call_id = str(item["call_id"])
         name = str(item["name"])
         arguments = str(item["arguments"])
+        # Track for pending client-side tool detection
+        translator._seen_function_calls[call_id] = {
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+        }
         updates.append(
             {
                 "sessionUpdate": "tool_call",
@@ -155,6 +184,9 @@ def _on_item_done(translator: EventTranslator, data: dict[str, object]) -> list[
             }
         )
     elif item_type == "function_call_output":
+        output_call_id = item.get("call_id")
+        if output_call_id is not None:
+            translator._seen_function_outputs.add(str(output_call_id))
         updates.extend(_on_function_call_output_item(item))
     elif item_type not in ("message", None):
         # Native tool items (web_search_call, file_search_call, etc.)

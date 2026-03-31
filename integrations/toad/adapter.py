@@ -16,6 +16,10 @@ import httpx
 
 from integrations.toad.events import EventTranslator
 from integrations.toad.jsonrpc import Server
+from integrations.toad.mcp_client import (
+    McpConnection,
+    parse_mcp_server_params,
+)
 
 log = logging.getLogger(__name__)
 
@@ -32,11 +36,19 @@ class SessionState:
         session, populated after the first prompt completes.
     :param translator: Event translator that tracks the last
         ``response_id`` for multi-turn conversation threading.
+    :param mcp_connections: Active MCP server connections for this
+        session, keyed by server name.
+    :param tool_schemas: OpenAI-format tool schemas discovered from
+        MCP servers, passed in the ``tools`` field of each request.
     """
 
     cwd: str
     conversation_id: str | None = None
     translator: EventTranslator = field(default_factory=EventTranslator)
+    mcp_connections: list[McpConnection] = field(default_factory=list)
+    tool_schemas: list[dict[str, object]] = field(default_factory=list)
+    # Lookup from tool name to the MCP connection that owns it
+    _tool_to_connection: dict[str, McpConnection] = field(default_factory=dict)
 
 
 def create_adapter(
@@ -101,6 +113,9 @@ def create_adapter(
     ) -> dict[str, object]:
         """Create a new chat session.
 
+        Connects to any MCP servers Toad provides, discovers
+        their tools, and stores schemas for use in prompts.
+
         :param params: ``{"cwd": str, "mcpServers": [...]}``.
         :returns: ``{"sessionId": str}``
         """
@@ -109,7 +124,12 @@ def create_adapter(
         session_id = uuid.uuid4().hex[:16]
         # cwd is required by ACP session/new spec
         cwd = str(params["cwd"])
-        sessions[session_id] = SessionState(cwd=cwd)
+        session = SessionState(cwd=cwd)
+        # Connect to MCP servers and discover tools
+        mcp_servers_raw = params.get("mcpServers", [])
+        if isinstance(mcp_servers_raw, list):
+            await _connect_mcp_servers(session, mcp_servers_raw, cwd)
+        sessions[session_id] = session
         return {"sessionId": session_id}
 
     @rpc.method("session/prompt")
@@ -121,7 +141,9 @@ def create_adapter(
         Calls ``POST /v1/responses`` with ``stream: true``, parses
         the SSE stream, translates events to ACP
         ``session/update`` notifications, and returns when the
-        stream ends.
+        stream ends. If the LLM invokes client-side tools, those
+        are executed via MCP, results PATCHed back, and the loop
+        continues.
 
         :param params: ``{"sessionId": str, "prompt":
             [{"type": "text", "text": str}, ...]}``.
@@ -142,14 +164,13 @@ def create_adapter(
             "stream": True,
             "store": True,
         }
+        if session.tool_schemas:
+            payload["tools"] = session.tool_schemas
         prev_id = session.translator.last_response_id
         if prev_id is not None:
             payload["previous_response_id"] = prev_id
 
-        await _stream_response(client, rpc, session_id, session.translator, payload)
-        # Update session conversation_id from translator
-        if session.translator.last_conversation_id is not None:
-            session.conversation_id = session.translator.last_conversation_id
+        await _prompt_with_tool_loop(client, rpc, session_id, session, agent_name, payload)
         stop_reason = session.translator.stop_reason or "end_turn"
         return {"stopReason": stop_reason}
 
@@ -667,3 +688,192 @@ async def _stream_response(
                     )
                 # Reset for next event pair
                 event_type = None
+
+
+async def _prompt_with_tool_loop(
+    client: httpx.AsyncClient,
+    rpc: Server,
+    session_id: str,
+    session: SessionState,
+    agent_name: str,
+    payload: dict[str, object],
+) -> None:
+    """Stream a response and execute client-side tools in a loop.
+
+    After each streamed response, checks for pending client-side
+    tool calls. If any exist, executes them via MCP, PATCHes
+    results back, and sends a follow-up ``POST /v1/responses``
+    to continue the agent loop.
+
+    :param client: The httpx async client pointed at agent-plane.
+    :param rpc: The JSONRPC server for sending notifications.
+    :param session_id: ACP session ID.
+    :param session: The session state with MCP connections.
+    :param agent_name: Agent model name for follow-up requests.
+    :param payload: Initial JSON body for ``POST /v1/responses``.
+    """
+    # Cap iterations to prevent runaway tool loops
+    max_iterations = 50
+    for _ in range(max_iterations):
+        session.translator.reset_for_prompt()
+        await _stream_response(client, rpc, session_id, session.translator, payload)
+        _sync_session_from_translator(session)
+        pending = session.translator.pending_client_tool_calls
+        if not pending:
+            break
+        await _execute_and_patch_tools(client, rpc, session_id, session, pending)
+        # Continue with a follow-up request
+        payload = _build_continuation_payload(agent_name, session)
+
+
+def _sync_session_from_translator(session: SessionState) -> None:
+    """Copy translator state back to session after a stream.
+
+    :param session: The session to update.
+    """
+    if session.translator.last_conversation_id is not None:
+        session.conversation_id = session.translator.last_conversation_id
+
+
+def _build_continuation_payload(
+    agent_name: str,
+    session: SessionState,
+) -> dict[str, object]:
+    """Build a follow-up POST /v1/responses payload after tool execution.
+
+    :param agent_name: Agent model name.
+    :param session: Session with updated response_id and tools.
+    :returns: A payload dict for the next ``POST /v1/responses``.
+    """
+    payload: dict[str, object] = {
+        "model": agent_name,
+        "input": [],
+        "stream": True,
+        "store": True,
+    }
+    if session.tool_schemas:
+        payload["tools"] = session.tool_schemas
+    prev_id = session.translator.last_response_id
+    if prev_id is not None:
+        payload["previous_response_id"] = prev_id
+    return payload
+
+
+async def _execute_and_patch_tools(
+    client: httpx.AsyncClient,
+    rpc: Server,
+    session_id: str,
+    session: SessionState,
+    pending: list[dict[str, str]],
+) -> None:
+    """Execute pending client-side tool calls via MCP and PATCH results.
+
+    For each pending tool call, finds the MCP connection that owns
+    it, invokes the tool, sends ``tool_call_update`` ACP
+    notifications, and PATCHes all results back to agent-plane.
+
+    :param client: The httpx async client.
+    :param rpc: The JSONRPC server for notifications.
+    :param session_id: ACP session ID.
+    :param session: The session with MCP connections.
+    :param pending: List of dicts with ``call_id``, ``name``,
+        ``arguments`` for each pending call.
+    """
+    tool_results: list[dict[str, str]] = []
+    for call in pending:
+        call_id = call["call_id"]
+        name = call["name"]
+        arguments_str = call["arguments"]
+        output = await _execute_single_tool(session, name, arguments_str)
+        tool_results.append({"call_id": call_id, "output": output})
+        # Notify Toad that the tool call completed
+        await rpc.notify(
+            "session/update",
+            {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": call_id,
+                    "status": "completed",
+                    "content": {
+                        "type": "text",
+                        "text": output,
+                    },
+                },
+            },
+        )
+    # PATCH results back to agent-plane
+    resp_id = session.translator.last_response_id
+    if resp_id is not None and tool_results:
+        await client.patch(
+            f"/v1/responses/{resp_id}",
+            json={"tool_results": tool_results},
+        )
+
+
+async def _execute_single_tool(
+    session: SessionState,
+    name: str,
+    arguments_str: str,
+) -> str:
+    """Execute one tool call via the session's MCP connections.
+
+    :param session: Session with ``_tool_to_connection`` lookup.
+    :param name: Tool name to invoke.
+    :param arguments_str: JSON-encoded arguments string.
+    :returns: Tool output string, or error message if execution
+        fails.
+    """
+    connection = session._tool_to_connection.get(name)
+    if connection is None:
+        return f"[Error] Tool {name!r} not found in MCP servers"
+    try:
+        arguments = json.loads(arguments_str)
+    except json.JSONDecodeError:
+        arguments = {}
+    try:
+        return await connection.call_tool(name, arguments)
+    except Exception as exc:
+        log.warning("MCP tool %s failed: %s", name, exc)
+        return f"[Error] {exc}"
+
+
+async def _connect_mcp_servers(
+    session: SessionState,
+    mcp_servers_raw: list[object],
+    cwd: str,
+) -> None:
+    """Connect to MCP servers and discover their tools.
+
+    :param session: Session to populate with connections and
+        tool schemas.
+    :param mcp_servers_raw: Raw MCP server dicts from ACP
+        ``session/new`` params.
+    :param cwd: Working directory for subprocess-based servers.
+    """
+    for raw in mcp_servers_raw:
+        if not isinstance(raw, dict):
+            continue
+        server_name = str(raw.get("name", "unnamed"))
+        try:
+            params = parse_mcp_server_params(raw, cwd=cwd)
+            conn = McpConnection(
+                server_params=params,
+                server_name=server_name,
+            )
+            tools = await conn.connect()
+            session.mcp_connections.append(conn)
+            for tool in tools:
+                session.tool_schemas.append(tool.schema)
+                session._tool_to_connection[tool.name] = conn
+            log.info(
+                "Connected to MCP server %s: %d tools",
+                server_name,
+                len(tools),
+            )
+        except Exception as exc:
+            log.warning(
+                "Failed to connect MCP server %s: %s",
+                server_name,
+                exc,
+            )
