@@ -7,13 +7,11 @@ This module maps between the two.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 # Handler function signature: (translator, data) -> list of ACP updates
-_HandlerFn = Callable[
-    ["EventTranslator", dict[str, object]], list[dict[str, object]]
-]
+_HandlerFn = Callable[["EventTranslator", dict[str, object]], list[dict[str, object]]]
 
 
 @dataclass
@@ -51,9 +49,7 @@ class EventTranslator:
     last_response_id: str | None = None
     last_conversation_id: str | None = None
     stop_reason: str | None = None
-    _pending_tool_calls: dict[str, ToolCallAccumulator] = field(
-        default_factory=dict
-    )
+    _pending_tool_calls: dict[str, ToolCallAccumulator] = field(default_factory=dict)
 
     def reset_for_prompt(self) -> None:
         """Clear per-prompt state before a new prompt starts.
@@ -64,9 +60,7 @@ class EventTranslator:
         """
         self.stop_reason = None
 
-    def translate(
-        self, event_type: str, data: dict[str, object]
-    ) -> list[dict[str, object]]:
+    def translate(self, event_type: str, data: dict[str, object]) -> list[dict[str, object]]:
         """Translate one SSE event into zero or more ACP updates.
 
         :param event_type: The SSE ``event:`` value, e.g.
@@ -124,9 +118,7 @@ def _on_reasoning_delta(
     ]
 
 
-def _on_item_done(
-    translator: EventTranslator, data: dict[str, object]
-) -> list[dict[str, object]]:
+def _on_item_done(translator: EventTranslator, data: dict[str, object]) -> list[dict[str, object]]:
     """Handle ``response.output_item.done``.
 
     Emits ``tool_call`` updates for function calls and
@@ -281,9 +273,7 @@ def _on_response_incomplete(
     response = data.get("response")
     reason = _extract_incomplete_reason(response)
     if reason is not None:
-        translator.stop_reason = _INCOMPLETE_REASON_MAP.get(
-            reason, "end_turn"
-        )
+        translator.stop_reason = _INCOMPLETE_REASON_MAP.get(reason, "end_turn")
     else:
         translator.stop_reason = "end_turn"
     if isinstance(response, dict):
@@ -347,9 +337,7 @@ def _on_response_error(
     # SSE error events may use "message" or "error" key; show
     # empty bracket prefix if neither is present so the user
     # still sees something happened.
-    message = str(
-        data.get("message") or data.get("error") or "Unknown error"
-    )
+    message = str(data.get("message") or data.get("error") or "Unknown error")
     return [
         {
             "sessionUpdate": "agent_message_chunk",

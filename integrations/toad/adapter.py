@@ -134,9 +134,7 @@ def create_adapter(
             raise ValueError(f"Unknown session: {session_id}")
 
         session.translator.reset_for_prompt()
-        input_blocks = await _build_input(
-            client, params.get("prompt", [])
-        )
+        input_blocks = await _build_input(client, params.get("prompt", []))
 
         payload: dict[str, object] = {
             "model": agent_name,
@@ -148,14 +146,10 @@ def create_adapter(
         if prev_id is not None:
             payload["previous_response_id"] = prev_id
 
-        await _stream_response(
-            client, rpc, session_id, session.translator, payload
-        )
+        await _stream_response(client, rpc, session_id, session.translator, payload)
         # Update session conversation_id from translator
         if session.translator.last_conversation_id is not None:
-            session.conversation_id = (
-                session.translator.last_conversation_id
-            )
+            session.conversation_id = session.translator.last_conversation_id
         stop_reason = session.translator.stop_reason or "end_turn"
         return {"stopReason": stop_reason}
 
@@ -240,15 +234,11 @@ def create_adapter(
         }
         if cursor is not None:
             query["after"] = str(cursor)
-        resp = await client.get(
-            "/v1/conversations", params=query
-        )
+        resp = await client.get("/v1/conversations", params=query)
         resp.raise_for_status()
         body = resp.json()
         sessions_list = _map_conversations_to_sessions(body)
-        next_cursor = (
-            body["last_id"] if body.get("has_more") else None
-        )
+        next_cursor = body["last_id"] if body.get("has_more") else None
         return {
             "sessions": sessions_list,
             "nextCursor": next_cursor,
@@ -316,15 +306,11 @@ async def _build_input(
             continue
         block_type = item.get("type")
         if block_type == "text":
-            blocks.append(
-                {"type": "input_text", "text": str(item["text"])}
-            )
+            blocks.append({"type": "input_text", "text": str(item["text"])})
         elif block_type == "image":
             file_id = await _upload_image(client, item)
             if file_id is not None:
-                blocks.append(
-                    {"type": "input_image", "file_id": file_id}
-                )
+                blocks.append({"type": "input_image", "file_id": file_id})
         elif block_type == "resource":
             blocks.append(_convert_resource_block(item))
         elif block_type == "resource_link":
@@ -439,14 +425,16 @@ def _map_conversations_to_sessions(
     for conv in data:
         if not isinstance(conv, dict):
             continue
-        sessions_list.append({
-            "sessionId": str(conv["id"]),
-            "cwd": "/",
-            # ACP requires a non-null title string; "Untitled" is
-            # the Toad convention for unnamed conversations.
-            "title": conv.get("title") or "Untitled",
-            "updatedAt": _unix_to_iso8601(conv.get("created_at")),
-        })
+        sessions_list.append(
+            {
+                "sessionId": str(conv["id"]),
+                "cwd": "/",
+                # ACP requires a non-null title string; "Untitled" is
+                # the Toad convention for unnamed conversations.
+                "title": conv.get("title") or "Untitled",
+                "updatedAt": _unix_to_iso8601(conv.get("created_at")),
+            }
+        )
     return sessions_list
 
 
@@ -541,10 +529,7 @@ def _replay_message_item(
     """
     role = item.get("role")
     content = item.get("content", [])
-    update_type = (
-        "user_message_chunk" if role == "user"
-        else "agent_message_chunk"
-    )
+    update_type = "user_message_chunk" if role == "user" else "agent_message_chunk"
     updates: list[dict[str, object]] = []
     if isinstance(content, list):
         for block in content:
@@ -552,10 +537,12 @@ def _replay_message_item(
                 # "text" may be absent on non-text content blocks
                 text = str(block.get("text") or "")
                 if text:
-                    updates.append({
-                        "sessionUpdate": update_type,
-                        "content": {"type": "text", "text": text},
-                    })
+                    updates.append(
+                        {
+                            "sessionUpdate": update_type,
+                            "content": {"type": "text", "text": text},
+                        }
+                    )
     return updates
 
 
@@ -572,13 +559,15 @@ def _replay_function_call_item(
     call_id = str(item["call_id"])
     name = str(item["name"])
     arguments = str(item["arguments"])
-    return [{
-        "sessionUpdate": "tool_call",
-        "toolCallId": call_id,
-        "title": name,
-        "status": "completed",
-        "tool": {"name": name, "parameters": arguments},
-    }]
+    return [
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": call_id,
+            "title": name,
+            "status": "completed",
+            "tool": {"name": name, "parameters": arguments},
+        }
+    ]
 
 
 def _replay_function_call_output_item(
@@ -593,12 +582,14 @@ def _replay_function_call_output_item(
     # call_id, output are required per API.md item schema
     call_id = str(item["call_id"])
     output = str(item["output"])
-    return [{
-        "sessionUpdate": "tool_call_update",
-        "toolCallId": call_id,
-        "status": "completed",
-        "content": {"type": "text", "text": output},
-    }]
+    return [
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": call_id,
+            "status": "completed",
+            "content": {"type": "text", "text": output},
+        }
+    ]
 
 
 def _replay_reasoning_item(
@@ -618,10 +609,12 @@ def _replay_reasoning_item(
                 # "text" may be absent on non-text content blocks
                 text = str(block.get("text") or "")
                 if text:
-                    updates.append({
-                        "sessionUpdate": "agent_thought_chunk",
-                        "content": {"type": "text", "text": text},
-                    })
+                    updates.append(
+                        {
+                            "sessionUpdate": "agent_thought_chunk",
+                            "content": {"type": "text", "text": text},
+                        }
+                    )
     return updates
 
 
@@ -645,9 +638,7 @@ async def _stream_response(
         tool call state and tracks the last response ID.
     :param payload: The JSON body for ``POST /v1/responses``.
     """
-    async with client.stream(
-        "POST", "/v1/responses", json=payload
-    ) as resp:
+    async with client.stream("POST", "/v1/responses", json=payload) as resp:
         resp.raise_for_status()
         event_type: str | None = None
         async for line in resp.aiter_lines():

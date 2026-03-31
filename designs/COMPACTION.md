@@ -739,6 +739,40 @@ Steered messages arrive via `try_deliver` and are discovered by `_sync_history` 
 
 ---
 
+## Interaction with Sub-Agents
+
+Sub-agents (spawned via `SpawnTool`) create isolated conversations (`kind="sub_agent"`) and run in separate DBOS workflows. The compaction design applies uniformly — no special sub-agent behavior.
+
+### Same compaction strategy
+
+Sub-agents execute via `_run_agent_loop()` — the same code path as top-level tasks. All three compaction layers (surgical clearing, summarization, truncation) apply identically. The sub-agent's own `compaction` config (from its spec) controls thresholds and recent window size. No framework in the industry treats sub-agent compaction differently from main agent compaction — LangGraph, Google ADK, OpenAI Agents SDK, CrewAI, AutoGen, Letta, and Semantic Kernel all apply the same rules uniformly.
+
+### Sub-agent compaction does not block the parent
+
+Sub-agents run in their own DBOS workflows (W2, W3, etc.), not inside the parent's workflow (W1). The parent only blocks when it explicitly calls `collect_sub_agents()`, which waits via `handle.get_result()`. If a sub-agent triggers Layer 2 summarization, that LLM call happens in the sub-agent's workflow thread — it extends the sub-agent's total execution time but does not hold a lock or resource in the parent. From the parent's perspective, the sub-agent simply takes longer to complete. This is no different from the sub-agent making an extra tool call.
+
+### Compaction items are persisted for sub-agent conversations
+
+Sub-agent conversations are single-use — each `SpawnTool` invocation creates a new conversation, and no future execution loads from it. Despite this, compaction items are persisted to the conversation store for auditability, matching the industry norm:
+
+- **Google ADK** writes compaction events to the Session even after the sub-agent is done.
+- **OpenAI Agents SDK** persists compaction items to Sessions so they appear in browsable history.
+- **LangGraph** checkpoints include compacted state for all subgraphs.
+
+The cost is one DB write per sub-agent execution that triggers Layer 2. The value is observability: when debugging why a sub-agent produced poor output, seeing "compaction happened at item 40" in `GET /v1/conversations/{conv_id}/items` is useful diagnostic context. Without it, the only signal would be log lines.
+
+### Sub-agents as a complementary context management strategy
+
+Sub-agents are themselves a form of context management. Verbose operations (file analysis, multi-step research, large code generation) run in a sub-agent's isolated context window. Only the extracted final text (~100–2000 tokens) returns to the parent via `collect_sub_agents`. This is the pattern recommended by Anthropic's context engineering guidance and used by Claude Code — prevent large content from entering the main context rather than compacting it after the fact.
+
+Compaction and sub-agent delegation are complementary:
+- **Sub-agent delegation** prevents context growth proactively (verbose work never enters the parent's history).
+- **Compaction** handles context growth reactively (when history grows despite best efforts).
+
+Both mechanisms coexist without interference. A parent agent may compact its own history (which includes the short sub-agent output strings) while sub-agents independently compact theirs.
+
+---
+
 ## Client Status Reporting
 
 Compaction — especially Layer 2 summarization — involves an extra LLM call that adds seconds of latency. Without a signal, the client cannot distinguish "agent is thinking" from "something is stuck."
@@ -794,51 +828,69 @@ Emitted once, immediately before the `summarize_history` `@step` call. No corres
 
 11. **Recursive summarization includes previous summary.** Provide a history that starts with a synthetic summary message (from a prior compaction). Assert: the prompt sent to the LLM includes the previous summary text.
 
+12. **Summarization failure falls back to Layer 3.** Mock `summarize_history` to raise an exception (e.g. `RetryableLLMError`). Call `compact()` with a history that requires Layer 2 (Layer 1 alone insufficient). Assert: `compact()` does not raise — it falls back to Layer 3 (truncation). Assert: returned messages are truncated (oldest items removed, tool call pairs intact). Assert: `summary_metadata` is `None` (no compaction item should be persisted). Assert: a warning is logged indicating summarization failure and fallback.
+
+### Unit tests: `ContextWindowExceededError` classification
+
+13. **OpenAI overflow detected.** Feed `_classify_error()` an HTTP 400 response with `error.code == "context_length_exceeded"` and message `"This model's maximum context length is 128000 tokens. However, you requested 142000 tokens"`. Assert: raises `ContextWindowExceededError` with `max_context_tokens=128000` and `actual_tokens=142000`.
+
+14. **Anthropic overflow detected.** Feed `_classify_error()` an HTTP 400 response with message matching `"197202 + 21333 > 200000"`. Assert: raises `ContextWindowExceededError` with `max_context_tokens=200000` and `actual_tokens=197202`. Test a second pattern: `"prompt is too long: 210000 tokens > 200000 maximum"`. Assert: same extraction logic works.
+
+15. **Gemini overflow detected.** Feed `_classify_error()` an HTTP 400 response with message `"input token count (1100000) exceeds the maximum number of tokens allowed (1048576)"`. Assert: raises `ContextWindowExceededError` with `max_context_tokens=1048576` and `actual_tokens=1100000`.
+
+16. **Unrecognized 400 error is not misclassified.** Feed `_classify_error()` an HTTP 400 response with a generic message (e.g. `"invalid request: missing 'model' field"`). Assert: raises `PermanentLLMError`, NOT `ContextWindowExceededError`.
+
+### Unit tests: tiktoken validation gate
+
+17. **Plausible overflow proceeds with compaction.** Catch a `ContextWindowExceededError` with `actual_tokens=142000`. Monkeypatch tiktoken to estimate 140000 tokens for the same messages. Assert: the workflow proceeds to compact (divergence is ~1.4%, well within 30%).
+
+18. **Implausible overflow re-raises as PermanentLLMError.** Catch a `ContextWindowExceededError` with `actual_tokens=142000`. Monkeypatch tiktoken to estimate 50000 tokens for the same messages (divergence ~65%). Assert: the error is re-raised as `PermanentLLMError` (not compacted). Assert: a warning is logged indicating the token count divergence.
+
 ### Unit tests: `compaction_to_history_item()` output format
 
-12. **Produces valid synthetic pair.** Pass a compaction item with a known summary. Assert: returns a list of two items. First item has `type="message"`, `data.role="user"`, content includes the summary marker prefix. Second item has `type="message"`, `data.role="assistant"`, content equals the summary text. Assert: both items can be processed by `history_to_input_items` without error and produce valid LLM input dicts.
+19. **Produces valid synthetic pair.** Pass a compaction item with a known summary. Assert: returns a list of two items. First item has `type="message"`, `data.role="user"`, content includes the summary marker prefix. Second item has `type="message"`, `data.role="assistant"`, content equals the summary text. Assert: both items can be processed by `history_to_input_items` without error and produce valid LLM input dicts.
 
 ### Unit tests: `list_items` type filter
 
-13. **Filter by type returns only matching items.** Append a mix of `message`, `function_call`, `function_call_output`, and `compaction` items. Call `list_items(type="compaction")`. Assert: only compaction items returned. Call `list_items(type="message")`. Assert: only message items returned. Call `list_items()` (no filter). Assert: all items returned.
+20. **Filter by type returns only matching items.** Append a mix of `message`, `function_call`, `function_call_output`, and `compaction` items. Call `list_items(type="compaction")`. Assert: only compaction items returned. Call `list_items(type="message")`. Assert: only message items returned. Call `list_items()` (no filter). Assert: all items returned.
 
-14. **Type filter with order and limit.** Append multiple compaction items. Call `list_items(type="compaction", order="desc", limit=1)`. Assert: returns only the latest compaction item.
+21. **Type filter with order and limit.** Append multiple compaction items. Call `list_items(type="compaction", order="desc", limit=1)`. Assert: returns only the latest compaction item.
 
 ### Unit tests: `load_history` with compaction items
 
-15. **No compaction item — loads everything.** Append 50 items with no compaction item. Assert: `load_history` returns all 50 items.
+22. **No compaction item — loads everything.** Append 50 items with no compaction item. Assert: `load_history` returns all 50 items.
 
-16. **Single compaction item — loads summary + recent items.** Append 50 items, then a compaction item with `last_item_id` pointing to item 40. Append 10 more items after the compaction item. Assert: `load_history` returns a synthetic summary message + the 10 items after item 40 (excluding the compaction item itself). The 40 original items are not loaded.
+23. **Single compaction item — loads summary + recent items.** Append 50 items, then a compaction item with `last_item_id` pointing to item 40. Append 10 more items after the compaction item. Assert: `load_history` returns a synthetic summary message + the 10 items after item 40 (excluding the compaction item itself). The 40 original items are not loaded.
 
-17. **Post-summary items are not lost.** Append 50 items. Append a compaction item with `last_item_id` pointing to item 30 (simulating summary generated mid-execution at iteration covering items 0–30, then iterations continued appending items 31–50). Assert: `load_history` returns summary + items 31–50 (excluding the compaction item). Items 31–50 are NOT covered by the summary and must be present. This is the gap scenario from crash safety.
+24. **Post-summary items are not lost.** Append 50 items. Append a compaction item with `last_item_id` pointing to item 30 (simulating summary generated mid-execution at iteration covering items 0–30, then iterations continued appending items 31–50). Assert: `load_history` returns summary + items 31–50 (excluding the compaction item). Items 31–50 are NOT covered by the summary and must be present. This is the gap scenario from crash safety.
 
-18. **Multiple compaction items — uses latest.** Append items, then compaction item C1 (covering items 0–20), then more items, then compaction item C2 (covering items 0–40 via recursive summary). Assert: `load_history` uses C2, loads summary + items after item 40. C1 is filtered out.
+25. **Multiple compaction items — uses latest.** Append items, then compaction item C1 (covering items 0–20), then more items, then compaction item C2 (covering items 0–40 via recursive summary). Assert: `load_history` uses C2, loads summary + items after item 40. C1 is filtered out.
 
-19. **Compaction items filtered from history.** Assert: the list returned by `load_history` contains no items with `type="compaction"`. They are metadata, not conversation content.
+26. **Compaction items filtered from history.** Assert: the list returned by `load_history` contains no items with `type="compaction"`. They are metadata, not conversation content.
 
 ### Unit tests: compaction item persistence
 
-20. **Idempotent append — no duplicate on retry.** Append a compaction item with `response_id="task_1"`. Attempt to append another compaction item with the same `response_id`. Assert: only one compaction item exists in the conversation.
+27. **Idempotent append — no duplicate on retry.** Append a compaction item with `response_id="task_1"`. Attempt to append another compaction item with the same `response_id`. Assert: only one compaction item exists in the conversation.
 
-21. **Different executions produce separate compaction items.** Append a compaction item with `response_id="task_1"`, then another with `response_id="task_2"`. Assert: both exist in the conversation.
+28. **Different executions produce separate compaction items.** Append a compaction item with `response_id="task_1"`, then another with `response_id="task_2"`. Assert: both exist in the conversation.
 
 ### Integration tests: compaction in the agent loop
 
 All integration tests run against a real server: real FastAPI app, real SQLAlchemy stores, real DBOS, `httpx.AsyncClient` via `ASGITransport`. The LLM is replaced with `ControllableMockClient`. Token counts are controlled by monkeypatching `token_counter` to return inflated values so compaction triggers with a small number of messages. Tests use the same `build_server` / `destroy_dbos` pattern as the durability tests.
 
-22. **Compaction triggers and persists during long execution.** Build server. Register agent. Monkeypatch `token_counter` to return inflated counts so the threshold is exceeded after a few tool-call iterations. Queue mock LLM calls that produce tool calls, then a final text response. `POST /v1/responses` and poll until complete. Assert: `GET /v1/responses/{id}` shows completed status. Assert: `GET /v1/conversations/{conv_id}/items` (paginated, unfiltered) includes a `compaction` item. Assert: the compaction item's `last_item_id` points to an item that exists in the conversation. Assert: the mock LLM's call history shows it received compacted messages (tool result bodies cleared or summary present) on later iterations.
+29. **Compaction triggers and persists during long execution.** Build server. Register agent. Monkeypatch `token_counter` to return inflated counts so the threshold is exceeded after a few tool-call iterations. Queue mock LLM calls that produce tool calls, then a final text response. `POST /v1/responses` and poll until complete. Assert: `GET /v1/responses/{id}` shows completed status. Assert: `GET /v1/conversations/{conv_id}/items` (paginated, unfiltered) includes a `compaction` item. Assert: the compaction item's `last_item_id` points to an item that exists in the conversation. Assert: the mock LLM's call history shows it received compacted messages (tool result bodies cleared or summary present) on later iterations.
 
-23. **Next execution loads from compaction item.** Continuing from test 22's database (same `db_uri`), rebuild the server. `POST /v1/responses` with `previous_response_id` pointing to the previous response. Poll until complete. Assert: the response completes successfully. Assert: `GET /v1/conversations/{conv_id}/items` shows the new response's items appended after the compaction item. Assert: the mock LLM received a summary message as the first history entry (not the original items from positions 0–N). This proves `load_history` used the compaction item rather than loading everything.
+30. **Next execution loads from compaction item.** Continuing from test 29's database (same `db_uri`), rebuild the server. `POST /v1/responses` with `previous_response_id` pointing to the previous response. Poll until complete. Assert: the response completes successfully. Assert: `GET /v1/conversations/{conv_id}/items` shows the new response's items appended after the compaction item. Assert: the mock LLM received a summary message as the first history entry (not the original items from positions 0–N). This proves `load_history` used the compaction item rather than loading everything.
 
-24. **Compaction item survives crash and recovery.** Build server. Register agent. Monkeypatch `token_counter` for inflated counts. Queue mock LLM calls: tool-call response (triggers compaction via `summarize_history` step), then a blocking call (simulates crash mid-LLM). `POST /v1/responses`, wait for the blocking call to be entered. Tear down server + DBOS (crash). Rebuild server on the same `db_uri`. Queue a recovery mock call. Let DBOS recover. Assert: the `summarize_history` step replays from DBOS cache (mock LLM call count proves it — the summary LLM call is NOT repeated). Assert: `GET /v1/conversations/{conv_id}/items` includes exactly one compaction item (idempotent dedup works).
+31. **Compaction item survives crash and recovery.** Build server. Register agent. Monkeypatch `token_counter` for inflated counts. Queue mock LLM calls: tool-call response (triggers compaction via `summarize_history` step), then a blocking call (simulates crash mid-LLM). `POST /v1/responses`, wait for the blocking call to be entered. Tear down server + DBOS (crash). Rebuild server on the same `db_uri`. Queue a recovery mock call. Let DBOS recover. Assert: the `summarize_history` step replays from DBOS cache (mock LLM call count proves it — the summary LLM call is NOT repeated). Assert: `GET /v1/conversations/{conv_id}/items` includes exactly one compaction item (idempotent dedup works).
 
-25. **Steering messages survive compaction.** Build server. Register agent. Monkeypatch `token_counter` for inflated counts. Queue mock LLM calls: first call blocks (to create a window for steering). `POST /v1/responses` to start execution. Wait for the first LLM call to be entered. `POST /v1/responses` with `previous_response_id` to deliver a steered message. Release the blocking call. Queue remaining mock calls (tool call + final text). Poll until complete. Assert: `GET /v1/conversations/{conv_id}/items` includes both the steered message and the compaction item. Assert: the steered message's position is after the compaction item's `last_item_id` (it was in the recent window, not summarized away).
+32. **Steering messages survive compaction.** Build server. Register agent. Monkeypatch `token_counter` for inflated counts. Queue mock LLM calls: first call blocks (to create a window for steering). `POST /v1/responses` to start execution. Wait for the first LLM call to be entered. `POST /v1/responses` with `previous_response_id` to deliver a steered message. Release the blocking call. Queue remaining mock calls (tool call + final text). Poll until complete. Assert: `GET /v1/conversations/{conv_id}/items` includes both the steered message and the compaction item. Assert: the steered message's position is after the compaction item's `last_item_id` (it was in the recent window, not summarized away).
 
-26. **User can browse full history after compaction.** After test 22 completes, paginate through the full conversation: `GET /v1/conversations/{conv_id}/items?order=asc` repeatedly using `after` cursors until `has_more` is false. Assert: all original items from position 0 onward are present (user messages, assistant messages, function calls, function call outputs). Assert: the compaction item appears in sequence at the expected position. Assert: no items have been deleted or modified — the total count matches the number of items appended during the execution. This proves compaction is additive and the user's scrollable history is unaffected.
+33. **User can browse full history after compaction.** After test 29 completes, paginate through the full conversation: `GET /v1/conversations/{conv_id}/items?order=asc` repeatedly using `after` cursors until `has_more` is false. Assert: all original items from position 0 onward are present (user messages, assistant messages, function calls, function call outputs). Assert: the compaction item appears in sequence at the expected position. Assert: no items have been deleted or modified — the total count matches the number of items appended during the execution. This proves compaction is additive and the user's scrollable history is unaffected.
 
-27. **`response.compaction.in_progress` event emitted when Layer 2 triggers.** Build server. Register agent. Monkeypatch `token_counter` for inflated counts so compaction triggers. Stream the response via `POST /v1/responses` (streaming mode). Collect all SSE events. Assert: a `response.compaction.in_progress` event appears in the stream. Assert: it appears before any `response.output_text.delta` events from the post-compaction LLM call. Assert: no `response.compaction.completed` event exists (we only emit `.in_progress`).
+34. **`response.compaction.in_progress` event emitted when Layer 2 triggers.** Build server. Register agent. Monkeypatch `token_counter` for inflated counts so compaction triggers. Stream the response via `POST /v1/responses` (streaming mode). Collect all SSE events. Assert: a `response.compaction.in_progress` event appears in the stream. Assert: it appears before any `response.output_text.delta` events from the post-compaction LLM call. Assert: no `response.compaction.completed` event exists (we only emit `.in_progress`).
 
-28. **No compaction event when threshold not exceeded.** Build server. Register agent. Use default `token_counter` (no monkeypatch — history is small). Stream the response. Collect all SSE events. Assert: no `response.compaction.in_progress` event appears.
+35. **No compaction event when threshold not exceeded.** Build server. Register agent. Use default `token_counter` (no monkeypatch — history is small). Stream the response. Collect all SSE events. Assert: no `response.compaction.in_progress` event appears.
 
 ---
 

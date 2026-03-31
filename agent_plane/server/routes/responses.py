@@ -73,26 +73,27 @@ def _build_response_object(task: Task) -> ResponseObject:
     )
 
 
-def _apply_tool_results(
+def _validate_tool_results(
     req: PatchResponseRequest,
     task_store: TaskStore,
 ) -> None:
     """
-    Process all tool results from a PATCH request.
+    Validate all tool results in a PATCH request without mutating.
 
-    Delegates to ``task_store.complete_pending_tool_call`` for
-    each result. Raises on the first ``NOT_FOUND`` or
-    ``SUB_AGENT_DONE`` outcome; ``ALREADY_COMPLETED`` is a
-    safe no-op (idempotent retry).
+    Checks every ``call_id`` via
+    ``task_store.check_pending_tool_call`` and raises on the first
+    error. Called before ``_apply_tool_results`` to guarantee
+    atomicity: no partial updates if any call_id fails.
 
     :param req: The PATCH request containing tool results.
-    :param task_store: Task store for pending tool call
-        operations.
+    :param task_store: Task store for pending tool call lookups.
     :raises AgentPlaneError: If any ``call_id`` is not found
         (404) or the sub-agent is no longer waiting (409).
     """
     for tool_result in req.tool_results:
-        outcome = task_store.complete_pending_tool_call(tool_result.call_id, tool_result.output)
+        outcome = task_store.check_pending_tool_call(
+            tool_result.call_id,
+        )
         if outcome == CompletePendingToolCallResult.NOT_FOUND:
             raise AgentPlaneError(
                 f"Tool call {tool_result.call_id} not found.",
@@ -103,6 +104,28 @@ def _apply_tool_results(
                 f"Sub-agent for {tool_result.call_id} is no longer waiting for results.",
                 code=ErrorCode.CONFLICT,
             )
+
+
+def _apply_tool_results(
+    req: PatchResponseRequest,
+    task_store: TaskStore,
+) -> None:
+    """
+    Apply all tool results from a validated PATCH request.
+
+    Caller must run ``_validate_tool_results`` first to ensure
+    atomicity. This function only processes ``COMPLETED`` and
+    ``ALREADY_COMPLETED`` outcomes.
+
+    :param req: The PATCH request containing tool results.
+    :param task_store: Task store for pending tool call
+        operations.
+    """
+    for tool_result in req.tool_results:
+        task_store.complete_pending_tool_call(
+            tool_result.call_id,
+            tool_result.output,
+        )
 
 
 def _normalize_input(
@@ -876,10 +899,19 @@ def create_responses_router(
         task = await task_store.get(response_id)
         if not task:
             raise AgentPlaneError("Response not found", code=ErrorCode.NOT_FOUND)
-        # Run in thread: complete_pending_tool_call uses sync DBOS
-        # APIs (get_workflow_status) that cannot be called from an
-        # async context with a running event loop.
-        await asyncio.to_thread(_apply_tool_results, req, task_store)
+        # Validate-then-apply: ensures atomicity — no partial
+        # updates if any call_id fails validation. Both use sync
+        # DBOS APIs, so they run in a thread.
+        await asyncio.to_thread(
+            _validate_tool_results,
+            req,
+            task_store,
+        )
+        await asyncio.to_thread(
+            _apply_tool_results,
+            req,
+            task_store,
+        )
         # Re-fetch to capture any output changes from completed
         # tool calls.
         updated_task = await task_store.get(response_id)

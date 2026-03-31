@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncIterator
 
 import httpx
@@ -163,20 +162,20 @@ async def test_initialize_advertises_full_capabilities() -> None:
         server_url="http://localhost:18400",
         agent_name="test-agent",
     )
-    result = await rpc.handlers["initialize"]({
-        "protocolVersion": 1,
-        "clientCapabilities": {},
-        "clientInfo": {"name": "test", "version": "0.0.1"},
-    })
+    result = await rpc.handlers["initialize"](
+        {
+            "protocolVersion": 1,
+            "clientCapabilities": {},
+            "clientInfo": {"name": "test", "version": "0.0.1"},
+        }
+    )
     assert result["protocolVersion"] == 1
     caps = result["agentCapabilities"]
     assert caps["loadSession"] is True
     assert caps["sessionCapabilities"]["list"] is True
     assert caps["promptCapabilities"]["image"] is True
     assert caps["promptCapabilities"]["embeddedContext"] is True
-    assert "image/png" in caps["promptCapabilities"][
-        "supportedMediaTypes"
-    ]
+    assert "image/png" in caps["promptCapabilities"]["supportedMediaTypes"]
 
 
 @pytest.mark.asyncio
@@ -186,10 +185,12 @@ async def test_session_new_returns_session_id() -> None:
         server_url="http://localhost:18400",
         agent_name="test-agent",
     )
-    result = await rpc.handlers["session/new"]({
-        "cwd": "/tmp/test",
-        "mcpServers": [],
-    })
+    result = await rpc.handlers["session/new"](
+        {
+            "cwd": "/tmp/test",
+            "mcpServers": [],
+        }
+    )
     assert isinstance(result, dict)
     session_id = result["sessionId"]
     assert isinstance(session_id, str)
@@ -204,10 +205,12 @@ async def test_session_prompt_unknown_session_raises() -> None:
         agent_name="test-agent",
     )
     with pytest.raises(ValueError, match="Unknown session"):
-        await rpc.handlers["session/prompt"]({
-            "sessionId": "nonexistent",
-            "prompt": [{"type": "text", "text": "hi"}],
-        })
+        await rpc.handlers["session/prompt"](
+            {
+                "sessionId": "nonexistent",
+                "prompt": [{"type": "text", "text": "hi"}],
+            }
+        )
 
 
 @pytest.mark.asyncio
@@ -223,10 +226,12 @@ async def test_read_file_handler(tmp_path: object) -> None:
         server_url="http://localhost:18400",
         agent_name="test-agent",
     )
-    result = await rpc.handlers["fs/read_text_file"]({
-        "sessionId": "ignored",
-        "path": str(test_file),
-    })
+    result = await rpc.handlers["fs/read_text_file"](
+        {
+            "sessionId": "ignored",
+            "path": str(test_file),
+        }
+    )
     assert isinstance(result, dict)
     assert result["content"] == "hello from test"
 
@@ -243,11 +248,13 @@ async def test_write_file_handler(tmp_path: object) -> None:
         server_url="http://localhost:18400",
         agent_name="test-agent",
     )
-    result = await rpc.handlers["fs/write_text_file"]({
-        "sessionId": "ignored",
-        "path": str(test_file),
-        "content": "written by test",
-    })
+    result = await rpc.handlers["fs/write_text_file"](
+        {
+            "sessionId": "ignored",
+            "path": str(test_file),
+            "content": "written by test",
+        }
+    )
     assert result == {}
     assert test_file.read_text() == "written by test"
 

@@ -31,10 +31,7 @@ _logger = logging.getLogger(__name__)
 _COLLECT_POLL_INTERVAL_S = 0.5
 
 # DBOS statuses that mean the workflow is still running.
-_DBOS_ACTIVE = frozenset(
-    {WorkflowStatusString.PENDING.value,
-     WorkflowStatusString.ENQUEUED.value}
-)
+_DBOS_ACTIVE = frozenset({WorkflowStatusString.PENDING.value, WorkflowStatusString.ENQUEUED.value})
 
 # Mapping from DBOS status strings to task status strings
 # used only by CollectTool for result reporting.
@@ -42,9 +39,7 @@ _DBOS_TO_RESULT_STATUS: dict[str, str] = {
     WorkflowStatusString.SUCCESS.value: "completed",
     WorkflowStatusString.ERROR.value: "failed",
     WorkflowStatusString.CANCELLED.value: "cancelled",
-    WorkflowStatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED.value: (
-        "failed"
-    ),
+    WorkflowStatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED.value: ("failed"),
 }
 
 # Module-level cache: populated by SpawnTool, read by CollectTool.
@@ -135,7 +130,8 @@ class SpawnTool(Tool):
             return args
 
         return _invoke_spawn(
-            args, self._sub_specs,
+            args,
+            self._sub_specs,
         )
 
 
@@ -230,24 +226,16 @@ def _build_spawn_schema(
                                 "name": {
                                     "type": "string",
                                     "enum": agent_names,
-                                    "description": (
-                                        "Sub-agent name."
-                                    ),
+                                    "description": ("Sub-agent name."),
                                 },
                                 "input": {
                                     "type": "string",
-                                    "description": (
-                                        "The task or question "
-                                        "for the sub-agent."
-                                    ),
+                                    "description": ("The task or question for the sub-agent."),
                                 },
                             },
                             "required": ["name", "input"],
                         },
-                        "description": (
-                            "List of sub-agents to spawn "
-                            "with their inputs."
-                        ),
+                        "description": ("List of sub-agents to spawn with their inputs."),
                     },
                 },
                 "required": ["agents"],
@@ -267,8 +255,7 @@ def _build_collect_schema() -> dict[str, Any]:
         "function": {
             "name": "collect_sub_agents",
             "description": (
-                "Wait for spawned sub-agent tasks to complete "
-                "and return their results."
+                "Wait for spawned sub-agent tasks to complete and return their results."
             ),
             "parameters": {
                 "type": "object",
@@ -276,17 +263,11 @@ def _build_collect_schema() -> dict[str, Any]:
                     "response_ids": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": (
-                            "Response IDs returned by "
-                            "spawn_sub_agents()."
-                        ),
+                        "description": ("Response IDs returned by spawn_sub_agents()."),
                     },
                     "timeout": {
                         "type": "integer",
-                        "description": (
-                            "Maximum seconds to wait. Omit to "
-                            "wait indefinitely."
-                        ),
+                        "description": ("Maximum seconds to wait. Omit to wait indefinitely."),
                     },
                 },
                 "required": ["response_ids"],
@@ -311,15 +292,11 @@ def _parse_spawn_args(
     try:
         args = json.loads(arguments)
     except (json.JSONDecodeError, TypeError) as exc:
-        return json.dumps(
-            {"error": f"invalid arguments: {exc}"}
-        )
+        return json.dumps({"error": f"invalid arguments: {exc}"})
 
     for field in ("agents", "root_task_id", "agent_id"):
         if field not in args:
-            return json.dumps(
-                {"error": f"missing required field: {field}"}
-            )
+            return json.dumps({"error": f"missing required field: {field}"})
     result: dict[str, Any] = args
     return result
 
@@ -337,14 +314,10 @@ def _parse_collect_args(
     try:
         args = json.loads(arguments)
     except (json.JSONDecodeError, TypeError) as exc:
-        return json.dumps(
-            {"error": f"invalid arguments: {exc}"}
-        )
+        return json.dumps({"error": f"invalid arguments: {exc}"})
 
     if "response_ids" not in args:
-        return json.dumps(
-            {"error": "missing required field: response_ids"}
-        )
+        return json.dumps({"error": "missing required field: response_ids"})
     result: dict[str, Any] = args
     return result
 
@@ -374,9 +347,7 @@ def _invoke_spawn(
         sa_input: str = entry["input"]
 
         if sa_name not in sub_specs:
-            return json.dumps(
-                {"error": f"unknown sub-agent: {sa_name!r}"}
-            )
+            return json.dumps({"error": f"unknown sub-agent: {sa_name!r}"})
 
         task_id = _spawn_one(
             agent_id=agent_id,
@@ -548,9 +519,7 @@ def _check_task_status(
     :returns: A result dict if terminal, or ``None`` if still
         running.
     """
-    wf_status: WorkflowStatus | None = get_workflow_status(
-        task_id
-    )
+    wf_status: WorkflowStatus | None = get_workflow_status(task_id)
     if wf_status is None:
         return None
 
@@ -562,13 +531,14 @@ def _check_task_status(
     agent_name = _resolve_agent_name(task_id)
 
     if mapped == "completed" and wf_status.output is not None:
+        # DBOS stores the workflow return value in wf_status.output.
+        # For agent workflows, this is a dict with an "output" key
+        # holding the list of output items. Empty list fallback is
+        # safe: _extract_output_text handles it gracefully.
         output_items = wf_status.output.get("output", [])
         output_text = _extract_output_text(output_items)
     else:
-        output_text = (
-            f"Sub-agent {agent_name!r} did not complete "
-            f"(status: {mapped})."
-        )
+        output_text = f"Sub-agent {agent_name!r} did not complete (status: {mapped})."
 
     return {
         "response_id": task_id,
@@ -591,16 +561,11 @@ def _build_timeout_result(task_id: str) -> dict[str, str]:
     current_status = "in_progress"
     wf_status = get_workflow_status(task_id)
     if wf_status is not None:
-        current_status = _DBOS_TO_RESULT_STATUS.get(
-            str(wf_status.status), "in_progress"
-        )
+        current_status = _DBOS_TO_RESULT_STATUS.get(str(wf_status.status), "in_progress")
 
     return {
         "response_id": task_id,
         "agent_name": agent_name,
         "status": "incomplete",
-        "output": (
-            f"Sub-agent {agent_name!r} did not complete "
-            f"(status: {current_status})."
-        ),
+        "output": (f"Sub-agent {agent_name!r} did not complete (status: {current_status})."),
     }

@@ -689,6 +689,29 @@ class SqlAlchemyTaskStore(TaskStore):
             )
             session.execute(stmt)
 
+    def check_pending_tool_call(
+        self,
+        call_id: str,
+    ) -> CompletePendingToolCallResult:
+        """
+        Check whether a pending tool call can be completed
+        without mutating it.
+
+        :param call_id: The tool call ID,
+            e.g. ``"call_abc123"``.
+        :returns: The outcome that ``complete_pending_tool_call``
+            would return.
+        """
+        with self._session() as session:
+            row = session.get(SqlPendingToolCall, call_id)
+            if row is None:
+                return CompletePendingToolCallResult.NOT_FOUND
+            if row.status == "completed":
+                return CompletePendingToolCallResult.ALREADY_COMPLETED
+            if self._is_sub_agent_terminal(row.task_id):
+                return CompletePendingToolCallResult.SUB_AGENT_DONE
+            return CompletePendingToolCallResult.COMPLETED
+
     def complete_pending_tool_call(
         self,
         call_id: str,

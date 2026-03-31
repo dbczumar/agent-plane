@@ -344,6 +344,28 @@ class TaskStore(ABC):
         ...
 
     @abstractmethod
+    def check_pending_tool_call(
+        self,
+        call_id: str,
+    ) -> CompletePendingToolCallResult:
+        """
+        Check whether a pending tool call can be completed,
+        without mutating it.
+
+        Returns the same outcome as
+        :meth:`complete_pending_tool_call` but performs no
+        writes. Used by the PATCH endpoint to validate all
+        ``call_id`` values before applying any updates
+        (atomicity).
+
+        :param call_id: The tool call ID,
+            e.g. ``"call_abc123"``.
+        :returns: The outcome that :meth:`complete_pending_tool_call`
+            *would* return for this call_id.
+        """
+        ...
+
+    @abstractmethod
     def complete_pending_tool_call(
         self,
         call_id: str,
