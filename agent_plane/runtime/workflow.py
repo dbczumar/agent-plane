@@ -1663,7 +1663,7 @@ def _run_agent_loop(
     )
 
 
-def _find_sub_agent_spec(
+def _find_spec_by_name(
     spec: AgentSpec,
     name: str,
 ) -> AgentSpec | None:
@@ -1682,13 +1682,13 @@ def _find_sub_agent_spec(
     for sa in spec.sub_agents:
         if sa.name == name:
             return sa
-        found = _find_sub_agent_spec(sa, name)
+        found = _find_spec_by_name(sa, name)
         if found is not None:
             return found
     return None
 
 
-def _resolve_spec(
+def _resolve_task_spec(
     task_id: str,
     root_spec: AgentSpec,
 ) -> AgentSpec:
@@ -1729,7 +1729,7 @@ def _resolve_spec(
         return root_spec
 
     # Sub-agent — find spec by agent_name in the tree
-    sub_spec = _find_sub_agent_spec(root_spec, task.agent_name)
+    sub_spec = _find_spec_by_name(root_spec, task.agent_name)
     if sub_spec is None:
         raise LookupError(f"sub-agent {task.agent_name!r} not found in spec tree")
     return sub_spec
@@ -1787,7 +1787,7 @@ def agent_execution_workflow(
 
         # Resolve spec for sub-agents: if root_task_id is set,
         # find the sub-agent spec by agent_name in the tree.
-        spec = _resolve_spec(task_id, root_spec)
+        spec = _resolve_task_spec(task_id, root_spec)
         # spec.name is None only for partially-constructed specs that
         # haven't been registered — fall back to agent_id for display.
         agent_name: str = spec.name or agent_id
