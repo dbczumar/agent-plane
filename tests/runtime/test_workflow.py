@@ -767,11 +767,20 @@ def test_reactive_compact_plausible_overflow_proceeds(
             summary_metadata=None,
         ),
     )
+    class _RaisesIfCalled:
+        """Stub LLM client — compact() is patched out so this must never be used."""
+
+        class responses:
+            """Responses namespace."""
+
+            @staticmethod
+            def create(**kwargs: Any) -> None:
+                """Raise — compact() is patched so the client must not be reached."""
+                raise AssertionError("_get_llm_client() result was accessed unexpectedly")
+
     monkeypatch.setattr(
         "agent_plane.runtime.workflow._get_llm_client",
-        # MagicMock acceptable: compact() is fully replaced above, so the
-        # llm_client returned here is never accessed by the real code.
-        lambda: MagicMock(),
+        lambda: _RaisesIfCalled(),
     )
 
     exc = ContextWindowExceededError(

@@ -165,12 +165,18 @@ Check each file against this checklist:
     exists (SDK types, Pydantic models, dataclasses). MagicMock
     silently returns MagicMock for any attribute access, making
     broken code pass green. Use real types from the same module
-    the production code imports. MagicMock is ONLY acceptable for
-    client/interface stubs where production calls methods but never
-    checks types or accesses nested attributes. After any
-    import-path refactor, grep tests for stale type references.
-    Stale mock *targets* (monkeypatch of renamed function) raise
-    errors; stale mock *types* silently degrade.
+    the production code imports. MagicMock is NOT acceptable for
+    client/interface stubs either — use a real stub class instead.
+    If the client must never be called (e.g. it's bypassed by a
+    monkeypatch), use a `_RaisesIfCalled` class that asserts if
+    `responses.create()` is invoked. If the client should return a
+    fixed response, use a `_ReturnsTextClient`-style class that
+    returns real SDK types. Both patterns catch regressions where
+    a code path that should be short-circuited accidentally reaches
+    the client. After any import-path refactor, grep tests for
+    stale type references. Stale mock *targets* (monkeypatch of
+    renamed function) raise errors; stale mock *types* degrade
+    silently.
 
 27. ASSERTION DEPTH: Test assertions must verify actual content values,
     not just structural properties. `assert len(x) >= 1` and
@@ -340,3 +346,29 @@ architecture guide, and anti-patterns list.
 - Always commit AND push after changes
 - Run `pre-commit run --all-files` before committing
 - Push to remote `corey`: `git push corey main`
+
+## Mandatory E2E Tests
+
+**🚨 REQUIRED: When changes touch sub-agent spawning, client-side tool
+tunneling, parking, auto-collect, the PATCH endpoint, or the GET
+response builder, you MUST run the e2e test suite before committing.**
+
+These tests use a real LLM and real server. They caught every major
+bug in the sub-agent system that mock-based integration tests missed:
+empty sub-agent output, "Unknown tool" errors, the DBOS thread pool
+deadlock, and turns completing before sub-agents finish.
+
+```bash
+pytest tests/e2e/ --llm-api-key $(cat /tmp/mykey) -v
+```
+
+The e2e tests are excluded from the default `pytest` run (no API key
+needed for CI). They must be run manually before committing changes
+to any of these files:
+
+- `agent_plane/runtime/workflow.py` (agent loop, parking, auto-collect)
+- `agent_plane/tools/builtins/spawn.py` (spawn/collect tools)
+- `agent_plane/server/routes/responses.py` (GET/PATCH endpoints)
+- `agent_plane/stores/task_store/` (pending tool call methods)
+- `examples/frontends/terminal.py` (tunneled tool call handling)
+- `examples/agents/coder/client.py` (polling client tunneling)

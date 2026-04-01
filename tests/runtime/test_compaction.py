@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -28,6 +27,91 @@ from agent_plane.runtime.compaction import (
 from agent_plane.spec.types import CompactionConfig
 from llms.errors import RetryableLLMError
 from llms.types import MessageOutput, OutputText, Response
+
+
+# ---------------------------------------------------------------------------
+# LLM client stubs
+# ---------------------------------------------------------------------------
+
+
+class _RaisesIfCalled:
+    """
+    LLM client stub that fails the test if ``responses.create()`` is ever
+    called.
+
+    Use this for ``compact()`` calls where Layer 2 must NOT fire. If the
+    production code unexpectedly reaches ``summarize_history``, the
+    ``AssertionError`` surfaces immediately rather than silently succeeding
+    via a ``MagicMock``.
+    """
+
+    class responses:
+        """Namespace mirroring the real client's ``responses`` attribute."""
+
+        @staticmethod
+        def create(**kwargs: Any) -> None:
+            """
+            Raise if called — Layer 2 must not have fired.
+
+            :param kwargs: Forwarded kwargs from the real API call.
+            :raises AssertionError: Always.
+            """
+            raise AssertionError(
+                "llm_client.responses.create() was called unexpectedly. "
+                "Layer 2 must not fire in this test — check that count_tokens "
+                "is mocked below budget or that summarize_history is patched."
+            )
+
+
+class _ReturnsTextClient:
+    """
+    LLM client stub that returns a real ``Response`` containing a fixed text.
+
+    Use this for ``summarize_history`` tests where a real LLM response is
+    needed but the test must not hit the network.
+
+    :param text: The assistant text the stub will return, e.g.
+        ``"Summary of earlier conversation context."``.
+    :param model: The model name to embed in the returned ``Response``, e.g.
+        ``"openai/gpt-4o"``.
+    """
+
+    def __init__(self, text: str, model: str = "test-model") -> None:
+        self._text = text
+        self._model = model
+        self.call_count = 0
+
+    class _Responses:
+        """
+        Inner namespace mirroring ``client.responses``.
+
+        :param outer: The enclosing ``_ReturnsTextClient`` instance.
+        """
+
+        def __init__(self, outer: "_ReturnsTextClient") -> None:
+            self._outer = outer
+
+        def create(self, **kwargs: Any) -> Response:
+            """
+            Return a real ``Response`` with the configured text.
+
+            :param kwargs: Forwarded kwargs from the real API call.
+            :returns: A ``Response`` wrapping the configured text.
+            """
+            self._outer.call_count += 1
+            return Response(
+                output=[MessageOutput(content=[OutputText(text=self._outer._text)])],
+                model=self._outer._model,
+            )
+
+    @property
+    def responses(self) -> "_ReturnsTextClient._Responses":
+        """
+        Return the ``responses`` namespace for this stub client.
+
+        :returns: The ``_Responses`` inner instance.
+        """
+        return self._Responses(self)
 
 
 # ---------------------------------------------------------------------------
@@ -206,9 +290,9 @@ def test_no_compaction_under_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
         system_token_budget=0,
         model="openai/gpt-4o",
         task_id="task_001",
-        # MagicMock acceptable: Layer 2 never fires here (budget met after Layer 1),
-        # so summarize_history() is never called and llm_client is never accessed.
-        llm_client=MagicMock(),
+        # _RaisesIfCalled: Layer 2 must not fire (budget met after Layer 1).
+        # If summarize_history() is unexpectedly called, the test fails immediately.
+        llm_client=_RaisesIfCalled(),
     )
 
     # Layer 1 always applies clearing, but since budget is met, returns early.
@@ -268,9 +352,9 @@ def test_layer1_clears_tool_results_outside_window(monkeypatch: pytest.MonkeyPat
         system_token_budget=0,
         model="openai/gpt-4o",
         task_id="task_001",
-        # MagicMock acceptable: token count is within budget after Layer 1,
-        # so Layer 2 never fires and llm_client is never accessed.
-        llm_client=MagicMock(),
+        # _RaisesIfCalled: token count is within budget so Layer 2 must not
+        # fire. Fails loudly if summarize_history() is unexpectedly reached.
+        llm_client=_RaisesIfCalled(),
     )
 
     # fco at index 2 (iter1, outside window) must be cleared.
@@ -324,9 +408,9 @@ def test_layer1_never_touches_user_message_text(monkeypatch: pytest.MonkeyPatch)
         system_token_budget=0,
         model="openai/gpt-4o",
         task_id="task_001",
-        # MagicMock acceptable: budget is met after Layer 1 so Layer 2
-        # never fires and llm_client is never accessed.
-        llm_client=MagicMock(),
+        # _RaisesIfCalled: budget is met after Layer 1 so Layer 2 must not
+        # fire. Fails loudly if summarize_history() is unexpectedly reached.
+        llm_client=_RaisesIfCalled(),
     )
 
     # User text at index 0 (outside window) must be preserved.
@@ -367,9 +451,9 @@ def test_layer1_clears_binary_content_and_preserves_file_id(
         system_token_budget=0,
         model="openai/gpt-4o",
         task_id="task_001",
-        # MagicMock acceptable: budget is met after Layer 1 so Layer 2
-        # never fires and llm_client is never accessed.
-        llm_client=MagicMock(),
+        # _RaisesIfCalled: budget is met after Layer 1 so Layer 2 must not
+        # fire. Fails loudly if summarize_history() is unexpectedly reached.
+        llm_client=_RaisesIfCalled(),
     )
 
     image_block = result.messages[0]["content"][0]
@@ -421,7 +505,8 @@ def test_layer1_binary_content_inside_window_untouched(
         system_token_budget=0,
         model="openai/gpt-4o",
         task_id="task_001",
-        llm_client=MagicMock(),
+        # _RaisesIfCalled: budget is met after Layer 1 so Layer 2 must not fire.
+        llm_client=_RaisesIfCalled(),
     )
 
     # The image OUTSIDE the window (index 0 < boundary=1) should be cleared.
@@ -485,9 +570,9 @@ def test_recent_window_boundary_parametrized(
         system_token_budget=0,
         model="openai/gpt-4o",
         task_id="task_001",
-        # MagicMock acceptable: count_tokens is mocked to stay within budget,
-        # so Layer 2 never fires and llm_client is never accessed.
-        llm_client=MagicMock(),
+        # _RaisesIfCalled: count_tokens is mocked below budget, so Layer 2
+        # must not fire. Fails loudly if summarize_history() is called.
+        llm_client=_RaisesIfCalled(),
     )
 
     outside_output = result.messages[outside_fco_idx]["output"]
@@ -564,9 +649,9 @@ def test_layer2_triggers_when_layer1_insufficient(monkeypatch: pytest.MonkeyPatc
         system_token_budget=0,
         model="openai/gpt-4o",
         task_id="task_001",
-        # MagicMock acceptable: summarize_history is monkeypatched above, so
-        # llm_client is never passed through to a real LLM call.
-        llm_client=MagicMock(),
+        # summarize_history is monkeypatched above so llm_client is never used.
+        # _RaisesIfCalled still catches any accidental bypass of the patch.
+        llm_client=_RaisesIfCalled(),
     )
 
     # summary_metadata being set proves Layer 2 fired successfully.
@@ -644,9 +729,9 @@ def test_layer2_failure_falls_back_to_layer3(monkeypatch: pytest.MonkeyPatch) ->
         system_token_budget=0,
         model="openai/gpt-4o",
         task_id="task_001",
-        # MagicMock acceptable: summarize_history is monkeypatched to raise, so
-        # llm_client is never accessed — the exception fires before the call.
-        llm_client=MagicMock(),
+        # summarize_history is monkeypatched to raise before reaching llm_client.
+        # _RaisesIfCalled catches any accidental bypass of the monkeypatch.
+        llm_client=_RaisesIfCalled(),
     )
 
     # summary_metadata=None proves Layer 2 failed (not persisted).
@@ -661,17 +746,10 @@ def test_layer2_failure_falls_back_to_layer3(monkeypatch: pytest.MonkeyPatch) ->
 def test_summarize_history_returns_text_and_token_count() -> None:
     """summarize_history calls the LLM and returns text + token_count > 0."""
     summary_text = "Summary of earlier conversation context."
-    mock_resp = Response(
-        output=[MessageOutput(content=[OutputText(text=summary_text)])],
-        model="openai/gpt-4o",
-    )
-    # MagicMock acceptable as LLM client stub: summarize_history only calls
-    # llm_client.responses.create() — no type checks or nested attribute access.
-    mock_llm = MagicMock()
-    mock_llm.responses.create.return_value = mock_resp
+    stub_llm = _ReturnsTextClient(text=summary_text, model="openai/gpt-4o")
 
     messages = [{"role": "user", "content": "prior conversation"}]
-    result = summarize_history(messages, mock_llm, "openai/gpt-4o")
+    result = summarize_history(messages, stub_llm, "openai/gpt-4o")
 
     # The "text" field must match what the LLM returned.
     assert result["text"] == summary_text, (
@@ -681,8 +759,11 @@ def test_summarize_history_returns_text_and_token_count() -> None:
     assert result["token_count"] > 0, (
         "token_count must be > 0; failure means count_tokens wasn't called or returned 0."
     )
-    # The LLM must have been called exactly once with model, input, instructions, tools.
-    assert mock_llm.responses.create.call_count == 1
+    # The LLM must have been called exactly once.
+    assert stub_llm.call_count == 1, (
+        f"Expected 1 LLM call, got {stub_llm.call_count}. "
+        "Failure means summarize_history called the LLM more than once or not at all."
+    )
 
 
 def test_summarize_history_recursive_prompt_includes_continuation_prefix() -> None:
