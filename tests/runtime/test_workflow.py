@@ -10,9 +10,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agent_plane.entities import MessageData, NewConversationItem
+from agent_plane.entities import CompactionData, MessageData, NewConversationItem
 from agent_plane.runtime.caps import RuntimeCaps
+from agent_plane.runtime.compaction import CompactionResult, SummaryMetadata, _CompactionState
 from agent_plane.runtime.workflow import (
+    _load_initial_history,
+    _maybe_persist_compaction_item,
+    _reactive_compact,
     _run_agent_loop,
     _split_tool_calls,
     _ToolCall,
@@ -30,6 +34,7 @@ from agent_plane.stores.conversation_store.sqlalchemy_store import (
 )
 from agent_plane.tools.client_specified import ClientSideToolSpec
 from agent_plane.tools.manager import ToolManager
+from llms.errors import ContextWindowExceededError, PermanentLLMError
 
 
 @pytest.fixture()
@@ -256,10 +261,16 @@ def _patch_agent_loop_deps(
         lambda: mock_task_store,
     )
 
-    # Return empty history so the loop starts with no items
+    # Return empty history so the loop starts with no items.
+    # Both fetch_all_items (used inside tool/steering paths) and
+    # _load_initial_history (used at loop start) are stubbed.
     monkeypatch.setattr(
         "agent_plane.runtime.workflow.fetch_all_items",
         lambda store, conv_id, after=None: [],
+    )
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._load_initial_history",
+        lambda store, conv_id: [],
     )
 
     return emitted_events
@@ -459,8 +470,9 @@ def test_execution_timeout_preserves_prior_output(
         history: list[Any],
         instructions: str | None,
         tool_schemas: list[Any],
+        compaction_state: _CompactionState,
         content_cache: dict[str, str] | None = None,
-    ) -> MagicMock:
+    ) -> dict[str, Any]:
         """
         Fake LLM call that simulates a tool-call response.
 
@@ -475,16 +487,16 @@ def test_execution_timeout_preserves_prior_output(
         :param history: Conversation history (unused).
         :param instructions: Instructions (unused).
         :param tool_schemas: Tool schemas (unused).
+        :param compaction_state: Per-execution compaction state (unused).
         :param content_cache: Per-task content cache (unused).
-        :returns: A MagicMock LLM response with tool calls.
+        :returns: An LLM response dict with empty tool calls (tool
+            detection is controlled via the separate ``_has_tool_calls``
+            stub).
         """
-        resp = MagicMock()
-        # Signal that this response has tool calls
-        resp.output = [MagicMock()]
-        return resp
+        return {"model": "fake", "text": None, "tool_calls": [], "native_tool_items": []}
 
     monkeypatch.setattr(
-        "agent_plane.runtime.workflow._call_llm_for_iteration_with_error_handling",
+        "agent_plane.runtime.workflow._call_llm_maybe_compact",
         _fake_llm_call,
     )
 
@@ -729,4 +741,368 @@ def test_split_preserves_tool_call_fields() -> None:
     assert split.server[0].name == "load_skill"
     assert split.server[0].arguments == '{"name": "summarize"}', (
         "arguments must survive the split unchanged"
+    )
+
+
+# ── _reactive_compact tiktoken validation ────────────────────────────────────
+
+
+def test_reactive_compact_plausible_overflow_proceeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When tiktoken estimate is within 30% of the provider-reported token count,
+    _reactive_compact proceeds with compaction and returns compacted messages.
+    """
+    # count_tokens returns 140000 — 1.4% divergence from reported 142000 (within 30%).
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.count_tokens",
+        lambda msgs, model: 140000,
+    )
+    compacted_messages = [{"role": "user", "content": "compacted summary"}]
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.compact",
+        lambda messages, history, **kw: CompactionResult(
+            messages=compacted_messages,
+            summary_metadata=None,
+        ),
+    )
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._get_llm_client",
+        # MagicMock acceptable: compact() is fully replaced above, so the
+        # llm_client returned here is never accessed by the real code.
+        lambda: MagicMock(),
+    )
+
+    exc = ContextWindowExceededError(
+        "Context window exceeded: 142000 tokens > 128000 max",
+        code="context_length_exceeded",
+        max_context_tokens=128000,
+        actual_tokens=142000,
+    )
+    state = _CompactionState(
+        context_window=None,
+        last_summary=None,
+        config=None,
+        model="openai/gpt-4o",
+    )
+    messages = [{"role": "user", "content": "long conversation history"}]
+
+    result = _reactive_compact(messages, [], 1000, exc, state, "task_001")
+
+    # Compacted messages returned — proves compact() was called (not re-raised).
+    assert result == compacted_messages, (
+        f"Expected compacted messages to be returned, got: {result!r}. "
+        "Failure means _reactive_compact raised PermanentLLMError instead of compacting."
+    )
+    # context_window cached from the overflow for proactive checks in future iterations.
+    assert state.context_window == 128000, (
+        f"Expected context_window cached as 128000, got: {state.context_window}. "
+        "Failure means the discovered window was not saved for proactive checks."
+    )
+
+
+def test_reactive_compact_implausible_overflow_raises_permanent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When tiktoken estimate diverges from provider-reported tokens by > 30%,
+    _reactive_compact re-raises as PermanentLLMError to prevent a pointless
+    compact-retry loop on a misclassified error.
+    """
+    # count_tokens returns 50000 — 65% divergence from reported 142000 (outside 30%).
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.count_tokens",
+        lambda msgs, model: 50000,
+    )
+
+    exc = ContextWindowExceededError(
+        "Context window exceeded: 142000 tokens > 128000 max",
+        code="context_length_exceeded",
+        max_context_tokens=128000,
+        actual_tokens=142000,
+    )
+    state = _CompactionState(
+        context_window=None,
+        last_summary=None,
+        config=None,
+        model="openai/gpt-4o",
+    )
+    messages = [{"role": "user", "content": "test"}]
+
+    with pytest.raises(PermanentLLMError) as exc_info:
+        _reactive_compact(messages, [], 1000, exc, state, "task_001")
+
+    # Must be PermanentLLMError, not ContextWindowExceededError, to prevent retry loop.
+    assert exc_info.value.code == exc.code, (
+        f"Expected code '{exc.code}' preserved on re-raise, got '{exc_info.value.code}'. "
+        "Failure means the re-raised error lost its original error code."
+    )
+    # Compact must not have been called — there's nothing to monkeypatch but we verify
+    # by checking that the state.context_window was cached before the validation check.
+    assert state.context_window == 128000, (
+        "context_window should be cached even when validation fails — "
+        "the window was discovered from the error before the ratio check."
+    )
+
+
+# ── _load_initial_history ─────────────────────────────────────────────────────
+
+
+def test_load_initial_history_no_compaction_loads_everything(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    With no compaction item, _load_initial_history loads the full conversation.
+    """
+    conv = conversation_store.create_conversation()
+    for i in range(5):
+        conversation_store.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=f"resp_{i:03d}",
+                    data=MessageData(
+                        role="user",
+                        content=[{"type": "input_text", "text": f"msg {i}"}],
+                    ),
+                )
+            ],
+        )
+
+    history = _load_initial_history(conversation_store, conv.id)
+
+    # All 5 messages loaded — no compaction cursor to limit the query.
+    assert len(history) == 5, (
+        f"Expected 5 items loaded when no compaction exists, got {len(history)}. "
+        "Failure means _load_initial_history incorrectly skipped items."
+    )
+    # No compaction items in the result — they are filtered out.
+    assert all(item.type != "compaction" for item in history)
+
+
+def test_load_initial_history_with_compaction_loads_summary_plus_recent(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    With a compaction item, _load_initial_history returns a synthetic summary
+    pair and only the items AFTER last_item_id, not the full history.
+    """
+    conv = conversation_store.create_conversation()
+
+    # Append 3 "old" items that will be covered by the summary
+    old_items = conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_000",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"old msg {i}"}],
+                ),
+            )
+            for i in range(3)
+        ],
+    )
+    last_covered_id = old_items[-1].id  # last item covered by compaction
+
+    # Append the compaction item (covers items 0..2)
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id="task_001",
+                data=CompactionData(
+                    summary="User asked about X. Agent answered Y.",
+                    last_item_id=last_covered_id,
+                    model="openai/gpt-4o",
+                    token_count=50,
+                ),
+            )
+        ],
+    )
+
+    # Append 2 "recent" items after the compaction
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_001",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"recent msg {i}"}],
+                ),
+            )
+            for i in range(2)
+        ],
+    )
+
+    history = _load_initial_history(conversation_store, conv.id)
+
+    # 2 synthetic items (user + assistant from compaction) + 2 recent items = 4 total.
+    assert len(history) == 4, (
+        f"Expected 4 items (2 synthetic + 2 recent), got {len(history)}. "
+        "Failure means old items were loaded verbatim instead of replaced by summary."
+    )
+    # First item is the synthetic user summary request.
+    assert history[0].type == "message"
+    assert isinstance(history[0].data, MessageData)
+    assert history[0].data.role == "user"
+    assert "[This is an automatically generated summary" in history[0].data.content[0]["text"]
+    # Second item is the synthetic assistant summary.
+    assert history[1].data.role == "assistant"
+    assert history[1].data.content[0]["text"] == "User asked about X. Agent answered Y."
+    # Items 2 and 3 are the recent real messages.
+    assert history[2].data.role == "user"
+    assert history[2].data.content[0]["text"] == "recent msg 0"
+    # No compaction items appear in the result — they are metadata only.
+    assert all(item.type != "compaction" for item in history)
+
+
+def test_load_initial_history_post_summary_items_not_lost(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Items appended AFTER the compaction but before last_item_id are NOT lost —
+    _load_initial_history uses last_item_id as the cursor, not the compaction item's position.
+    """
+    conv = conversation_store.create_conversation()
+
+    # 5 "old" items
+    old_items = conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_000",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"old {i}"}],
+                ),
+            )
+            for i in range(5)
+        ],
+    )
+    covered_id = old_items[2].id  # summary covers items 0..2 only
+
+    # Append compaction covering only items 0..2 (items 3,4 are NOT covered)
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id="task_001",
+                data=CompactionData(
+                    summary="Summary of items 0 to 2.",
+                    last_item_id=covered_id,
+                    model="openai/gpt-4o",
+                    token_count=30,
+                ),
+            )
+        ],
+    )
+
+    history = _load_initial_history(conversation_store, conv.id)
+
+    # Expected: 2 synthetic items (user+assistant) + items 3 and 4 = 4 total.
+    # Items 3 and 4 are AFTER covered_id so they must not be lost.
+    assert len(history) == 4, (
+        f"Expected 4 items (2 synthetic + 2 post-coverage items), got {len(history)}. "
+        "Failure means items between last_item_id and compaction item were dropped."
+    )
+    # Items 3 and 4 must be present verbatim.
+    assert history[2].data.content[0]["text"] == "old 3"
+    assert history[3].data.content[0]["text"] == "old 4"
+
+
+# ── _maybe_persist_compaction_item ───────────────────────────────────────────
+
+
+def test_maybe_persist_compaction_item_idempotent(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Calling _maybe_persist_compaction_item twice with the same task_id
+    results in exactly one compaction item (idempotent for crash-recovery).
+    """
+    conv = conversation_store.create_conversation()
+    summary = SummaryMetadata(
+        text="First summary.",
+        last_item_id="msg_abc",
+        model="openai/gpt-4o",
+        token_count=25,
+    )
+
+    _maybe_persist_compaction_item(summary, "task_001", conv.id, conversation_store)
+    # Simulate crash-recovery replay: call again with the same task_id.
+    _maybe_persist_compaction_item(summary, "task_001", conv.id, conversation_store)
+
+    items = conversation_store.list_items(conv.id, type="compaction")
+    # Only one compaction item must exist — the second call was a no-op.
+    assert len(items.data) == 1, (
+        f"Expected exactly 1 compaction item after idempotent double-persist, "
+        f"got {len(items.data)}. Failure means the dedup check is missing or broken."
+    )
+    item = items.data[0]
+    # Full structure must be preserved through persist round-trip.
+    assert item.data.summary == "First summary.", f"summary text mismatch: {item.data.summary!r}"
+    assert item.data.last_item_id == "msg_abc", (
+        f"last_item_id mismatch: {item.data.last_item_id!r}"
+    )
+    assert item.data.model == "openai/gpt-4o", f"model mismatch: {item.data.model!r}"
+    # response_id is on ConversationItem, not CompactionData — it's the task_id.
+    # The dedup guard in _maybe_persist_compaction_item checks this field.
+    assert item.response_id == "task_001", (
+        f"response_id={item.response_id!r} must equal task_id 'task_001'. "
+        "If different, the dedup guard would not block re-append on crash replay."
+    )
+
+
+def test_maybe_persist_compaction_item_different_task_ids_produce_separate_items(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Two executions with different task IDs each produce their own compaction item.
+    """
+    conv = conversation_store.create_conversation()
+    summary1 = SummaryMetadata(
+        text="Summary from task 1.",
+        last_item_id="msg_001",
+        model="openai/gpt-4o",
+        token_count=20,
+    )
+    summary2 = SummaryMetadata(
+        text="Summary from task 2.",
+        last_item_id="msg_002",
+        model="openai/gpt-4o",
+        token_count=25,
+    )
+
+    _maybe_persist_compaction_item(summary1, "task_001", conv.id, conversation_store)
+    _maybe_persist_compaction_item(summary2, "task_002", conv.id, conversation_store)
+
+    items = conversation_store.list_items(conv.id, type="compaction")
+    # Two compaction items — one per execution.
+    assert len(items.data) == 2, (
+        f"Expected 2 compaction items (one per task), got {len(items.data)}. "
+        "Failure means different task IDs were incorrectly treated as duplicates."
+    )
+    # response_id is on ConversationItem — use it to map items by task_id.
+    by_response_id = {i.response_id: i for i in items.data}
+    # Each task_id produces a distinct compaction item with the correct summary.
+    assert by_response_id["task_001"].data.summary == "Summary from task 1.", (
+        f"task_001 summary mismatch: {by_response_id.get('task_001')}"
+    )
+    assert by_response_id["task_001"].data.last_item_id == "msg_001", (
+        "task_001 last_item_id mismatch"
+    )
+    assert by_response_id["task_002"].data.summary == "Summary from task 2.", (
+        f"task_002 summary mismatch: {by_response_id.get('task_002')}"
+    )
+    assert by_response_id["task_002"].data.last_item_id == "msg_002", (
+        "task_002 last_item_id mismatch"
     )

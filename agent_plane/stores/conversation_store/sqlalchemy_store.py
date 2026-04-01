@@ -239,6 +239,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         after: str | None = None,
         before: str | None = None,
         order: str = "asc",
+        type: str | None = None,
     ) -> PagedList[ConversationItem]:
         """
         List items in a conversation with cursor-based pagination.
@@ -253,6 +254,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             before this item in sort order.
         :param order: Sort direction on position,
             ``"asc"`` or ``"desc"``.
+        :param type: Optional item type filter. When provided, only items
+            with this type are returned, e.g. ``"compaction"``. ``None``
+            means return all types.
         :returns: A :class:`PagedList` of
             :class:`ConversationItem` objects.
         """
@@ -262,6 +266,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             stmt = select(SqlConversationItem).where(
                 SqlConversationItem.conversation_id == conversation_id
             )
+            if type is not None:
+                stmt = stmt.where(SqlConversationItem.type == type)
             if after:
                 sub = (
                     select(SqlConversationItem.position)

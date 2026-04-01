@@ -13,6 +13,7 @@ from agent_plane.errors import AgentPlaneError, ErrorCode
 from agent_plane.spec.types import (
     AgentSpec,
     BuiltinToolConfig,
+    CompactionConfig,
     ExecutionConfig,
     InteractionConfig,
     LLMConfig,
@@ -62,6 +63,7 @@ def parse(root: Path) -> AgentSpec:
     interaction = _parse_interaction(raw.get("interaction"))
     tools_config = _parse_tools_config(raw.get("tools"))
     execution = _parse_execution(raw.get("execution"))
+    compaction = _parse_compaction(raw.get("compaction"))
     params = raw.get("params", {})
 
     instructions = _resolve_instructions(root, raw.get("instructions"))
@@ -78,6 +80,7 @@ def parse(root: Path) -> AgentSpec:
         interaction=interaction,
         tools=tools_config,
         execution=execution,
+        compaction=compaction,
         params=params,
         instructions=instructions,
         skills=skills,
@@ -273,6 +276,27 @@ def _parse_execution(
     return ExecutionConfig(
         timeout=int(raw.get("timeout", 3600)),
         max_iterations=int(raw.get("max_iterations", 1000)),
+    )
+
+
+def _parse_compaction(
+    raw: dict[str, Any] | None,
+) -> CompactionConfig | None:
+    """
+    Parse the ``compaction:`` block from config.yaml into a
+    :class:`CompactionConfig`.
+
+    :param raw: The raw ``compaction:`` mapping from config.yaml, or
+        ``None`` if the block was absent. Example:
+        ``{"trigger_threshold": 0.8, "recent_window": 5}``.
+    :returns: A populated :class:`CompactionConfig`, or ``None`` when
+        the ``compaction:`` block is absent.
+    """
+    if raw is None:
+        return None
+    return CompactionConfig(
+        trigger_threshold=float(raw.get("trigger_threshold", 0.8)),
+        recent_window=int(raw.get("recent_window", 5)),
     )
 
 

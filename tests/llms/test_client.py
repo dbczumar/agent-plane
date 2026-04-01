@@ -8,6 +8,7 @@ failures surface immediately.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock
@@ -16,7 +17,12 @@ import httpx
 import pytest
 
 from llms.client import Client
-from llms.errors import LLMErrorDetail, PermanentLLMError, RetryableLLMError
+from llms.errors import (
+    ContextWindowExceededError,
+    LLMErrorDetail,
+    PermanentLLMError,
+    RetryableLLMError,
+)
 from llms.types import (
     MessageOutput,
     OutputText,
@@ -477,3 +483,192 @@ def test_create_with_retry_http_status_classification(
     # Detail must carry the status code for downstream diagnostics.
     assert exc_info.value.detail is not None
     assert exc_info.value.detail.status_code == status_code
+
+
+# ── ContextWindowExceededError tests ──────────────────
+
+
+def test_context_overflow_openai_error_body(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryConfig,
+) -> None:
+    """
+    OpenAI context overflow (HTTP 400 with context_length_exceeded code)
+    raises ContextWindowExceededError with correct token counts extracted.
+    """
+    openai_body = json.dumps(
+        {
+            "error": {
+                "code": "context_length_exceeded",
+                "message": (
+                    "This model's maximum context length is 128000 tokens. "
+                    "However, you requested 142000 tokens (10000 in the messages, "
+                    "132000 in the completion). Please reduce the length of the "
+                    "messages or completion."
+                ),
+            }
+        }
+    )
+    mock_adapter = MagicMock()
+    http_400 = httpx.HTTPStatusError(
+        "context window exceeded",
+        request=httpx.Request("POST", "http://test"),
+        response=httpx.Response(
+            400,
+            content=openai_body.encode(),
+            headers={"content-type": "application/json"},
+        ),
+    )
+    mock_adapter.chat_completions.side_effect = http_400
+    _patch_client_deps(monkeypatch, mock_adapter)
+
+    with pytest.raises(ContextWindowExceededError) as exc_info:
+        Client().responses.create(
+            **_default_create_kwargs(),
+            retry=retry_config,
+        )
+
+    # max_context_tokens must match the limit in the OpenAI error message.
+    assert exc_info.value.max_context_tokens == 128000, (
+        f"Expected max_context_tokens=128000, got {exc_info.value.max_context_tokens}. "
+        "Failure means the OpenAI error pattern regex did not match."
+    )
+    # actual_tokens must match the reported count from the error message.
+    assert exc_info.value.actual_tokens == 142000, (
+        f"Expected actual_tokens=142000, got {exc_info.value.actual_tokens}."
+    )
+    # Code must be context_length_exceeded for downstream detection.
+    assert exc_info.value.code == "context_length_exceeded"
+
+
+def test_context_overflow_anthropic_sum_pattern(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryConfig,
+) -> None:
+    """
+    Anthropic overflow error (N + M > limit) raises ContextWindowExceededError
+    with correct token counts extracted.
+    """
+    # Anthropic's "{input} + {max_tokens} > {limit}" format
+    anthropic_body = "197202 + 21333 > 200000"
+    mock_adapter = MagicMock()
+    http_400 = httpx.HTTPStatusError(
+        "overflow",
+        request=httpx.Request("POST", "http://test"),
+        response=httpx.Response(400, content=anthropic_body.encode()),
+    )
+    mock_adapter.chat_completions.side_effect = http_400
+    _patch_client_deps(monkeypatch, mock_adapter)
+
+    with pytest.raises(ContextWindowExceededError) as exc_info:
+        Client().responses.create(
+            **_default_create_kwargs(),
+            retry=retry_config,
+        )
+
+    # In Anthropic's "a + b > limit" pattern: group(1)=actual (197202), group(2)=max (200000).
+    assert exc_info.value.max_context_tokens == 200000, (
+        f"Expected max_context_tokens=200000, got {exc_info.value.max_context_tokens}."
+    )
+    assert exc_info.value.actual_tokens == 197202, (
+        f"Expected actual_tokens=197202, got {exc_info.value.actual_tokens}."
+    )
+
+
+def test_context_overflow_anthropic_long_pattern(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryConfig,
+) -> None:
+    """
+    Anthropic overflow (prompt is too long: N tokens > M maximum) raises
+    ContextWindowExceededError with correct token counts.
+    """
+    anthropic_body = "prompt is too long: 210000 tokens > 200000 maximum"
+    mock_adapter = MagicMock()
+    http_400 = httpx.HTTPStatusError(
+        "overflow",
+        request=httpx.Request("POST", "http://test"),
+        response=httpx.Response(400, content=anthropic_body.encode()),
+    )
+    mock_adapter.chat_completions.side_effect = http_400
+    _patch_client_deps(monkeypatch, mock_adapter)
+
+    with pytest.raises(ContextWindowExceededError) as exc_info:
+        Client().responses.create(
+            **_default_create_kwargs(),
+            retry=retry_config,
+        )
+
+    assert exc_info.value.max_context_tokens == 200000, (
+        f"Expected max=200000, got {exc_info.value.max_context_tokens}."
+    )
+    assert exc_info.value.actual_tokens == 210000, (
+        f"Expected actual=210000, got {exc_info.value.actual_tokens}."
+    )
+
+
+def test_context_overflow_gemini_pattern(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryConfig,
+) -> None:
+    """
+    Gemini overflow error raises ContextWindowExceededError with correct
+    token counts extracted.
+    """
+    gemini_body = (
+        "input token count (1100000) exceeds the maximum number of tokens allowed (1048576)"
+    )
+    mock_adapter = MagicMock()
+    http_400 = httpx.HTTPStatusError(
+        "overflow",
+        request=httpx.Request("POST", "http://test"),
+        response=httpx.Response(400, content=gemini_body.encode()),
+    )
+    mock_adapter.chat_completions.side_effect = http_400
+    _patch_client_deps(monkeypatch, mock_adapter)
+
+    with pytest.raises(ContextWindowExceededError) as exc_info:
+        Client().responses.create(
+            **_default_create_kwargs(),
+            retry=retry_config,
+        )
+
+    assert exc_info.value.max_context_tokens == 1048576, (
+        f"Expected max=1048576, got {exc_info.value.max_context_tokens}."
+    )
+    assert exc_info.value.actual_tokens == 1100000, (
+        f"Expected actual=1100000, got {exc_info.value.actual_tokens}."
+    )
+
+
+def test_unrecognized_400_not_context_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryConfig,
+) -> None:
+    """
+    A generic HTTP 400 that doesn't match any overflow pattern raises
+    PermanentLLMError (not ContextWindowExceededError).
+    """
+    generic_body = "invalid request: missing required 'model' field"
+    mock_adapter = MagicMock()
+    http_400 = httpx.HTTPStatusError(
+        "bad request",
+        request=httpx.Request("POST", "http://test"),
+        response=httpx.Response(400, content=generic_body.encode()),
+    )
+    mock_adapter.chat_completions.side_effect = http_400
+    _patch_client_deps(monkeypatch, mock_adapter)
+
+    with pytest.raises(PermanentLLMError) as exc_info:
+        Client().responses.create(
+            **_default_create_kwargs(),
+            retry=retry_config,
+        )
+
+    # Must be PermanentLLMError, NOT ContextWindowExceededError.
+    # Failure means an unrelated 400 would enter the compact-retry loop.
+    assert not isinstance(exc_info.value, ContextWindowExceededError), (
+        "Unrecognized 400 must not be classified as ContextWindowExceededError — "
+        "it would incorrectly trigger the compaction-retry loop."
+    )
+    assert exc_info.value.code == "400"

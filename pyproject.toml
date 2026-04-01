@@ -12,6 +12,7 @@ dependencies = [
     "pydantic>=2.0",
     "pyyaml>=6.0",
     "sqlalchemy>=2.0",
+    "tiktoken>=0.7",
     "alembic",
     "uvicorn[standard]",
 ]
@@ -34,6 +35,13 @@ strict = true
 [[tool.mypy.overrides]]
 module = "cachetools"
 ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+addopts = "--ignore=tests/e2e"
+markers = [
+    "live: end-to-end tests requiring real LLM API key (run with --llm-api-key)",
+]
 
 [tool.ruff]
 line-length = 99

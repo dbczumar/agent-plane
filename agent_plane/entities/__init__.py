@@ -2,6 +2,7 @@
 
 from agent_plane.entities.agent import Agent, LoadedAgent
 from agent_plane.entities.conversation import (
+    CompactionData,
     Conversation,
     ConversationItem,
     FunctionCallData,
@@ -23,6 +24,7 @@ from agent_plane.entities.task import ACTIVE_STATUSES, TERMINAL_STATUSES, Task, 
 __all__ = [
     "Agent",
     "LoadedAgent",
+    "CompactionData",
     "CompletePendingToolCallResult",
     "Conversation",
     "ConversationItem",

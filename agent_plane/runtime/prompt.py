@@ -105,7 +105,16 @@ def history_to_input_items(
                 }
             )
 
-        # reasoning items are not included in the LLM prompt
-        # (they are output-only)
+        elif item.type == "reasoning":
+            # reasoning items are not included in the LLM prompt
+            # (they are output-only)
+            pass
+
+        elif item.type == "compaction":
+            # compaction items are metadata, not conversation content
+            # the LLM should see — they are converted to a synthetic
+            # summary message pair by compaction_to_history_items()
+            # before being prepended to history.
+            pass
 
     return result

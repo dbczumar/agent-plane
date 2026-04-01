@@ -5,10 +5,13 @@ routes to provider adapters.
 
 from __future__ import annotations
 
+import json
 import logging
 import random
+import re
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 import httpx
@@ -20,7 +23,12 @@ from llms._responses_to_chat import (
 )
 from llms.adapters import get_adapter
 from llms.adapters.openai import OpenAIAdapter
-from llms.errors import LLMErrorDetail, PermanentLLMError, RetryableLLMError
+from llms.errors import (
+    ContextWindowExceededError,
+    LLMErrorDetail,
+    PermanentLLMError,
+    RetryableLLMError,
+)
 from llms.routing import parse_model_string
 from llms.types import Response, ResponseStreamEvent, RetryConfig
 
@@ -220,6 +228,95 @@ def _execute_with_retry(
     raise last_error
 
 
+@dataclass
+class _OverflowTokens:
+    """
+    Token counts parsed from a provider context-overflow error body.
+
+    :param max_context_tokens: The model's context window size as
+        reported by the provider, e.g. ``128000``.
+    :param actual_tokens: The token count the provider measured for
+        the rejected request, e.g. ``142000``.
+    """
+
+    max_context_tokens: int
+    actual_tokens: int
+
+
+def _detect_context_overflow(body: str) -> _OverflowTokens | None:
+    """
+    Parse provider-specific context-overflow error messages and
+    extract token counts.
+
+    Matches conservatively — only well-known error shapes produce a
+    result. Unknown 400 errors return ``None`` so they propagate as
+    :class:`PermanentLLMError` rather than entering a
+    compact-retry loop.
+
+    Supported providers:
+    - **OpenAI**: status 400, ``error.code == "context_length_exceeded"``
+    - **Anthropic**: status 400, message ``"{input} + {max_tokens} > {limit}"``
+      or ``"prompt is too long: {actual} tokens > {limit} maximum"``
+    - **Gemini**: status 400, message contains
+      ``"input token count ({actual}) exceeds the maximum number
+      of tokens allowed ({limit})"``
+
+    :param body: The raw HTTP response body string from the provider.
+    :returns: Parsed token counts, or ``None`` if the body does not
+        match any known overflow pattern.
+    """
+    # OpenAI: {"error": {"code": "context_length_exceeded", "message": "..."}}
+    # Message: "This model's maximum context length is 128000 tokens.
+    #           However, you requested 142000 tokens"
+    try:
+        parsed = json.loads(body)
+        error_obj = parsed.get("error", {})
+        if error_obj.get("code") == "context_length_exceeded":
+            msg = error_obj.get("message", "")
+            max_match = re.search(r"maximum context length is (\d+) tokens", msg)
+            actual_match = re.search(r"you requested (\d+) tokens", msg)
+            if max_match and actual_match:
+                return _OverflowTokens(
+                    max_context_tokens=int(max_match.group(1)),
+                    actual_tokens=int(actual_match.group(1)),
+                )
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    # Anthropic: "{input} + {max_tokens} > {limit}"
+    # e.g. "197202 + 21333 > 200000"
+    anthropic_sum = re.search(r"(\d+)\s*\+\s*\d+\s*>\s*(\d+)", body)
+    if anthropic_sum:
+        return _OverflowTokens(
+            max_context_tokens=int(anthropic_sum.group(2)),
+            actual_tokens=int(anthropic_sum.group(1)),
+        )
+
+    # Anthropic: "prompt is too long: {actual} tokens > {limit} maximum"
+    anthropic_long = re.search(
+        r"prompt is too long:\s*(\d+)\s*tokens\s*>\s*(\d+)\s*maximum",
+        body,
+    )
+    if anthropic_long:
+        return _OverflowTokens(
+            max_context_tokens=int(anthropic_long.group(2)),
+            actual_tokens=int(anthropic_long.group(1)),
+        )
+
+    # Gemini: "input token count ({actual}) exceeds the maximum number of tokens allowed ({limit})"
+    gemini_match = re.search(
+        r"input token count \((\d+)\) exceeds the maximum number of tokens allowed \((\d+)\)",
+        body,
+    )
+    if gemini_match:
+        return _OverflowTokens(
+            max_context_tokens=int(gemini_match.group(2)),
+            actual_tokens=int(gemini_match.group(1)),
+        )
+
+    return None
+
+
 def _classify_error(
     exc: Exception,
     retryable_status_codes: list[int],
@@ -240,7 +337,22 @@ def _classify_error(
         )
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
-        detail = LLMErrorDetail(status_code=status)
+        body = exc.response.text
+        detail = LLMErrorDetail(status_code=status, response_body=body)
+        # HTTP 400 may be a context-window overflow — check before
+        # the generic retryable/permanent split so the workflow can
+        # catch ContextWindowExceededError and compact-retry.
+        if status == 400:
+            overflow = _detect_context_overflow(body)
+            if overflow is not None:
+                return ContextWindowExceededError(
+                    f"Context window exceeded: {overflow.actual_tokens} tokens"
+                    f" > {overflow.max_context_tokens} max",
+                    code="context_length_exceeded",
+                    detail=detail,
+                    max_context_tokens=overflow.max_context_tokens,
+                    actual_tokens=overflow.actual_tokens,
+                )
         msg = f"LLM returned HTTP {status}"
         if status in retryable_status_codes:
             return RetryableLLMError(msg, code=str(status), detail=detail)

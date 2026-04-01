@@ -542,3 +542,137 @@ def test_list_conversations_asc_with_after_cursor(
     all_ids = [c.id for c in page1.data + page2.data + page3.data]
     full_asc = conversation_store.list_conversations(limit=100, order="asc")
     assert all_ids == [c.id for c in full_asc.data]
+
+
+# ── list_items type filter ────────────────────────────
+
+
+def test_list_items_type_filter_returns_only_matching_type(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    list_items(type=...) returns only items of the specified type,
+    while list_items() without a filter returns all types.
+    """
+    from agent_plane.entities import CompactionData
+
+    conv = conversation_store.create_conversation()
+
+    # Append a mix of message and compaction items
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_001",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+            ),
+        ],
+    )
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id="resp_001",
+                data=CompactionData(
+                    summary="Summary text",
+                    last_item_id="msg_001",
+                    model="openai/gpt-4o",
+                    token_count=50,
+                ),
+            ),
+        ],
+    )
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_002",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "hello"}],
+                    agent="test-agent",
+                ),
+            ),
+        ],
+    )
+
+    compaction_items = conversation_store.list_items(conv.id, type="compaction")
+    message_items = conversation_store.list_items(conv.id, type="message")
+    all_items = conversation_store.list_items(conv.id)
+
+    # Only the one compaction item must be returned.
+    assert len(compaction_items.data) == 1, (
+        f"Expected 1 compaction item, got {len(compaction_items.data)}. "
+        "Failure means type filter did not exclude message items."
+    )
+    assert compaction_items.data[0].type == "compaction"
+
+    # Only message items (2) must be returned.
+    assert len(message_items.data) == 2, (
+        f"Expected 2 message items, got {len(message_items.data)}. "
+        "Failure means type filter did not exclude the compaction item."
+    )
+    assert all(i.type == "message" for i in message_items.data)
+
+    # No filter returns all 3 items.
+    assert len(all_items.data) == 3, (
+        f"Expected 3 total items (2 message + 1 compaction), got {len(all_items.data)}."
+    )
+
+
+def test_list_items_type_filter_with_order_and_limit(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    list_items(type="compaction", order="desc", limit=1) returns only
+    the most recently appended compaction item.
+    """
+    from agent_plane.entities import CompactionData
+
+    conv = conversation_store.create_conversation()
+
+    # Append two compaction items
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id="resp_001",
+                data=CompactionData(
+                    summary="First summary",
+                    last_item_id="msg_010",
+                    model="openai/gpt-4o",
+                    token_count=100,
+                ),
+            ),
+        ],
+    )
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id="resp_002",
+                data=CompactionData(
+                    summary="Second summary",
+                    last_item_id="msg_020",
+                    model="openai/gpt-4o",
+                    token_count=120,
+                ),
+            ),
+        ],
+    )
+
+    result = conversation_store.list_items(conv.id, type="compaction", order="desc", limit=1)
+
+    # Only one item returned (limit=1).
+    assert len(result.data) == 1, f"Expected 1 item with limit=1, got {len(result.data)}."
+    # The most recent compaction item (second) should be returned (order=desc).
+    assert result.data[0].data.summary == "Second summary", (
+        f"Expected the latest compaction item with 'Second summary', "
+        f"got: {result.data[0].data.summary!r}. "
+        "Failure means order=desc with limit=1 did not return the newest item."
+    )

@@ -205,6 +205,9 @@ class SqlPendingToolCall(Base):
     :param root_task_id: The top-level task whose response output
         contains the ``function_call`` item.
     :param task_id: The parked sub-agent's task ID.
+    :param tool_name: The tool function name, e.g. ``"Read"``.
+    :param arguments: JSON-encoded arguments from the LLM,
+        e.g. ``'{"file_path": "/tmp/foo.py"}'``.
     :param status: ``"action_required"`` or ``"completed"``.
     :param result: The tool's string output from the client.
         ``None`` until the client PATCHes.
@@ -220,6 +223,8 @@ class SqlPendingToolCall(Base):
         String(64), ForeignKey("tasks.id", ondelete="CASCADE")
     )
     task_id: Mapped[str] = mapped_column(String(64), ForeignKey("tasks.id", ondelete="CASCADE"))
+    tool_name: Mapped[str] = mapped_column(String(256))
+    arguments: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32))
     result: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[int] = mapped_column(Integer)

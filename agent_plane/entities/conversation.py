@@ -115,13 +115,44 @@ class ReasoningData(BaseModel):
     encrypted_content: str | None = None
 
 
-ItemData = MessageData | FunctionCallData | FunctionCallOutputData | ReasoningData
+class CompactionData(BaseModel):
+    """
+    Data payload for a compaction summary item.
+
+    Stored as a conversation item of ``type="compaction"``.
+    The summary covers all items from the start of the
+    conversation (or the previous compaction item) through
+    the item identified by ``last_item_id``.
+
+    :param summary: The LLM-generated summary text covering
+        all conversation items up through ``last_item_id``,
+        e.g. ``"User asked to analyze a dataset. Agent loaded
+        data.csv and computed statistics."``.
+    :param last_item_id: The item ID (inclusive) of the last
+        conversation item covered by this summary, e.g.
+        ``"msg_abc123"``. Items at positions <= this item are
+        summarized and do not need to be loaded for prompt
+        construction.
+    :param model: The model used to generate the summary,
+        e.g. ``"openai/gpt-4o"``.
+    :param token_count: Approximate token count of the summary
+        text, for budget tracking, e.g. ``342``.
+    """
+
+    summary: str
+    last_item_id: str
+    model: str
+    token_count: int
+
+
+ItemData = MessageData | FunctionCallData | FunctionCallOutputData | ReasoningData | CompactionData
 
 ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
     "message": MessageData,
     "function_call": FunctionCallData,
     "function_call_output": FunctionCallOutputData,
     "reasoning": ReasoningData,
+    "compaction": CompactionData,
 }
 
 

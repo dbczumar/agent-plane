@@ -6,6 +6,7 @@ All durably checkpointed for crash recovery.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Iterator
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from agent_plane.entities import (
+    CompactionData,
     ConversationItem,
     FunctionCallData,
     FunctionCallOutputData,
@@ -28,6 +30,13 @@ from agent_plane.runtime import (
     get_task_store,
     get_tool_manager,
     set_tool_manager,
+)
+from agent_plane.runtime.compaction import (
+    SummaryMetadata,
+    _CompactionState,
+    compact,
+    compaction_to_history_items,
+    count_tokens,
 )
 from agent_plane.runtime.content_resolver import resolve_content_references
 from agent_plane.runtime.durability import (
@@ -47,12 +56,13 @@ from agent_plane.spec.types import LLMConfig, RetryConfig, ToolsConfig
 from agent_plane.stores import ConversationStore, TaskStore
 from agent_plane.tools import ToolManager
 from agent_plane.tools.base import ToolContext
+from agent_plane.tools.builtins import CollectTool, SpawnTool
 from agent_plane.tools.client_specified import (
     ClientSideToolSpec,
     parse_client_side_tool_specs,
 )
 from llms import Client as LLMClient
-from llms.errors import PermanentLLMError, RetryableLLMError
+from llms.errors import ContextWindowExceededError, PermanentLLMError, RetryableLLMError
 from llms.types import (
     FunctionCallOutput,
     MessageOutput,
@@ -179,9 +189,13 @@ class _ClientToolCallsPending:
         item. Used as the inbox-close cursor so that
         ``close_inbox`` sees no new items and atomically closes,
         e.g. ``"item_abc123"``.
+    :param client_call_ids: Call IDs of the client-side tool calls,
+        e.g. ``["call_abc123", "call_def456"]``. Used by the park
+        mechanism to register pending tool calls for sub-agents.
     """
 
     last_seen: str
+    client_call_ids: list[str]
 
 
 @dataclass
@@ -598,6 +612,10 @@ def _call_tool(
     """
     mgr = get_tool_manager()
     ctx = ToolContext(task_id=task_id, agent_id=agent_id)
+    # Inject client-side tool schemas into spawn arguments so
+    # sub-agents know which client tools are available.
+    if tool_name == SpawnTool.name():
+        arguments = _inject_client_tools(arguments, mgr.get_client_tool_schemas())
     return execute_tool_with_retry(
         tool_name=tool_name,
         call_fn=lambda: mgr.call_tool(tool_name, arguments, ctx),
@@ -605,6 +623,31 @@ def _call_tool(
         retry_config=retry_config,
         on_event=lambda event: _write_output(task_id, event),
     )
+
+
+def _inject_client_tools(
+    arguments: str,
+    client_tool_schemas: list[dict[str, Any]],
+) -> str:
+    """
+    Inject client-side tool schemas into spawn arguments JSON.
+
+    Adds a ``client_tools`` key so SpawnTool can propagate
+    them to sub-agents without needing access to the
+    ToolManager or ContextVars.
+
+    :param arguments: Original JSON-encoded arguments from the
+        LLM, e.g. ``'{"agents": [...]}'``.
+    :param client_tool_schemas: OpenAI-format tool schemas,
+        e.g. ``[{"type": "function", "function": {...}}]``.
+    :returns: Updated JSON string with ``_client_tools`` added.
+    """
+    try:
+        args = json.loads(arguments)
+    except (json.JSONDecodeError, TypeError):
+        return arguments
+    args["client_tools"] = client_tool_schemas
+    return json.dumps(args)
 
 
 # ── Output helpers ────────────────────────────────────────
@@ -1071,11 +1114,14 @@ class _ToolCallSplit:
 
     :param server: Tool calls that must be executed server-side
         (MCP, skills, etc.).
+    :param client: Tool calls that must be executed client-side,
+        e.g. ``[_ToolCall(call_id="call_1", name="Read", ...)]``.
     :param has_client: ``True`` if the batch contains at least
         one client-side tool call.
     """
 
     server: list[_ToolCall]
+    client: list[_ToolCall]
     has_client: bool
 
 
@@ -1097,13 +1143,13 @@ def _split_tool_calls(
         calls and a flag indicating client-side presence.
     """
     server: list[_ToolCall] = []
-    has_client = False
+    client: list[_ToolCall] = []
     for tc in tool_calls:
         if tool_mgr.is_client_side_tool(tc.name):
-            has_client = True
+            client.append(tc)
         else:
             server.append(tc)
-    return _ToolCallSplit(server=server, has_client=has_client)
+    return _ToolCallSplit(server=server, client=client, has_client=bool(client))
 
 
 def _handle_tool_calls(
@@ -1184,9 +1230,236 @@ def _handle_tool_calls(
         # and streamed. Server-side tool outputs (if any) are
         # also persisted. Complete the response so the caller
         # can handle the client-side calls externally.
-        return _ClientToolCallsPending(last_seen=last_seen)
+        return _ClientToolCallsPending(
+            last_seen=last_seen,
+            client_call_ids=[tc.call_id for tc in split.client],
+        )
 
     return last_seen
+
+
+def _track_spawn_collect(
+    output_items: list[dict[str, Any]],
+    spawned_ids: set[str],
+    collected_ids: set[str],
+) -> None:
+    """
+    Scan output items for spawn/collect tool results and update
+    the tracking sets.
+
+    Parses ``function_call_output`` items whose corresponding
+    ``function_call`` was ``spawn_sub_agents`` or
+    ``collect_sub_agents`` to extract response IDs.
+
+    :param output_items: The accumulated output items list.
+    :param spawned_ids: Mutable set of spawned response IDs.
+    :param collected_ids: Mutable set of collected response IDs.
+    """
+    # Build call_id → tool_name lookup from function_call items.
+    call_names: dict[str, str] = {}
+    for item in output_items:
+        if item.get("type") == "function_call":
+            call_names[item.get("call_id", "")] = item.get("name", "")
+
+    for item in output_items:
+        if item.get("type") != "function_call_output":
+            continue
+        call_id = item.get("call_id", "")
+        name = call_names.get(call_id, "")
+        output_str = item.get("output", "")
+        if not output_str:
+            continue
+        try:
+            parsed = json.loads(output_str)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if name == SpawnTool.name():
+            for rid in parsed.get("response_ids", []):
+                spawned_ids.add(rid)
+        elif name == CollectTool.name():
+            for r in parsed.get("results", []):
+                rid = r.get("response_id", "")
+                if rid:
+                    collected_ids.add(rid)
+
+
+def _auto_collect_sub_agents(
+    task_id: str,
+    conversation_id: str,
+    response_ids: list[str],
+    history: list[ConversationItem],
+    output_items: list[dict[str, Any]],
+    conv_store: ConversationStore,
+) -> str:
+    """
+    Auto-collect outstanding sub-agents before turn completion.
+
+    Waits for all sub-agents to finish, then injects their
+    results as a synthetic ``function_call_output`` into the
+    conversation so the LLM can see them on the next iteration.
+
+    :param task_id: The parent task ID.
+    :param conversation_id: The parent's conversation ID.
+    :param response_ids: Sub-agent response IDs to collect.
+    :param history: Mutable conversation history.
+    :param output_items: Mutable output items list.
+    :param conv_store: ConversationStore for persistence.
+    :returns: The last_seen cursor after persisting results.
+    """
+    from agent_plane.tools.builtins.spawn import _collect_all
+
+    results = _collect_all(response_ids, timeout=None)
+    result_json = json.dumps({"results": results})
+
+    # Persist as a system-injected message so the LLM sees
+    # the sub-agent results on the next iteration.
+    new_items = [
+        NewConversationItem(
+            type="message",
+            response_id=task_id,
+            data=MessageData(
+                role="user",
+                content=[
+                    {
+                        "type": "input_text",
+                        "text": ("[System: auto-collected sub-agent results]\n" + result_json),
+                    },
+                ],
+            ),
+        ),
+    ]
+    persisted = _persist_and_stream(task_id, conv_store, conversation_id, new_items, output_items)
+    history.extend(persisted)
+    return persisted[-1].id
+
+
+def _park_for_client_tools(
+    task_id: str,
+    conversation_id: str,
+    root_task_id: str,
+    client_call_ids: list[str],
+    last_seen: str,
+    history: list[ConversationItem],
+    output_items: list[dict[str, Any]],
+    task_store: TaskStore,
+    conv_store: ConversationStore,
+) -> str:
+    """
+    Park a sub-agent workflow while client-side tool calls are
+    tunneled to the root response's client.
+
+    Registers pending tool call rows, publishes ``function_call``
+    items to the root task's SSE stream, polls until all results
+    are delivered via PATCH, then injects ``function_call_output``
+    items into the sub-agent's conversation so the loop can
+    continue.
+
+    :param task_id: The sub-agent's task ID, e.g.
+        ``"task_sub1"``.
+    :param conversation_id: The sub-agent's conversation ID.
+    :param root_task_id: The root task ID for tunneling,
+        e.g. ``"task_root1"``.
+    :param client_call_ids: Call IDs of client-side tool calls
+        to wait for, e.g. ``["call_abc123"]``.
+    :param last_seen: Current cursor (last persisted item ID).
+    :param history: Mutable conversation history.
+    :param output_items: Mutable output items list.
+    :param task_store: TaskStore for pending tool call ops.
+    :param conv_store: ConversationStore for persistence.
+    :returns: Updated ``last_seen`` cursor after injecting
+        tool results.
+    """
+    # Build a lookup from call_id → function_call item so we
+    # can extract tool_name and arguments for storage.
+    client_id_set = set(client_call_ids)
+    fc_by_call_id: dict[str, dict[str, Any]] = {
+        item["call_id"]: item
+        for item in output_items
+        if item.get("type") == "function_call" and item.get("call_id") in client_id_set
+    }
+
+    # 1. Register pending tool calls so the PATCH endpoint
+    #    can route results back to this sub-agent.
+    for call_id in client_call_ids:
+        fc = fc_by_call_id.get(call_id, {})
+        task_store.create_pending_tool_call(
+            call_id=call_id,
+            root_task_id=root_task_id,
+            task_id=task_id,
+            tool_name=str(fc.get("name", "")),
+            arguments=str(fc.get("arguments", "{}")),
+        )
+
+    # 2. Publish function_call items to the root task's SSE
+    #    stream with status "action_required" so the client
+    #    knows to execute and PATCH them back.
+    for item in fc_by_call_id.values():
+        tunneled = {**item, "status": "action_required"}
+        _write_output(
+            root_task_id,
+            {
+                "type": "response.output_item.done",
+                "item": tunneled,
+            },
+        )
+
+    # 3. Wait for the PATCH handler to signal that all pending
+    #    calls are completed. Uses DBOS recv which yields the
+    #    thread (no polling) — the PATCH handler calls
+    #    DBOS.send to wake us.
+    _wait_for_pending_calls(client_call_ids)
+
+    # 4. Fetch completed results and inject as
+    #    function_call_output items into the conversation.
+    completed = task_store.list_pending_tool_calls(task_id=task_id, status="completed")
+    results_by_call_id = {ptc.call_id: ptc.result for ptc in completed}
+
+    fco_new_items: list[NewConversationItem] = []
+    for call_id in client_call_ids:
+        result = results_by_call_id.get(call_id, "")
+        fco_new_items.append(
+            NewConversationItem(
+                type="function_call_output",
+                response_id=task_id,
+                data=FunctionCallOutputData(
+                    call_id=call_id,
+                    output=result or "",
+                ),
+            ),
+        )
+
+    fco_items = _persist_and_stream(
+        task_id,
+        conv_store,
+        conversation_id,
+        fco_new_items,
+        output_items,
+    )
+    history.extend(fco_items)
+    return fco_items[-1].id
+
+
+def _wait_for_pending_calls(
+    call_ids: list[str],
+) -> None:
+    """
+    Block until all pending tool calls are completed.
+
+    Uses ``DBOS.recv`` per call_id — each ``recv`` yields the
+    workflow thread until the PATCH handler calls
+    ``DBOS.send(workflow_id, call_id, topic="tool_result")``.
+    This avoids the ``time.sleep`` polling loop that caused
+    DBOS thread pool exhaustion under concurrent load.
+
+    :param call_ids: Call IDs to wait for.
+    """
+    from agent_plane.runtime.durability import dbos_recv
+
+    for _call_id in call_ids:
+        # Each recv blocks until the corresponding send
+        # arrives. DBOS internally uses threading.Event.wait
+        # which releases the GIL — no busy polling.
+        dbos_recv(topic="tool_result", timeout_seconds=600)
 
 
 def _complete_for_client_tools(
@@ -1294,8 +1567,13 @@ def _sync_history(
     history: list[ConversationItem],
 ) -> str | None:
     """
-    Check steering inbox for new messages and extend history.
-    Returns the updated ``last_seen`` ID.
+    Check for new conversation items since *last_seen* and extend
+    history with non-compaction items.
+
+    Advances ``last_seen`` to the highest position seen — including
+    compaction items — so they are not re-fetched on the next sync.
+    Compaction items are excluded from *history* because they are
+    metadata, not conversation content for prompt construction.
 
     :param conv_store: The ConversationStore to query.
     :param conversation_id: The conversation ID, e.g.
@@ -1303,9 +1581,9 @@ def _sync_history(
     :param last_seen: The ID of the last item the agent has
         seen, or ``None`` if no items have been seen yet.
     :param history: Mutable conversation history. Extended
-        in place if new items are found.
-    :returns: The updated ``last_seen`` ID, or the original
-        value if no new items were found.
+        in place with non-compaction items only.
+    :returns: The updated ``last_seen`` ID (the highest position
+        fetched), or the original value if no new items were found.
     """
     if last_seen is not None:
         new_items = fetch_all_items(
@@ -1314,71 +1592,44 @@ def _sync_history(
             after=last_seen,
         )
         if new_items:
-            history.extend(new_items)
+            # Advance last_seen past compaction items so we don't
+            # re-fetch them on subsequent syncs.
+            content_items = [i for i in new_items if i.type != "compaction"]
+            if content_items:
+                history.extend(content_items)
             return new_items[-1].id
     return last_seen
 
 
-def _call_llm_for_iteration(
+def _invoke_llm_streaming(
     task_id: str,
-    spec: AgentSpec,
+    messages: list[dict[str, Any]],
+    sys_instructions: str,
     llm_config: LLMConfig,
-    history: list[ConversationItem],
-    instructions: str | None,
     tool_schemas: list[dict[str, Any]],
-    *,
-    stream: bool = False,
-    content_cache: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
-    Build prompt messages and call the LLM for one iteration.
+    Call ``_call_llm_streaming`` with unpacked :class:`LLMConfig` fields.
 
-    When ``stream=True``, emits
-    ``response.output_text.delta`` events for each text chunk
-    via :func:`_write_output` so SSE consumers see tokens
-    incrementally. Falls back to the checkpointed ``@step``
-    when ``stream=False`` (used for tool-call iterations where
-    checkpointing matters more than token-level output).
+    Thin wrapper that extracts ``model``, ``extra``, ``connection``,
+    ``timeout``, and ``retry`` from *llm_config* so callers don't
+    repeat the same kwarg extraction.
 
-    :param task_id: The task identifier, e.g.
-        ``"task_abc123"``.
-    :param spec: The parsed AgentSpec for the executing agent.
-    :param llm_config: The agent's LLM configuration
-        (model identifier and extra kwargs).
-    :param history: Conversation history as persisted items.
-    :param instructions: Optional per-request instructions.
-    :param tool_schemas: OpenAI-format tool schemas for the
-        agent's available tools.
-    :param stream: If ``True``, stream tokens via SSE.
-        If ``False``, use checkpointed non-streaming.
-    :param content_cache: Per-task cache mapping ``file_id``
-        to base64-encoded content, avoiding redundant
-        artifact store fetches across iterations.
-    :returns: The LLM response dict.
+    :param task_id: The task identifier, e.g. ``"task_abc123"``.
+    :param messages: Pre-built Responses API input items
+        (output of ``history_to_input_items`` or ``compact()``).
+    :param sys_instructions: Assembled system prompt string.
+    :param llm_config: The agent's LLM configuration.
+    :param tool_schemas: OpenAI-format tool schemas.
+    :returns: Accumulated LLM response dict.
+    :raises ContextWindowExceededError: When the prompt exceeds
+        the model's context window.
+    :raises PermanentLLMError: On non-retryable LLM errors.
+    :raises RetryableLLMError: When all retry attempts are exhausted.
     """
-    sys_instructions = build_instructions(spec, instructions, tool_schemas)
-    # Resolve file_id references to inline base64 content before
-    # building the prompt. Skipped when stores are not configured.
-    file_store = get_file_store()
-    artifact_store = get_artifact_store()
-    if file_store is not None and artifact_store is not None:
-        history = resolve_content_references(history, file_store, artifact_store, content_cache)
-    input_items = history_to_input_items(history)
-    if stream:
-        return _call_llm_streaming(
-            task_id,
-            input_items,
-            sys_instructions,
-            llm_config.model,
-            tool_schemas,
-            llm_config.extra,
-            llm_config.connection,
-            llm_config.timeout,
-            llm_config.retry,
-        )
-    return _call_llm(
+    return _call_llm_streaming(
         task_id,
-        input_items,
+        messages,
         sys_instructions,
         llm_config.model,
         tool_schemas,
@@ -1389,22 +1640,202 @@ def _call_llm_for_iteration(
     )
 
 
-def _call_llm_for_iteration_with_error_handling(
+def _find_latest_compaction_item(
+    conv_store: ConversationStore,
+    conversation_id: str,
+) -> ConversationItem | None:
+    """
+    Return the most recently appended compaction item for a
+    conversation, or ``None`` if none exists.
+
+    Uses a descending ``limit=1`` query so only one row is read
+    regardless of total conversation length.
+
+    :param conv_store: The ConversationStore to query.
+    :param conversation_id: The conversation to search,
+        e.g. ``"conv_abc123"``.
+    :returns: The latest compaction item, or ``None``.
+    """
+    page = conv_store.list_items(
+        conversation_id,
+        type="compaction",
+        order="desc",
+        limit=1,
+    )
+    return page.data[0] if page.data else None
+
+
+def _load_initial_history(
+    conv_store: ConversationStore,
+    conversation_id: str,
+) -> list[ConversationItem]:
+    """
+    Load the conversation history for the start of an execution.
+
+    When a compaction item exists, only the items AFTER the
+    summary's coverage boundary are loaded — the synthetic
+    summary pair replaces the older items the LLM does not need
+    to see verbatim. This bounds the load to O(items since last
+    compaction), not O(total conversation length).
+
+    When no compaction item exists, the full conversation is
+    loaded (existing behaviour).
+
+    :param conv_store: The ConversationStore to query.
+    :param conversation_id: The conversation to load,
+        e.g. ``"conv_abc123"``.
+    :returns: History list ready for prompt construction. May
+        begin with a synthetic summary pair from
+        :func:`compaction_to_history_items`.
+    """
+    compaction_item = _find_latest_compaction_item(conv_store, conversation_id)
+    if compaction_item is None:
+        return fetch_all_items(conv_store, conversation_id)
+    assert isinstance(compaction_item.data, CompactionData)
+    # Load after last_item_id, NOT after the compaction item itself.
+    # The compaction item may be appended after additional output
+    # items that the summary does not cover — using last_item_id
+    # ensures those post-summary items are included.
+    recent_items = fetch_all_items(
+        conv_store,
+        conversation_id,
+        after=compaction_item.data.last_item_id,
+    )
+    # Filter compaction items — they are metadata, not conversation
+    # content the LLM should receive verbatim.
+    content_items = [i for i in recent_items if i.type != "compaction"]
+    return compaction_to_history_items(compaction_item) + content_items
+
+
+def _proactive_compact_if_needed(
+    messages: list[dict[str, Any]],
+    history: list[ConversationItem],
+    sys_tokens: int,
+    compaction_state: _CompactionState,
+    task_id: str,
+) -> list[dict[str, Any]]:
+    """
+    Proactively compact *messages* before an LLM call when the
+    estimated token count exceeds the trigger threshold.
+
+    Only fires when ``compaction_state.context_window`` is set —
+    i.e. after the first reactive overflow has revealed the model's
+    limit. Returns *messages* unchanged when below the threshold.
+
+    :param messages: The Responses API input items to check
+        (output of ``history_to_input_items``).
+    :param history: Conversation history items, passed through
+        to :func:`compact` for boundary detection.
+    :param sys_tokens: Tokens consumed by system instructions
+        and tool schemas, subtracted from the window budget.
+    :param compaction_state: Per-execution compaction state.
+        Mutated in place: ``last_summary`` is updated if Layer 2
+        triggers.
+    :param task_id: Task identifier for SSE event emission.
+    :returns: The (possibly compacted) messages list.
+    """
+    if compaction_state.context_window is None:
+        return messages
+    config = compaction_state.config
+    threshold = config.trigger_threshold if config else 0.8
+    budget = int(compaction_state.context_window * threshold)
+    if count_tokens(messages, compaction_state.model) + sys_tokens <= budget:
+        return messages
+    result = compact(
+        messages,
+        history,
+        config=config,
+        context_window=compaction_state.context_window,
+        system_token_budget=sys_tokens,
+        model=compaction_state.model,
+        task_id=task_id,
+        llm_client=_get_llm_client(),
+    )
+    if result.summary_metadata is not None:
+        compaction_state.last_summary = result.summary_metadata
+    return result.messages
+
+
+def _reactive_compact(
+    messages: list[dict[str, Any]],
+    history: list[ConversationItem],
+    sys_tokens: int,
+    exc: ContextWindowExceededError,
+    compaction_state: _CompactionState,
+    task_id: str,
+) -> list[dict[str, Any]]:
+    """
+    React to a ``ContextWindowExceededError`` by validating with
+    tiktoken, caching the discovered context window, and compacting.
+
+    The tiktoken estimate must be within ~30% of the error's reported
+    token count. If they diverge more than that, the error may be
+    misclassified — it is re-raised as ``PermanentLLMError`` to avoid
+    entering a pointless compact-retry loop.
+
+    :param messages: The messages that triggered the overflow.
+    :param history: Conversation history for boundary detection.
+    :param sys_tokens: System and tool schema token budget.
+    :param exc: The ``ContextWindowExceededError`` to react to.
+    :param compaction_state: Per-execution state. ``context_window``
+        and ``last_summary`` are mutated in place.
+    :param task_id: Task identifier for SSE event emission.
+    :returns: Compacted messages list ready for LLM retry.
+    :raises PermanentLLMError: If tiktoken estimate diverges from
+        the reported token count by more than 30%, indicating the
+        error may be misclassified.
+    """
+    compaction_state.context_window = exc.max_context_tokens
+    our_estimate = count_tokens(messages, compaction_state.model) + sys_tokens
+    if exc.actual_tokens > 0:
+        ratio = our_estimate / exc.actual_tokens
+        if not (0.7 <= ratio <= 1.3):
+            _logger.warning(
+                "tiktoken estimate %d diverges from reported %d (ratio %.2f) "
+                "for task %s — re-raising as PermanentLLMError",
+                our_estimate,
+                exc.actual_tokens,
+                ratio,
+                task_id,
+            )
+            raise PermanentLLMError(str(exc), code=exc.code, detail=exc.detail) from exc
+    result = compact(
+        messages,
+        history,
+        config=compaction_state.config,
+        context_window=exc.max_context_tokens,
+        system_token_budget=sys_tokens,
+        model=compaction_state.model,
+        task_id=task_id,
+        llm_client=_get_llm_client(),
+    )
+    if result.summary_metadata is not None:
+        compaction_state.last_summary = result.summary_metadata
+    return result.messages
+
+
+def _call_llm_maybe_compact(
     task_id: str,
     spec: AgentSpec,
     llm_config: LLMConfig,
     history: list[ConversationItem],
     instructions: str | None,
     tool_schemas: list[dict[str, Any]],
+    compaction_state: _CompactionState,
     content_cache: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
-    Call the LLM for one iteration with error handling and SSE
-    error event emission.
+    Call the LLM for one iteration with proactive and reactive
+    compaction, plus SSE error event emission on failure.
 
-    Wraps :func:`_call_llm_for_iteration` to catch LLM errors,
-    emit a ``response.error`` SSE event, and re-raise. This keeps
-    the agent loop clean of error-handling boilerplate.
+    **Proactive path** (after the first overflow reveals the window):
+    estimate tokens with tiktoken; if over threshold, compact before
+    calling the LLM.
+
+    **Reactive path** (first overflow, or proactive check missed):
+    catch ``ContextWindowExceededError``, validate with tiktoken,
+    compact, retry once. All other LLM errors emit a ``response.error``
+    SSE event and re-raise immediately.
 
     :param task_id: The task identifier, e.g. ``"task_abc123"``.
     :param spec: The parsed AgentSpec for the executing agent.
@@ -1412,27 +1843,94 @@ def _call_llm_for_iteration_with_error_handling(
     :param history: Conversation history as persisted items.
     :param instructions: Optional per-request instructions.
     :param tool_schemas: OpenAI-format tool schemas.
+    :param compaction_state: Per-execution compaction state.
+        Mutated in place when compaction triggers.
     :param content_cache: Per-task cache mapping ``file_id``
-        to base64-encoded content (see
-        :func:`_call_llm_for_iteration`).
+        to base64-encoded content, avoiding redundant artifact
+        store fetches across iterations.
     :returns: The LLM response dict.
-    :raises PermanentLLMError: On non-retryable LLM errors.
+    :raises PermanentLLMError: On non-retryable errors or
+        misclassified overflow.
     :raises RetryableLLMError: When all retries are exhausted.
     """
+    sys_instructions = build_instructions(spec, instructions, tool_schemas)
+    file_store = get_file_store()
+    artifact_store = get_artifact_store()
+    resolved = history
+    if file_store is not None and artifact_store is not None:
+        resolved = resolve_content_references(history, file_store, artifact_store, content_cache)
+    messages = history_to_input_items(resolved)
+    sys_tokens = count_tokens(
+        [{"role": "system", "content": sys_instructions}],
+        compaction_state.model,
+    )
+    messages = _proactive_compact_if_needed(
+        messages, resolved, sys_tokens, compaction_state, task_id
+    )
     try:
-        return _call_llm_for_iteration(
-            task_id,
-            spec,
-            llm_config,
-            history,
-            instructions,
-            tool_schemas,
-            stream=True,
-            content_cache=content_cache,
+        return _invoke_llm_streaming(task_id, messages, sys_instructions, llm_config, tool_schemas)
+    except ContextWindowExceededError as exc:
+        messages = _reactive_compact(
+            messages, resolved, sys_tokens, exc, compaction_state, task_id
         )
+        try:
+            return _invoke_llm_streaming(
+                task_id, messages, sys_instructions, llm_config, tool_schemas
+            )
+        except (RetryableLLMError, PermanentLLMError) as inner_exc:
+            _emit_llm_error_event(task_id, inner_exc)
+            raise
     except (RetryableLLMError, PermanentLLMError) as exc:
         _emit_llm_error_event(task_id, exc)
         raise
+
+
+def _maybe_persist_compaction_item(
+    summary: SummaryMetadata,
+    task_id: str,
+    conversation_id: str,
+    conv_store: ConversationStore,
+) -> None:
+    """
+    Persist a compaction item for the current execution, unless one
+    already exists (idempotent append for crash-recovery safety).
+
+    The ``response_id`` on the item is the task ID, which is unique
+    per execution. On crash recovery DBOS replays the workflow tail —
+    the check-before-write prevents a duplicate compaction item from
+    being appended.
+
+    :param summary: The :class:`SummaryMetadata` from Layer 2.
+    :param task_id: The task identifier used as the item's
+        ``response_id``, e.g. ``"task_abc123"``.
+    :param conversation_id: The conversation to append to,
+        e.g. ``"conv_abc123"``.
+    :param conv_store: The ConversationStore to append to.
+    """
+    existing = conv_store.list_items(
+        conversation_id,
+        type="compaction",
+        order="desc",
+        limit=1,
+    )
+    if existing.data and existing.data[0].response_id == task_id:
+        # Already persisted — idempotent on crash recovery replay.
+        return
+    conv_store.append(
+        conversation_id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id=task_id,
+                data=CompactionData(
+                    summary=summary.text,
+                    last_item_id=summary.last_item_id,
+                    model=summary.model,
+                    token_count=summary.token_count,
+                ),
+            )
+        ],
+    )
 
 
 def _emit_llm_error_event(
@@ -1509,8 +2007,8 @@ def _run_agent_loop(
     reasoning: dict[str, str] | None = None,
 ) -> _AgentLoopResult:
     """
-    Core agent loop: load history, call LLM, dispatch to
-    final response or tool call handler.
+    Core agent loop: load history, call LLM with optional compaction,
+    dispatch to final response or tool call handler.
 
     :param task_id: The task identifier, e.g.
         ``"task_abc123"``.
@@ -1537,7 +2035,15 @@ def _run_agent_loop(
     tool_schemas = tool_mgr.get_tool_schemas()
     conv_store = get_conversation_store()
     task_store = get_task_store()
-    history = fetch_all_items(conv_store, conversation_id)
+    # Determine if this is a sub-agent (has root_task_id).
+    # Sub-agents park when hitting client tools instead of
+    # completing — the park mechanism tunnels tool calls to
+    # the root response's client.
+    task_row = task_store.get_sync(task_id)
+    root_task_id: str | None = task_row.root_task_id if task_row else None
+    # Load history, using the latest compaction item as a cursor
+    # to avoid loading the full conversation on long-running agents.
+    history = _load_initial_history(conv_store, conversation_id)
     last_seen = history[-1].id if history else None
     output_items: list[dict[str, Any]] = []
     # spec.llm is guaranteed non-None — checked by caller
@@ -1553,108 +2059,169 @@ def _run_agent_loop(
     execution_timeout = min(spec.execution.timeout, caps.execution_timeout)
     max_iterations = spec.execution.max_iterations
     start_time = time.monotonic()
+    # Track spawned sub-agent response IDs for auto-collect.
+    # When the LLM produces a final response without collecting,
+    # the loop auto-collects outstanding sub-agents before
+    # completing the turn.
+    spawned_ids: set[str] = set()
+    collected_ids: set[str] = set()
+    # Per-execution compaction state. context_window is None until
+    # the first reactive overflow reveals the model's limit; then
+    # subsequent iterations check proactively via tiktoken.
+    compaction_state = _CompactionState(
+        context_window=None,
+        last_summary=None,
+        config=spec.compaction,
+        model=llm_config.model,
+    )
 
-    for iteration in range(max_iterations):
-        # Check execution timeout at the top of each iteration.
-        elapsed = time.monotonic() - start_time
-        if elapsed >= execution_timeout:
-            return _handle_execution_timeout(task_id, output_items, execution_timeout)
+    try:
+        for iteration in range(max_iterations):
+            # Check execution timeout at the top of each iteration.
+            elapsed = time.monotonic() - start_time
+            if elapsed >= execution_timeout:
+                return _handle_execution_timeout(task_id, output_items, execution_timeout)
 
-        _logger.debug(
-            "agent loop iteration %d for task %s",
-            iteration,
-            task_id,
-        )
-        last_seen = _sync_history(
-            conv_store,
-            conversation_id,
-            last_seen,
-            history,
-        )
-        llm_resp = _call_llm_for_iteration_with_error_handling(
-            task_id,
-            spec,
-            llm_config,
-            history,
-            instructions,
-            tool_schemas,
-            content_cache,
-        )
+            _logger.debug(
+                "agent loop iteration %d for task %s",
+                iteration,
+                task_id,
+            )
+            last_seen = _sync_history(
+                conv_store,
+                conversation_id,
+                last_seen,
+                history,
+            )
+            llm_resp = _call_llm_maybe_compact(
+                task_id,
+                spec,
+                llm_config,
+                history,
+                instructions,
+                tool_schemas,
+                compaction_state,
+                content_cache,
+            )
 
-        # Emit provider-native tool items (e.g. web_search_call) to
-        # output before handling function calls or final response.
-        _emit_native_tool_items(task_id, llm_resp, output_items)
+            # Emit provider-native tool items (e.g. web_search_call) to
+            # output before handling function calls or final response.
+            _emit_native_tool_items(task_id, llm_resp, output_items)
 
-        if not _has_tool_calls(llm_resp):
-            result = _handle_final_response(
+            if not _has_tool_calls(llm_resp):
+                # Auto-collect outstanding sub-agents before completing.
+                uncollected = spawned_ids - collected_ids
+                if uncollected:
+                    last_seen = _auto_collect_sub_agents(
+                        task_id,
+                        conversation_id,
+                        list(uncollected),
+                        history,
+                        output_items,
+                        conv_store,
+                    )
+                    collected_ids.update(uncollected)
+                    # Re-run the LLM so it can see the collect
+                    # results and synthesize a final answer.
+                    continue
+                result = _handle_final_response(
+                    task_id,
+                    conversation_id,
+                    llm_resp,
+                    agent_name,
+                    last_seen,
+                    history,
+                    output_items,
+                    task_store,
+                    conv_store,
+                )
+                if isinstance(result, _SteeringRetry):
+                    # Late steered messages arrived during streaming.
+                    # _handle_final_response persisted the assistant
+                    # response and appended both it and the steered
+                    # messages to history. Use the cursor from the
+                    # retry (the assistant message's ID, which has
+                    # the highest store position) so _sync_history
+                    # doesn't re-fetch already-processed items.
+                    last_seen = result.last_seen
+                    continue
+                return result
+
+            # Save the pre-tool last_seen so we can detect steered
+            # messages that arrived during tool execution. Tool
+            # outputs get positions after the steered message, so
+            # using the post-tool last_seen would skip it.
+            pre_tool_last_seen = last_seen
+            handle_result = _handle_tool_calls(
                 task_id,
                 conversation_id,
                 llm_resp,
                 agent_name,
-                last_seen,
+                agent_id,
+                tools_config,
                 history,
                 output_items,
-                task_store,
                 conv_store,
+                tool_mgr,
             )
-            if isinstance(result, _SteeringRetry):
-                # Late steered messages arrived during streaming.
-                # _handle_final_response persisted the assistant
-                # response and appended both it and the steered
-                # messages to history. Use the cursor from the
-                # retry (the assistant message's ID, which has
-                # the highest store position) so _sync_history
-                # doesn't re-fetch already-processed items.
-                last_seen = result.last_seen
-                continue
-            return result
+            if isinstance(handle_result, _ClientToolCallsPending):
+                if root_task_id is not None:
+                    # Sub-agent: park and wait for client to deliver
+                    # tool results via PATCH on the root response.
+                    last_seen = _park_for_client_tools(
+                        task_id,
+                        conversation_id,
+                        root_task_id,
+                        handle_result.client_call_ids,
+                        handle_result.last_seen,
+                        history,
+                        output_items,
+                        task_store,
+                        conv_store,
+                    )
+                    continue
+                # Top-level task: return function_call items to the
+                # caller and complete without server-side execution.
+                return _complete_for_client_tools(
+                    task_id,
+                    conversation_id,
+                    handle_result.last_seen,
+                    output_items,
+                    task_store,
+                )
+            last_seen = handle_result
+            # Track spawned/collected sub-agent IDs for auto-collect.
+            _track_spawn_collect(output_items, spawned_ids, collected_ids)
+            # Check for steered messages that arrived between the
+            # LLM call and tool completion. Use the pre-tool cursor
+            # to catch messages with positions interleaved among
+            # tool call items.
+            last_seen = _sync_steered_after_tools(
+                conv_store,
+                conversation_id,
+                pre_tool_last_seen,
+                last_seen,
+                history,
+            )
 
-        # Save the pre-tool last_seen so we can detect steered
-        # messages that arrived during tool execution. Tool
-        # outputs get positions after the steered message, so
-        # using the post-tool last_seen would skip it.
-        pre_tool_last_seen = last_seen
-        handle_result = _handle_tool_calls(
-            task_id,
-            conversation_id,
-            llm_resp,
-            agent_name,
-            agent_id,
-            tools_config,
-            history,
-            output_items,
-            conv_store,
-            tool_mgr,
+        # Hit max iterations without a final response
+        return _AgentLoopResult(
+            status="incomplete",
+            output=output_items,
+            incomplete_details={"reason": "max_iterations"},
         )
-        if isinstance(handle_result, _ClientToolCallsPending):
-            # Client-side tool calls — return function_call items to
-            # the caller and complete without server-side execution.
-            return _complete_for_client_tools(
+    finally:
+        # Persist a compaction item if Layer 2 ran during this
+        # execution. Idempotent — safe to call on crash recovery
+        # replay because _maybe_persist_compaction_item checks
+        # for an existing item with the same response_id first.
+        if compaction_state.last_summary is not None:
+            _maybe_persist_compaction_item(
+                compaction_state.last_summary,
                 task_id,
                 conversation_id,
-                handle_result.last_seen,
-                output_items,
-                task_store,
+                conv_store,
             )
-        last_seen = handle_result
-        # Check for steered messages that arrived between the
-        # LLM call and tool completion. Use the pre-tool cursor
-        # to catch messages with positions interleaved among
-        # tool call items.
-        last_seen = _sync_steered_after_tools(
-            conv_store,
-            conversation_id,
-            pre_tool_last_seen,
-            last_seen,
-            history,
-        )
-
-    # Hit max iterations without a final response
-    return _AgentLoopResult(
-        status="incomplete",
-        output=output_items,
-        incomplete_details={"reason": "max_iterations"},
-    )
 
 
 def _find_spec_by_name(

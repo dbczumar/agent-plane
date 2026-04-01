@@ -96,6 +96,7 @@ class ConversationStore(ABC):
         after: str | None = None,
         before: str | None = None,
         order: str = "asc",
+        type: str | None = None,
     ) -> PagedList[ConversationItem]:
         """
         Return items in a conversation with cursor-based pagination.
@@ -115,6 +116,9 @@ class ConversationStore(ABC):
         :param before: Cursor item ID; only return items before
             this item in sort order.
         :param order: Sort direction, ``"asc"`` or ``"desc"``.
+        :param type: Optional item type filter. When provided, only items
+            with this type are returned, e.g. ``"compaction"``. ``None``
+            means return all types.
         :returns: A :class:`PagedList` of
             :class:`ConversationItem` objects.
         """

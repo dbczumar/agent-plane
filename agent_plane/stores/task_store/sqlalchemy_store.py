@@ -79,6 +79,9 @@ _DBOS_TO_TASK_STATUS: dict[str, str] = {
 # DBOS statuses that mean the workflow is still running.
 _DBOS_ACTIVE = frozenset({WorkflowStatusString.PENDING.value, WorkflowStatusString.ENQUEUED.value})
 
+# Polling interval for wait_sync, in seconds.
+_WAIT_SYNC_POLL_S = 0.5
+
 
 def _map_dbos_status(dbos_status_value: str) -> str:
     """
@@ -434,6 +437,43 @@ class SqlAlchemyTaskStore(TaskStore):
             raise LookupError(f"task {task_id!r} not found")
         return task
 
+    def wait_sync(
+        self,
+        task_id: str,
+        timeout: float | None = None,
+    ) -> Task:
+        """
+        Synchronous equivalent of :meth:`wait`.
+
+        Polls until the task reaches a terminal state. Called from
+        tool ``@step()`` contexts (e.g. ``collect_sub_agents``),
+        which are not DBOS workflows — so we use plain
+        ``time.sleep`` instead of ``dbos_sleep``.
+
+        :param task_id: Unique task identifier,
+            e.g. ``"task_abc123"``.
+        :param timeout: Maximum seconds to wait. ``None`` blocks
+            indefinitely. If the deadline expires, returns the
+            task in its current (non-terminal) state.
+        :returns: The final :class:`Task` in a terminal state,
+            or the current state if timeout expired.
+        :raises LookupError: If the task does not exist.
+        """
+        import time
+
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        while True:
+            task = self.get_sync(task_id)
+            if task is None:
+                raise LookupError(f"task {task_id!r} not found")
+            if task.status in TERMINAL_STATUSES:
+                return task
+            if deadline is not None and time.monotonic() >= deadline:
+                return task
+            # Plain sleep — this runs inside a @step(), not a
+            # workflow, so dbos_sleep() would raise.
+            time.sleep(_WAIT_SYNC_POLL_S)
+
     # ── Steering handshake (DB-only, unchanged) ──────────
 
     def _lock_conversation(self, session: Session, conversation_id: str) -> None:
@@ -656,17 +696,16 @@ class SqlAlchemyTaskStore(TaskStore):
 
     # ── Pending tool call helpers ─────────────────────────
 
-    def _is_sub_agent_terminal(self, task_id: str) -> bool:
+    def _is_task_terminal(self, task_id: str) -> bool:
         """
-        Check whether a sub-agent's DBOS workflow has reached a
-        terminal state.
+        Check whether a task's workflow has reached a terminal
+        state.
 
-        Uses the sync DBOS status API. Returns ``True`` if the
-        mapped task status is in :data:`TERMINAL_STATUSES`, or if
-        no workflow status exists (workflow never started).
+        Returns ``True`` if the mapped task status is in
+        :data:`TERMINAL_STATUSES`, or if no workflow status
+        exists (workflow never started).
 
-        :param task_id: The sub-agent's task ID,
-            e.g. ``"task_sub2"``.
+        :param task_id: The task ID, e.g. ``"task_abc123"``.
         :returns: ``True`` if terminal, ``False`` if still active.
         """
         wf_status: WorkflowStatus | None = get_workflow_status(task_id)
@@ -683,6 +722,8 @@ class SqlAlchemyTaskStore(TaskStore):
         call_id: str,
         root_task_id: str,
         task_id: str,
+        tool_name: str,
+        arguments: str,
     ) -> None:
         """
         Insert a routing entry for a tunneled client-side tool
@@ -693,6 +734,10 @@ class SqlAlchemyTaskStore(TaskStore):
         :param root_task_id: The root task whose response output
             contains the function_call item.
         :param task_id: The parked sub-agent's task ID.
+        :param tool_name: The tool function name,
+            e.g. ``"Read"``.
+        :param arguments: JSON-encoded arguments from the LLM,
+            e.g. ``'{"file_path": "/tmp/foo.py"}'``.
         """
         with self._session() as session:
             # ON CONFLICT DO NOTHING: safe for DBOS replay — if the
@@ -703,6 +748,8 @@ class SqlAlchemyTaskStore(TaskStore):
                     call_id=call_id,
                     root_task_id=root_task_id,
                     task_id=task_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
                     status="action_required",
                     result=None,
                     created_at=now_epoch(),
@@ -711,29 +758,6 @@ class SqlAlchemyTaskStore(TaskStore):
                 .on_conflict_do_nothing()
             )
             session.execute(stmt)
-
-    def check_pending_tool_call(
-        self,
-        call_id: str,
-    ) -> CompletePendingToolCallResult:
-        """
-        Check whether a pending tool call can be completed
-        without mutating it.
-
-        :param call_id: The tool call ID,
-            e.g. ``"call_abc123"``.
-        :returns: The outcome that ``complete_pending_tool_call``
-            would return.
-        """
-        with self._session() as session:
-            row = session.get(SqlPendingToolCall, call_id)
-            if row is None:
-                return CompletePendingToolCallResult.NOT_FOUND
-            if row.status == "completed":
-                return CompletePendingToolCallResult.ALREADY_COMPLETED
-            if self._is_sub_agent_terminal(row.task_id):
-                return CompletePendingToolCallResult.SUB_AGENT_DONE
-            return CompletePendingToolCallResult.COMPLETED
 
     def complete_pending_tool_call(
         self,
@@ -757,27 +781,38 @@ class SqlAlchemyTaskStore(TaskStore):
             # Check if sub-agent's DBOS workflow has reached a
             # terminal state. Uses the sync DBOS API because this
             # method is called from sync HTTP handlers.
-            if self._is_sub_agent_terminal(row.task_id):
+            if self._is_task_terminal(row.task_id):
                 return CompletePendingToolCallResult.SUB_AGENT_DONE
             row.status = "completed"
             row.result = result
             row.completed_at = now_epoch()
             return CompletePendingToolCallResult.COMPLETED
 
-    def get_pending_tool_calls(
+    def list_pending_tool_calls(
         self,
-        task_id: str,
+        *,
+        task_id: str | None = None,
+        root_task_id: str | None = None,
+        call_id: str | None = None,
         status: str | None = None,
     ) -> list[PendingToolCall]:
         """
-        Query pending tool calls for a task.
+        Query pending tool calls with optional filters.
 
-        :param task_id: The sub-agent's task ID.
-        :param status: Optional status filter.
+        :param task_id: Filter by sub-agent task ID.
+        :param root_task_id: Filter by root task ID.
+        :param call_id: Filter by tool call ID.
+        :param status: Filter by status.
         :returns: Matching pending tool call rows.
         """
         with self._session() as session:
-            stmt = select(SqlPendingToolCall).where(SqlPendingToolCall.task_id == task_id)
+            stmt = select(SqlPendingToolCall)
+            if task_id is not None:
+                stmt = stmt.where(SqlPendingToolCall.task_id == task_id)
+            if root_task_id is not None:
+                stmt = stmt.where(SqlPendingToolCall.root_task_id == root_task_id)
+            if call_id is not None:
+                stmt = stmt.where(SqlPendingToolCall.call_id == call_id)
             if status is not None:
                 stmt = stmt.where(SqlPendingToolCall.status == status)
             rows = list(session.execute(stmt).scalars().all())
@@ -786,6 +821,8 @@ class SqlAlchemyTaskStore(TaskStore):
                     call_id=r.call_id,
                     root_task_id=r.root_task_id,
                     task_id=r.task_id,
+                    tool_name=r.tool_name,
+                    arguments=r.arguments,
                     status=r.status,
                     result=r.result,
                     created_at=r.created_at,

@@ -117,6 +117,8 @@ def upgrade() -> None:
         sa.Column("call_id", sa.String(length=64), nullable=False),
         sa.Column("root_task_id", sa.String(length=64), nullable=False),
         sa.Column("task_id", sa.String(length=64), nullable=False),
+        sa.Column("tool_name", sa.String(length=256), nullable=False),
+        sa.Column("arguments", sa.Text(), nullable=False),
         sa.Column("status", sa.String(length=32), nullable=False),
         sa.Column("result", sa.Text(), nullable=True),
         sa.Column("created_at", sa.Integer(), nullable=False),

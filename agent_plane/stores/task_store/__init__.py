@@ -196,6 +196,27 @@ class TaskStore(ABC):
         ...
 
     @abstractmethod
+    def wait_sync(self, task_id: str, timeout: float | None = None) -> Task:
+        """
+        Synchronous equivalent of :meth:`wait`.
+
+        Blocks until the task reaches a terminal state and returns
+        the final enriched :class:`Task`. Safe to call from
+        synchronous contexts (workflow code, tool implementations)
+        where ``await`` is not available.
+
+        :param task_id: Unique task identifier,
+            e.g. ``"task_abc123"``.
+        :param timeout: Maximum seconds to wait. ``None`` blocks
+            indefinitely. If the deadline expires, returns the
+            task in its current (non-terminal) state.
+        :returns: The final :class:`Task` in a terminal state,
+            or the current state if timeout expired.
+        :raises LookupError: If the task does not exist.
+        """
+        ...
+
+    @abstractmethod
     def try_deliver(
         self,
         task_id: str,
@@ -341,6 +362,8 @@ class TaskStore(ABC):
         call_id: str,
         root_task_id: str,
         task_id: str,
+        tool_name: str,
+        arguments: str,
     ) -> None:
         """
         Insert a routing entry for a tunneled client-side tool call.
@@ -354,28 +377,10 @@ class TaskStore(ABC):
             e.g. ``"task_root1"``.
         :param task_id: The parked sub-agent's task ID,
             e.g. ``"task_sub2"``.
-        """
-        ...
-
-    @abstractmethod
-    def check_pending_tool_call(
-        self,
-        call_id: str,
-    ) -> CompletePendingToolCallResult:
-        """
-        Check whether a pending tool call can be completed,
-        without mutating it.
-
-        Returns the same outcome as
-        :meth:`complete_pending_tool_call` but performs no
-        writes. Used by the PATCH endpoint to validate all
-        ``call_id`` values before applying any updates
-        (atomicity).
-
-        :param call_id: The tool call ID,
-            e.g. ``"call_abc123"``.
-        :returns: The outcome that :meth:`complete_pending_tool_call`
-            *would* return for this call_id.
+        :param tool_name: The tool function name,
+            e.g. ``"Read"``.
+        :param arguments: JSON-encoded arguments from the LLM,
+            e.g. ``'{"file_path": "/tmp/foo.py"}'``.
         """
         ...
 
@@ -408,22 +413,30 @@ class TaskStore(ABC):
         ...
 
     @abstractmethod
-    def get_pending_tool_calls(
+    def list_pending_tool_calls(
         self,
-        task_id: str,
+        *,
+        task_id: str | None = None,
+        root_task_id: str | None = None,
+        call_id: str | None = None,
         status: str | None = None,
     ) -> list[PendingToolCall]:
         """
-        Query pending tool calls for a task, optionally
-        filtered by status. The park loop calls this with
-        ``status="completed"`` to find delivered results.
+        Query pending tool calls with optional filters.
 
-        :param task_id: The sub-agent's task ID,
+        All filters are AND-ed. At least one filter should be
+        provided to avoid scanning the entire table.
+
+        :param task_id: Filter by sub-agent task ID,
             e.g. ``"task_sub2"``.
-        :param status: Optional status filter.
+        :param root_task_id: Filter by root task ID,
+            e.g. ``"task_root1"``.
+        :param call_id: Filter by tool call ID,
+            e.g. ``"call_abc123"``.
+        :param status: Filter by status.
             ``"completed"`` returns only delivered results.
             ``"action_required"`` returns only waiting calls.
-            ``None`` returns all.
+            ``None`` skips status filtering.
         :returns: Matching pending tool call rows.
         """
         ...

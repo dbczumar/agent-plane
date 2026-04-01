@@ -69,6 +69,30 @@ class ExecutionConfig:
 
 
 @dataclass
+class CompactionConfig:
+    """
+    Context compaction configuration.
+
+    Controls when the agent compacts its conversation history to
+    stay within the LLM's context window. Compaction is layered:
+    (1) clear tool result bodies, (2) LLM summarization, (3)
+    truncation as emergency fallback.
+
+    :param trigger_threshold: Fraction of the model's context window
+        at which proactive compaction fires (after the first overflow
+        has been observed and the window size is known), e.g. ``0.8``
+        means fire at 80% of the window.
+    :param recent_window: Number of recent LLM iterations to protect
+        from compaction. Items within this window are never cleared or
+        summarized — the agent always has verbatim access to its most
+        recent work, e.g. ``5``.
+    """
+
+    trigger_threshold: float = 0.8
+    recent_window: int = 5
+
+
+@dataclass
 class LLMConfig:
     """
     LLM configuration block from config.yaml.
@@ -322,6 +346,9 @@ class AgentSpec:
         ``agents/<name>/``.
     :param execution: Agent execution limits (wall-clock timeout
         and max iterations).
+    :param compaction: Compaction configuration for context management.
+        ``None`` means use defaults (trigger at 80%, protect last 5
+        iterations).
     """
 
     spec_version: int
@@ -340,3 +367,4 @@ class AgentSpec:
     local_tools: list[LocalToolInfo] = field(default_factory=list)
     sub_agents: list[AgentSpec] = field(default_factory=list)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    compaction: CompactionConfig | None = None

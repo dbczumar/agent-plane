@@ -83,6 +83,7 @@ def validate(spec: AgentSpec) -> ValidationResult:
     _validate_mcp_servers(spec, result)
     _validate_local_tools(spec, result)
     _validate_sub_agents(spec, result)
+    _validate_compaction(spec, result)
     return result
 
 
@@ -246,6 +247,27 @@ def _validate_sub_agents(
 
     # Unique names across the entire spec tree
     _check_unique_sub_agent_names(spec, result)
+
+
+def _validate_compaction(spec: AgentSpec, result: ValidationResult) -> None:
+    """
+    Validate the compaction configuration if present.
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
+    if spec.compaction is None:
+        return
+    if not (0.0 < spec.compaction.trigger_threshold <= 1.0):
+        result.add(
+            "compaction.trigger_threshold",
+            f"must be in (0.0, 1.0], got {spec.compaction.trigger_threshold}",
+        )
+    if spec.compaction.recent_window < 0:
+        result.add(
+            "compaction.recent_window",
+            f"must be non-negative, got {spec.compaction.recent_window}",
+        )
 
 
 def _validate_agent_names(

@@ -174,6 +174,7 @@ _ITEM_TYPE_PREFIX: dict[str, str] = {
     "function_call": "fc_",
     "function_call_output": "fco_",
     "reasoning": "rs_",
+    "compaction": "cmp_",
 }
 
 
@@ -227,9 +228,11 @@ def generate_item_id(item_type: str) -> str:
     - ``"function_call"`` -> ``"fc_"``
     - ``"function_call_output"`` -> ``"fco_"``
     - ``"reasoning"`` -> ``"rs_"``
+    - ``"compaction"`` -> ``"cmp_"``
 
     :param item_type: One of ``"message"``, ``"function_call"``,
-        ``"function_call_output"``, or ``"reasoning"``.
+        ``"function_call_output"``, ``"reasoning"``, or
+        ``"compaction"``.
     :returns: A prefixed identifier, e.g. ``"msg_a1b2c3d4..."``.
     :raises ValueError: If *item_type* is not a recognised type.
     """
@@ -331,10 +334,13 @@ def extract_search_text(item: NewConversationItem) -> str:
 
     :param item: A Pydantic-validated conversation item whose
         ``type`` is one of ``"message"``, ``"function_call"``,
-        ``"function_call_output"``, or ``"reasoning"``.
+        ``"function_call_output"``, ``"reasoning"``, or
+        ``"compaction"``.
     :returns: A single plain-text string suitable for FTS indexing.
     :raises ValueError: If *item.type* is not a recognised type.
     """
+    from agent_plane.entities.conversation import CompactionData
+
     data = item.data.model_dump()
     if item.type == "message":
         return " ".join(
@@ -352,6 +358,9 @@ def extract_search_text(item: NewConversationItem) -> str:
             for block in data["summary"]
             if isinstance(block, dict) and block.get("text")
         )
+    if item.type == "compaction":
+        assert isinstance(item.data, CompactionData)
+        return item.data.summary
     raise ValueError(f"unknown item type: {item.type!r}")
 
 

@@ -78,3 +78,41 @@ class PermanentLLMError(Exception):
         super().__init__(message)
         self.code = code
         self.detail = detail
+
+
+class ContextWindowExceededError(PermanentLLMError):
+    """
+    The LLM rejected the request because the prompt exceeded the
+    model's context window. Unlike other permanent errors, this one
+    is recoverable after compaction — the caller can compact the
+    conversation history and retry.
+
+    Subclasses :class:`PermanentLLMError` so existing ``except
+    PermanentLLMError`` catch blocks still work. If the workflow does
+    not specifically catch this subclass, the error propagates as
+    fatal — the safe default.
+
+    :param message: Human-readable description, e.g.
+        ``"Context window exceeded: 142000 tokens > 128000 max"``.
+    :param code: Error code string, e.g.
+        ``"context_length_exceeded"``.
+    :param detail: Structured provider detail. ``None`` when
+        unavailable.
+    :param max_context_tokens: The model's context window size as
+        reported by the provider, e.g. ``128000``.
+    :param actual_tokens: The token count the provider measured for
+        the rejected request, e.g. ``142000``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        detail: LLMErrorDetail | None = None,
+        max_context_tokens: int,
+        actual_tokens: int,
+    ) -> None:
+        super().__init__(message, code=code, detail=detail)
+        self.max_context_tokens = max_context_tokens
+        self.actual_tokens = actual_tokens
