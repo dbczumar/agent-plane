@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from agent_plane.tools.base import Tool, is_valid_tool_name
+from agent_plane.tools.base import Tool, ToolContext, is_valid_tool_name
 
 
 @dataclass
@@ -65,8 +65,7 @@ class ClientSideTool(Tool):
         """
         self._spec = spec
 
-    @property
-    def name(self) -> str:
+    def name(self) -> str:  # type: ignore[override]
         """
         :returns: The tool function name, e.g. ``"get_weather"``.
         """
@@ -80,7 +79,7 @@ class ClientSideTool(Tool):
         """
         return self._spec.schema
 
-    def invoke(self, arguments: str) -> str:
+    def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
         Raise ``RuntimeError`` — client-side tools must never be executed
         server-side.
@@ -90,6 +89,7 @@ class ClientSideTool(Tool):
         method should never be reached in normal operation.
 
         :param arguments: JSON-encoded arguments string (unused).
+        :param ctx: Server-side execution context (unused).
         :raises RuntimeError: Always — indicates a workflow bug.
         """
         raise RuntimeError(
@@ -136,7 +136,7 @@ def parse_client_side_tool_spec(raw: dict[str, Any]) -> ClientSideToolSpec:
         raise ValueError("client-specified tool missing function.name")
 
     if not is_valid_tool_name(name):
-        raise ValueError(f"Invalid tool name {name!r}: must match [a-zA-Z0-9_-]{{1,64}}")
+        raise ValueError(f"Invalid tool name {name!r}: must match [a-zA-Z0-9_-]{{1,256}}")
 
     return ClientSideToolSpec(name=name, schema=raw)
 

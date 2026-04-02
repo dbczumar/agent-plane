@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent_plane.spec.types import SkillSpec
+from agent_plane.tools.base import ToolContext
 from agent_plane.tools.builtins import LoadSkillTool
 
 
@@ -49,29 +50,32 @@ def skill_no_resources() -> SkillSpec:
 
 def test_load_skill_returns_content(
     skill_no_resources: SkillSpec,
+    tool_ctx: ToolContext,
 ) -> None:
     """
     LoadSkillTool.invoke returns the skill's content string.
     """
     tool = LoadSkillTool([skill_no_resources])
-    result = tool.invoke(json.dumps({"name": "summarize"}))
+    result = tool.invoke(json.dumps({"name": "summarize"}), tool_ctx)
     assert result == "Summarize the input concisely."
 
 
 def test_load_skill_not_found(
     skill_no_resources: SkillSpec,
+    tool_ctx: ToolContext,
 ) -> None:
     """
     LoadSkillTool.invoke returns error for unknown skill name.
     """
     tool = LoadSkillTool([skill_no_resources])
-    result = tool.invoke(json.dumps({"name": "nonexistent"}))
+    result = tool.invoke(json.dumps({"name": "nonexistent"}), tool_ctx)
     assert "not found" in result
     assert "summarize" in result
 
 
 def test_load_skill_with_resources_lists_files(
     skill_with_resources: SkillSpec,
+    tool_ctx: ToolContext,
 ) -> None:
     """
     LoadSkillTool.invoke appends a resource listing when the
@@ -80,6 +84,7 @@ def test_load_skill_with_resources_lists_files(
     tool = LoadSkillTool([skill_with_resources])
     result = tool.invoke(
         json.dumps({"name": "code-review"}),
+        tool_ctx,
     )
     assert "Review the code." in result
     assert "references/style-guide.md" in result
@@ -88,12 +93,13 @@ def test_load_skill_with_resources_lists_files(
 
 def test_load_skill_missing_name_argument(
     skill_no_resources: SkillSpec,
+    tool_ctx: ToolContext,
 ) -> None:
     """
     LoadSkillTool.invoke returns error when 'name' is missing.
     """
     tool = LoadSkillTool([skill_no_resources])
-    result = tool.invoke(json.dumps({}))
+    result = tool.invoke(json.dumps({}), tool_ctx)
     assert "missing required 'name'" in result
 
 

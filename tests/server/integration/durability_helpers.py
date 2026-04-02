@@ -35,6 +35,7 @@ from agent_plane.stores.task_store.sqlalchemy_store import (
     SqlAlchemyTaskStore,
 )
 from agent_plane.tools import ToolManager
+from agent_plane.tools.base import ToolContext
 from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import create_test_agent, create_test_response
 
@@ -246,6 +247,7 @@ def setup_tool_tracking(
         self: ToolManager,
         name: str,
         arguments: str,
+        ctx: ToolContext,
     ) -> str:
         """
         Wrapper that records each real tool execution.
@@ -253,13 +255,14 @@ def setup_tool_tracking(
         :param self: The ToolManager instance.
         :param name: Tool name, e.g. ``"load_skill"``.
         :param arguments: JSON arguments string.
+        :param ctx: Server-side execution context.
         :returns: The original ``call_tool`` result.
         """
         invocations.append(name)
         if gate is not None and gate.should_block:
             gate.entered.set()
             gate.release.wait()
-        return original_call_tool(self, name, arguments)
+        return original_call_tool(self, name, arguments, ctx)
 
     patch_ctx = patch.object(
         ToolManager,

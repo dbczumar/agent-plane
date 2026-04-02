@@ -4,22 +4,44 @@ from __future__ import annotations
 
 import abc
 import re
+from dataclasses import dataclass
 from typing import Any
 
-# OpenAI function-calling constraint: names must match this pattern.
-# MCP and client-specified tools must be validated before registration.
-TOOL_NAME_RE: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+# Tool name constraint: alphanumeric plus ``_`` and ``-``, up to
+# 256 characters. OpenAI enforces 1–64 but other providers allow
+# longer names, and client-side tools come from the user.
+TOOL_NAME_RE: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9_-]{1,256}$")
 
 
 def is_valid_tool_name(name: str) -> bool:
     """
-    Check whether a tool name satisfies the OpenAI function-calling
-    constraint: 1–64 characters, alphanumeric plus ``_`` and ``-``.
+    Check whether a tool name is valid: 1–256 characters,
+    alphanumeric plus ``_`` and ``-``.
 
     :param name: The tool name to validate, e.g. ``"get_weather"``.
     :returns: ``True`` if the name is valid, ``False`` otherwise.
     """
     return TOOL_NAME_RE.match(name) is not None
+
+
+@dataclass(frozen=True)
+class ToolContext:
+    """
+    Execution context passed to every tool invocation.
+
+    Provides server-side metadata that tools may need but
+    which the LLM does not supply (task identity, agent
+    identity). Individual tools read the fields they need
+    and ignore the rest.
+
+    :param task_id: The current task/workflow ID,
+        e.g. ``"task_abc123"``.
+    :param agent_id: The registered agent ID,
+        e.g. ``"ag_xyz789"``.
+    """
+
+    task_id: str
+    agent_id: str
 
 
 class Tool(abc.ABC):
@@ -29,11 +51,16 @@ class Tool(abc.ABC):
     Each tool has a unique name, an OpenAI-format schema for the
     LLM, and an ``invoke`` method that executes the tool and
     returns a string result.
+
+    Subclasses must implement ``name()`` as a ``@classmethod``
+    (for tools with a fixed name, e.g. ``SpawnTool.name()``)
+    or as a regular method (for tools whose name depends on
+    instance state, e.g. ``McpTool``).
     """
 
-    @property
+    @classmethod
     @abc.abstractmethod
-    def name(self) -> str:
+    def name(cls) -> str:
         """
         Unique tool name used for dispatch and schema registration.
 
@@ -51,11 +78,13 @@ class Tool(abc.ABC):
         """
 
     @abc.abstractmethod
-    def invoke(self, arguments: str) -> str:
+    def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
         Execute the tool with the given arguments.
 
         :param arguments: JSON-encoded arguments string from
             the LLM, e.g. ``'{"name": "summarize"}'``.
+        :param ctx: Server-side execution context with task
+            and agent identity.
         :returns: The tool's string result.
         """

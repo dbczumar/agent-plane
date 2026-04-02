@@ -12,6 +12,9 @@ llm:
 tools:
   builtins:
     - web_search_openai
+  agents:
+    - fact_checker
+    - summarizer
 
 interaction:
   modalities:

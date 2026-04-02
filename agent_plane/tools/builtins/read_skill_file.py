@@ -7,7 +7,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from agent_plane.spec.types import SkillSpec
-from agent_plane.tools.base import Tool
+from agent_plane.tools.base import Tool, ToolContext
 
 
 class ReadSkillFileTool(Tool):
@@ -30,11 +30,9 @@ class ReadSkillFileTool(Tool):
         """
         self._skills_by_name: dict[str, SkillSpec] = {s.name: s for s in skills}
 
-    @property
-    def name(self) -> str:
+    @classmethod
+    def name(cls) -> str:
         """
-        Tool name: ``"read_skill_file"``.
-
         :returns: ``"read_skill_file"``.
         """
         return "read_skill_file"
@@ -76,7 +74,7 @@ class ReadSkillFileTool(Tool):
             },
         }
 
-    def invoke(self, arguments: str) -> str:
+    def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
         Read a file from the named skill's directory.
 
@@ -87,6 +85,8 @@ class ReadSkillFileTool(Tool):
             ``"path"`` keys, e.g.
             ``'{"skill_name": "code-review",
             "path": "references/style-guide.md"}'``.
+        :param ctx: Server-side execution context (unused by
+            skill tools, required by the :class:`Tool` interface).
         :returns: The file contents, or an error message.
         """
         args: dict[str, str] = json.loads(arguments)

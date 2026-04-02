@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from typing import Any
@@ -104,10 +105,7 @@ async def test_create_response_streaming(
     assert msg["role"] == "assistant"
 
     # Text delta events were emitted during streaming
-    text_deltas = [
-        e for e in events
-        if e[0] == "response.output_text.delta"
-    ]
+    text_deltas = [e for e in events if e[0] == "response.output_text.delta"]
     assert len(text_deltas) >= 1
     # Each delta has a non-empty string
     for _, delta_data in text_deltas:
@@ -119,10 +117,7 @@ async def test_create_response_streaming(
     assert "Hello world" in full_text
 
     # output_item.done event has the assistant message
-    item_done_events = [
-        e for e in events
-        if e[0] == "response.output_item.done"
-    ]
+    item_done_events = [e for e in events if e[0] == "response.output_item.done"]
     assert len(item_done_events) >= 1
     done_item = item_done_events[0][1]["item"]
     assert done_item["type"] == "message"
@@ -1595,6 +1590,8 @@ async def test_patch_response_completes_pending_tool_call(
         call_id="call_test_1",
         root_task_id=response_id,
         task_id=response_id,
+        tool_name="test_tool",
+        arguments='{"key": "value"}',
     )
 
     resp = await client.patch(
@@ -1609,7 +1606,7 @@ async def test_patch_response_completes_pending_tool_call(
     assert resp.json()["id"] == response_id
 
     # Verify the pending tool call is now completed in the store
-    rows = task_store.get_pending_tool_calls(response_id, status="completed")
+    rows = task_store.list_pending_tool_calls(task_id=response_id, status="completed")
     assert len(rows) == 1, "Expected exactly 1 completed row"
     assert rows[0].call_id == "call_test_1"
     assert rows[0].result == "tool output"
@@ -1631,6 +1628,8 @@ async def test_patch_response_idempotent(
         call_id="call_idem",
         root_task_id=response_id,
         task_id=response_id,
+        tool_name="test_tool",
+        arguments="{}",
     )
 
     # First PATCH
@@ -1656,7 +1655,7 @@ async def test_patch_response_idempotent(
     )
     assert resp2.status_code == 200
 
-    rows = task_store.get_pending_tool_calls(response_id, status="completed")
+    rows = task_store.list_pending_tool_calls(task_id=response_id, status="completed")
     assert len(rows) == 1, "Expected exactly 1 completed row"
     assert rows[0].result == "first", "First writer wins — stored result must not be overwritten"
 
@@ -1715,7 +1714,12 @@ async def test_spawn_sub_agent_creates_child_task(
     # Mock call 2 (sub-agent researcher): complete with text
     mock_llm.add_call(text="Python 3.14 introduces JIT compilation.")
 
-    # Mock call 3 (parent, after spawn result): final text
+    # Mock call 3 (parent, after spawn result): final text —
+    # triggers auto-collect since sub-agent wasn't collected.
+    mock_llm.add_call(text="Based on research: Python 3.14 has JIT.")
+
+    # Mock call 4 (parent, after auto-collect injects sub-agent
+    # results): final text incorporating collected output.
     mock_llm.add_call(text="Based on research: Python 3.14 has JIT.")
 
     # Create the response (foreground blocking wait)
@@ -1894,3 +1898,338 @@ async def test_spawn_and_collect_sub_agent(
         f"Expected collect_sub_agents in output, got: "
         f"{[i.get('name') for i in output if i.get('type') == 'function_call']}"
     )
+
+
+# ── Sub-agent parking and tunneling tests ──────────────
+
+
+async def _poll_until_terminal(
+    client: httpx.AsyncClient,
+    response_id: str,
+) -> dict[str, Any]:
+    """
+    Poll until the response reaches a terminal state.
+
+    :param client: The HTTP client.
+    :param response_id: The response ID to poll.
+    :returns: The terminal response body.
+    """
+    for _ in range(200):
+        resp = await client.get(f"/v1/responses/{response_id}")
+        body = resp.json()
+        if body["status"] in ("completed", "failed"):
+            return body
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"Response {response_id} never reached terminal state")
+
+
+async def test_get_response_surfaces_pending_tool_calls(
+    client: httpx.AsyncClient,
+    task_store: SqlAlchemyTaskStore,
+) -> None:
+    """
+    GET /v1/responses/{id} includes action_required function_call
+    items in the output when pending tool calls exist for the
+    root task — with tool_name and arguments populated.
+
+    This would have caught the bug where the polling client never
+    saw tunneled tool calls because the GET response returned
+    empty output for in-progress tasks.
+    """
+    await create_test_agent(client)
+    result = await create_test_response(client, background=True)
+    response_id = result.body["id"]
+
+    # Directly insert a pending tool call (simulates what
+    # _park_for_client_tools does).
+    task_store.create_pending_tool_call(
+        call_id="call_tunnel_1",
+        root_task_id=response_id,
+        task_id=response_id,
+        tool_name="Read",
+        arguments='{"file_path": "/tmp/test.txt"}',
+    )
+
+    # GET should surface the pending call with action_required.
+    resp = await client.get(f"/v1/responses/{response_id}")
+    body = resp.json()
+    output = body.get("output", [])
+
+    # Find action_required function_call items.
+    action_items = [
+        item
+        for item in output
+        if item.get("type") == "function_call" and item.get("status") == "action_required"
+    ]
+    # At least one action_required item must be present.
+    # If empty, the GET endpoint didn't query pending_tool_calls
+    # or didn't include them in the output.
+    assert len(action_items) >= 1, (
+        f"Expected action_required function_call in GET output. Got output: {output}"
+    )
+    fc = action_items[0]
+    # Must have the tool name so the client knows what to execute.
+    assert fc["name"] == "Read", (
+        f"Expected tool name 'Read', got {fc.get('name')!r}. "
+        "If wrong, tool_name wasn't populated in pending_tool_calls."
+    )
+    # Must have arguments so the client has the full call details.
+    assert "file_path" in fc.get("arguments", ""), (
+        "Expected arguments to contain 'file_path'. If missing, "
+        "the arguments column wasn't stored at park time."
+    )
+    assert fc["call_id"] == "call_tunnel_1", (
+        f"Expected call_id 'call_tunnel_1', got {fc.get('call_id')!r}"
+    )
+
+
+async def _poll_for_pending(
+    client: httpx.AsyncClient,
+    response_id: str,
+    max_attempts: int = 100,
+) -> list[dict[str, Any]]:
+    """
+    Poll until action_required function_calls appear.
+
+    :param client: HTTP client.
+    :param response_id: Root response ID.
+    :param max_attempts: Max poll iterations.
+    :returns: List of action_required items.
+    """
+    for _ in range(max_attempts):
+        resp = await client.get(f"/v1/responses/{response_id}")
+        body = resp.json()
+        pending = [
+            item
+            for item in body.get("output", [])
+            if item.get("type") == "function_call" and item.get("status") == "action_required"
+        ]
+        if pending:
+            return pending
+        if body["status"] in ("completed", "failed"):
+            return []
+        await asyncio.sleep(0.1)
+    return []
+
+
+async def test_park_patch_resume_end_to_end(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+    task_store: SqlAlchemyTaskStore,
+) -> None:
+    """
+    Full park→PATCH→resume→collect flow: sub-agent parks for a
+    client tool, client discovers it via GET, PATCHes the result,
+    sub-agent resumes with the tool result and completes, parent
+    auto-collects and produces a final response.
+
+    This test previously deadlocked due to DBOS thread pool
+    exhaustion from ``time.sleep`` polling loops. The fix
+    (DBOS recv/send signaling) eliminated the deadlock.
+    """
+    bundle = build_agent_bundle(
+        name="e2e-parent",
+        sub_agents=[
+            {"name": "reader", "description": "File reader"},
+        ],
+    )
+    resp = await client.post(
+        "/api/agents",
+        files={
+            "bundle": ("agent.tar.gz", bundle, "application/gzip"),
+        },
+    )
+    assert resp.status_code == 201
+
+    # Mock call 1 (parent): spawn reader
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_sp",
+                "name": "spawn_sub_agents",
+                "arguments": json.dumps(
+                    {
+                        "agents": [
+                            {"name": "reader", "input": "read file"},
+                        ],
+                    }
+                ),
+            },
+        ],
+    )
+
+    # tool_calls_fn routes Read to the sub-agent (input contains
+    # "read file") and text to the parent.
+    def _maybe_read(
+        kwargs: dict[str, Any],
+    ) -> list[dict[str, str]] | None:
+        input_str = json.dumps(kwargs.get("input", []))
+        if "read file" in input_str and "function_call_output" not in input_str:
+            return [
+                {
+                    "call_id": "call_rd",
+                    "name": "Read",
+                    "arguments": '{"file_path": "/tmp/f.txt"}',
+                },
+            ]
+        return None
+
+    # Calls 2-3: race between parent and sub-agent.
+    mock_llm.add_call(text="Let me check...", tool_calls_fn=_maybe_read)
+    mock_llm.add_call(text="Let me check...", tool_calls_fn=_maybe_read)
+    # Call 4: sub-agent after tool result → final text
+    mock_llm.add_call(text="File says: test content")
+    # Call 5: parent after auto-collect → final answer
+    mock_llm.add_call(text="The file contains: test content")
+
+    # Client-side tool schema for Read.
+    read_tool: dict[str, Any] = {
+        "type": "function",
+        "function": {
+            "name": "Read",
+            "description": "Read a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                },
+                "required": ["file_path"],
+            },
+        },
+    }
+
+    result = await create_test_response(
+        client,
+        model="e2e-parent",
+        input_text="Read /tmp/f.txt",
+        background=True,
+        tools=[read_tool],
+    )
+    response_id = result.body["id"]
+
+    # Poll until the sub-agent parks and pending calls appear.
+    pending = await _poll_for_pending(client, response_id)
+    assert len(pending) >= 1, (
+        "Sub-agent didn't park or pending calls not surfaced. "
+        "If this hangs, DBOS thread pool exhaustion is back."
+    )
+
+    # PATCH the tool result — wakes the sub-agent via DBOS send.
+    patch_resp = await client.patch(
+        f"/v1/responses/{response_id}",
+        json={
+            "tool_results": [
+                {"call_id": "call_rd", "output": "test content"},
+            ],
+        },
+    )
+    assert patch_resp.status_code == 200
+
+    # Wait for the full workflow to complete.
+    final = await _poll_until_terminal(client, response_id)
+    assert final["status"] == "completed", (
+        f"Expected completed, got {final['status']}. Error: {final.get('error')}"
+    )
+    # The output must contain "test content" — proves the tool
+    # result traversed: PATCH → pending_tool_calls table →
+    # DBOS send → sub-agent recv → LLM → collect → parent LLM.
+    output = final["output"]
+    text_items = [item for item in output if item.get("type") == "message"]
+    all_text = " ".join(c.get("text", "") for item in text_items for c in item.get("content", []))
+    assert "test content" in all_text, (
+        f"Expected 'test content' in final output. Got: {all_text!r}"
+    )
+
+
+async def test_auto_collect_at_turn_end(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+    task_store: SqlAlchemyTaskStore,
+) -> None:
+    """
+    When the parent spawns a sub-agent but the LLM produces a
+    final text response without calling collect_sub_agents, the
+    workflow auto-collects before completing the turn.
+
+    This would have caught the bug where the parent completed
+    early, leaving the sub-agent orphaned.
+    """
+    bundle = build_agent_bundle(
+        name="auto-parent",
+        sub_agents=[{"name": "worker", "description": "Worker"}],
+    )
+    resp = await client.post(
+        "/api/agents",
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert resp.status_code == 201
+
+    # Mock call 1 (parent): spawn worker
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_sp",
+                "name": "spawn_sub_agents",
+                "arguments": json.dumps(
+                    {
+                        "agents": [
+                            {"name": "worker", "input": "do work"},
+                        ],
+                    }
+                ),
+            },
+        ],
+    )
+    # Mock call 2 (sub-agent): completes with text (no tools)
+    mock_llm.add_call(text="Work done: result is 42")
+    # Mock call 3 (parent): text WITHOUT collect — auto-collect
+    # should trigger and re-run the LLM.
+    mock_llm.add_call(text="Spawned the worker.")
+    # Mock call 4 (parent, after auto-collect): final response
+    # incorporating collected results.
+    mock_llm.add_call(text="Worker result: 42")
+
+    result = await create_test_response(
+        client,
+        model="auto-parent",
+        input_text="Do work via worker",
+        background=True,
+    )
+    response_id = result.body["id"]
+
+    final = await _poll_until_terminal(client, response_id)
+    assert final["status"] == "completed", (
+        f"Expected completed, got {final['status']}. Error: {final.get('error')}"
+    )
+
+    # The parent must have called the LLM at least 4 times:
+    # spawn, sub-agent text, parent text (triggers auto-collect),
+    # and parent final (after auto-collect injects results).
+    # If only 3, auto-collect didn't trigger the extra iteration.
+    assert mock_llm.call_count >= 4, (
+        f"Expected >= 4 LLM calls (spawn + sub-agent + parent "
+        f"text + post-auto-collect), got {mock_llm.call_count}. "
+        f"If 3, auto-collect didn't re-run the LLM."
+    )
+
+    # The final output must contain the post-auto-collect text.
+    output = final["output"]
+    text_items = [item for item in output if item.get("type") == "message"]
+    all_text = " ".join(c.get("text", "") for item in text_items for c in item.get("content", []))
+    # "42" in the output proves the auto-collected sub-agent
+    # result was visible to the final LLM call.
+    assert "42" in all_text, (
+        f"Expected '42' in final output (proves auto-collect "
+        f"injected sub-agent results before final LLM call). "
+        f"Got: {all_text!r}"
+    )
+
+    # Verify: no uncollected child tasks remain.
+    tasks = await task_store.list_tasks()
+    child_tasks = [t for t in tasks if t.root_task_id == response_id]
+    # Every child must be in a terminal state.
+    for child in child_tasks:
+        assert child.status in ("completed", "failed"), (
+            f"Child task {child.id} has status {child.status!r} — "
+            f"auto-collect should have waited for it to finish."
+        )

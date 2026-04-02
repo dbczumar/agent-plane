@@ -19,7 +19,7 @@ from typing import Any
 
 import httpx
 
-from agent_plane.tools.base import Tool
+from agent_plane.tools.base import Tool, ToolContext
 
 _logger = logging.getLogger(__name__)
 
@@ -52,11 +52,9 @@ class WebSearchGoogleTool(Tool):
         """
         self._config = config or {}
 
-    @property
-    def name(self) -> str:
+    @classmethod
+    def name(cls) -> str:
         """
-        Tool name: ``"web_search_google"``.
-
         :returns: ``"web_search_google"``.
         """
         return "web_search_google"
@@ -88,11 +86,13 @@ class WebSearchGoogleTool(Tool):
             },
         }
 
-    def invoke(self, arguments: str) -> str:
+    def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
         Execute a Google Custom Search query.
 
         :param arguments: JSON-encoded dict with a ``query`` key.
+        :param ctx: Server-side execution context (unused by
+            search tools, required by the :class:`Tool` interface).
         :returns: Formatted search results or an error message.
         """
         parsed: dict[str, Any] = json.loads(arguments)

@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from agent_plane.tools.base import ToolContext
 from agent_plane.tools.client_specified import (
     ClientSideTool,
     ClientSideToolSpec,
@@ -198,17 +199,19 @@ def test_get_schema_returns_spec_schema(weather_spec: ClientSideToolSpec) -> Non
 
 def test_name_property(weather_spec: ClientSideToolSpec) -> None:
     """
-    ClientSideTool.name returns the tool name from the spec.
+    ClientSideTool.name() returns the tool name from the spec.
     """
     tool = ClientSideTool(weather_spec)
 
-    assert tool.name == "get_weather"
+    assert tool.name() == "get_weather"
 
 
 # ── ClientSideTool.invoke ─────────────────────────────────
 
 
-def test_invoke_raises_runtime_error(weather_spec: ClientSideToolSpec) -> None:
+def test_invoke_raises_runtime_error(
+    weather_spec: ClientSideToolSpec, tool_ctx: ToolContext
+) -> None:
     """
     ClientSideTool.invoke raises RuntimeError — client-side tools
     must never be executed server-side.
@@ -224,7 +227,7 @@ def test_invoke_raises_runtime_error(weather_spec: ClientSideToolSpec) -> None:
     tool = ClientSideTool(weather_spec)
 
     with pytest.raises(RuntimeError, match="must not be invoked server-side"):
-        tool.invoke('{"city": "San Francisco"}')
+        tool.invoke('{"city": "San Francisco"}', tool_ctx)
 
 
 # ── Tool name validation ─────────────────────────────────

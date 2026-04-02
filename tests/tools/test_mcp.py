@@ -17,6 +17,7 @@ from mcp.shared.exceptions import McpError
 from mcp.types import CONNECTION_CLOSED, ErrorData, ImageContent, TextContent
 
 from agent_plane.spec.types import MCPServerConfig, RetryConfig
+from agent_plane.tools.base import ToolContext
 from agent_plane.tools.mcp import (
     _CIRCUIT_BREAKER_COOLDOWN_SECONDS,
     _CIRCUIT_BREAKER_THRESHOLD,
@@ -299,7 +300,7 @@ async def test_close_is_safe_when_never_connected() -> None:
 
 def test_mcp_tool_name() -> None:
     """
-    McpTool.name returns the MCP tool definition's name.
+    McpTool.name() returns the MCP tool definition's name.
     """
     tool_def = _make_mcp_tool_def("my_tool")
     conn = McpServerConnection(config=_make_http_config())
@@ -309,7 +310,7 @@ def test_mcp_tool_name() -> None:
         # Stub run_sync — not exercised in this test.
         run_sync=MagicMock(),
     )
-    assert tool.name == "my_tool"
+    assert tool.name() == "my_tool"
 
 
 def test_mcp_tool_schema_openai_format() -> None:
@@ -332,7 +333,7 @@ def test_mcp_tool_schema_openai_format() -> None:
     assert "properties" in schema["function"]["parameters"]
 
 
-def test_mcp_tool_invoke_delegates_to_run_sync() -> None:
+def test_mcp_tool_invoke_delegates_to_run_sync(tool_ctx: ToolContext) -> None:
     """
     McpTool.invoke parses JSON args and calls the connection's
     call_tool method via the run_sync callable.
@@ -346,13 +347,13 @@ def test_mcp_tool_invoke_delegates_to_run_sync() -> None:
         connection=conn,
         run_sync=mock_run_sync,
     )
-    result = tool.invoke(json.dumps({"query": "hello"}))
+    result = tool.invoke(json.dumps({"query": "hello"}), tool_ctx)
 
     assert result == "result text"
     mock_run_sync.assert_called_once()
 
 
-def test_mcp_tool_invoke_returns_error_on_invalid_json() -> None:
+def test_mcp_tool_invoke_returns_error_on_invalid_json(tool_ctx: ToolContext) -> None:
     """
     McpTool.invoke returns an error string (not raises) when the
     LLM sends malformed JSON arguments.
@@ -370,7 +371,7 @@ def test_mcp_tool_invoke_returns_error_on_invalid_json() -> None:
         run_sync=mock_run_sync,
     )
 
-    result = tool.invoke("not valid json {{{")
+    result = tool.invoke("not valid json {{{", tool_ctx)
 
     # Error message returned to the LLM, not an exception.
     # If this were a JSONDecodeError instead of a string, the
@@ -380,7 +381,7 @@ def test_mcp_tool_invoke_returns_error_on_invalid_json() -> None:
     mock_run_sync.assert_not_called()
 
 
-def test_mcp_tool_invoke_empty_string_parses_as_empty_dict() -> None:
+def test_mcp_tool_invoke_empty_string_parses_as_empty_dict(tool_ctx: ToolContext) -> None:
     """
     Empty-string arguments parse as ``{}`` so tools with no
     required parameters can be called without arguments.
@@ -394,7 +395,7 @@ def test_mcp_tool_invoke_empty_string_parses_as_empty_dict() -> None:
         run_sync=mock_run_sync,
     )
 
-    result = tool.invoke("")
+    result = tool.invoke("", tool_ctx)
 
     assert result == "ok"
     # Exactly one dispatch — empty string parsed as {} successfully.

@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent_plane.tools.base import ToolContext
 from agent_plane.tools.builtins import get_builtin_tool
 from agent_plane.tools.builtins.web_search_google import (
     WebSearchGoogleTool,
@@ -68,19 +69,19 @@ def test_openai_schema_is_passthrough() -> None:
     )
 
 
-def test_openai_invoke_raises() -> None:
+def test_openai_invoke_raises(tool_ctx: ToolContext) -> None:
     """
     OpenAI tool invoke() raises RuntimeError since execution
     is handled by OpenAI server-side.
     """
     tool = WebSearchOpenAITool()
     with pytest.raises(RuntimeError, match="passthrough"):
-        tool.invoke("{}")
+        tool.invoke("{}", tool_ctx)
 
 
 def test_openai_name() -> None:
     """Tool name matches the config.yaml builtin name."""
-    assert WebSearchOpenAITool().name == "web_search_openai"
+    assert WebSearchOpenAITool.name() == "web_search_openai"
 
 
 # ── Google Custom Search ─────────────────────────────
@@ -100,32 +101,32 @@ def test_google_schema_is_function() -> None:
     assert "query" in func["parameters"]["required"]
 
 
-def test_google_invoke_missing_keys() -> None:
+def test_google_invoke_missing_keys(tool_ctx: ToolContext) -> None:
     """
     Google tool returns a clear error when neither spec config
     nor env vars provide the required keys.
     """
     tool = WebSearchGoogleTool()
     with patch.dict("os.environ", {}, clear=True):
-        result = tool.invoke(json.dumps({"query": "test"}))
+        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
     # Error message mentions both spec config and env var paths.
     assert "api_key" in result, f"Expected key error message, got: {result!r}"
     assert "engine_id" in result, f"Expected engine_id in error, got: {result!r}"
 
 
-def test_google_invoke_missing_query() -> None:
+def test_google_invoke_missing_query(tool_ctx: ToolContext) -> None:
     """
     Google tool returns error when query param is missing.
     """
     tool = WebSearchGoogleTool()
-    result = tool.invoke(json.dumps({}))
+    result = tool.invoke(json.dumps({}), tool_ctx)
     # Exact error message from invoke() when query is absent.
     assert result == "Error: 'query' parameter is required", (
         f"Expected specific 'query' required error, got: {result!r}"
     )
 
 
-def test_google_invoke_formats_results() -> None:
+def test_google_invoke_formats_results(tool_ctx: ToolContext) -> None:
     """
     Google tool invoke() with a mocked HTTP response returns
     numbered results with title, link, and snippet.
@@ -156,7 +157,7 @@ def test_google_invoke_formats_results() -> None:
         patch("agent_plane.tools.builtins.web_search_google.httpx.get") as mock_get,
     ):
         mock_get.return_value = fake_response
-        result = tool.invoke(json.dumps({"query": "python"}))
+        result = tool.invoke(json.dumps({"query": "python"}), tool_ctx)
 
     # Both results present with correct numbering — proves the
     # formatting pipeline ran end-to-end through invoke().
@@ -166,7 +167,7 @@ def test_google_invoke_formats_results() -> None:
     assert "Style guide." in result
 
 
-def test_google_invoke_empty_results() -> None:
+def test_google_invoke_empty_results(tool_ctx: ToolContext) -> None:
     """
     Google tool returns 'No results found.' when the API
     returns no items.
@@ -184,7 +185,7 @@ def test_google_invoke_empty_results() -> None:
         patch("agent_plane.tools.builtins.web_search_google.httpx.get") as mock_get,
     ):
         mock_get.return_value = fake_response
-        result = tool.invoke(json.dumps({"query": "python"}))
+        result = tool.invoke(json.dumps({"query": "python"}), tool_ctx)
 
     assert result == "No results found."
 
@@ -205,32 +206,32 @@ def test_perplexity_schema_is_function() -> None:
     assert "query" in func["parameters"]["required"]
 
 
-def test_perplexity_invoke_missing_key() -> None:
+def test_perplexity_invoke_missing_key(tool_ctx: ToolContext) -> None:
     """
     Perplexity tool returns a clear error when neither spec
     config nor env var provides the API key.
     """
     tool = WebSearchPerplexityTool()
     with patch.dict("os.environ", {}, clear=True):
-        result = tool.invoke(json.dumps({"query": "test"}))
+        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
     # Error message mentions both spec config and env var paths.
     assert "api_key" in result, f"Expected key error message, got: {result!r}"
     assert "PERPLEXITY_API_KEY" in result, f"Expected env var name in error, got: {result!r}"
 
 
-def test_perplexity_invoke_missing_query() -> None:
+def test_perplexity_invoke_missing_query(tool_ctx: ToolContext) -> None:
     """
     Perplexity tool returns error when query param is missing.
     """
     tool = WebSearchPerplexityTool()
-    result = tool.invoke(json.dumps({}))
+    result = tool.invoke(json.dumps({}), tool_ctx)
     # Exact error message from invoke() when query is absent.
     assert result == "Error: 'query' parameter is required", (
         f"Expected specific 'query' required error, got: {result!r}"
     )
 
 
-def test_perplexity_invoke_with_citations() -> None:
+def test_perplexity_invoke_with_citations(tool_ctx: ToolContext) -> None:
     """
     Perplexity tool invoke() with a mocked HTTP response returns
     the answer text with numbered citations.
@@ -260,7 +261,7 @@ def test_perplexity_invoke_with_citations() -> None:
         patch("agent_plane.tools.builtins.web_search_perplexity.httpx.post") as mock_post,
     ):
         mock_post.return_value = fake_response
-        result = tool.invoke(json.dumps({"query": "what is python"}))
+        result = tool.invoke(json.dumps({"query": "what is python"}), tool_ctx)
 
     # Answer content traversed the full pipeline from mock → invoke → format.
     assert "Python is a programming language." in result
@@ -269,7 +270,7 @@ def test_perplexity_invoke_with_citations() -> None:
     assert "[2] https://wikipedia.org/wiki/Python" in result
 
 
-def test_perplexity_invoke_no_citations() -> None:
+def test_perplexity_invoke_no_citations(tool_ctx: ToolContext) -> None:
     """
     Perplexity tool invoke() works when no citations are returned.
     """
@@ -290,14 +291,14 @@ def test_perplexity_invoke_no_citations() -> None:
         patch("agent_plane.tools.builtins.web_search_perplexity.httpx.post") as mock_post,
     ):
         mock_post.return_value = fake_response
-        result = tool.invoke(json.dumps({"query": "simple question"}))
+        result = tool.invoke(json.dumps({"query": "simple question"}), tool_ctx)
 
     assert result == "Just an answer."
     # No "Sources:" section when citations are absent.
     assert "Sources:" not in result
 
 
-def test_perplexity_invoke_empty_response() -> None:
+def test_perplexity_invoke_empty_response(tool_ctx: ToolContext) -> None:
     """
     Perplexity tool returns 'No answer returned.' when the
     API returns empty choices.
@@ -315,7 +316,7 @@ def test_perplexity_invoke_empty_response() -> None:
         patch("agent_plane.tools.builtins.web_search_perplexity.httpx.post") as mock_post,
     ):
         mock_post.return_value = fake_response
-        result = tool.invoke(json.dumps({"query": "test"}))
+        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
 
     assert result == "No answer returned."
 
@@ -323,7 +324,7 @@ def test_perplexity_invoke_empty_response() -> None:
 # ── Spec-level config ───────────────────────────────
 
 
-def test_google_uses_spec_config_over_env() -> None:
+def test_google_uses_spec_config_over_env(tool_ctx: ToolContext) -> None:
     """
     Google tool prefers api_key/engine_id from spec config
     over environment variables.
@@ -349,7 +350,7 @@ def test_google_uses_spec_config_over_env() -> None:
         ) as mock_get,
     ):
         mock_get.return_value = fake_response
-        tool.invoke(json.dumps({"query": "test"}))
+        tool.invoke(json.dumps({"query": "test"}), tool_ctx)
 
     # Verify the HTTP call used spec config keys, not env keys.
     call_kwargs = mock_get.call_args
@@ -358,7 +359,7 @@ def test_google_uses_spec_config_over_env() -> None:
     assert params["cx"] == "spec-engine", f"Expected spec config engine_id, got {params['cx']!r}"
 
 
-def test_perplexity_uses_spec_config_over_env() -> None:
+def test_perplexity_uses_spec_config_over_env(tool_ctx: ToolContext) -> None:
     """
     Perplexity tool prefers api_key from spec config over
     environment variable.
@@ -380,7 +381,7 @@ def test_perplexity_uses_spec_config_over_env() -> None:
         ) as mock_post,
     ):
         mock_post.return_value = fake_response
-        tool.invoke(json.dumps({"query": "test"}))
+        tool.invoke(json.dumps({"query": "test"}), tool_ctx)
 
     # Verify the HTTP call used spec config key, not env key.
     call_kwargs = mock_post.call_args
@@ -390,7 +391,7 @@ def test_perplexity_uses_spec_config_over_env() -> None:
     )
 
 
-def test_get_builtin_tool_passes_config() -> None:
+def test_get_builtin_tool_passes_config(tool_ctx: ToolContext) -> None:
     """
     ``get_builtin_tool`` passes the config dict through to
     the tool constructor.
@@ -410,6 +411,6 @@ def test_get_builtin_tool_passes_config() -> None:
         ) as mock_get,
     ):
         mock_get.return_value = fake_response
-        result = tool.invoke(json.dumps({"query": "test"}))
+        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
     # Should succeed (no error) because config provided the keys.
     assert result == "No results found."

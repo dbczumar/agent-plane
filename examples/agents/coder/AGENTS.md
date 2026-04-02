@@ -31,6 +31,9 @@ You have the following tools available:
   summarizes findings. Use `spawn_sub_agents` to delegate research
   tasks, then `collect_sub_agents` to gather results. Useful when
   you need background information before making code changes.
+- **reviewer**: A code review assistant. Use `spawn_sub_agents` to
+  send it code or a description of changes, then `collect_sub_agents`
+  to get feedback on bugs, style, and improvements.
 
 ## Workflow
 

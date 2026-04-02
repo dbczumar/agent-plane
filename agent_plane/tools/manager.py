@@ -15,7 +15,7 @@ from mcp.types import Tool as McpToolDef
 
 from agent_plane.errors import AgentPlaneError, ErrorCode
 from agent_plane.spec import AgentSpec
-from agent_plane.tools.base import Tool, is_valid_tool_name
+from agent_plane.tools.base import Tool, ToolContext, is_valid_tool_name
 from agent_plane.tools.builtins import (
     CollectTool,
     LoadSkillTool,
@@ -105,10 +105,10 @@ class ToolManager:
         if not self._spec.skills:
             return
         load_tool = LoadSkillTool(self._spec.skills)
-        self._tools[load_tool.name] = load_tool
+        self._tools[load_tool.name()] = load_tool
         if any_skill_has_resources(self._spec.skills):
             read_tool = ReadSkillFileTool(self._spec.skills)
-            self._tools[read_tool.name] = read_tool
+            self._tools[read_tool.name()] = read_tool
 
     def _register_builtin_tools(self) -> None:
         """
@@ -128,7 +128,7 @@ class ToolManager:
                     entry.name,
                 )
                 continue
-            self._tools[tool.name] = tool
+            self._tools[tool.name()] = tool
 
     def _register_sub_agent_tools(self) -> None:
         """
@@ -143,10 +143,9 @@ class ToolManager:
             return
 
         sub_specs = {sa.name: sa for sa in self._spec.sub_agents if sa.name is not None}
-        self._tools["spawn_sub_agents"] = SpawnTool(
-            sub_specs=sub_specs,
-        )
-        self._tools["collect_sub_agents"] = CollectTool()
+        spawn = SpawnTool(sub_specs=sub_specs)
+        self._tools[SpawnTool.name()] = spawn
+        self._tools[CollectTool.name()] = CollectTool()
 
     def _register_local_tools(self, workdir: Path | None) -> None:
         """
@@ -161,18 +160,18 @@ class ToolManager:
         if workdir is None or not self._spec.local_tools:
             return
         for tool in load_local_python_tools(self._spec.local_tools, workdir):
-            if not is_valid_tool_name(tool.name):
+            if not is_valid_tool_name(tool.name()):
                 _logger.warning(
                     "Local tool %r has invalid name — skipping",
-                    tool.name,
+                    tool.name(),
                 )
                 continue
-            if tool.name in self._tools:
+            if tool.name() in self._tools:
                 _logger.warning(
                     "Local tool %r shadows existing tool — overwriting",
-                    tool.name,
+                    tool.name(),
                 )
-            self._tools[tool.name] = tool
+            self._tools[tool.name()] = tool
 
     def _register_client_tools(
         self,
@@ -183,7 +182,7 @@ class ToolManager:
 
         Raises :class:`AgentPlaneError` if a tool name violates the
         OpenAI function-calling constraint
-        (``^[a-zA-Z0-9_-]{1,64}$``). If a client tool name collides
+        (``^[a-zA-Z0-9_-]{1,256}$``). If a client tool name collides
         with an already-registered tool (e.g. a built-in skill tool),
         the client tool wins and a warning is logged.
 
@@ -195,7 +194,7 @@ class ToolManager:
         for spec in specs:
             if not is_valid_tool_name(spec.name):
                 raise AgentPlaneError(
-                    f"Invalid client tool name {spec.name!r}: must match [a-zA-Z0-9_-]{{1,64}}",
+                    f"Invalid client tool name {spec.name!r}: must match [a-zA-Z0-9_-]{{1,256}}",
                     code=ErrorCode.INVALID_INPUT,
                 )
             if spec.name in self._tools:
@@ -243,7 +242,12 @@ class ToolManager:
         """
         return [tool.get_schema() for tool in self._tools.values()]
 
-    def call_tool(self, name: str, arguments: str) -> str:
+    def call_tool(
+        self,
+        name: str,
+        arguments: str,
+        ctx: ToolContext,
+    ) -> str:
         """
         Dispatch a tool call to the registered handler.
 
@@ -251,13 +255,32 @@ class ToolManager:
             ``"load_skill"`` or ``"github_list_issues"``.
         :param arguments: JSON-encoded arguments string from
             the LLM, e.g. ``'{"name": "summarize"}'``.
+        :param ctx: Server-side execution context with task
+            and agent identity.
         :returns: The tool's string result, or an error
             message if the tool is not registered.
         """
         tool = self._tools.get(name)
         if tool is None:
             return f"Error: tool {name!r} not found. Registered tools: {list(self._tools.keys())}"
-        return tool.invoke(arguments)
+        return tool.invoke(arguments, ctx)
+
+    def get_client_tool_schemas(self) -> list[dict[str, Any]]:
+        """
+        Return the raw OpenAI-format schemas for all registered
+        client-side tools.
+
+        Used by :class:`SpawnTool` to propagate client tools to
+        sub-agent workflows — the sub-agent's LLM needs the schemas
+        so it knows which tools are available.
+
+        :returns: List of tool schema dicts, e.g.
+            ``[{"type": "function", "function": {"name": "Read", ...}}]``.
+            Empty list if no client tools are registered.
+        """
+        return [
+            tool.get_schema() for tool in self._tools.values() if isinstance(tool, ClientSideTool)
+        ]
 
     def is_client_side_tool(self, name: str) -> bool:
         """
@@ -306,7 +329,7 @@ class ToolManager:
         Register discovered MCP tools in the tool registry.
 
         Tools with names that violate the OpenAI function-calling
-        constraint (``^[a-zA-Z0-9_-]{1,64}$``) are skipped with a
+        constraint (``^[a-zA-Z0-9_-]{1,256}$``) are skipped with a
         warning — MCP servers may expose tools whose names contain
         characters that LLM providers reject.
 
@@ -321,7 +344,7 @@ class ToolManager:
             if not is_valid_tool_name(tool_def.name):
                 _logger.warning(
                     "MCP tool %r from server %r has an invalid name "
-                    "(must match [a-zA-Z0-9_-]{1,64}) — skipping",
+                    "(must match [a-zA-Z0-9_-]{1,256}) — skipping",
                     tool_def.name,
                     connection.config.name,
                 )
@@ -337,7 +360,7 @@ class ToolManager:
                 connection=connection,
                 run_sync=self._loop_thread.run,
             )
-            self._tools[mcp_tool.name] = mcp_tool
+            self._tools[mcp_tool.name()] = mcp_tool
 
     async def _close_mcp_servers(self) -> None:
         """

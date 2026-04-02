@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from agent_plane.spec.types import LocalToolInfo
+from agent_plane.tools.base import ToolContext
 from agent_plane.tools.local import (
     LocalPythonTool,
     load_local_python_tools,
@@ -53,7 +54,7 @@ def run(arguments: dict[str, Any]) -> str:
     (tools_dir / filename).write_text(code)
 
 
-def test_load_valid_tool(tmp_path: Path) -> None:
+def test_load_valid_tool(tmp_path: Path, tool_ctx: ToolContext) -> None:
     """
     A valid Python tool file with SCHEMA and run() is loaded
     and callable.
@@ -72,11 +73,11 @@ def test_load_valid_tool(tmp_path: Path) -> None:
         f"If 0, the loader failed to find or validate the file."
     )
     tool = tools[0]
-    assert tool.name == "echo.tool"
+    assert tool.name() == "echo.tool"
     schema = tool.get_schema()
     # Schema name matches what the file defined.
     assert schema["function"]["name"] == "echo_tool"
-    result = tool.invoke(json.dumps({"input": "hello"}))
+    result = tool.invoke(json.dumps({"input": "hello"}), tool_ctx)
     # run() was called with the parsed arguments.
     assert "hello" in result, (
         f"Expected 'hello' in tool output, got {result!r}. "
@@ -173,11 +174,11 @@ def test_load_multiple_tools(tmp_path: Path) -> None:
     ]
     tools = load_local_python_tools(infos, tmp_path)
     assert len(tools) == 2, f"Expected 2 tools loaded, got {len(tools)}."
-    names = {t.name for t in tools}
+    names = {t.name() for t in tools}
     assert names == {"tool.a", "tool.b"}
 
 
-def test_invoke_passes_empty_args_for_empty_string() -> None:
+def test_invoke_passes_empty_args_for_empty_string(tool_ctx: ToolContext) -> None:
     """
     invoke('') passes an empty dict to run(), not raising
     JSONDecodeError.
@@ -189,6 +190,6 @@ def test_invoke_passes_empty_args_for_empty_string() -> None:
     module.run = lambda args: f"got: {args}"  # type: ignore[attr-defined]
     info = LocalToolInfo(name="t", path="t.py", language="python")
     tool = LocalPythonTool(info=info, module=module)
-    result = tool.invoke("")
+    result = tool.invoke("", tool_ctx)
     # Empty string arguments treated as empty dict.
     assert result == "got: {}"

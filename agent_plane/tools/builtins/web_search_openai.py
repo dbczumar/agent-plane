@@ -11,7 +11,7 @@ from __future__ import annotations
 # keys and mixed value types (str, dict, list).
 from typing import Any
 
-from agent_plane.tools.base import Tool
+from agent_plane.tools.base import Tool, ToolContext
 
 
 class WebSearchOpenAITool(Tool):
@@ -35,11 +35,9 @@ class WebSearchOpenAITool(Tool):
             consistency with other built-in tools.
         """
 
-    @property
-    def name(self) -> str:
+    @classmethod
+    def name(cls) -> str:
         """
-        Tool name: ``"web_search_openai"``.
-
         :returns: ``"web_search_openai"``.
         """
         return "web_search_openai"
@@ -56,11 +54,12 @@ class WebSearchOpenAITool(Tool):
         """
         return {"type": "web_search_preview"}
 
-    def invoke(self, arguments: str) -> str:
+    def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
         Not callable — OpenAI handles execution server-side.
 
         :param arguments: Unused.
+        :param ctx: Unused.
         :raises RuntimeError: Always. This tool is a passthrough.
         """
         raise RuntimeError(

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent_plane.spec.types import SkillSpec
+from agent_plane.tools.base import ToolContext
 from agent_plane.tools.builtins import ReadSkillFileTool
 
 
@@ -49,6 +50,7 @@ def skill_no_resources() -> SkillSpec:
 
 def test_read_skill_file_returns_content(
     skill_with_resources: SkillSpec,
+    tool_ctx: ToolContext,
 ) -> None:
     """
     ReadSkillFileTool.invoke reads a file from the skill dir.
@@ -60,7 +62,8 @@ def test_read_skill_file_returns_content(
                 "skill_name": "code-review",
                 "path": "references/style-guide.md",
             }
-        )
+        ),
+        tool_ctx,
     )
     assert "# Style Guide" in result
     assert "snake_case" in result
@@ -68,6 +71,7 @@ def test_read_skill_file_returns_content(
 
 def test_read_skill_file_unknown_skill(
     skill_with_resources: SkillSpec,
+    tool_ctx: ToolContext,
 ) -> None:
     """
     ReadSkillFileTool.invoke returns error for unknown skill.
@@ -79,7 +83,8 @@ def test_read_skill_file_unknown_skill(
                 "skill_name": "nonexistent",
                 "path": "references/style-guide.md",
             }
-        )
+        ),
+        tool_ctx,
     )
     assert "not found" in result
     assert "code-review" in result
@@ -87,6 +92,7 @@ def test_read_skill_file_unknown_skill(
 
 def test_read_skill_file_traversal_blocked(
     skill_with_resources: SkillSpec,
+    tool_ctx: ToolContext,
 ) -> None:
     """
     ReadSkillFileTool.invoke rejects path traversal attempts.
@@ -98,13 +104,15 @@ def test_read_skill_file_traversal_blocked(
                 "skill_name": "code-review",
                 "path": "../../etc/passwd",
             }
-        )
+        ),
+        tool_ctx,
     )
     assert "traversal not allowed" in result
 
 
 def test_read_skill_file_absolute_path_blocked(
     skill_with_resources: SkillSpec,
+    tool_ctx: ToolContext,
 ) -> None:
     """
     ReadSkillFileTool.invoke rejects absolute paths.
@@ -116,13 +124,15 @@ def test_read_skill_file_absolute_path_blocked(
                 "skill_name": "code-review",
                 "path": "/etc/passwd",
             }
-        )
+        ),
+        tool_ctx,
     )
     assert "path must be relative" in result
 
 
 def test_read_skill_file_not_found(
     skill_with_resources: SkillSpec,
+    tool_ctx: ToolContext,
 ) -> None:
     """
     ReadSkillFileTool.invoke returns error for missing files.
@@ -134,13 +144,15 @@ def test_read_skill_file_not_found(
                 "skill_name": "code-review",
                 "path": "references/nonexistent.md",
             }
-        )
+        ),
+        tool_ctx,
     )
     assert "file not found" in result
 
 
 def test_read_skill_file_no_skill_dir(
     skill_no_resources: SkillSpec,
+    tool_ctx: ToolContext,
 ) -> None:
     """
     ReadSkillFileTool.invoke returns error when skill has no
@@ -153,13 +165,15 @@ def test_read_skill_file_no_skill_dir(
                 "skill_name": "summarize",
                 "path": "references/foo.md",
             }
-        )
+        ),
+        tool_ctx,
     )
     assert "no directory on disk" in result
 
 
 def test_read_skill_file_missing_arguments(
     skill_with_resources: SkillSpec,
+    tool_ctx: ToolContext,
 ) -> None:
     """
     ReadSkillFileTool.invoke returns error when required
@@ -169,10 +183,12 @@ def test_read_skill_file_missing_arguments(
 
     result_no_name = tool.invoke(
         json.dumps({"path": "references/style-guide.md"}),
+        tool_ctx,
     )
     assert "missing required 'skill_name'" in result_no_name
 
     result_no_path = tool.invoke(
         json.dumps({"skill_name": "code-review"}),
+        tool_ctx,
     )
     assert "missing required 'path'" in result_no_path

@@ -16,8 +16,11 @@ from agent_plane.spec.types import (
     SkillSpec,
 )
 from agent_plane.tools import ToolManager
+from agent_plane.tools.base import ToolContext
 from agent_plane.tools.client_specified import ClientSideToolSpec
 from agent_plane.tools.mcp import clear_discovery_cache
+
+_TEST_CTX = ToolContext(task_id="task_test", agent_id="agent_test")
 
 
 @pytest.fixture()
@@ -105,6 +108,7 @@ def test_registry_dispatches_to_load_skill(
     result = mgr.call_tool(
         "load_skill",
         json.dumps({"name": "summarize"}),
+        _TEST_CTX,
     )
     assert result == "Summarize the input concisely."
 
@@ -127,6 +131,7 @@ def test_registry_dispatches_to_read_skill_file(
                 "path": "references/style-guide.md",
             }
         ),
+        _TEST_CTX,
     )
     assert "# Style Guide" in result
 
@@ -140,7 +145,7 @@ def test_registry_unknown_tool_returns_error(
     mgr = ToolManager(
         _make_spec([skill_no_resources]),
     )
-    result = mgr.call_tool("nonexistent", json.dumps({}))
+    result = mgr.call_tool("nonexistent", json.dumps({}), _TEST_CTX)
     assert "not found" in result
     assert "load_skill" in result
 
@@ -293,6 +298,7 @@ def test_start_mcp_tools_callable() -> None:
     result = mgr.call_tool(
         "do_thing",
         json.dumps({"param": "value"}),
+        _TEST_CTX,
     )
 
     assert result == "tool result"
@@ -328,6 +334,7 @@ def test_start_mcp_failure_does_not_block_other_tools(
     result = mgr.call_tool(
         "load_skill",
         json.dumps({"name": "summarize"}),
+        _TEST_CTX,
     )
     assert "Summarize" in result
 
@@ -716,7 +723,7 @@ def test_local_tools_registered_and_callable(
         f"If missing, _register_local_tools did not register the tool."
     )
     # Dispatching works through call_tool.
-    result = mgr.call_tool("echo_tool", json.dumps({}))
+    result = mgr.call_tool("echo_tool", json.dumps({}), _TEST_CTX)
     assert result == "local_tool_result", (
         f"Expected 'local_tool_result', got {result!r}. "
         f"If 'Error: tool not found', the tool was not registered."

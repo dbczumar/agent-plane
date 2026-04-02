@@ -1,71 +1,62 @@
 """Spawn and collect tools for sub-agent lifecycle management.
 
-SpawnTool launches sub-agents as independent DBOS workflow tasks.
-CollectTool waits for spawned sub-agents to complete and returns
-their results. See designs/SUBAGENT.md for the full design.
+SpawnTool launches sub-agents as independent tasks via the
+TaskStore interface. CollectTool waits for spawned sub-agents to
+complete and returns their results. See designs/SUBAGENT.md for
+the full design.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import time
 from typing import Any
 
 from agent_plane.entities import (
     MessageData,
     NewConversationItem,
+    Task,
 )
-from agent_plane.runtime.durability import (
-    WorkflowStatus,
-    WorkflowStatusString,
-    get_workflow_status,
-)
+from agent_plane.entities.task import TERMINAL_STATUSES
 from agent_plane.spec import AgentSpec
-from agent_plane.tools.base import Tool
+from agent_plane.tools.base import Tool, ToolContext
 
 _logger = logging.getLogger(__name__)
 
-# Polling interval for CollectTool's sync wait loop, in seconds.
-# Uses DBOS.sleep() for replay safety.
+# Polling / wait timeout used by CollectTool's wait_sync calls.
 _COLLECT_POLL_INTERVAL_S = 0.5
-
-# DBOS statuses that mean the workflow is still running.
-_DBOS_ACTIVE = frozenset({WorkflowStatusString.PENDING.value, WorkflowStatusString.ENQUEUED.value})
-
-# Mapping from DBOS status strings to task status strings
-# used only by CollectTool for result reporting.
-_DBOS_TO_RESULT_STATUS: dict[str, str] = {
-    WorkflowStatusString.SUCCESS.value: "completed",
-    WorkflowStatusString.ERROR.value: "failed",
-    WorkflowStatusString.CANCELLED.value: "cancelled",
-    WorkflowStatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED.value: ("failed"),
-}
 
 
 def _extract_output_text(output: list[dict[str, Any]]) -> str:
     """
     Extract final text from a task's output items.
 
-    Walks the output list, pulls items where ``type ==
-    "output_text"``, and concatenates their text content.
+    Walks the output list looking for assistant message items,
+    then extracts ``output_text`` blocks from their ``content``
+    arrays.
 
     :param output: The task's output items list, e.g.
-        ``[{"type": "output_text", "text": "Hello"}]``.
-    :returns: Concatenated text, or empty string if no text items.
+        ``[{"type": "message", "role": "assistant",
+        "content": [{"type": "output_text",
+        "text": "Hello"}]}]``.
+    :returns: Concatenated text, or empty string if no text
+        items found.
     """
     parts: list[str] = []
     for item in output:
-        if item.get("type") == "output_text":
-            text = item.get("text")
-            if text is not None and text:
-                parts.append(text)
+        if item.get("type") != "message":
+            continue
+        for block in item.get("content", []):
+            if block.get("type") == "output_text":
+                text = block.get("text")
+                if text is not None and text:
+                    parts.append(text)
     return "\n\n".join(parts)
 
 
 class SpawnTool(Tool):
     """
-    Launch sub-agents as independent DBOS workflow tasks.
+    Launch sub-agents as independent tasks via the TaskStore.
 
     The LLM calls ``spawn_sub_agents`` with a list of
     ``{name, input}`` pairs. Each sub-agent gets its own
@@ -76,6 +67,13 @@ class SpawnTool(Tool):
         sub-agents, e.g. ``{"researcher": AgentSpec(...)}``.
     """
 
+    @classmethod
+    def name(cls) -> str:
+        """
+        :returns: ``"spawn_sub_agents"``.
+        """
+        return "spawn_sub_agents"
+
     def __init__(self, sub_specs: dict[str, AgentSpec]) -> None:
         """
         Initialize the spawn tool.
@@ -84,15 +82,6 @@ class SpawnTool(Tool):
             sub-agents, e.g. ``{"researcher": AgentSpec(...)}``.
         """
         self._sub_specs = sub_specs
-
-    @property
-    def name(self) -> str:
-        """
-        Tool name for dispatch and schema registration.
-
-        :returns: ``"spawn_sub_agents"``.
-        """
-        return "spawn_sub_agents"
 
     def get_schema(self) -> dict[str, Any]:
         """
@@ -104,18 +93,20 @@ class SpawnTool(Tool):
         """
         return _build_spawn_schema(self._sub_specs)
 
-    def invoke(self, arguments: str) -> str:
+    def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
         Spawn sub-agents from the LLM's tool call arguments.
 
         Parses the arguments JSON, validates sub-agent names,
         creates a conversation and task for each, and starts
-        execution. The ``root_task_id`` and ``agent_id`` fields
-        are injected by the agent loop before dispatch.
+        execution. Server-side identity (``task_id``,
+        ``agent_id``) comes from ``ctx``, not the LLM arguments.
 
         :param arguments: JSON-encoded arguments string, e.g.
-            ``'{"agents": [...], "root_task_id": "task_abc",
-            "agent_id": "ag_xyz"}'``.
+            ``'{"agents": [{"name": "researcher",
+            "input": "find X"}]}'``.
+        :param ctx: Server-side execution context with task
+            and agent identity.
         :returns: JSON with response IDs, e.g.
             ``'{"response_ids": ["resp_child1"]}'``.
         """
@@ -123,9 +114,17 @@ class SpawnTool(Tool):
         if isinstance(args, str):
             return args
 
+        # _call_tool injects client_tools into the arguments
+        # JSON before calling invoke — extract and remove it.
+        client_tools: list[dict[str, Any]] = args.pop("client_tools", [])
+
+        root_task_id = _resolve_root_task_id(ctx.task_id)
         return _invoke_spawn(
             args,
             self._sub_specs,
+            root_task_id=root_task_id,
+            agent_id=ctx.agent_id,
+            client_tools=client_tools,
         )
 
 
@@ -134,16 +133,14 @@ class CollectTool(Tool):
     Wait for spawned sub-agent tasks to complete and return
     their results.
 
-    Uses sync DBOS primitives (``get_workflow_status``) because
-    ``invoke()`` runs inside a DBOS workflow thread. Polls with
-    ``DBOS.sleep()`` for replay safety.
+    Uses ``TaskStore.wait_sync`` and ``TaskStore.get_sync`` to
+    block until sub-agents finish. Runs inside a synchronous
+    workflow context.
     """
 
-    @property
-    def name(self) -> str:
+    @classmethod
+    def name(cls) -> str:
         """
-        Tool name for dispatch and schema registration.
-
         :returns: ``"collect_sub_agents"``.
         """
         return "collect_sub_agents"
@@ -157,7 +154,7 @@ class CollectTool(Tool):
         """
         return _build_collect_schema()
 
-    def invoke(self, arguments: str) -> str:
+    def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
         Collect results from spawned sub-agents.
 
@@ -166,6 +163,8 @@ class CollectTool(Tool):
 
         :param arguments: JSON-encoded arguments string, e.g.
             ``'{"response_ids": ["resp_1"], "timeout": 60}'``.
+        :param ctx: Server-side execution context (unused by
+            collect, required by the :class:`Tool` interface).
         :returns: JSON with results per sub-agent.
         """
         args = _parse_collect_args(arguments)
@@ -288,9 +287,8 @@ def _parse_spawn_args(
     except (json.JSONDecodeError, TypeError) as exc:
         return json.dumps({"error": f"invalid arguments: {exc}"})
 
-    for field in ("agents", "root_task_id", "agent_id"):
-        if field not in args:
-            return json.dumps({"error": f"missing required field: {field}"})
+    if "agents" not in args:
+        return json.dumps({"error": "missing required field: agents"})
     result: dict[str, Any] = args
     return result
 
@@ -319,21 +317,51 @@ def _parse_collect_args(
 # ── Spawn implementation ──────────────────────────────
 
 
+def _resolve_root_task_id(task_id: str) -> str:
+    """
+    Determine the root task ID for sub-agent spawning.
+
+    If the current task already has a ``root_task_id`` (it is
+    itself a sub-agent), that value is propagated so
+    ``root_task_id`` always points to the original top-level
+    task regardless of nesting depth. Otherwise, the current
+    task's own ID is used as the root.
+
+    :param task_id: The current task/workflow ID,
+        e.g. ``"task_abc123"``.
+    :returns: The root task ID for spawned children.
+    """
+    from agent_plane.runtime import get_task_store
+
+    task = get_task_store().get_sync(task_id)
+    if task is not None and task.root_task_id is not None:
+        return task.root_task_id
+    return task_id
+
+
 def _invoke_spawn(
     args: dict[str, Any],
     sub_specs: dict[str, AgentSpec],
+    *,
+    root_task_id: str,
+    agent_id: str,
+    client_tools: list[dict[str, Any]],
 ) -> str:
     """
     Execute the spawn logic for validated arguments.
 
-    :param args: Parsed arguments dict with ``agents``,
-        ``root_task_id``, and ``agent_id``.
+    :param args: Parsed arguments dict with ``agents`` list.
     :param sub_specs: Name-to-AgentSpec mapping.
+    :param root_task_id: The resolved root task ID for
+        tunneling, e.g. ``"task_root1"``.
+    :param agent_id: The registered agent ID,
+        e.g. ``"ag_xyz789"``.
+    :param client_tools: OpenAI-format schemas for client-side
+        tools to propagate to sub-agents, e.g.
+        ``[{"type": "function", "function": {...}}]``.
     :returns: JSON with response IDs.
     """
     agents_list: list[dict[str, str]] = args["agents"]
-    root_task_id: str = args["root_task_id"]
-    agent_id: str = args["agent_id"]
 
     response_ids: list[str] = []
     for entry in agents_list:
@@ -348,6 +376,7 @@ def _invoke_spawn(
             agent_name=sa_name,
             user_input=sa_input,
             root_task_id=root_task_id,
+            client_tools=client_tools,
         )
         response_ids.append(task_id)
 
@@ -360,6 +389,7 @@ def _spawn_one(
     agent_name: str,
     user_input: str,
     root_task_id: str,
+    client_tools: list[dict[str, Any]] | None = None,
 ) -> str:
     """
     Create a conversation, append the user input, create a task,
@@ -373,6 +403,11 @@ def _spawn_one(
         sub-agent.
     :param root_task_id: The top-level task ID for tunneling,
         e.g. ``"task_abc123"``.
+    :param client_tools: Optional list of client-side tool schemas
+        (OpenAI format) to propagate to the sub-agent. The
+        sub-agent's LLM needs these schemas so it can invoke
+        client-side tools; calls are tunneled back to the root
+        response via ``root_task_id``.
     :returns: The created task ID (doubles as response_id).
     """
     # Lazy imports to avoid circular dependency — these modules
@@ -413,7 +448,10 @@ def _spawn_one(
         ],
     )
 
-    task_store.start(task.id)
+    # Propagate client-side tool schemas so the sub-agent's LLM
+    # knows about them. Tool calls are tunneled to the root
+    # response via the park mechanism.
+    task_store.start(task.id, tools=client_tools or None)
     return task.id
 
 
@@ -427,123 +465,70 @@ def _collect_all(
     """
     Wait for all sub-agent tasks to complete and extract results.
 
-    Uses a sync polling loop: ``DBOS.sleep()`` + workflow status
-    check + deadline check. ``DBOS.sleep()`` is used (not
-    ``time.sleep()``) so DBOS can track the sleep for replay.
+    Delegates to ``TaskStore.wait_sync`` per task, splitting the
+    remaining timeout budget across tasks sequentially.
 
     :param response_ids: List of task/response IDs to collect.
-    :param timeout: Maximum seconds to wait. ``None`` means no
-        deadline.
+    :param timeout: Maximum seconds to wait across all tasks.
+        ``None`` means no deadline.
     :returns: List of result dicts with ``response_id``,
         ``agent_name``, ``status``, and ``output`` keys.
     """
-    from dbos import DBOS
+    import time
 
-    deadline = time.monotonic() + timeout if timeout else None
-    pending = set(response_ids)
-    collected: dict[str, dict[str, str]] = {}
+    from agent_plane.runtime import get_task_store
 
-    while pending:
-        if deadline is not None and time.monotonic() >= deadline:
-            break
-        still_pending: set[str] = set()
-        for task_id in pending:
-            result = _check_task_status(task_id)
-            if result is not None:
-                collected[task_id] = result
-            else:
-                still_pending.add(task_id)
-        pending = still_pending
-        if pending:
-            DBOS.sleep(_COLLECT_POLL_INTERVAL_S)
+    task_store = get_task_store()
+    deadline = time.monotonic() + timeout if timeout is not None else None
 
-    # Build results in the original order
     results: list[dict[str, str]] = []
     for task_id in response_ids:
-        if task_id in collected:
-            results.append(collected[task_id])
-        else:
-            results.append(_build_timeout_result(task_id))
+        remaining = _remaining_timeout(deadline)
+        task = task_store.wait_sync(task_id, timeout=remaining)
+        results.append(_task_to_result(task))
     return results
 
 
-def _resolve_agent_name(task_id: str) -> str:
+def _remaining_timeout(
+    deadline: float | None,
+) -> float | None:
     """
-    Look up the agent name for a spawned sub-agent task.
+    Compute remaining seconds until the deadline.
 
-    Reads the task row from the database. The row is always
-    present because ``_spawn_one`` creates it before this
-    function is ever called.
-
-    :param task_id: The sub-agent's task ID,
-        e.g. ``"task_child1"``.
-    :returns: The agent name, or ``"unknown"`` if not found.
+    :param deadline: Absolute monotonic deadline, or ``None``
+        for no deadline.
+    :returns: Seconds remaining (clamped to 0), or ``None``.
     """
-    from agent_plane.runtime import get_task_store
-
-    task = get_task_store().get_sync(task_id)
-    if task is not None:
-        return task.agent_name
-    return "unknown"
-
-
-def _check_task_status(
-    task_id: str,
-) -> dict[str, str] | None:
-    """
-    Check if a sub-agent workflow has reached a terminal state.
-
-    :param task_id: The sub-agent's task ID.
-    :returns: A result dict if terminal, or ``None`` if still
-        running.
-    """
-    wf_status: WorkflowStatus | None = get_workflow_status(task_id)
-    if wf_status is None:
+    if deadline is None:
         return None
+    import time
 
-    dbos_str = str(wf_status.status)
-    if dbos_str in _DBOS_ACTIVE:
-        return None
+    return max(0.0, deadline - time.monotonic())
 
-    mapped = _DBOS_TO_RESULT_STATUS.get(dbos_str, "failed")
-    agent_name = _resolve_agent_name(task_id)
 
-    if mapped == "completed" and wf_status.output is not None:
-        # DBOS stores the workflow return value in wf_status.output.
-        # For agent workflows, this is a dict with an "output" key
-        # holding the list of output items. Empty list fallback is
-        # safe: _extract_output_text handles it gracefully.
-        output_items = wf_status.output.get("output", [])
-        output_text = _extract_output_text(output_items)
+def _task_to_result(task: Task) -> dict[str, str]:
+    """
+    Convert a :class:`Task` to a collect-result dict.
+
+    :param task: The enriched task, possibly in a terminal or
+        non-terminal state.
+    :returns: A dict with ``response_id``, ``agent_name``,
+        ``status``, and ``output`` keys.
+    """
+    if task.status in TERMINAL_STATUSES:
+        status = task.status
     else:
-        output_text = f"Sub-agent {agent_name!r} did not complete (status: {mapped})."
+        # Timed out — task is still running.
+        status = "incomplete"
+
+    if task.status == "completed" and task.output:
+        output_text = _extract_output_text(task.output)
+    else:
+        output_text = f"Sub-agent {task.agent_name!r} did not complete (status: {status})."
 
     return {
-        "response_id": task_id,
-        "agent_name": agent_name,
-        "status": mapped,
+        "response_id": task.id,
+        "agent_name": task.agent_name,
+        "status": status,
         "output": output_text,
-    }
-
-
-def _build_timeout_result(task_id: str) -> dict[str, str]:
-    """
-    Build a result dict for a timed-out sub-agent.
-
-    :param task_id: The sub-agent's task ID.
-    :returns: A result dict with status ``"incomplete"``.
-    """
-    agent_name = _resolve_agent_name(task_id)
-
-    # Get the current DBOS status for the error message
-    current_status = "in_progress"
-    wf_status = get_workflow_status(task_id)
-    if wf_status is not None:
-        current_status = _DBOS_TO_RESULT_STATUS.get(str(wf_status.status), "in_progress")
-
-    return {
-        "response_id": task_id,
-        "agent_name": agent_name,
-        "status": "incomplete",
-        "output": (f"Sub-agent {agent_name!r} did not complete (status: {current_status})."),
     }

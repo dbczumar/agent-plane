@@ -67,6 +67,10 @@ class MockCall:
     :param exception: If set, ``create()`` raises this exception
         instead of returning a response. Used to simulate retryable
         LLM errors (e.g. ``httpx.HTTPStatusError`` with 429).
+    :param tool_calls_fn: If set, called with the ``create()`` kwargs
+        to produce ``tool_calls`` dynamically. Use when tool call
+        arguments depend on runtime state (e.g. response_ids from a
+        prior spawn). Takes precedence over static ``tool_calls``.
     :param received_kwargs: Populated by the mock when this call is
         consumed. Contains the kwargs passed to
         ``responses.create()`` so tests can inspect what the LLM
@@ -80,6 +84,9 @@ class MockCall:
     call_event: threading.Event = field(default_factory=threading.Event)
     stream_tokens: bool = False
     exception: Exception | None = None
+    # Callable[[dict[str, Any]], list[dict[str, str]]] — generates
+    # tool_calls dynamically from create() kwargs.
+    tool_calls_fn: Any = None
     # Populated by the mock when this call is consumed. Contains
     # the kwargs passed to responses.create() so tests can inspect
     # what the LLM received (e.g. the input/history).
@@ -165,6 +172,7 @@ class ControllableMockClient:
         block: bool = False,
         stream_tokens: bool = False,
         tool_calls: list[dict[str, str]] | None = None,
+        tool_calls_fn: Any = None,
         exception: Exception | None = None,
     ) -> MockCall:
         """
@@ -179,6 +187,10 @@ class ControllableMockClient:
         :param tool_calls: If provided, the response contains
             function calls instead of text. Each dict must have
             ``"call_id"``, ``"name"``, and ``"arguments"`` keys.
+        :param tool_calls_fn: If provided, called with the
+            ``create()`` kwargs to produce ``tool_calls``
+            dynamically. Use when arguments depend on runtime
+            state (e.g. response_ids from a prior spawn).
         :param exception: If provided, ``create()`` raises this
             instead of returning. Use with ``httpx.HTTPStatusError``
             to simulate retryable LLM errors.
@@ -187,6 +199,7 @@ class ControllableMockClient:
         call = MockCall(
             text=text or self._default_text,
             tool_calls=tool_calls,
+            tool_calls_fn=tool_calls_fn,
             block_before_response=threading.Event() if block else None,
             stream_tokens=stream_tokens,
             exception=exception,
@@ -267,6 +280,13 @@ class _MockResponsesNamespace:
         call = self._client._next_call()
         # Capture kwargs so tests can inspect what the LLM received
         call.received_kwargs = kwargs
+        # Resolve dynamic tool_calls if a factory function is set.
+        # Returns None to fall back to text (e.g. when the input
+        # doesn't match the expected pattern for this call).
+        if call.tool_calls_fn is not None:
+            dynamic = call.tool_calls_fn(kwargs)
+            if dynamic is not None:
+                call.tool_calls = dynamic
         # Signal that this call has been entered
         call.call_event.set()
         # Optionally block until the test releases us

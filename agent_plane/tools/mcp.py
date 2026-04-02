@@ -39,7 +39,7 @@ from mcp.types import CONNECTION_CLOSED, CallToolResult, ContentBlock, TextConte
 from mcp.types import Tool as McpToolDef
 
 from agent_plane.spec.types import MCPServerConfig, RetryConfig
-from agent_plane.tools.base import Tool
+from agent_plane.tools.base import Tool, ToolContext
 
 _T = TypeVar("_T")
 
@@ -825,8 +825,7 @@ class McpTool(Tool):
         self._connection = connection
         self._run_sync = run_sync
 
-    @property
-    def name(self) -> str:
+    def name(self) -> str:  # type: ignore[override]
         """
         Unique tool name from the MCP server.
 
@@ -862,7 +861,7 @@ class McpTool(Tool):
             },
         }
 
-    def invoke(self, arguments: str) -> str:
+    def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
         Invoke the MCP tool via the server session.
 
@@ -875,6 +874,8 @@ class McpTool(Tool):
 
         :param arguments: JSON-encoded arguments string from
             the LLM, e.g. ``'{"path": "."}'``.
+        :param ctx: Server-side execution context (unused by
+            MCP tools, required by the :class:`Tool` interface).
         :returns: The tool result as a string, or an error
             message if arguments are not valid JSON.
         """
@@ -882,7 +883,7 @@ class McpTool(Tool):
             parsed = json.loads(arguments) if arguments else {}
         except json.JSONDecodeError as exc:
             return f"Invalid JSON arguments: {exc}"
-        return self._run_sync(self._connection.call_tool(self.name, parsed))
+        return self._run_sync(self._connection.call_tool(self.name(), parsed))
 
 
 # Exception types that indicate a dead/broken connection

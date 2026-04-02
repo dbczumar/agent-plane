@@ -544,6 +544,10 @@ def upload_agent(client: httpx.Client) -> str:
         f"{BASE_URL}/api/agents",
         files={"bundle": ("agent.tar.gz", buf, "application/gzip")},
     )
+    if resp.status_code == 409:
+        # Agent already exists — reuse it.
+        print("Agent already exists, reusing.")
+        return "coder"
     resp.raise_for_status()
     print(f"Agent uploaded: {resp.json()['name']}")
     return resp.json()["name"]
@@ -583,7 +587,9 @@ def create_response(
     response_id = resp.json()["id"]
     print(f"Response created: {response_id}")
 
-    # Poll until terminal state.
+    # Poll until terminal state. While polling, check for
+    # tunneled client tool calls from sub-agents and execute
+    # them mid-flight.
     while True:
         poll = client.get(f"{BASE_URL}/v1/responses/{response_id}")
         poll.raise_for_status()
@@ -591,7 +597,53 @@ def create_response(
         status = body.get("status")
         if status in ("completed", "failed"):
             return body
+        # Check for tunneled tool calls needing client execution.
+        _handle_tunneled_tool_calls(client, response_id, body)
         time.sleep(0.5)
+
+
+def _handle_tunneled_tool_calls(
+    client: httpx.Client,
+    response_id: str,
+    body: dict[str, Any],
+) -> None:
+    """
+    Execute tunneled client-side tool calls from sub-agents
+    and PATCH results back to the server.
+
+    Scans the response output for ``function_call`` items with
+    ``status: "action_required"``, executes each locally, and
+    submits results via ``PATCH /v1/responses/{id}``.
+
+    :param client: HTTP client.
+    :param response_id: The root response ID for PATCH.
+    :param body: The polled response body dict.
+    """
+    output = body.get("output", [])
+    action_required = [
+        item
+        for item in output
+        if item.get("type") == "function_call" and item.get("status") == "action_required"
+    ]
+    if not action_required:
+        return
+    tool_results = []
+    for fc in action_required:
+        name = fc["name"]
+        call_id = fc["call_id"]
+        arguments = json.loads(fc.get("arguments", "{}"))
+        print(f"\n> Tunneled tool: {name}({json.dumps(arguments, indent=2)})")
+        result = execute_tool(name, arguments)
+        display = result[:500] + "..." if len(result) > 500 else result
+        print(f"  Result: {display}")
+        tool_results.append({"call_id": call_id, "output": result})
+    # PATCH results back to the server.
+    patch_resp = client.patch(
+        f"{BASE_URL}/v1/responses/{response_id}",
+        json={"tool_results": tool_results},
+    )
+    if patch_resp.status_code != 200:
+        print(f"  PATCH failed: {patch_resp.text[:200]}")
 
 
 def _print_text_output(output: list[dict[str, Any]]) -> None:
@@ -670,7 +722,17 @@ def run_conversation(model: str, user_input: str) -> None:
                 return
 
             output = resp.get("output", [])
-            function_calls = [item for item in output if item.get("type") == "function_call"]
+            # Server-side tools already have function_call_output
+            # in the output — only execute client-side calls that
+            # the server left for us to handle.
+            completed_ids = {
+                item["call_id"] for item in output if item.get("type") == "function_call_output"
+            }
+            function_calls = [
+                item
+                for item in output
+                if item.get("type") == "function_call" and item.get("call_id") not in completed_ids
+            ]
             _print_text_output(output)
 
             if not function_calls:

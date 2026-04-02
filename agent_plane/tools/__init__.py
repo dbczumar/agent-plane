@@ -8,7 +8,7 @@ Public API:
 - ``LocalPythonTool``: A tool backed by a local Python file in the agent image.
 """
 
-from agent_plane.tools.base import Tool
+from agent_plane.tools.base import Tool, ToolContext
 from agent_plane.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from agent_plane.tools.local import LocalPythonTool
 from agent_plane.tools.manager import ToolManager
@@ -18,5 +18,6 @@ __all__ = [
     "ClientSideToolSpec",
     "LocalPythonTool",
     "Tool",
+    "ToolContext",
     "ToolManager",
 ]

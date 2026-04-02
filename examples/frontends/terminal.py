@@ -19,6 +19,7 @@ locally by the TUI — results are sent back as
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -231,7 +232,9 @@ def _extract_agent_name(bundle: bytes) -> str:
 
     with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tf:
         for member in tf.getmembers():
-            if member.name == "config.yaml" or member.name.endswith("/config.yaml"):
+            # Only match the root config.yaml, not sub-agent
+            # configs like agents/researcher/config.yaml.
+            if member.name == "config.yaml":
                 f = tf.extractfile(member)
                 if f is None:
                     continue
@@ -335,6 +338,16 @@ class _StreamAccumulator:
     # stream completes. Each dict has "call_id", "name",
     # "arguments" keys.
     pending_tool_calls: list[dict[str, object]] = field(
+        default_factory=list,
+    )
+    # call_ids of server-side tools that already have a
+    # function_call_output — used to skip them in
+    # pending_tool_calls.
+    _completed_call_ids: set[str] = field(default_factory=set)
+    # Tunneled function_calls from sub-agents needing
+    # immediate execution and PATCH. Drained by
+    # _run_sse_stream after each SSE event.
+    _tunneled_calls: list[dict[str, object]] = field(
         default_factory=list,
     )
 
@@ -588,11 +601,16 @@ class ChatApp(App[None]):
         try:
             await self._stream_loop(scroll, current_input)
         except httpx.HTTPStatusError as exc:
+            # Streaming responses must be read before accessing .text.
+            try:
+                await exc.response.aread()
+                detail = exc.response.text[:200]
+            except Exception:
+                detail = str(exc)
             error_widget = _ensure_live(self, scroll, self._live_widget)
             error_widget.update(
                 Text.from_markup(
-                    f"[bold red]Error {exc.response.status_code}:"
-                    f"[/bold red] {escape(exc.response.text[:200])}"
+                    f"[bold red]Error {exc.response.status_code}:[/bold red] {escape(detail)}"
                 )
             )
         except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
@@ -665,6 +683,14 @@ class ChatApp(App[None]):
             # Prune old widgets to prevent DOM slowdown in
             # long conversations with many tool calls.
             _prune_old_widgets(scroll)
+
+            # Filter out server-side calls that already have a
+            # function_call_output — only client-side calls remain.
+            acc.pending_tool_calls = [
+                tc
+                for tc in acc.pending_tool_calls
+                if tc.get("call_id") not in acc._completed_call_ids
+            ]
 
             # If no client-side tool calls pending, we're done.
             if not acc.pending_tool_calls or self._tool_set is None:
@@ -1230,6 +1256,12 @@ async def _run_sse_stream(
 
                                 debug_file.write(f"ERROR: {traceback.format_exc()}\n")
                                 debug_file.flush()
+                        # Fire off tunneled calls as background
+                        # tasks — execute and PATCH results back
+                        # while the SSE stream continues reading.
+                        for tc in acc._tunneled_calls:
+                            asyncio.ensure_future(_execute_and_patch_tool_call(app, scroll, tc))
+                        acc._tunneled_calls.clear()
                         current_event = None
                     elif line == "":
                         current_event = None
@@ -1420,15 +1452,83 @@ def _handle_item_done(
         # Mount at scroll end — below the live status widget,
         # so tool calls appear as part of the assistant's turn.
         _mount_tool_call(scroll, item)
-        # If client-side tools are active, collect for local
-        # execution after the stream completes.
         if app._tool_set is not None:
-            acc.pending_tool_calls.append(item)
+            fc_status = item.get("status", "")
+            if fc_status == "action_required":
+                # Tunneled call from a sub-agent — execute
+                # immediately in background and PATCH result
+                # back to the server. Mark as completed so
+                # post-stream filtering skips it.
+                acc._completed_call_ids.add(item.get("call_id", ""))
+                acc._tunneled_calls.append(item)
+            else:
+                # Non-tunneled client tool — batch for
+                # post-stream execution.
+                acc.pending_tool_calls.append(item)
     elif item_type == "function_call_output":
         _mount_tool_result(scroll, item)
+        # Track server-side completions so we can filter them
+        # out of pending_tool_calls after the stream ends.
+        call_id = item.get("call_id", "")
+        if call_id:
+            acc._completed_call_ids.add(call_id)
     elif item_type in _NATIVE_TOOL_TYPES:
         _mount_native_tool(scroll, item)
     return live
+
+
+async def _execute_and_patch_tool_call(
+    app: ChatApp,
+    scroll: VerticalScroll,
+    item: dict[str, object],
+) -> None:
+    """
+    Execute a tunneled client-side tool call and PATCH the
+    result back to the server.
+
+    Called as a background task for ``action_required``
+    function_call items from sub-agents. The result is
+    submitted via ``PATCH /v1/responses/{root_id}`` so the
+    parked sub-agent can resume.
+
+    :param app: The ChatApp instance (for tool set access).
+    :param scroll: The scrollable container for result display.
+    :param item: The function_call item dict with ``call_id``,
+        ``name``, ``arguments``.
+    """
+    assert app._tool_set is not None
+    name = str(item.get("name", ""))
+    call_id = str(item.get("call_id", ""))
+    args_str = str(item.get("arguments", "{}"))
+    try:
+        arguments = json.loads(args_str)
+    except json.JSONDecodeError:
+        arguments = {}
+
+    output = app._tool_set.execute_tool(name, arguments)
+    _mount_tool_result(scroll, {"output": output})
+
+    # PATCH result back to the root response so the parked
+    # sub-agent can resume.
+    root_id = app._current_response_id or app._previous_response_id
+    if root_id is None:
+        _logger.error("No response ID for PATCH — tunneled tool call lost")
+        return
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        patch_resp = await client.patch(
+            f"{BASE_URL}/v1/responses/{root_id}",
+            json={
+                "tool_results": [
+                    {"call_id": call_id, "output": output},
+                ],
+            },
+        )
+        if patch_resp.status_code != 200:
+            _logger.error(
+                "PATCH failed for call_id %s: %s",
+                call_id,
+                patch_resp.text[:200],
+            )
 
 
 def _truncate_for_display(text: str) -> str:

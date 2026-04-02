@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 from agent_plane.spec.types import SkillSpec
-from agent_plane.tools.base import Tool
+from agent_plane.tools.base import Tool, ToolContext
 
 
 class LoadSkillTool(Tool):
@@ -29,11 +29,9 @@ class LoadSkillTool(Tool):
         self._skills = skills
         self._skills_by_name: dict[str, SkillSpec] = {s.name: s for s in skills}
 
-    @property
-    def name(self) -> str:
+    @classmethod
+    def name(cls) -> str:
         """
-        Tool name: ``"load_skill"``.
-
         :returns: ``"load_skill"``.
         """
         return "load_skill"
@@ -70,7 +68,7 @@ class LoadSkillTool(Tool):
             },
         }
 
-    def invoke(self, arguments: str) -> str:
+    def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
         Look up a skill by name and return its content.
 
@@ -79,6 +77,8 @@ class LoadSkillTool(Tool):
 
         :param arguments: JSON with ``"name"`` key, e.g.
             ``'{"name": "code-review"}'``.
+        :param ctx: Server-side execution context (unused by
+            skill tools, required by the :class:`Tool` interface).
         :returns: The skill content string, or an error
             message if the skill is not found.
         """

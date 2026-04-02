@@ -92,7 +92,37 @@ start_workflow = DBOS.start_workflow
 retrieve_workflow = DBOS.retrieve_workflow
 get_workflow_status = DBOS.get_workflow_status
 cancel_workflow = DBOS.cancel_workflow
+dbos_sleep = DBOS.sleep
+dbos_recv = DBOS.recv
 read_stream = DBOS.read_stream
+
+
+def send_direct(
+    destination_id: str,
+    message: object,
+    topic: str | None = None,
+) -> None:
+    """
+    Send a DBOS message without requiring a workflow context.
+
+    Used by HTTP handlers to wake parked sub-agent workflows.
+    Internally uses ``_sys_db.send_direct`` which provides
+    idempotency via a generated message UUID.
+
+    :param destination_id: The target workflow ID,
+        e.g. ``"task_sub1"``.
+    :param message: The message payload (any serializable value).
+    :param topic: Optional topic string for routing,
+        e.g. ``"tool_result"``.
+    """
+    # Access internal API — DBOS doesn't expose send_direct
+    # on the public DBOS class. This is the only way to send
+    # from outside a workflow context.
+    from dbos._dbos import _get_dbos_instance
+
+    _get_dbos_instance()._sys_db.send_direct(destination_id, message, topic=topic)
+
+
 write_stream = DBOS.write_stream
 close_stream = DBOS.close_stream
 
@@ -120,6 +150,9 @@ __all__ = [
     "WorkflowHandleAsync",
     "WorkflowStatus",
     "WorkflowStatusString",
+    "dbos_recv",
+    "dbos_sleep",
+    "send_direct",
     "cancel_workflow",
     "cancel_workflow_async",
     "close_stream",

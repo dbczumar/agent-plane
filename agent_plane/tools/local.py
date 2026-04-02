@@ -23,7 +23,7 @@ from types import ModuleType
 from typing import Any
 
 from agent_plane.spec.types import LocalToolInfo
-from agent_plane.tools.base import Tool
+from agent_plane.tools.base import Tool, ToolContext
 
 _logger = logging.getLogger(__name__)
 
@@ -52,15 +52,15 @@ class LocalPythonTool(Tool):
         self._module = module
         self._schema: dict[str, Any] = module.SCHEMA
         self._run_fn = module.run
+        self._name: str = info.name
 
-    @property
-    def name(self) -> str:
+    def name(self) -> str:  # type: ignore[override]
         """
         Tool name derived from the filename.
 
         :returns: The tool name, e.g. ``"web.fetch"``.
         """
-        return self._info.name
+        return self._name
 
     def get_schema(self) -> dict[str, Any]:
         """
@@ -71,11 +71,13 @@ class LocalPythonTool(Tool):
         """
         return self._schema
 
-    def invoke(self, arguments: str) -> str:
+    def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
         Execute the tool by calling the module's ``run`` function.
 
         :param arguments: JSON-encoded arguments string from the LLM.
+        :param ctx: Server-side execution context (unused by
+            local tools, required by the :class:`Tool` interface).
         :returns: The tool's string result.
         """
         parsed: dict[str, Any] = json.loads(arguments) if arguments else {}

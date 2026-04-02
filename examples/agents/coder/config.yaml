@@ -14,5 +14,6 @@ tools:
     - web_search_openai
   agents:
     - researcher
+    - reviewer
 
 instructions: AGENTS.md

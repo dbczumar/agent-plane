@@ -44,6 +44,10 @@ class PendingToolCall:
         contains the ``function_call`` item, e.g. ``"task_root1"``.
     :param task_id: The parked sub-agent's task ID,
         e.g. ``"task_sub2"``.
+    :param tool_name: The tool function name,
+        e.g. ``"Read"``.
+    :param arguments: JSON-encoded arguments from the LLM,
+        e.g. ``'{"file_path": "/tmp/foo.py"}'``.
     :param status: ``"action_required"`` or ``"completed"``.
     :param result: The tool's string output from the client.
         ``None`` until the client PATCHes.
@@ -55,6 +59,8 @@ class PendingToolCall:
     call_id: str
     root_task_id: str
     task_id: str
+    tool_name: str
+    arguments: str
     status: str
     result: str | None
     created_at: int

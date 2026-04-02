@@ -40,7 +40,10 @@ from agent_plane.stores import AgentStore, ConversationStore, FileStore, TaskSto
 from agent_plane.tools.client_specified import parse_client_side_tool_specs
 
 
-def _build_response_object(task: Task) -> ResponseObject:
+def _build_response_object(
+    task: Task,
+    pending_output: list[dict[str, Any]] | None = None,
+) -> ResponseObject:
     """
     Convert a runtime Task into an API-layer ResponseObject.
 
@@ -49,17 +52,25 @@ def _build_response_object(task: Task) -> ResponseObject:
     deleted.
 
     :param task: The runtime task entity to convert.
+    :param pending_output: Optional list of tunneled
+        ``function_call`` dicts from parked sub-agents. Surfaced
+        in the output when the task is in-progress so polling
+        clients can execute them and PATCH results back.
     :returns: A fully populated :class:`ResponseObject`.
     """
+    if task.status == TaskStatus.COMPLETED:
+        output = task.output
+    elif pending_output:
+        output = pending_output
+    else:
+        output = []
     return ResponseObject(
         id=task.id,
         status=task.status,
         model=task.agent_name,
         created_at=task.created_at,
         completed_at=task.completed_at,
-        # Only completed tasks surface output; failed/incomplete/cancelled
-        # return [] per the OpenResponses spec.
-        output=task.output if task.status == TaskStatus.COMPLETED else [],
+        output=output,
         background=task.background,
         previous_response_id=task.previous_response_id,
         conversation=ConversationRef(id=task.conversation_id),
@@ -73,26 +84,31 @@ def _build_response_object(task: Task) -> ResponseObject:
     )
 
 
-def _validate_tool_results(
+def _apply_tool_results(
     req: PatchResponseRequest,
     task_store: TaskStore,
 ) -> None:
     """
-    Validate all tool results in a PATCH request without mutating.
+    Apply all tool results from a PATCH request.
 
-    Checks every ``call_id`` via
-    ``task_store.check_pending_tool_call`` and raises on the first
-    error. Called before ``_apply_tool_results`` to guarantee
-    atomicity: no partial updates if any call_id fails.
+    Calls ``complete_pending_tool_call`` for each result.
+    Partial delivery is safe: each pending tool call is
+    independent, the park loop waits for ALL its pending IDs,
+    and ``complete_pending_tool_call`` is idempotent
+    (``ALREADY_COMPLETED`` on retry).
 
     :param req: The PATCH request containing tool results.
-    :param task_store: Task store for pending tool call lookups.
+    :param task_store: Task store for pending tool call
+        operations.
     :raises AgentPlaneError: If any ``call_id`` is not found
         (404) or the sub-agent is no longer waiting (409).
     """
+    from agent_plane.runtime.durability import send_direct
+
     for tool_result in req.tool_results:
-        outcome = task_store.check_pending_tool_call(
+        outcome = task_store.complete_pending_tool_call(
             tool_result.call_id,
+            tool_result.output,
         )
         if outcome == CompletePendingToolCallResult.NOT_FOUND:
             raise AgentPlaneError(
@@ -104,28 +120,18 @@ def _validate_tool_results(
                 f"Sub-agent for {tool_result.call_id} is no longer waiting for results.",
                 code=ErrorCode.CONFLICT,
             )
-
-
-def _apply_tool_results(
-    req: PatchResponseRequest,
-    task_store: TaskStore,
-) -> None:
-    """
-    Apply all tool results from a validated PATCH request.
-
-    Caller must run ``_validate_tool_results`` first to ensure
-    atomicity. This function only processes ``COMPLETED`` and
-    ``ALREADY_COMPLETED`` outcomes.
-
-    :param req: The PATCH request containing tool results.
-    :param task_store: Task store for pending tool call
-        operations.
-    """
-    for tool_result in req.tool_results:
-        task_store.complete_pending_tool_call(
-            tool_result.call_id,
-            tool_result.output,
-        )
+        # Wake the parked sub-agent workflow via DBOS messaging.
+        # The sub-agent's _wait_for_pending_calls uses DBOS.recv
+        # on topic "tool_result" — one send per completed call.
+        if outcome == CompletePendingToolCallResult.COMPLETED:
+            rows = task_store.list_pending_tool_calls(call_id=tool_result.call_id)
+            sub_task_id = rows[0].task_id if rows else None
+            if sub_task_id is not None:
+                send_direct(
+                    sub_task_id,
+                    tool_result.call_id,
+                    topic="tool_result",
+                )
 
 
 def _normalize_input(
@@ -875,7 +881,24 @@ def create_responses_router(
         task = await task_store.get(response_id)
         if not task:
             raise AgentPlaneError("Response not found", code=ErrorCode.NOT_FOUND)
-        return _build_response_object(task)
+        # Surface tunneled client tool calls from sub-agents so
+        # polling clients can discover and execute them.
+        pending = await asyncio.to_thread(
+            task_store.list_pending_tool_calls,
+            root_task_id=response_id,
+            status="action_required",
+        )
+        pending_output = [
+            {
+                "type": "function_call",
+                "call_id": p.call_id,
+                "name": p.tool_name,
+                "arguments": p.arguments,
+                "status": "action_required",
+            }
+            for p in pending
+        ]
+        return _build_response_object(task, pending_output=pending_output)
 
     # ── PATCH /responses/{response_id} ───────────────────────────
 
@@ -899,14 +922,10 @@ def create_responses_router(
         task = await task_store.get(response_id)
         if not task:
             raise AgentPlaneError("Response not found", code=ErrorCode.NOT_FOUND)
-        # Validate-then-apply: ensures atomicity — no partial
-        # updates if any call_id fails validation. Both use sync
-        # DBOS APIs, so they run in a thread.
-        await asyncio.to_thread(
-            _validate_tool_results,
-            req,
-            task_store,
-        )
+        # Each complete_pending_tool_call is independent and
+        # idempotent — partial delivery is safe because the park
+        # loop waits for ALL its pending IDs. Uses sync store
+        # APIs, so runs in a thread.
         await asyncio.to_thread(
             _apply_tool_results,
             req,
