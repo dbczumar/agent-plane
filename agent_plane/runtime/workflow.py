@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+from agent_plane.errors import AgentPlaneError, ErrorCode
 from agent_plane.entities import (
     CompactionData,
     ConversationItem,
@@ -146,6 +147,13 @@ def _create_executor(spec: AgentSpec) -> Executor:
         from agent_plane.runtime.executor import RemoteExecutor
 
         return RemoteExecutor.from_spec(spec)
+
+    if executor_type != "llm":
+        raise AgentPlaneError(
+            f"Unknown executor type: {executor_type!r}. "
+            f"Must be 'llm', 'claude_sdk', or 'remote'.",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
     from agent_plane.runtime.executor import DefaultExecutor
 

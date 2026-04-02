@@ -107,6 +107,7 @@ class _StreamState:
     Mutable state accumulated while consuming the SDK event stream.
 
     :param response_text: Accumulated response text from text deltas.
+        ``None`` until the first text delta arrives.
     :param got_stream_events: Whether any ``StreamEvent`` messages
         have been received (controls dedup with ``AssistantMessage``).
     :param pending: In-flight tool calls keyed by ``tool_use_id``.
@@ -114,7 +115,7 @@ class _StreamState:
         per ``tool_use_id``.
     """
 
-    response_text: str = ""
+    response_text: str | None = None
     got_stream_events: bool = False
     pending: dict[str, _PendingToolCall] = dataclass_field(
         default_factory=dict,
@@ -607,7 +608,7 @@ async def _consume_sdk_stream(
                 _handle_tool_results(sdk, message, state, event_queue)
 
             elif isinstance(message, sdk.ResultMessage):
-                if not state.response_text and message.result:
+                if state.response_text is None and message.result:
                     state.response_text = message.result
 
             elif isinstance(message, sdk.SystemMessage):
@@ -668,7 +669,10 @@ def _handle_content_delta(
     if delta_type == "text_delta":
         text = delta.get("text", "")
         if text:
-            state.response_text += text
+            if state.response_text is None:
+                state.response_text = text
+            else:
+                state.response_text += text
             event_queue.put(TextChunk(text=text))
     elif delta_type == "input_json_delta":
         partial = delta.get("partial_json", "")
@@ -761,7 +765,13 @@ def _emit_tool_call_observed(
         name = pending_call.name
         start = pending_call.start_time
     else:
-        name, start = "unknown", time.monotonic()
+        _logger.warning(
+            "ToolResultBlock for unknown tool_use_id %s — "
+            "tool call tracking may be out of sync",
+            tool_id,
+        )
+        name = "unknown"
+        start = time.monotonic()
     duration_ms = (time.monotonic() - start) * 1000
 
     arguments = _reconstruct_tool_args(state.args_buffers.pop(tool_id, []))
