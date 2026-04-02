@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from agent_plane.errors import AgentPlaneError
+
 
 @dataclass
 class LLMErrorDetail:
@@ -25,7 +27,7 @@ class LLMErrorDetail:
     response_body: str | None = None
 
 
-class RetryableLLMError(Exception):
+class RetryableLLMError(AgentPlaneError):
     """
     An LLM call failure that may be retried.
 
@@ -49,12 +51,11 @@ class RetryableLLMError(Exception):
         code: str,
         detail: LLMErrorDetail | None = None,
     ) -> None:
-        super().__init__(message)
-        self.code = code
+        super().__init__(message, code=code)
         self.detail = detail
 
 
-class PermanentLLMError(Exception):
+class PermanentLLMError(AgentPlaneError):
     """
     An LLM call failure that should NOT be retried.
 
@@ -75,8 +76,7 @@ class PermanentLLMError(Exception):
         code: str,
         detail: LLMErrorDetail | None = None,
     ) -> None:
-        super().__init__(message)
-        self.code = code
+        super().__init__(message, code=code)
         self.detail = detail
 
 
