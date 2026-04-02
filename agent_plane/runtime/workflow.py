@@ -127,6 +127,7 @@ def _create_executor(spec: AgentSpec) -> Executor:
 
     Dispatches based on ``spec.executor.type``:
     ``"llm"`` (default) uses ``DefaultExecutor``,
+    ``"claude_sdk"`` uses ``ClaudeAgentsExecutor``,
     ``"remote"`` uses ``RemoteExecutor``.
 
     :param spec: Agent spec. Must have ``llm`` set for the
@@ -134,6 +135,13 @@ def _create_executor(spec: AgentSpec) -> Executor:
     :returns: A configured executor instance.
     """
     executor_type = spec.executor.type
+    if executor_type == "claude_sdk":
+        from agent_plane.runtime.claude_agents_executor import (
+            ClaudeAgentsExecutor,
+        )
+
+        return ClaudeAgentsExecutor.from_spec(spec)
+
     if executor_type == "remote":
         from agent_plane.runtime.executor import RemoteExecutor
 
