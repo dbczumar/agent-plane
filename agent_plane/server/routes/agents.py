@@ -76,6 +76,13 @@ def create_agents_router(
             raise
         except ExtractionError as exc:
             raise AgentPlaneError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        except Exception as exc:
+            # Catch YAML parse errors and other unexpected failures
+            # during spec loading so they surface as 400, not 500.
+            raise AgentPlaneError(
+                f"invalid agent bundle: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
 
         if spec.name is None:
             raise AgentPlaneError(

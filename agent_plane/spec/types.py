@@ -54,18 +54,39 @@ TOOL_RETRY_DEFAULTS = RetryConfig(
 
 
 @dataclass
-class ExecutionConfig:
+class ExecutorSpec:
     """
-    Overall agent execution limits.
+    Top-level executor configuration.
 
-    :param timeout: Wall-clock deadline for the entire agent loop
-        in seconds, e.g. ``3600``.
-    :param max_iterations: Maximum agent loop iterations, e.g.
-        ``1000``.
+    ``type`` is the discriminator for the entire spec's validity —
+    it determines which other top-level sections and fields are
+    valid. Invalid fields are rejected by the validator.
+
+    :param type: Executor type. ``"llm"`` (default), ``"claude_sdk"``,
+        or ``"remote"``.
+    :param timeout: Task deadline in seconds (wall-clock limit for
+        the entire agent loop), e.g. ``3600``.
+    :param max_iterations: Maximum ``run_turn()`` calls before the
+        loop terminates as incomplete, e.g. ``1000``.
+    :param endpoint: URL for the remote executor's turn endpoint,
+        e.g. ``"http://localhost:8000/v1/turns"``. Required when
+        ``type`` is ``"remote"``, invalid otherwise.
+    :param request_timeout: Per-HTTP-call timeout in seconds for the
+        remote executor, e.g. ``300``. Only valid when ``type`` is
+        ``"remote"``.
     """
 
+    type: str = "llm"
     timeout: int = 3600
     max_iterations: int = 1000
+    endpoint: str | None = None
+    request_timeout: int | None = None
+
+
+# Keep ExecutionConfig as a backwards-compat alias so that existing
+# imports don't break during migration.  Will be removed once all
+# consumers are updated.
+ExecutionConfig = ExecutorSpec
 
 
 @dataclass
@@ -97,39 +118,41 @@ class LLMConfig:
     """
     LLM configuration block from config.yaml.
 
-    ``model`` is the only required field. ``timeout`` and ``retry``
-    control call-level resilience. All other keys from the YAML
-    ``llm:`` block are collected into ``extra`` and passed through
-    to the OpenAI SDK as-is.
+    ``model`` is the only required field. ``request_timeout`` and
+    ``retry`` control call-level resilience. All other keys from the
+    YAML ``llm:`` block are collected into ``extra`` and passed
+    through to the OpenAI SDK as-is.
 
     :param model: The provider-prefixed model identifier, e.g.
         ``"openai/gpt-5.4"`` or ``"anthropic/claude-sonnet-4-20250514"``.
     :param extra: Arbitrary kwargs from the YAML ``llm:`` block
-        (everything except ``model``, ``connection``, ``timeout``,
-        and ``retry``). Values are heterogeneous (str, int, dict,
-        etc.) so ``Any`` is the narrowest safe type. Example:
-        ``{"temperature": 0.7, "max_tokens": 4096}``.
+        (everything except ``model``, ``connection``,
+        ``request_timeout``, and ``retry``). Values are heterogeneous
+        (str, int, dict, etc.) so ``Any`` is the narrowest safe type.
+        Example: ``{"temperature": 0.7, "max_tokens": 4096}``.
     :param connection: Per-provider connection overrides from the
         YAML ``connection:`` sub-block. Keys are provider-specific,
         e.g. ``{"api_key": "...", "base_url": "..."}`` for
         OpenAI-compatible providers or
         ``{"aws_region": "us-west-2"}`` for Bedrock.
         ``None`` means use environment variable defaults.
-    :param timeout: LLM call timeout in seconds (both streaming
-        and non-streaming), e.g. ``300``.
+    :param request_timeout: Per-LLM-call timeout in seconds (both
+        streaming and non-streaming), e.g. ``300``. Named
+        ``request_timeout`` to distinguish from the task-level
+        ``executor.timeout``.
     :param retry: Retry policy for transient LLM failures.
     """
 
     model: str
     # Arbitrary kwargs from the YAML llm block (everything except
-    # ``model``, ``connection``, ``timeout``, and ``retry``). Values
-    # are heterogeneous (str, int, dict, etc.) so Any is the narrowest
-    # safe type.
+    # ``model``, ``connection``, ``request_timeout``, and ``retry``).
+    # Values are heterogeneous (str, int, dict, etc.) so Any is the
+    # narrowest safe type.
     extra: dict[str, Any] = field(default_factory=dict)
     # Per-provider connection overrides (api_key, base_url, etc.).
     # None means rely on environment variable defaults.
     connection: dict[str, str] | None = None
-    timeout: int = 300
+    request_timeout: int = 300
     retry: RetryConfig = field(
         default_factory=lambda: RetryConfig(
             max_attempts=3,
@@ -344,8 +367,9 @@ class AgentSpec:
         ``tools/python/`` and ``tools/typescript/``.
     :param sub_agents: Recursively parsed child agents from
         ``agents/<name>/``.
-    :param execution: Agent execution limits (wall-clock timeout
-        and max iterations).
+    :param executor: Executor configuration (type, task timeout,
+        max iterations, remote endpoint). ``executor.type`` is the
+        discriminator for the entire spec's validity.
     :param compaction: Compaction configuration for context management.
         ``None`` means use defaults (trigger at 80%, protect last 5
         iterations).
@@ -366,5 +390,5 @@ class AgentSpec:
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
     local_tools: list[LocalToolInfo] = field(default_factory=list)
     sub_agents: list[AgentSpec] = field(default_factory=list)
-    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    executor: ExecutorSpec = field(default_factory=ExecutorSpec)
     compaction: CompactionConfig | None = None

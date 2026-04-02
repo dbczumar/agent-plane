@@ -11,6 +11,7 @@ import logging
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
 from agent_plane.entities import (
@@ -67,6 +68,24 @@ from agent_plane.runtime.durability import (
     workflow,
     write_stream,
 )
+from agent_plane.runtime.executor import (
+    ContextWindowExceeded as ExecutorContextWindowExceeded,
+)
+from agent_plane.runtime.executor import (
+    Executor,
+    ExecutorContext,
+    ExecutorError,
+    ExecutorEvent,
+    ReasoningChunk,
+    TextChunk,
+    ToolCallRequested,
+    TurnComplete,
+    dict_to_event,
+    event_to_dict,
+)
+from agent_plane.runtime.executor import (
+    NativeToolOutput as ExecutorNativeToolOutput,
+)
 from agent_plane.runtime.live_stream import close as _live_close
 from agent_plane.runtime.live_stream import publish as _live_publish
 from agent_plane.runtime.llm_retry import detail_to_dict, execute_with_retry
@@ -100,6 +119,29 @@ def _get_llm_client() -> LLMClient:
     if _llm_client is None:
         _llm_client = LLMClient()
     return _llm_client
+
+
+def _create_executor(spec: AgentSpec) -> Executor:
+    """
+    Create an executor from the agent spec.
+
+    Dispatches based on ``spec.executor.type``:
+    ``"llm"`` (default) uses ``DefaultExecutor``,
+    ``"remote"`` uses ``RemoteExecutor``.
+
+    :param spec: Agent spec. Must have ``llm`` set for the
+        ``"llm"`` type, or ``executor.endpoint`` for ``"remote"``.
+    :returns: A configured executor instance.
+    """
+    executor_type = spec.executor.type
+    if executor_type == "remote":
+        from agent_plane.runtime.executor import RemoteExecutor
+
+        return RemoteExecutor.from_spec(spec)
+
+    from agent_plane.runtime.executor import DefaultExecutor
+
+    return DefaultExecutor.from_spec(spec)
 
 
 def _write_output(task_id: str, event: dict[str, Any]) -> None:
@@ -284,7 +326,7 @@ def _apply_request_reasoning(
         model=llm_config.model,
         extra=merged_extra,
         connection=llm_config.connection,
-        timeout=llm_config.timeout,
+        request_timeout=llm_config.request_timeout,
         retry=llm_config.retry,
     )
 
@@ -577,6 +619,447 @@ def _accumulate_stream(
         "tool_calls": [],
         "native_tool_items": [],
     }
+
+
+# ── Executor @step wrapper ────────────────────────────────
+
+
+# Maps executor reasoning event_type to SSE event type string.
+_EXECUTOR_REASONING_SSE_TYPES: dict[str, str] = {
+    "reasoning_text": _REASONING_TEXT_EVENT,
+    "reasoning_summary": _REASONING_SUMMARY_EVENT,
+    "reasoning_started": _REASONING_STARTED_EVENT,
+}
+
+
+@step()
+def _checkpointed_turn(
+    task_id: str,
+    executor: Executor,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    system_prompt: str,
+    llm_config: LLMConfig,
+    context: ExecutorContext,
+) -> list[dict[str, Any]]:
+    """
+    Run one executor turn inside a DBOS checkpoint.
+
+    Eagerly consumes the executor's event generator. Streaming
+    events (text, reasoning, native tool output) are emitted to
+    the live SSE stream via ``_write_output`` as they arrive.
+    All events are serialized and returned so DBOS can cache
+    them — on crash replay, the cached list is returned without
+    re-calling the executor.
+
+    :param task_id: Task identifier for SSE routing, e.g.
+        ``"task_abc123"``.
+    :param executor: The executor to run.
+    :param messages: Conversation history as Responses API
+        input items.
+    :param tools: OpenAI-format tool schemas.
+    :param system_prompt: Assembled system instructions.
+    :param llm_config: LLM configuration (model, extra,
+        connection, timeout, retry).
+    :param context: Agent-plane capabilities and identifiers.
+    :returns: Serialized event list (DBOS-cached on replay).
+    """
+    events: list[dict[str, Any]] = []
+    for event in executor.run_turn(
+        messages,
+        tools,
+        system_prompt,
+        llm_config,
+        context,
+    ):
+        _emit_executor_streaming_event(task_id, event)
+        events.append(event_to_dict(event))
+    return events
+
+
+def _emit_executor_streaming_event(
+    task_id: str,
+    event: ExecutorEvent,
+) -> None:
+    """
+    Emit an SSE event for a streaming executor event.
+
+    Only emits for ``TextChunk``, ``ReasoningChunk``, and
+    ``NativeToolOutput`` — other event types are handled by the
+    loop body, not the SSE stream.
+
+    :param task_id: Task identifier for SSE routing, e.g.
+        ``"task_abc123"``.
+    :param event: The executor event to potentially emit.
+    """
+    if isinstance(event, TextChunk):
+        _write_output(
+            task_id,
+            {"type": "response.output_text.delta", "delta": event.text},
+        )
+    elif isinstance(event, ReasoningChunk):
+        sse_type = _EXECUTOR_REASONING_SSE_TYPES[event.event_type]
+        payload: dict[str, Any] = {"type": sse_type}
+        if event.delta:
+            payload["delta"] = event.delta
+        _write_output(task_id, payload)
+    elif isinstance(event, ExecutorNativeToolOutput):
+        _write_output(
+            task_id,
+            {"type": "response.output_item.done", "item": event.item},
+        )
+
+
+# ── Executor turn → response dict bridge ──────────────────
+
+
+@dataclass
+class _ContextWindowOverflow:
+    """
+    Signal from ``_run_executor_turn`` that the executor hit
+    a context window overflow.
+
+    The caller compacts messages and retries. Not an exception —
+    it is returned, not raised, so the caller can decide how
+    to handle it without unwinding the stack.
+
+    :param max_tokens: Model context window size, e.g. ``128000``.
+    :param actual_tokens: Token count that triggered the overflow,
+        e.g. ``142000``.
+    """
+
+    max_tokens: int
+    actual_tokens: int
+
+
+def _run_executor_turn(
+    task_id: str,
+    executor: Executor,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    system_prompt: str,
+    llm_config: LLMConfig,
+    context: ExecutorContext,
+) -> dict[str, Any] | _ContextWindowOverflow:
+    """
+    Run one executor turn and convert to a response dict.
+
+    Workflow-managed executors (``max_context_tokens() is not None``)
+    go through ``_checkpointed_turn`` for DBOS durability + live SSE.
+    Executor-managed ones iterate directly with SSE emission here.
+
+    :param task_id: Task identifier for SSE routing, e.g.
+        ``"task_abc123"``.
+    :param executor: The executor to run.
+    :param messages: Responses API input items.
+    :param tools: OpenAI-format tool schemas.
+    :param system_prompt: Assembled system instructions.
+    :param llm_config: LLM configuration.
+    :param context: Agent-plane capabilities and identifiers.
+    :returns: A response dict compatible with existing handlers,
+        or ``_ContextWindowOverflow`` if compaction is needed.
+    :raises PermanentLLMError: On unrecoverable executor errors.
+    """
+    if executor.max_context_tokens() is not None:
+        raw = _checkpointed_turn(
+            task_id,
+            executor,
+            messages,
+            tools,
+            system_prompt,
+            llm_config,
+            context,
+        )
+        events: list[ExecutorEvent] = [dict_to_event(e) for e in raw]
+    else:
+        events = _consume_executor_live(
+            task_id, executor, messages, tools, system_prompt, llm_config, context
+        )
+
+    return _events_to_response_dict(events, llm_config.model)
+
+
+def _consume_executor_live(
+    task_id: str,
+    executor: Executor,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    system_prompt: str,
+    llm_config: LLMConfig,
+    context: ExecutorContext,
+) -> list[ExecutorEvent]:
+    """
+    Consume an executor turn with live SSE emission.
+
+    Used for executor-managed executors (``max_context_tokens()``
+    returns ``None``) that skip the ``@step`` wrapper.
+
+    :param task_id: Task identifier for SSE routing.
+    :param executor: The executor to run.
+    :param messages: Responses API input items.
+    :param tools: OpenAI-format tool schemas.
+    :param system_prompt: Assembled system instructions.
+    :param llm_config: LLM configuration.
+    :param context: Agent-plane capabilities and identifiers.
+    :returns: Collected list of all executor events.
+    """
+    events: list[ExecutorEvent] = []
+    for event in executor.run_turn(
+        messages,
+        tools,
+        system_prompt,
+        llm_config,
+        context,
+    ):
+        _emit_executor_streaming_event(task_id, event)
+        events.append(event)
+    return events
+
+
+def _events_to_response_dict(
+    events: list[ExecutorEvent],
+    model: str,
+) -> dict[str, Any] | _ContextWindowOverflow:
+    """
+    Convert collected executor events to a response dict
+    compatible with existing handler functions.
+
+    Returns ``_ContextWindowOverflow`` if a
+    ``ContextWindowExceeded`` event is found. Raises
+    ``PermanentLLMError`` on ``ExecutorError``.
+
+    :param events: Collected executor events from a single turn.
+    :param model: The model identifier, e.g. ``"openai/gpt-4o"``.
+    :returns: Response dict with ``"model"``, ``"text"``,
+        ``"tool_calls"``, ``"native_tool_items"`` keys, or
+        ``_ContextWindowOverflow``.
+    :raises PermanentLLMError: On executor error events.
+    """
+    tool_calls: list[dict[str, Any]] = []
+    native_items: list[dict[str, Any]] = []
+    turn_text: str | None = None
+
+    for event in events:
+        if isinstance(event, ToolCallRequested):
+            tool_calls.append(
+                {
+                    "call_id": event.call_id,
+                    "name": event.name,
+                    # Existing handlers expect arguments as JSON string.
+                    "arguments": json.dumps(event.arguments),
+                }
+            )
+        elif isinstance(event, ExecutorNativeToolOutput):
+            native_items.append(event.item)
+        elif isinstance(event, TurnComplete):
+            turn_text = event.text
+        elif isinstance(event, ExecutorContextWindowExceeded):
+            return _ContextWindowOverflow(
+                max_tokens=event.max_tokens,
+                actual_tokens=event.actual_tokens,
+            )
+        elif isinstance(event, ExecutorError):
+            raise PermanentLLMError(
+                event.message,
+                code=event.code or "executor_error",
+            )
+
+    return {
+        "model": model,
+        "text": turn_text,
+        "tool_calls": tool_calls,
+        "native_tool_items": native_items,
+    }
+
+
+def _executor_turn_with_compaction(
+    task_id: str,
+    executor: Executor,
+    spec: AgentSpec,
+    llm_config: LLMConfig,
+    history: list[ConversationItem],
+    instructions: str | None,
+    tool_schemas: list[dict[str, Any]],
+    compaction_state: _CompactionState,
+    context: ExecutorContext,
+    content_cache: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """
+    Run an executor turn with proactive and reactive compaction.
+
+    Same contract as ``_call_llm_maybe_compact``: returns a
+    response dict on success, raises on unrecoverable error.
+    Replaces ``_call_llm_maybe_compact`` in the agent loop when
+    an executor is used.
+
+    :param task_id: Task identifier, e.g. ``"task_abc123"``.
+    :param executor: The executor to run.
+    :param spec: The parsed AgentSpec.
+    :param llm_config: LLM configuration.
+    :param history: Conversation history as persisted items.
+    :param instructions: Optional per-request instructions.
+    :param tool_schemas: OpenAI-format tool schemas.
+    :param compaction_state: Per-execution compaction state.
+        Mutated in place when compaction triggers.
+    :param context: Agent-plane capabilities and identifiers.
+    :param content_cache: Per-task content reference cache.
+    :returns: The response dict.
+    :raises PermanentLLMError: On unrecoverable errors.
+    """
+    sys_instructions, messages, sys_tokens = _prepare_messages(
+        spec,
+        llm_config,
+        history,
+        instructions,
+        tool_schemas,
+        compaction_state,
+        content_cache,
+    )
+    messages = _proactive_compact_if_needed(
+        messages,
+        history,
+        sys_tokens,
+        compaction_state,
+        task_id,
+    )
+    result = _run_executor_turn(
+        task_id,
+        executor,
+        messages,
+        tool_schemas,
+        sys_instructions,
+        llm_config,
+        context,
+    )
+    if not isinstance(result, _ContextWindowOverflow):
+        return result
+
+    # Reactive compaction — compact and retry once.
+    messages = _reactive_compact_from_overflow(
+        messages,
+        history,
+        sys_tokens,
+        result,
+        compaction_state,
+        task_id,
+    )
+    retry_result = _run_executor_turn(
+        task_id,
+        executor,
+        messages,
+        tool_schemas,
+        sys_instructions,
+        llm_config,
+        context,
+    )
+    if isinstance(retry_result, _ContextWindowOverflow):
+        raise PermanentLLMError(
+            f"Context window exceeded after compaction: "
+            f"{retry_result.actual_tokens} > {retry_result.max_tokens}",
+            code="context_length_exceeded",
+        )
+    return retry_result
+
+
+def _prepare_messages(
+    spec: AgentSpec,
+    llm_config: LLMConfig,
+    history: list[ConversationItem],
+    instructions: str | None,
+    tool_schemas: list[dict[str, Any]],
+    compaction_state: _CompactionState,
+    content_cache: dict[str, str] | None,
+) -> tuple[str, list[dict[str, Any]], int]:
+    """
+    Build system instructions and Responses API input items.
+
+    Resolves content references and counts system token budget.
+    Extracted from ``_call_llm_maybe_compact`` for reuse by the
+    executor path.
+
+    :param spec: The parsed AgentSpec.
+    :param llm_config: LLM configuration.
+    :param history: Conversation history as persisted items.
+    :param instructions: Optional per-request instructions.
+    :param tool_schemas: OpenAI-format tool schemas.
+    :param compaction_state: Per-execution compaction state.
+    :param content_cache: Per-task content reference cache.
+    :returns: Tuple of (system_instructions, messages, sys_tokens).
+    """
+    sys_instructions = build_instructions(spec, instructions, tool_schemas)
+    file_store = get_file_store()
+    artifact_store = get_artifact_store()
+    resolved = history
+    if file_store is not None and artifact_store is not None:
+        resolved = resolve_content_references(
+            history,
+            file_store,
+            artifact_store,
+            content_cache,
+        )
+    messages = history_to_input_items(resolved)
+    sys_tokens = count_tokens(
+        [{"role": "system", "content": sys_instructions}],
+        compaction_state.model,
+    )
+    return sys_instructions, messages, sys_tokens
+
+
+def _reactive_compact_from_overflow(
+    messages: list[dict[str, Any]],
+    history: list[ConversationItem],
+    sys_tokens: int,
+    overflow: _ContextWindowOverflow,
+    compaction_state: _CompactionState,
+    task_id: str,
+) -> list[dict[str, Any]]:
+    """
+    React to a context window overflow by compacting messages.
+
+    Mirrors ``_reactive_compact`` but takes a
+    ``_ContextWindowOverflow`` signal instead of a
+    ``ContextWindowExceededError`` exception.
+
+    :param messages: The messages that triggered the overflow.
+    :param history: Conversation history for boundary detection.
+    :param sys_tokens: System and tool schema token budget.
+    :param overflow: The overflow signal from the executor.
+    :param compaction_state: Per-execution state. Mutated in place.
+    :param task_id: Task identifier for SSE event emission.
+    :returns: Compacted messages list ready for retry.
+    :raises PermanentLLMError: If tiktoken estimate diverges from
+        the reported token count by more than 30%.
+    """
+    compaction_state.context_window = overflow.max_tokens
+    our_estimate = count_tokens(messages, compaction_state.model) + sys_tokens
+    if overflow.actual_tokens > 0:
+        ratio = our_estimate / overflow.actual_tokens
+        if not (0.7 <= ratio <= 1.3):
+            _logger.warning(
+                "tiktoken estimate %d diverges from reported %d "
+                "(ratio %.2f) for task %s — raising PermanentLLMError",
+                our_estimate,
+                overflow.actual_tokens,
+                ratio,
+                task_id,
+            )
+            raise PermanentLLMError(
+                f"Context window exceeded: {overflow.actual_tokens} > {overflow.max_tokens}",
+                code="context_length_exceeded",
+            )
+    result = compact(
+        messages,
+        history,
+        config=compaction_state.config,
+        context_window=overflow.max_tokens,
+        system_token_budget=sys_tokens,
+        model=compaction_state.model,
+        task_id=task_id,
+        llm_client=_get_llm_client(),
+    )
+    if result.summary_metadata is not None:
+        compaction_state.last_summary = result.summary_metadata
+    return result.messages
 
 
 @step()
@@ -1639,7 +2122,7 @@ def _invoke_llm_streaming(
         tool_schemas,
         llm_config.extra,
         llm_config.connection,
-        llm_config.timeout,
+        llm_config.request_timeout,
         llm_config.retry,
     )
 
@@ -1997,6 +2480,41 @@ def _handle_execution_timeout(
     )
 
 
+def _build_executor_context(
+    task_id: str,
+    conversation_id: str,
+) -> ExecutorContext:
+    """
+    Build an :class:`ExecutorContext` for an agent execution.
+
+    The ``await_tool_output`` callback is a placeholder that raises
+    if called — ``DefaultExecutor`` never invokes it because it
+    yields ``ToolCallRequested`` events for the workflow to dispatch.
+    Future executor types (Claude SDK, Remote) will provide a real
+    implementation that bridges to the client-side tool mechanism.
+
+    :param task_id: Current task identifier, e.g. ``"task_abc123"``.
+    :param conversation_id: Current conversation identifier,
+        e.g. ``"conv_abc123"``.
+    :returns: A configured ExecutorContext.
+    """
+    from agent_plane.runtime.executor import ToolCallRequested as _TCR
+    from agent_plane.runtime.executor import ToolResult
+
+    def _await_tool_output_not_supported(call: _TCR) -> ToolResult:
+        raise NotImplementedError(
+            "await_tool_output is not supported for workflow-managed executors. "
+            "Tools should be dispatched via ToolCallRequested events."
+        )
+
+    return ExecutorContext(
+        task_id=task_id,
+        conversation_id=conversation_id,
+        storage_dir=Path("."),  # placeholder — will be real storage_dir
+        await_tool_output=_await_tool_output_not_supported,
+    )
+
+
 # ── The agent loop ────────────────────────────────────────
 
 
@@ -2008,6 +2526,7 @@ def _run_agent_loop(
     agent_id: str,
     instructions: str | None,
     tool_mgr: ToolManager,
+    executor: Executor,
     reasoning: dict[str, str] | None = None,
 ) -> _AgentLoopResult:
     """
@@ -2028,6 +2547,8 @@ def _run_agent_loop(
     :param instructions: Optional per-request instructions
         to include in the system message.
     :param tool_mgr: The ToolManager for this workflow.
+    :param executor: The executor for LLM calls. Constructed
+        by the caller via ``Executor.from_spec()``.
     :param reasoning: Optional per-request reasoning config,
         e.g. ``{"effort": "high"}``. When provided, the
         ``effort`` value overrides the agent spec's
@@ -2050,9 +2571,12 @@ def _run_agent_loop(
     history = _load_initial_history(conv_store, conversation_id)
     last_seen = history[-1].id if history else None
     output_items: list[dict[str, Any]] = []
-    # spec.llm is guaranteed non-None — checked by caller
-    assert spec.llm is not None
-    llm_config = _apply_request_reasoning(spec.llm, reasoning)
+    # For remote executors, spec.llm may be None — they ignore it.
+    # Provide a stub LLMConfig so downstream code doesn't break.
+    if spec.llm is not None:
+        llm_config = _apply_request_reasoning(spec.llm, reasoning)
+    else:
+        llm_config = LLMConfig(model="remote")
     tools_config = spec.tools
     # Per-task cache for resolved file_id → base64 content.
     # Shared across iterations so the same file is fetched and
@@ -2060,8 +2584,8 @@ def _run_agent_loop(
     content_cache: dict[str, str] = {}
     # Resolve execution timeout: min(spec, runtime cap)
     caps = get_caps()
-    execution_timeout = min(spec.execution.timeout, caps.execution_timeout)
-    max_iterations = spec.execution.max_iterations
+    execution_timeout = min(spec.executor.timeout, caps.execution_timeout)
+    max_iterations = spec.executor.max_iterations
     start_time = time.monotonic()
     # Track spawned sub-agent response IDs for auto-collect.
     # When the LLM produces a final response without collecting,
@@ -2078,6 +2602,12 @@ def _run_agent_loop(
         config=spec.compaction,
         model=llm_config.model,
     )
+    # Build executor context for lifecycle hooks and run_turn.
+    executor_context = _build_executor_context(
+        task_id,
+        conversation_id,
+    )
+    executor.on_task_start(executor_context)
 
     try:
         for iteration in range(max_iterations):
@@ -2097,14 +2627,16 @@ def _run_agent_loop(
                 last_seen,
                 history,
             )
-            llm_resp = _call_llm_maybe_compact(
+            llm_resp = _executor_turn_with_compaction(
                 task_id,
+                executor,
                 spec,
                 llm_config,
                 history,
                 instructions,
                 tool_schemas,
                 compaction_state,
+                executor_context,
                 content_cache,
             )
 
@@ -2215,6 +2747,7 @@ def _run_agent_loop(
             incomplete_details={"reason": "max_iterations"},
         )
     finally:
+        executor.on_task_end(executor_context)
         # Persist a compaction item if Layer 2 ran during this
         # execution. Idempotent — safe to call on crash recovery
         # replay because _maybe_persist_compaction_item checks
@@ -2358,7 +2891,7 @@ def agent_execution_workflow(
         # haven't been registered — fall back to agent_id for display.
         agent_name: str = spec.name or agent_id
 
-        if spec.llm is None:
+        if spec.llm is None and spec.executor.type == "llm":
             return _AgentLoopResult(
                 status="failed",
                 output=[],
@@ -2375,6 +2908,7 @@ def agent_execution_workflow(
             workdir=loaded.workdir,
         )
         set_tool_manager(tool_mgr)
+        executor = _create_executor(spec)
 
         result = _run_agent_loop(
             task_id,
@@ -2384,6 +2918,7 @@ def agent_execution_workflow(
             agent_id,
             instructions,
             tool_mgr,
+            executor,
             reasoning=reasoning,
         )
         return result.to_dict(task_id)

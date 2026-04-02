@@ -14,7 +14,7 @@ from agent_plane.spec.types import (
     AgentSpec,
     BuiltinToolConfig,
     CompactionConfig,
-    ExecutionConfig,
+    ExecutorSpec,
     InteractionConfig,
     LLMConfig,
     LocalToolInfo,
@@ -62,7 +62,7 @@ def parse(root: Path) -> AgentSpec:
     llm = _parse_llm(raw.get("llm"))
     interaction = _parse_interaction(raw.get("interaction"))
     tools_config = _parse_tools_config(raw.get("tools"))
-    execution = _parse_execution(raw.get("execution"))
+    executor = _parse_executor(raw.get("executor"))
     compaction = _parse_compaction(raw.get("compaction"))
     params = raw.get("params", {})
 
@@ -79,7 +79,7 @@ def parse(root: Path) -> AgentSpec:
         llm=llm,
         interaction=interaction,
         tools=tools_config,
-        execution=execution,
+        executor=executor,
         compaction=compaction,
         params=params,
         instructions=instructions,
@@ -111,23 +111,23 @@ def _parse_llm(raw: dict[str, Any] | None) -> LLMConfig | None:
             "llm block present but missing required field: model",
             code=ErrorCode.INVALID_INPUT,
         )
-    # ``connection``, ``timeout``, and ``retry`` are separated into
-    # their own typed fields; everything else is passed through to
-    # the LLM SDK as extra kwargs.
+    # ``connection``, ``request_timeout``, and ``retry`` are separated
+    # into their own typed fields; everything else is passed through
+    # to the LLM SDK as extra kwargs.
     connection_raw = raw.get("connection")
     connection: dict[str, str] | None = None
     if isinstance(connection_raw, dict):
         # Expand ${VAR} references so api_key: ${OPENAI_API_KEY} works.
         connection = expand_env_vars({str(k): str(v) for k, v in connection_raw.items()})
-    timeout = int(raw["timeout"]) if "timeout" in raw else 300
+    request_timeout = int(raw["request_timeout"]) if "request_timeout" in raw else 300
     retry = _parse_retry(raw.get("retry"))
-    reserved = {"model", "connection", "timeout", "retry"}
+    reserved = {"model", "connection", "request_timeout", "retry"}
     extra = {k: v for k, v in raw.items() if k not in reserved}
     return LLMConfig(
         model=str(model),
         extra=extra,
         connection=connection,
-        timeout=timeout,
+        request_timeout=request_timeout,
         retry=retry,
     )
 
@@ -259,23 +259,35 @@ def _parse_retry(
     )
 
 
-def _parse_execution(
+def _parse_executor(
     raw: dict[str, Any] | None,
-) -> ExecutionConfig:
+) -> ExecutorSpec:
     """
-    Parse the ``execution:`` block into an :class:`ExecutionConfig`.
+    Parse the ``executor:`` block into an :class:`ExecutorSpec`.
 
-    Returns defaults when *raw* is ``None``.
+    Returns defaults (``type="llm"``) when *raw* is ``None``.
 
-    :param raw: The raw ``execution:`` mapping, or ``None`` if
-        absent. Example: ``{"timeout": 3600, "max_iterations": 500}``.
-    :returns: A populated :class:`ExecutionConfig`.
+    :param raw: The raw ``executor:`` mapping, or ``None`` if
+        absent. Example: ``{"type": "remote",
+        "endpoint": "http://localhost:8000/v1/turns"}``.
+    :returns: A populated :class:`ExecutorSpec`.
     """
     if raw is None:
-        return ExecutionConfig()
-    return ExecutionConfig(
+        return ExecutorSpec()
+    endpoint_raw = raw.get("endpoint")
+    endpoint: str | None = None
+    if endpoint_raw is not None:
+        endpoint = str(endpoint_raw)
+    request_timeout_raw = raw.get("request_timeout")
+    request_timeout: int | None = None
+    if request_timeout_raw is not None:
+        request_timeout = int(request_timeout_raw)
+    return ExecutorSpec(
+        type=str(raw.get("type", "llm")),
         timeout=int(raw.get("timeout", 3600)),
         max_iterations=int(raw.get("max_iterations", 1000)),
+        endpoint=endpoint,
+        request_timeout=request_timeout,
     )
 
 

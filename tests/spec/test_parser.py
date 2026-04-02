@@ -611,12 +611,12 @@ def test_mcp_missing_url_raises(agent_dir: Path) -> None:
 
 
 def test_parse_llm_timeout_and_retry(tmp_path: Path) -> None:
-    """LLM block with explicit timeout and retry overrides."""
+    """LLM block with explicit request_timeout and retry overrides."""
     config = {
         "spec_version": 1,
         "llm": {
             "model": "openai/gpt-5.4",
-            "timeout": 120,
+            "request_timeout": 120,
             "retry": {
                 "max_attempts": 5,
                 "status_codes": [429, 502],
@@ -627,9 +627,9 @@ def test_parse_llm_timeout_and_retry(tmp_path: Path) -> None:
     spec = parse(tmp_path)
     assert spec.llm is not None
 
-    # Explicit timeout should override the 300s default.
-    # Failure means the parser ignores the timeout key.
-    assert spec.llm.timeout == 120
+    # Explicit request_timeout should override the 300s default.
+    # Failure means the parser ignores the request_timeout key.
+    assert spec.llm.request_timeout == 120
 
     # Retry max_attempts should match the YAML value.
     # Failure means retry block is not parsed or defaults are used instead.
@@ -650,9 +650,9 @@ def test_parse_llm_timeout_defaults(tmp_path: Path) -> None:
     spec = parse(tmp_path)
     assert spec.llm is not None
 
-    # Default LLM timeout is 300s per LLMConfig dataclass.
+    # Default LLM request_timeout is 300s per LLMConfig dataclass.
     # Failure means the parser sets a different default.
-    assert spec.llm.timeout == 300
+    assert spec.llm.request_timeout == 300
 
     # Default retry max_attempts is 3 per RetryConfig dataclass.
     # Failure means the parser produces a non-default retry config.
@@ -768,11 +768,11 @@ def test_parse_builtins_dict_missing_name(tmp_path: Path) -> None:
         parse(tmp_path)
 
 
-def test_parse_execution_config(tmp_path: Path) -> None:
-    """Execution block with explicit timeout and max_iterations."""
+def test_parse_executor_config(tmp_path: Path) -> None:
+    """Executor block with explicit timeout and max_iterations."""
     config = {
         "spec_version": 1,
-        "execution": {
+        "executor": {
             "timeout": 7200,
             "max_iterations": 500,
         },
@@ -780,28 +780,62 @@ def test_parse_execution_config(tmp_path: Path) -> None:
     (tmp_path / "config.yaml").write_text(yaml.dump(config))
     spec = parse(tmp_path)
 
-    # Explicit execution timeout should be honored.
-    # Failure means execution block parsing is broken.
-    assert spec.execution.timeout == 7200
+    # Explicit executor timeout should be honored.
+    # Failure means executor block parsing is broken.
+    assert spec.executor.timeout == 7200
 
     # Explicit max_iterations should override the 1000 default.
     # Failure means max_iterations is ignored by the parser.
-    assert spec.execution.max_iterations == 500
+    assert spec.executor.max_iterations == 500
+
+    # Default type should be "llm" when not specified.
+    # Failure means the parser doesn't apply the default type.
+    assert spec.executor.type == "llm"
 
 
-def test_parse_execution_defaults(tmp_path: Path) -> None:
-    """No execution block yields ExecutionConfig defaults."""
+def test_parse_executor_defaults(tmp_path: Path) -> None:
+    """No executor block yields ExecutorSpec defaults."""
     config = {"spec_version": 1}
     (tmp_path / "config.yaml").write_text(yaml.dump(config))
     spec = parse(tmp_path)
 
-    # Default execution timeout is 3600s per ExecutionConfig.
+    # Default executor timeout is 3600s per ExecutorSpec.
     # Failure means the parser uses a different default.
-    assert spec.execution.timeout == 3600
+    assert spec.executor.timeout == 3600
 
-    # Default max_iterations is 1000 per ExecutionConfig.
+    # Default max_iterations is 1000 per ExecutorSpec.
     # Failure means the parser uses a different default.
-    assert spec.execution.max_iterations == 1000
+    assert spec.executor.max_iterations == 1000
+
+    # Default type is "llm" per ExecutorSpec.
+    # Failure means the parser uses a different default.
+    assert spec.executor.type == "llm"
+
+
+def test_parse_executor_remote(tmp_path: Path) -> None:
+    """Executor block with type: remote parses endpoint."""
+    config = {
+        "spec_version": 1,
+        "executor": {
+            "type": "remote",
+            "endpoint": "http://localhost:8000/v1/turns",
+            "request_timeout": 300,
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    # Remote executor type should be parsed from YAML.
+    # Failure means executor type parsing is broken.
+    assert spec.executor.type == "remote"
+
+    # Endpoint should be captured from the YAML block.
+    # Failure means the endpoint field is not parsed.
+    assert spec.executor.endpoint == "http://localhost:8000/v1/turns"
+
+    # Per-call request_timeout should be parsed.
+    # Failure means executor.request_timeout is not parsed.
+    assert spec.executor.request_timeout == 300
 
 
 def test_parse_mcp_server_with_timeout_and_retry(

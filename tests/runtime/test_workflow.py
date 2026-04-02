@@ -14,6 +14,7 @@ from agent_plane.entities import CompactionData, MessageData, NewConversationIte
 from agent_plane.llms.errors import ContextWindowExceededError, PermanentLLMError
 from agent_plane.runtime.caps import RuntimeCaps
 from agent_plane.runtime.compaction import CompactionResult, SummaryMetadata, _CompactionState
+from agent_plane.runtime.executor import DefaultExecutor
 from agent_plane.runtime.workflow import (
     _load_initial_history,
     _maybe_persist_compaction_item,
@@ -25,7 +26,7 @@ from agent_plane.runtime.workflow import (
 )
 from agent_plane.spec.types import (
     AgentSpec,
-    ExecutionConfig,
+    ExecutorSpec,
     LLMConfig,
     RetryConfig,
     ToolsConfig,
@@ -168,11 +169,11 @@ def _make_agent_spec(execution_timeout: int) -> AgentSpec:
         name="timeout-test-agent",
         llm=LLMConfig(
             model="openai/gpt-4o",
-            timeout=300,
+            request_timeout=300,
             retry=RetryConfig(max_attempts=1),
         ),
         tools=ToolsConfig(),
-        execution=ExecutionConfig(
+        executor=ExecutorSpec(
             timeout=execution_timeout,
             max_iterations=1000,
         ),
@@ -195,6 +196,25 @@ def _stub_tool_manager() -> MagicMock:
     mgr.start.return_value = None
     mgr.get_tool_schemas.return_value = []
     return mgr
+
+
+def _stub_executor() -> DefaultExecutor:
+    """
+    Create a DefaultExecutor for timeout tests.
+
+    The timeout tests exit the loop before reaching the executor
+    call, so this executor is never invoked — it just satisfies
+    the ``_run_agent_loop`` signature.
+
+    :returns: A DefaultExecutor with minimal LLM config.
+    """
+    return DefaultExecutor(
+        llm_config=LLMConfig(
+            model="openai/gpt-4o",
+            request_timeout=300,
+            retry=RetryConfig(max_attempts=1),
+        ),
+    )
 
 
 def _patch_agent_loop_deps(
@@ -281,7 +301,7 @@ def test_execution_timeout_resolution_takes_minimum(
 ) -> None:
     """
     The effective execution timeout is
-    ``min(spec.execution.timeout, caps.execution_timeout)``.
+    ``min(spec.executor.timeout, caps.execution_timeout)``.
 
     When the spec timeout (30s) is lower than the cap (7200s),
     the loop uses 30s. We verify by providing a monotonic clock
@@ -306,6 +326,7 @@ def test_execution_timeout_resolution_takes_minimum(
         agent_id="ag_test",
         instructions=None,
         tool_mgr=_stub_tool_manager(),
+        executor=_stub_executor(),
     )
 
     # The loop should have terminated due to timeout, not
@@ -346,6 +367,7 @@ def test_execution_timeout_terminates_loop(
         agent_id="ag_test",
         instructions=None,
         tool_mgr=_stub_tool_manager(),
+        executor=_stub_executor(),
     )
 
     # Status must be "incomplete" — not "completed" or "failed"
@@ -387,6 +409,7 @@ def test_execution_timeout_emits_error_event(
         agent_id="ag_test",
         instructions=None,
         tool_mgr=_stub_tool_manager(),
+        executor=_stub_executor(),
     )
 
     # Exactly one error event should have been emitted
@@ -463,18 +486,20 @@ def test_execution_timeout_preserves_prior_output(
         "content": [{"type": "output_text", "text": "partial"}],
     }
 
-    def _fake_llm_call(
+    def _fake_executor_turn(
         task_id: str,
+        executor: Any,
         spec: AgentSpec,
         llm_config: LLMConfig,
         history: list[Any],
         instructions: str | None,
         tool_schemas: list[Any],
         compaction_state: _CompactionState,
+        context: Any,
         content_cache: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """
-        Fake LLM call that simulates a tool-call response.
+        Fake executor turn that simulates a tool-call response.
 
         We return a response with tool calls so the loop enters
         ``_handle_tool_calls``, which we also stub. The important
@@ -482,12 +507,14 @@ def test_execution_timeout_preserves_prior_output(
         next iteration's timeout check.
 
         :param task_id: Task identifier (unused).
+        :param executor: Executor (unused).
         :param spec: Agent spec (unused).
         :param llm_config: LLM config (unused).
         :param history: Conversation history (unused).
         :param instructions: Instructions (unused).
         :param tool_schemas: Tool schemas (unused).
         :param compaction_state: Per-execution compaction state (unused).
+        :param context: Executor context (unused).
         :param content_cache: Per-task content cache (unused).
         :returns: An LLM response dict with empty tool calls (tool
             detection is controlled via the separate ``_has_tool_calls``
@@ -496,8 +523,8 @@ def test_execution_timeout_preserves_prior_output(
         return {"model": "fake", "text": None, "tool_calls": [], "native_tool_items": []}
 
     monkeypatch.setattr(
-        "agent_plane.runtime.workflow._call_llm_maybe_compact",
-        _fake_llm_call,
+        "agent_plane.runtime.workflow._executor_turn_with_compaction",
+        _fake_executor_turn,
     )
 
     # _has_tool_calls returns True so loop enters tool handling
@@ -559,6 +586,7 @@ def test_execution_timeout_preserves_prior_output(
         agent_id="ag_test",
         instructions=None,
         tool_mgr=_stub_tool_manager(),
+        executor=_stub_executor(),
     )
 
     # Status must be incomplete due to timeout
@@ -597,11 +625,11 @@ def _make_tool_manager(
         name="split-test-agent",
         llm=LLMConfig(
             model="openai/gpt-4o",
-            timeout=300,
+            request_timeout=300,
             retry=RetryConfig(max_attempts=1),
         ),
         tools=ToolsConfig(),
-        execution=ExecutionConfig(timeout=60, max_iterations=100),
+        executor=ExecutorSpec(timeout=60, max_iterations=100),
     )
     client_specs = [
         ClientSideToolSpec(

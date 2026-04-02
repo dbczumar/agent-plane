@@ -77,6 +77,7 @@ def validate(spec: AgentSpec) -> ValidationResult:
     """
     result = ValidationResult()
     _validate_spec_version(spec, result)
+    _validate_executor_type(spec, result)
     _validate_llm(spec, result)
     _validate_interaction(spec, result)
     _validate_skills(spec, result)
@@ -96,6 +97,133 @@ def _validate_spec_version(spec: AgentSpec, result: ValidationResult) -> None:
     """
     if spec.spec_version != 1:
         result.add("spec_version", f"must be 1, got {spec.spec_version}")
+
+
+_VALID_EXECUTOR_TYPES = {"llm", "claude_sdk", "remote"}
+
+
+def _validate_executor_type(
+    spec: AgentSpec, result: ValidationResult,
+) -> None:
+    """
+    Validate that all spec fields are valid for the declared executor type.
+
+    ``executor.type`` is the discriminator for the entire spec.
+    Fields that are invalid for a given type are rejected with a
+    clear error message. Delegates to per-type helpers.
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
+    etype = spec.executor.type
+    if etype not in _VALID_EXECUTOR_TYPES:
+        result.add(
+            "executor.type",
+            f"must be one of {sorted(_VALID_EXECUTOR_TYPES)}, "
+            f"got {etype!r}",
+        )
+        return
+
+    if etype == "remote":
+        _validate_remote_executor(spec, result)
+    elif etype == "claude_sdk":
+        _validate_claude_sdk_executor(spec, result)
+    elif etype == "llm":
+        _validate_llm_executor(spec, result)
+
+
+def _validate_remote_executor(
+    spec: AgentSpec, result: ValidationResult,
+) -> None:
+    """
+    Validate fields for ``executor.type: remote``.
+
+    Remote agents own their own prompt, tools, and compaction.
+    Only ``executor.endpoint`` and ``executor.request_timeout``
+    are valid alongside the standard executor fields.
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
+    if spec.executor.endpoint is None:
+        result.add(
+            "executor.endpoint",
+            "required when executor.type is 'remote'",
+        )
+    if spec.llm is not None:
+        result.add("llm", "not supported when executor.type is 'remote'")
+    if spec.instructions is not None:
+        result.add(
+            "instructions",
+            "not supported when executor.type is 'remote'",
+        )
+    if spec.tools.agents or spec.tools.builtins:
+        result.add("tools", "not supported when executor.type is 'remote'")
+    if spec.compaction is not None:
+        result.add(
+            "compaction",
+            "not supported when executor.type is 'remote'",
+        )
+
+
+def _validate_claude_sdk_executor(
+    spec: AgentSpec, result: ValidationResult,
+) -> None:
+    """
+    Validate fields for ``executor.type: claude_sdk``.
+
+    The SDK manages its own compaction and connections. Remote-only
+    fields (endpoint, executor.request_timeout) are invalid.
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
+    if spec.executor.endpoint is not None:
+        result.add(
+            "executor.endpoint",
+            "not supported when executor.type is 'claude_sdk'",
+        )
+    if spec.executor.request_timeout is not None:
+        result.add(
+            "executor.request_timeout",
+            "not supported when executor.type is 'claude_sdk'"
+            " — use llm.request_timeout instead",
+        )
+    if spec.llm is not None and spec.llm.connection is not None:
+        result.add(
+            "llm.connection",
+            "not supported when executor.type is 'claude_sdk'",
+        )
+    if spec.compaction is not None:
+        result.add(
+            "compaction",
+            "not supported when executor.type is 'claude_sdk'",
+        )
+
+
+def _validate_llm_executor(
+    spec: AgentSpec, result: ValidationResult,
+) -> None:
+    """
+    Validate fields for ``executor.type: llm``.
+
+    Remote-only fields (endpoint, executor.request_timeout) are
+    invalid — per-call timeout belongs in ``llm.request_timeout``.
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
+    if spec.executor.endpoint is not None:
+        result.add(
+            "executor.endpoint",
+            "not supported when executor.type is 'llm'",
+        )
+    if spec.executor.request_timeout is not None:
+        result.add(
+            "executor.request_timeout",
+            "not supported when executor.type is 'llm'"
+            " — use llm.request_timeout instead",
+        )
 
 
 def _validate_llm(spec: AgentSpec, result: ValidationResult) -> None:
