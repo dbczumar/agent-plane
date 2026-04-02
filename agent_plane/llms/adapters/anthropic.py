@@ -15,8 +15,8 @@ from typing import Any
 import httpx
 
 from agent_plane.errors import AgentPlaneError, ErrorCode
-from llms.adapters._content import parse_data_uri
-from llms.adapters.base import BaseAdapter
+from agent_plane.llms.adapters._content import parse_data_uri
+from agent_plane.llms.adapters.base import BaseAdapter
 
 _BASE_URL = "https://api.anthropic.com/v1"
 _API_VERSION = "2023-06-01"

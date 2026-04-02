@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent_plane.entities import CompactionData, MessageData, NewConversationItem
+from agent_plane.llms.errors import ContextWindowExceededError, PermanentLLMError
 from agent_plane.runtime.caps import RuntimeCaps
 from agent_plane.runtime.compaction import CompactionResult, SummaryMetadata, _CompactionState
 from agent_plane.runtime.workflow import (
@@ -34,7 +35,6 @@ from agent_plane.stores.conversation_store.sqlalchemy_store import (
 )
 from agent_plane.tools.client_specified import ClientSideToolSpec
 from agent_plane.tools.manager import ToolManager
-from llms.errors import ContextWindowExceededError, PermanentLLMError
 
 
 @pytest.fixture()
@@ -767,6 +767,7 @@ def test_reactive_compact_plausible_overflow_proceeds(
             summary_metadata=None,
         ),
     )
+
     class _RaisesIfCalled:
         """Stub LLM client — compact() is patched out so this must never be used."""
 

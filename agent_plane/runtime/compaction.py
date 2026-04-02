@@ -256,7 +256,7 @@ def _truncate_oldest(
         drop_idx = _find_safe_drop_index(result)
         if drop_idx >= len(result):
             break
-        result = result[drop_idx + 1:]
+        result = result[drop_idx + 1 :]
     return result
 
 
@@ -494,9 +494,7 @@ def compact(
     :returns: A :class:`CompactionResult` with the compacted messages
         and optional summary metadata.
     """
-    trigger_threshold = (
-        config.trigger_threshold if config else _DEFAULT_TRIGGER_THRESHOLD
-    )
+    trigger_threshold = config.trigger_threshold if config else _DEFAULT_TRIGGER_THRESHOLD
     recent_window = config.recent_window if config else _DEFAULT_RECENT_WINDOW
     # Budget = fraction of context window minus system/tool tokens.
     budget = int(context_window * trigger_threshold) - system_token_budget
@@ -540,8 +538,7 @@ def compact(
 
     # --- Layer 3 ---
     _logger.warning(
-        "Layer 3 truncation triggered for task %s — context still exceeds "
-        "budget after layers 1+2",
+        "Layer 3 truncation triggered for task %s — context still exceeds budget after layers 1+2",
         task_id,
     )
     truncated = _truncate_oldest(working, budget, model)

@@ -14,8 +14,8 @@ from typing import Any
 import httpx
 
 from agent_plane.errors import AgentPlaneError, ErrorCode
-from llms.adapters.base import BaseAdapter
-from llms.types import (
+from agent_plane.llms.adapters.base import BaseAdapter
+from agent_plane.llms.types import (
     NATIVE_TOOL_OUTPUT_TYPES,
     FunctionCallOutput,
     MessageOutput,

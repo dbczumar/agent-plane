@@ -3,7 +3,7 @@
 import pytest
 
 from agent_plane.errors import AgentPlaneError
-from llms.routing import RoutedModel, parse_model_string
+from agent_plane.llms.routing import RoutedModel, parse_model_string
 
 
 @pytest.mark.parametrize(

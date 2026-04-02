@@ -16,14 +16,14 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from llms.client import Client
-from llms.errors import (
+from agent_plane.llms.client import Client
+from agent_plane.llms.errors import (
     ContextWindowExceededError,
     LLMErrorDetail,
     PermanentLLMError,
     RetryableLLMError,
 )
-from llms.types import (
+from agent_plane.llms.types import (
     MessageOutput,
     OutputText,
     Response,
@@ -72,31 +72,31 @@ def _patch_client_deps(
     # Route model parsing to a fake routed model
     routed = MagicMock(provider="test", model="test-model")
     monkeypatch.setattr(
-        "llms.client.parse_model_string",
+        "agent_plane.llms.client.parse_model_string",
         lambda model: routed,
     )
 
     # Return the mock adapter (not OpenAIAdapter, so we hit
     # the chat_completions path instead of responses_create)
     monkeypatch.setattr(
-        "llms.client.get_adapter",
+        "agent_plane.llms.client.get_adapter",
         lambda provider: mock_adapter,
     )
 
     # Stub the responses-to-chat conversion helpers
     monkeypatch.setattr(
-        "llms.client.responses_input_to_chat_messages",
+        "agent_plane.llms.client.responses_input_to_chat_messages",
         lambda input, instructions: [{"role": "user", "content": "test"}],
     )
     monkeypatch.setattr(
-        "llms.client.chat_response_to_response",
+        "agent_plane.llms.client.chat_response_to_response",
         lambda result: _make_response(),
     )
 
     # Capture sleep calls instead of actually sleeping
     tracker = _SleepTracker(calls=[])
     monkeypatch.setattr(
-        "llms.client.time.sleep",
+        "agent_plane.llms.client.time.sleep",
         lambda duration: tracker.calls.append(duration),
     )
 

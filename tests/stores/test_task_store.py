@@ -11,6 +11,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent_plane.entities import MessageData, NewConversationItem
+from agent_plane.llms.types import (
+    MessageOutput,
+    OutputText,
+    Response,
+    ResponseCompletedEvent,
+)
 from agent_plane.runtime import live_stream
 from agent_plane.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from agent_plane.stores.artifact_store.local import LocalArtifactStore
@@ -18,12 +24,6 @@ from agent_plane.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from agent_plane.stores.task_store.sqlalchemy_store import SqlAlchemyTaskStore
-from llms.types import (
-    MessageOutput,
-    OutputText,
-    Response,
-    ResponseCompletedEvent,
-)
 
 # ── Helpers ──────────────────────────────────────────
 

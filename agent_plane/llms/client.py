@@ -16,21 +16,21 @@ from typing import Any, TypeVar
 
 import httpx
 
-from llms._responses_to_chat import (
+from agent_plane.llms._responses_to_chat import (
     chat_response_to_response,
     chat_stream_to_response_events,
     responses_input_to_chat_messages,
 )
-from llms.adapters import get_adapter
-from llms.adapters.openai import OpenAIAdapter
-from llms.errors import (
+from agent_plane.llms.adapters import get_adapter
+from agent_plane.llms.adapters.openai import OpenAIAdapter
+from agent_plane.llms.errors import (
     ContextWindowExceededError,
     LLMErrorDetail,
     PermanentLLMError,
     RetryableLLMError,
 )
-from llms.routing import parse_model_string
-from llms.types import Response, ResponseStreamEvent, RetryConfig
+from agent_plane.llms.routing import parse_model_string
+from agent_plane.llms.types import Response, ResponseStreamEvent, RetryConfig
 
 _logger = logging.getLogger(__name__)
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import pytest
@@ -14,20 +13,17 @@ from agent_plane.entities import (
     FunctionCallOutputData,
     MessageData,
 )
+from agent_plane.llms.errors import RetryableLLMError
+from agent_plane.llms.types import MessageOutput, OutputText, Response
 from agent_plane.runtime.compaction import (
     _BINARY_CONTENT_CLEARED,
     _TOOL_RESULT_CLEARED,
-    CompactionResult,
-    SummaryMetadata,
     compact,
     compaction_to_history_items,
     count_tokens,
     summarize_history,
 )
 from agent_plane.spec.types import CompactionConfig
-from llms.errors import RetryableLLMError
-from llms.types import MessageOutput, OutputText, Response
-
 
 # ---------------------------------------------------------------------------
 # LLM client stubs
@@ -88,7 +84,7 @@ class _ReturnsTextClient:
         :param outer: The enclosing ``_ReturnsTextClient`` instance.
         """
 
-        def __init__(self, outer: "_ReturnsTextClient") -> None:
+        def __init__(self, outer: _ReturnsTextClient) -> None:
             self._outer = outer
 
         def create(self, **kwargs: Any) -> Response:
@@ -105,7 +101,7 @@ class _ReturnsTextClient:
             )
 
     @property
-    def responses(self) -> "_ReturnsTextClient._Responses":
+    def responses(self) -> _ReturnsTextClient._Responses:
         """
         Return the ``responses`` namespace for this stub client.
 
@@ -858,10 +854,9 @@ def test_compaction_to_history_items_produces_valid_pair() -> None:
     assert isinstance(assistant_item.data, MessageData)
     assert assistant_item.data.role == "assistant"
     assistant_text = assistant_item.data.content[0]["text"]
-    assert (
-        assistant_text
-        == "The user asked to analyze the dataset. The agent loaded data.csv."
-    ), f"Assistant content must equal the CompactionData.summary, got: {assistant_text!r}"
+    assert assistant_text == "The user asked to analyze the dataset. The agent loaded data.csv.", (
+        f"Assistant content must equal the CompactionData.summary, got: {assistant_text!r}"
+    )
 
     # IDs must be derived from the compaction item ID.
     assert user_item.id == "cmp_abc123_user"

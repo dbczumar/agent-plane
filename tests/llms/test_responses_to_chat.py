@@ -2,14 +2,14 @@
 
 import pytest
 
-from llms._responses_to_chat import (
+from agent_plane.llms._responses_to_chat import (
     _translate_block,
     _translate_content,
     chat_response_to_response,
     chat_stream_to_response_events,
     responses_input_to_chat_messages,
 )
-from llms.types import (
+from agent_plane.llms.types import (
     FunctionCallOutput,
     MessageOutput,
     Response,

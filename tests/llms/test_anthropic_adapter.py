@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from llms.adapters.anthropic import (
+from agent_plane.llms.adapters.anthropic import (
     _anthropic_to_chat,
     _chat_to_anthropic,
     _convert_tool_choice,

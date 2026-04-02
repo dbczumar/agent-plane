@@ -3,7 +3,7 @@ Multi-provider LLM client with OpenAI Responses API interface.
 
 Usage::
 
-    from llms import Client
+    from agent_plane.llms import Client
 
     client = Client()
     resp = client.responses.create(
@@ -13,6 +13,6 @@ Usage::
     )
 """
 
-from llms.client import Client
+from agent_plane.llms.client import Client
 
 __all__ = ["Client"]

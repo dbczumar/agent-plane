@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any
 
-from llms.types import (
+from agent_plane.llms.types import (
     FunctionCallOutput,
     MessageOutput,
     NativeToolOutput,

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
+from agent_plane.llms.errors import LLMErrorDetail, PermanentLLMError, RetryableLLMError
 from agent_plane.runtime.llm_retry import (
     classify_llm_error,
     compute_backoff_delay,
@@ -15,7 +16,6 @@ from agent_plane.runtime.llm_retry import (
     execute_with_retry,
 )
 from agent_plane.spec.types import RetryConfig
-from llms.errors import LLMErrorDetail, PermanentLLMError, RetryableLLMError
 
 
 @pytest.fixture()

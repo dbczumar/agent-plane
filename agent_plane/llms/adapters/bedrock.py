@@ -13,8 +13,8 @@ import time
 from collections.abc import Iterator
 from typing import Any
 
-from llms.adapters._content import parse_data_uri
-from llms.adapters.base import BaseAdapter
+from agent_plane.llms.adapters._content import parse_data_uri
+from agent_plane.llms.adapters.base import BaseAdapter
 
 # Default connect timeout: 30s to establish TCP connection.
 _BOTO_CONNECT_TIMEOUT = 30

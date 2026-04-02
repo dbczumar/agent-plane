@@ -2,7 +2,7 @@
 
 import json
 
-from llms.adapters.bedrock import (
+from agent_plane.llms.adapters.bedrock import (
     _build_converse_kwargs,
     _converse_to_chat,
     _convert_tools,

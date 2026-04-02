@@ -14,8 +14,8 @@ from typing import Any, TypeVar
 
 import httpx
 
+from agent_plane.llms.errors import LLMErrorDetail, PermanentLLMError, RetryableLLMError
 from agent_plane.spec.types import RetryConfig
-from llms.errors import LLMErrorDetail, PermanentLLMError, RetryableLLMError
 
 _logger = logging.getLogger(__name__)
 

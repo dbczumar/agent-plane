@@ -16,7 +16,7 @@ from collections.abc import Iterator
 from typing import Any
 
 from agent_plane.errors import AgentPlaneError, ErrorCode
-from llms.adapters.openai import OpenAICompatibleAdapter
+from agent_plane.llms.adapters.openai import OpenAICompatibleAdapter
 
 
 class DatabricksAdapter(OpenAICompatibleAdapter):

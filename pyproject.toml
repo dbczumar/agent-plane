@@ -22,7 +22,7 @@ ap = "agent_plane.cli:cli"
 agent-plane-acp = "integrations.toad.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["agent_plane*", "llms*", "integrations*"]
+include = ["agent_plane*", "integrations*"]
 
 [build-system]
 requires = ["setuptools>=68.0"]

@@ -3,7 +3,7 @@
 import pytest
 
 from agent_plane.errors import AgentPlaneError
-from llms.adapters.vertex import _build_vertex_url, _resolve_vertex_params
+from agent_plane.llms.adapters.vertex import _build_vertex_url, _resolve_vertex_params
 
 
 def test_resolve_raises_when_no_params() -> None:

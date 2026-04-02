@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent_plane.errors import AgentPlaneError, ErrorCode
-from llms.adapters.base import BaseAdapter
+from agent_plane.llms.adapters.base import BaseAdapter
 
 # Lazy-initialized adapter cache. Each provider gets at most one
 # adapter instance per process.
@@ -65,35 +65,35 @@ def _create_adapter(provider: str, **kwargs: Any) -> BaseAdapter:
             # OpenAI supports the Responses API natively; use the
             # subclass that calls /v1/responses directly so reasoning
             # token events (reasoning_summary_text.delta etc.) flow through.
-            from llms.adapters.openai import OpenAIAdapter
+            from agent_plane.llms.adapters.openai import OpenAIAdapter
 
             return OpenAIAdapter(base_url=resolved_url)
-        from llms.adapters.openai import OpenAICompatibleAdapter
+        from agent_plane.llms.adapters.openai import OpenAICompatibleAdapter
 
         return OpenAICompatibleAdapter(base_url=resolved_url)
 
     if provider == "anthropic":
-        from llms.adapters.anthropic import AnthropicAdapter
+        from agent_plane.llms.adapters.anthropic import AnthropicAdapter
 
         return AnthropicAdapter(**kwargs)
 
     if provider == "gemini":
-        from llms.adapters.gemini import GeminiAdapter
+        from agent_plane.llms.adapters.gemini import GeminiAdapter
 
         return GeminiAdapter(**kwargs)
 
     if provider == "bedrock":
-        from llms.adapters.bedrock import BedrockAdapter
+        from agent_plane.llms.adapters.bedrock import BedrockAdapter
 
         return BedrockAdapter(**kwargs)
 
     if provider == "vertex":
-        from llms.adapters.vertex import VertexAdapter
+        from agent_plane.llms.adapters.vertex import VertexAdapter
 
         return VertexAdapter(**kwargs)
 
     if provider == "databricks":
-        from llms.adapters.databricks import DatabricksAdapter
+        from agent_plane.llms.adapters.databricks import DatabricksAdapter
 
         return DatabricksAdapter(**kwargs)
 

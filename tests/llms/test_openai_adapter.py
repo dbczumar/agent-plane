@@ -2,7 +2,7 @@
 
 import json
 
-from llms.adapters.openai import OpenAICompatibleAdapter, _parse_sse_line
+from agent_plane.llms.adapters.openai import OpenAICompatibleAdapter, _parse_sse_line
 
 # ── Payload building ─────────────────────────────────────
 

@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from llms.adapters.gemini import (
+from agent_plane.llms.adapters.gemini import (
     _chat_to_gemini,
     _convert_tools,
     _extract_usage,

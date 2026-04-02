@@ -16,7 +16,7 @@ from collections.abc import Iterator
 from typing import Any
 
 from agent_plane.errors import AgentPlaneError, ErrorCode
-from llms.adapters.gemini import GeminiAdapter
+from agent_plane.llms.adapters.gemini import GeminiAdapter
 
 _DEFAULT_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 
