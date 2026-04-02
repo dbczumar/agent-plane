@@ -47,7 +47,7 @@ from textual.widgets import Footer, Header, Input, Static
 
 # ── Configuration ─────────────────────────────────────
 
-PORT = 18400
+PORT = 18401
 BASE_URL = f"http://127.0.0.1:{PORT}"
 # Set by main() after parsing the agent's config.yaml.
 AGENT_NAME: str = "agent"

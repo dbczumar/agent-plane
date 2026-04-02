@@ -745,6 +745,11 @@ def _open_stream_with_retry(
                 connection,
                 timeout,
             )
+        except ContextWindowExceededError:
+            # Re-raise directly — classify_llm_error doesn't
+            # preserve the subclass and would wrap it in a
+            # generic PermanentLLMError, losing token counts.
+            raise
         except Exception as exc:
             classified = classify_llm_error(
                 exc,
@@ -902,50 +907,85 @@ class RemoteExecutor(Executor):
         On 404 (session not found), retries once with full
         conversation history so the remote can rebuild its session.
 
+        Uses httpx streaming so events are yielded in real-time
+        as the remote service produces them.
+
         :param messages: Conversation history as input items.
         :param tools: Ignored — remote defines its own tools.
         :param system_prompt: Ignored — remote defines its prompt.
         :param llm_config: Ignored — remote defines its config.
         :param context: Agent-plane capabilities and identifiers.
         """
+        import httpx
 
         new_messages = _extract_new_messages(messages)
         body: dict[str, Any] = {
             "conversation_id": context.conversation_id,
             "new_messages": new_messages,
         }
-
-        response = self._post(body)
-
-        if response.status_code == 404:
-            # Session lost — resend with full history for rebuild.
-            body["history"] = _messages_to_history(messages)
-            response = self._post(body)
-
-        if response.status_code != 200:
-            yield ExecutorError(
-                message=f"Remote executor returned {response.status_code}",
-                code="remote_error",
-            )
-            return
-
-        yield from _consume_remote_sse(response)
-
-    def _post(self, body: dict[str, Any]) -> Any:
-        """
-        POST to the remote endpoint with streaming enabled.
-
-        :param body: JSON request body.
-        :returns: Streaming httpx Response.
-        """
-        import httpx
-
-        return httpx.post(
-            self._endpoint,
-            json=body,
-            headers={"Accept": "text/event-stream"},
-            timeout=self._request_timeout,
+        headers = {"Accept": "text/event-stream"}
+        timeout = httpx.Timeout(
+            connect=30.0,
+            read=float(self._request_timeout),
+            write=30.0,
+            pool=30.0,
         )
+
+        with httpx.Client(timeout=timeout) as client:
+            try:
+                # First attempt — normal turn.
+                with client.stream(
+                    "POST",
+                    self._endpoint,
+                    json=body,
+                    headers=headers,
+                ) as response:
+                    if response.status_code == 404:
+                        # Consume and discard the 404 body so the
+                        # connection is released for the retry.
+                        response.read()
+                    elif response.status_code != 200:
+                        yield ExecutorError(
+                            message=(f"Remote executor returned {response.status_code}"),
+                            code="remote_error",
+                        )
+                        return
+                    else:
+                        yield from _consume_remote_sse_stream(
+                            response,
+                        )
+                        return
+            except Exception as exc:
+                yield ExecutorError(
+                    message=(f"Cannot connect to remote executor at {self._endpoint}: {exc}"),
+                    code="connection_error",
+                )
+                return
+
+            # 404 recovery — resend with full history.
+            body["history"] = _messages_to_history(messages)
+            try:
+                with client.stream(
+                    "POST",
+                    self._endpoint,
+                    json=body,
+                    headers=headers,
+                ) as response:
+                    if response.status_code != 200:
+                        yield ExecutorError(
+                            message=(f"Remote executor returned {response.status_code}"),
+                            code="remote_error",
+                        )
+                        return
+                    yield from _consume_remote_sse_stream(
+                        response,
+                    )
+            except Exception as exc:
+                yield ExecutorError(
+                    message=(f"Cannot connect to remote executor at {self._endpoint}: {exc}"),
+                    code="connection_error",
+                )
+                return
 
 
 def _extract_new_messages(
@@ -987,17 +1027,19 @@ def _messages_to_history(
     return list(messages)
 
 
-def _consume_remote_sse(
+def _consume_remote_sse_stream(
     response: Any,
 ) -> Iterator[ExecutorEvent]:
     """
-    Parse SSE data lines from a remote executor into events.
+    Parse SSE data lines from a streaming httpx response.
 
+    Uses ``iter_lines()`` on a streaming response so events
+    are yielded in real-time as the remote produces them.
     Heartbeat events are consumed silently (keepalive only).
-    ``turn_complete`` and ``error`` are terminal — iteration
-    stops after yielding them.
+    ``turn_complete`` and ``error`` are terminal.
 
-    :param response: An httpx streaming response.
+    :param response: An httpx streaming response (from
+        ``client.stream()`` context manager).
     """
     for line in response.iter_lines():
         if not line.startswith("data: "):
@@ -1007,6 +1049,12 @@ def _consume_remote_sse(
 
         if evt_type == "text_chunk":
             yield TextChunk(text=payload["text"])
+
+        elif evt_type == "reasoning_chunk":
+            yield ReasoningChunk(
+                delta=payload.get("delta", ""),
+                event_type=payload.get("event_type", "reasoning_text"),
+            )
 
         elif evt_type == "tool_call_requested":
             yield ToolCallRequested(

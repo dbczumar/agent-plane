@@ -1,0 +1,19 @@
+spec_version: 1
+
+name: fact_checker
+description: A sub-agent that verifies claims by searching for corroborating or contradicting evidence.
+
+llm:
+  model: gpt-5.4
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  builtins:
+    - web_search_openai
+
+instructions: |
+  You are a fact-checker. When given a claim or statement, search the web
+  to find evidence that supports or contradicts it. Return a brief verdict
+  (supported, contradicted, or mixed) with the key sources you found.
+  Be precise and cite URLs.

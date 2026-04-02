@@ -1,0 +1,9 @@
+spec_version: 1
+
+name: omni
+description: A coding assistant powered by OmniAgents, running as a remote executor with its own tools and agent loop.
+
+executor:
+  type: remote
+  endpoint: http://127.0.0.1:8000/v1/turns
+  request_timeout: 300

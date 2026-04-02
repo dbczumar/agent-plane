@@ -1,0 +1,19 @@
+spec_version: 1
+
+name: summarizer
+description: A sub-agent that condenses long content into concise, structured summaries.
+
+llm:
+  model: gpt-5.4
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  builtins:
+    - web_search_openai
+
+instructions: |
+  You are a summarizer. When given a topic or long text, produce a concise
+  summary that captures the key points. Use bullet points for clarity.
+  If given a topic instead of text, search the web first to gather
+  information, then summarize your findings.

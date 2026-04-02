@@ -11,7 +11,7 @@ behavior that only surfaces when the full workflow runs end-to-end
 with real stores.
 
 Compaction is triggered here by monkeypatching
-``_call_llm_maybe_compact`` in ``agent_plane.runtime.workflow``: the
+``_executor_turn_with_compaction`` in ``agent_plane.runtime.workflow``: the
 patched version sets ``compaction_state.last_summary`` directly on the
 mutable state object, simulating what happens after Layer 2 fires, and
 then lets the workflow's ``finally`` block call
@@ -61,38 +61,39 @@ def _make_compacting_llm_call(
     first_call_seen: list[bool],
 ) -> Any:
     """
-    Build a ``_call_llm_maybe_compact`` replacement that injects a
-    fake :class:`SummaryMetadata` on the first call.
+    Build a ``_executor_turn_with_compaction`` replacement that injects
+    a fake :class:`SummaryMetadata` on the first call.
 
     On the first call the patched function mutates
     ``compaction_state.last_summary`` to simulate what happens after
     Layer 2 fires. On subsequent calls it returns normally, allowing
-    the workflow to complete. The ``_fake_last_item_id`` is a sentinel
-    that the test overrides with a real item ID in the conversation
-    by using a real workflow run before the compacting execution.
+    the workflow to complete.
 
     :param first_call_seen: A single-element mutable list used as a
         boolean flag to track whether the first call has fired.
         Pass ``[False]`` from the test to initialize.
     :returns: A callable with the same signature as
-        ``_call_llm_maybe_compact``.
+        ``_executor_turn_with_compaction``.
     """
 
-    def _fake_llm_call(
+    def _fake_executor_turn(
         task_id: str,
+        executor: Any,
         spec: AgentSpec,
         llm_config: LLMConfig,
         history: list[Any],
         instructions: str | None,
         tool_schemas: list[Any],
         compaction_state: _CompactionState,
+        context: Any,
         content_cache: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """
-        Fake LLM call that sets ``compaction_state.last_summary`` on
-        the first invocation to simulate Layer 2 firing.
+        Fake executor turn that sets ``compaction_state.last_summary``
+        on the first invocation to simulate Layer 2 firing.
 
         :param task_id: Task identifier (unused — passed through).
+        :param executor: Executor (unused).
         :param spec: Agent spec (unused).
         :param llm_config: LLM config (unused).
         :param history: Conversation history. Used to find the last
@@ -103,6 +104,7 @@ def _make_compacting_llm_call(
         :param compaction_state: Per-execution compaction state.
             Mutated in place on the first call to set
             ``last_summary``, triggering compaction item persistence.
+        :param context: Executor context (unused).
         :param content_cache: Per-task content cache (unused).
         :returns: A minimal LLM response dict that causes the loop
             to emit a final assistant message and complete.
@@ -121,7 +123,7 @@ def _make_compacting_llm_call(
             )
         return _FAKE_LLM_RESPONSE
 
-    return _fake_llm_call
+    return _fake_executor_turn
 
 
 async def _run_compacting_execution(
@@ -131,7 +133,7 @@ async def _run_compacting_execution(
     """
     Run a single foreground execution that simulates Layer 2 compaction.
 
-    Monkeypatches ``_call_llm_maybe_compact`` to inject a
+    Monkeypatches ``_executor_turn_with_compaction`` to inject a
     ``SummaryMetadata`` into ``compaction_state``, which causes the
     ``finally`` block in ``_run_agent_loop`` to call
     ``_maybe_persist_compaction_item``. Returns the completed response
@@ -143,7 +145,7 @@ async def _run_compacting_execution(
     """
     first_call_seen: list[bool] = [False]
     monkeypatch.setattr(
-        "agent_plane.runtime.workflow._call_llm_maybe_compact",
+        "agent_plane.runtime.workflow._executor_turn_with_compaction",
         _make_compacting_llm_call(first_call_seen),
     )
 
@@ -230,17 +232,17 @@ async def test_next_execution_loads_from_compaction_cursor(
 
     :param client: Async HTTP client wired to the FastAPI app.
     :param mock_llm: Controllable mock LLM for the test (unused — both
-        executions are driven by a monkeypatched _call_llm_maybe_compact).
+        executions are driven by a monkeypatched _executor_turn_with_compaction).
     :param monkeypatch: Pytest monkeypatch fixture.
     """
     await create_test_agent(client)
 
-    # --- Execution 1: triggers compaction via patched _call_llm_maybe_compact ---
+    # --- Execution 1: triggers compaction via patched _executor_turn_with_compaction ---
     first_resp = await _run_compacting_execution(client, monkeypatch)
     first_response_id = first_resp["id"]
 
     # --- Execution 2: inspect what history _load_initial_history produces ---
-    # We patch _call_llm_maybe_compact for execution 2 to capture the
+    # We patch _executor_turn_with_compaction for execution 2 to capture the
     # ``history`` argument it receives. This tells us whether
     # _load_initial_history used the compaction cursor and prepended
     # the synthetic summary pair. The fake still returns a valid response
@@ -249,12 +251,14 @@ async def test_next_execution_loads_from_compaction_cursor(
 
     def _capture_history_llm_call(
         task_id: str,
+        executor: Any,
         spec: AgentSpec,
         llm_config: LLMConfig,
         history: list[Any],
         instructions: str | None,
         tool_schemas: list[Any],
         compaction_state: _CompactionState,
+        context: Any,
         content_cache: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """
@@ -262,6 +266,7 @@ async def test_next_execution_loads_from_compaction_cursor(
         normal response so the workflow completes.
 
         :param task_id: Task identifier (unused).
+        :param executor: Executor (unused).
         :param spec: Agent spec (unused).
         :param llm_config: LLM config (unused).
         :param history: The history list passed by the agent loop,
@@ -269,6 +274,7 @@ async def test_next_execution_loads_from_compaction_cursor(
         :param instructions: Per-request instructions (unused).
         :param tool_schemas: Tool schemas (unused).
         :param compaction_state: Per-execution compaction state (unused).
+        :param context: Executor context (unused).
         :param content_cache: Per-task content cache (unused).
         :returns: A minimal LLM response dict.
         """
@@ -276,7 +282,7 @@ async def test_next_execution_loads_from_compaction_cursor(
         return _FAKE_LLM_RESPONSE
 
     monkeypatch.setattr(
-        "agent_plane.runtime.workflow._call_llm_maybe_compact",
+        "agent_plane.runtime.workflow._executor_turn_with_compaction",
         _capture_history_llm_call,
     )
 
@@ -396,7 +402,7 @@ def _extract_texts_from_history(history: list[Any]) -> list[str]:
     ``content`` blocks. Returns a flat list of all text strings.
 
     :param history: List of ``ConversationItem`` objects as passed
-        to ``_call_llm_maybe_compact``.
+        to ``_executor_turn_with_compaction``.
     :returns: Flat list of all text strings found across all items.
     """
     from agent_plane.entities import MessageData

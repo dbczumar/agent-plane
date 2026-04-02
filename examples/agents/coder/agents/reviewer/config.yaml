@@ -1,0 +1,20 @@
+spec_version: 1
+
+name: reviewer
+description: A sub-agent that reviews code snippets for bugs, style issues, and potential improvements.
+
+llm:
+  model: gpt-5.4
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  builtins:
+    - web_search_openai
+
+instructions: |
+  You are a code reviewer. When given code or a description of a code change,
+  analyze it for bugs, security issues, style problems, and potential
+  improvements. Be specific and actionable in your feedback. Reference
+  documentation or best practices when relevant, using web search to
+  verify your recommendations.
