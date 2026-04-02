@@ -16,29 +16,20 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import sys
 from pathlib import Path
 from typing import Any
 
 import httpx
-import pytest
 
 from tests.e2e.conftest import (
     poll_for_pending_tool_calls,
-    poll_until_terminal,
 )
 
 # Load the coder tool set for client-side tool execution.
 _TOOL_SET_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "examples"
-    / "frontends"
-    / "tool_sets"
-    / "coder.py"
+    Path(__file__).resolve().parents[2] / "examples" / "frontends" / "tool_sets" / "coder.py"
 )
-_spec = importlib.util.spec_from_file_location(
-    "coder_tools", _TOOL_SET_PATH
-)
+_spec = importlib.util.spec_from_file_location("coder_tools", _TOOL_SET_PATH)
 assert _spec is not None and _spec.loader is not None
 _tool_mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_tool_mod)
@@ -90,17 +81,17 @@ def _handle_tunneled_calls(
         call_id = fc["call_id"]
         arguments = json.loads(fc.get("arguments", "{}"))
         result = execute_tool(name, arguments)
-        tool_results.append({
-            "call_id": call_id,
-            "output": result,
-        })
+        tool_results.append(
+            {
+                "call_id": call_id,
+                "output": result,
+            }
+        )
     resp = client.patch(
         f"/v1/responses/{response_id}",
         json={"tool_results": tool_results},
     )
-    assert resp.status_code == 200, (
-        f"PATCH failed: {resp.text[:300]}"
-    )
+    assert resp.status_code == 200, f"PATCH failed: {resp.text[:300]}"
 
 
 def _run_with_tunneling(
@@ -126,16 +117,12 @@ def _run_with_tunneling(
 
     while True:
         # Check for pending tunneled tool calls.
-        pending = poll_for_pending_tool_calls(
-            client, response_id, timeout=120
-        )
+        pending = poll_for_pending_tool_calls(client, response_id, timeout=120)
         if pending:
             _handle_tunneled_calls(client, response_id, pending)
             continue
         # No pending calls — check if terminal.
-        resp = client.get(
-            f"/v1/responses/{response_id}"
-        )
+        resp = client.get(f"/v1/responses/{response_id}")
         body = resp.json()
         if body["status"] in ("completed", "failed"):
             return body
@@ -170,8 +157,7 @@ def test_coder_spawns_reviewer_and_collects(
     )
 
     assert result["status"] == "completed", (
-        f"Expected completed, got {result['status']}. "
-        f"Error: {result.get('error')}"
+        f"Expected completed, got {result['status']}. Error: {result.get('error')}"
     )
 
     output = result["output"]
@@ -180,34 +166,25 @@ def test_coder_spawns_reviewer_and_collects(
     # proving the LLM actually spawned instead of acting
     # directly.
     spawn_calls = [
-        item for item in output
-        if item.get("type") == "function_call"
-        and item.get("name") == "spawn_sub_agents"
+        item
+        for item in output
+        if item.get("type") == "function_call" and item.get("name") == "spawn_sub_agents"
     ]
     assert len(spawn_calls) >= 1, (
         "LLM didn't call spawn_sub_agents — it may have used "
         "client tools directly instead of delegating. Output: "
-        + str([i.get("name") for i in output
-               if i.get("type") == "function_call"])
+        + str([i.get("name") for i in output if i.get("type") == "function_call"])
     )
 
     # The output must contain text from the assistant with
     # substantial review content.
-    text_items = [
-        item for item in output
-        if item.get("type") == "message"
-    ]
-    assert len(text_items) >= 1, (
-        f"Expected at least one message, got: {output}"
-    )
+    text_items = [item for item in output if item.get("type") == "message"]
+    assert len(text_items) >= 1, f"Expected at least one message, got: {output}"
     all_text = " ".join(
-        c.get("text", "")
-        for item in text_items
-        for c in item.get("content", [])
+        c.get("text", "") for item in text_items for c in item.get("content", [])
     ).lower()
     assert len(all_text) > 100, (
-        f"Expected substantial review output, got {len(all_text)} "
-        f"chars: {all_text[:200]!r}"
+        f"Expected substantial review output, got {len(all_text)} chars: {all_text[:200]!r}"
     )
 
 
@@ -243,45 +220,31 @@ def test_coder_spawns_parallel_subagents(
     )
 
     assert result["status"] == "completed", (
-        f"Expected completed, got {result['status']}. "
-        f"Error: {result.get('error')}"
+        f"Expected completed, got {result['status']}. Error: {result.get('error')}"
     )
 
     output = result["output"]
 
     # Must have at least one spawn_sub_agents call.
     spawn_calls = [
-        item for item in output
-        if item.get("type") == "function_call"
-        and item.get("name") == "spawn_sub_agents"
+        item
+        for item in output
+        if item.get("type") == "function_call" and item.get("name") == "spawn_sub_agents"
     ]
-    assert len(spawn_calls) >= 1, (
-        "LLM didn't call spawn_sub_agents"
-    )
+    assert len(spawn_calls) >= 1, "LLM didn't call spawn_sub_agents"
 
     # Check the spawn call had both agents. The arguments
     # JSON should contain both "reviewer" and "researcher".
     spawn_args = spawn_calls[0].get("arguments", "")
-    assert "reviewer" in spawn_args, (
-        f"spawn_sub_agents didn't include reviewer: {spawn_args}"
-    )
-    assert "researcher" in spawn_args, (
-        f"spawn_sub_agents didn't include researcher: {spawn_args}"
-    )
+    assert "reviewer" in spawn_args, f"spawn_sub_agents didn't include reviewer: {spawn_args}"
+    assert "researcher" in spawn_args, f"spawn_sub_agents didn't include researcher: {spawn_args}"
 
     # The final output must contain text from the assistant
     # with substantial content from both sub-agents.
-    text_items = [
-        item for item in output
-        if item.get("type") == "message"
-    ]
-    assert len(text_items) >= 1, (
-        f"Expected at least one message, got: {output}"
-    )
+    text_items = [item for item in output if item.get("type") == "message"]
+    assert len(text_items) >= 1, f"Expected at least one message, got: {output}"
     all_text = " ".join(
-        c.get("text", "")
-        for item in text_items
-        for c in item.get("content", [])
+        c.get("text", "") for item in text_items for c in item.get("content", [])
     ).lower()
     # Loose check — LLM output is non-deterministic, but
     # it should mention something from both sub-agents.

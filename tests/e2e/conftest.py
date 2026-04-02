@@ -18,8 +18,9 @@ import subprocess
 import tarfile
 import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import httpx
 import pytest
@@ -99,9 +100,7 @@ def live_server(
     else:
         proc.kill()
         stdout = proc.stdout.read().decode() if proc.stdout else ""
-        raise RuntimeError(
-            f"Server didn't start within 30s. Output:\n{stdout}"
-        )
+        raise RuntimeError(f"Server didn't start within 30s. Output:\n{stdout}")
 
     yield base_url
 
@@ -118,9 +117,7 @@ def http_client(live_server: str) -> Iterator[httpx.Client]:
     :param live_server: The server base URL.
     :returns: An ``httpx.Client`` with long timeout.
     """
-    with httpx.Client(
-        base_url=live_server, timeout=300
-    ) as client:
+    with httpx.Client(base_url=live_server, timeout=300) as client:
         yield client
 
 
@@ -135,9 +132,7 @@ def _upload_agent(
     :param agent_dir: Path to the agent directory.
     :returns: The agent ID or name.
     """
-    with tempfile.NamedTemporaryFile(
-        suffix=".tar.gz", delete=False
-    ) as tmp:
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
         with tarfile.open(tmp.name, "w:gz") as tar:
             tar.add(str(agent_dir), arcname=".")
         tmp_path = tmp.name
@@ -188,46 +183,46 @@ def sample_code_dir(
 
     # A module with a deliberate bug (division by zero risk).
     (d / "calculator.py").write_text(
-        'def divide(a: float, b: float) -> float:\n'
+        "def divide(a: float, b: float) -> float:\n"
         '    """Divide a by b."""\n'
-        '    return a / b\n'
-        '\n'
-        '\n'
-        'def average(numbers: list[float]) -> float:\n'
+        "    return a / b\n"
+        "\n"
+        "\n"
+        "def average(numbers: list[float]) -> float:\n"
         '    """Return the mean of a list of numbers."""\n'
-        '    total = sum(numbers)\n'
-        '    return divide(total, len(numbers))\n'
+        "    total = sum(numbers)\n"
+        "    return divide(total, len(numbers))\n"
     )
 
     # A test file with incomplete coverage.
     (d / "test_calculator.py").write_text(
-        'from calculator import divide, average\n'
-        '\n'
-        '\n'
-        'def test_divide():\n'
-        '    assert divide(10, 2) == 5.0\n'
-        '\n'
-        '\n'
-        'def test_average():\n'
-        '    assert average([1, 2, 3]) == 2.0\n'
-        '    # Missing: test for empty list (ZeroDivisionError)\n'
+        "from calculator import divide, average\n"
+        "\n"
+        "\n"
+        "def test_divide():\n"
+        "    assert divide(10, 2) == 5.0\n"
+        "\n"
+        "\n"
+        "def test_average():\n"
+        "    assert average([1, 2, 3]) == 2.0\n"
+        "    # Missing: test for empty list (ZeroDivisionError)\n"
     )
 
     # A utility with a bare except and hardcoded path.
     (d / "utils.py").write_text(
-        'import json\n'
-        'import os\n'
-        '\n'
-        '\n'
-        'def load_config():\n'
-        '    try:\n'
+        "import json\n"
+        "import os\n"
+        "\n"
+        "\n"
+        "def load_config():\n"
+        "    try:\n"
         '        with open("/etc/myapp/config.json") as f:\n'
-        '            return json.load(f)\n'
-        '    except:\n'
-        '        return {}\n'
-        '\n'
-        '\n'
-        'def get_temp_dir():\n'
+        "            return json.load(f)\n"
+        "    except:\n"
+        "        return {}\n"
+        "\n"
+        "\n"
+        "def get_temp_dir():\n"
         '    return os.environ.get("TEMP_DIR", "/tmp/myapp")\n'
     )
 
@@ -255,9 +250,7 @@ def poll_until_terminal(
         if body["status"] in ("completed", "failed"):
             return body
         time.sleep(0.5)
-    raise AssertionError(
-        f"Response {response_id} didn't complete within {timeout}s"
-    )
+    raise AssertionError(f"Response {response_id} didn't complete within {timeout}s")
 
 
 def poll_for_pending_tool_calls(
@@ -280,8 +273,7 @@ def poll_for_pending_tool_calls(
         pending = [
             item
             for item in body.get("output", [])
-            if item.get("type") == "function_call"
-            and item.get("status") == "action_required"
+            if item.get("type") == "function_call" and item.get("status") == "action_required"
         ]
         if pending:
             return pending

@@ -40,8 +40,7 @@ TOOLS: list[dict[str, Any]] = [
                     "file_path": {
                         "type": "string",
                         "description": (
-                            "Absolute path to the file to read, "
-                            "e.g. '/home/user/project/main.py'."
+                            "Absolute path to the file to read, e.g. '/home/user/project/main.py'."
                         ),
                     },
                     "offset": {
@@ -54,8 +53,7 @@ TOOLS: list[dict[str, Any]] = [
                     "limit": {
                         "type": "integer",
                         "description": (
-                            "Maximum number of lines to read. "
-                            "Only needed for large files."
+                            "Maximum number of lines to read. Only needed for large files."
                         ),
                     },
                 },
@@ -114,8 +112,7 @@ TOOLS: list[dict[str, Any]] = [
                     "replace_all": {
                         "type": "boolean",
                         "description": (
-                            "If true, replace all occurrences of old_string. "
-                            "Defaults to false."
+                            "If true, replace all occurrences of old_string. Defaults to false."
                         ),
                     },
                 },
@@ -136,16 +133,12 @@ TOOLS: list[dict[str, Any]] = [
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": (
-                            "Glob pattern to match, "
-                            "e.g. '**/*.py' or 'src/**/*.ts'."
-                        ),
+                        "description": ("Glob pattern to match, e.g. '**/*.py' or 'src/**/*.ts'."),
                     },
                     "path": {
                         "type": "string",
                         "description": (
-                            "Directory to search in. "
-                            "Defaults to the current working directory."
+                            "Directory to search in. Defaults to the current working directory."
                         ),
                     },
                 },
@@ -167,8 +160,7 @@ TOOLS: list[dict[str, Any]] = [
                     "pattern": {
                         "type": "string",
                         "description": (
-                            "Regex pattern to search for, "
-                            "e.g. 'def main' or 'import\\s+asyncio'."
+                            "Regex pattern to search for, e.g. 'def main' or 'import\\s+asyncio'."
                         ),
                     },
                     "path": {
@@ -181,8 +173,7 @@ TOOLS: list[dict[str, Any]] = [
                     "glob": {
                         "type": "string",
                         "description": (
-                            "Glob pattern to filter files, "
-                            "e.g. '*.py' or '*.{ts,tsx}'."
+                            "Glob pattern to filter files, e.g. '*.py' or '*.{ts,tsx}'."
                         ),
                     },
                     "output_mode": {
@@ -220,8 +211,7 @@ TOOLS: list[dict[str, Any]] = [
                     "timeout": {
                         "type": "integer",
                         "description": (
-                            "Timeout in milliseconds. "
-                            "Defaults to 120000 (2 minutes)."
+                            "Timeout in milliseconds. Defaults to 120000 (2 minutes)."
                         ),
                     },
                 },
@@ -306,8 +296,7 @@ def _truncate(output: str) -> str:
     if len(output) <= _MAX_OUTPUT_CHARS:
         return output
     return (
-        output[:_MAX_OUTPUT_CHARS]
-        + f"\n\n... (truncated — {len(output)} chars total, "
+        output[:_MAX_OUTPUT_CHARS] + f"\n\n... (truncated — {len(output)} chars total, "
         f"showing first {_MAX_OUTPUT_CHARS})"
     )
 
@@ -428,8 +417,7 @@ def _execute_glob(args: dict[str, Any]) -> str:
     if total > _MAX_GLOB_RESULTS:
         truncated = matches[:_MAX_GLOB_RESULTS]
         return (
-            "\n".join(truncated)
-            + f"\n\n... ({total} total matches, "
+            "\n".join(truncated) + f"\n\n... ({total} total matches, "
             f"showing first {_MAX_GLOB_RESULTS})"
         )
     return "\n".join(matches)

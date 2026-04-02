@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from agent_plane.errors import AgentPlaneError, ErrorCode
 from agent_plane.entities import (
     CompactionData,
     ConversationItem,
@@ -23,6 +22,7 @@ from agent_plane.entities import (
     MessageData,
     NewConversationItem,
 )
+from agent_plane.errors import AgentPlaneError, ErrorCode
 from agent_plane.llms import Client as LLMClient
 from agent_plane.llms.errors import (
     ContextWindowExceededError,
@@ -150,8 +150,7 @@ def _create_executor(spec: AgentSpec) -> Executor:
 
     if executor_type != "llm":
         raise AgentPlaneError(
-            f"Unknown executor type: {executor_type!r}. "
-            f"Must be 'llm', 'claude_sdk', or 'remote'.",
+            f"Unknown executor type: {executor_type!r}. Must be 'llm', 'claude_sdk', or 'remote'.",
             code=ErrorCode.INVALID_INPUT,
         )
 
@@ -827,8 +826,10 @@ def _consume_executor_live(
         llm_config,
         context,
     ):
+        _logger.info("executor event: %s", type(event).__name__)
         _emit_executor_streaming_event(task_id, event)
         events.append(event)
+    _logger.info("total executor events: %d", len(events))
     return events
 
 

@@ -103,7 +103,8 @@ _VALID_EXECUTOR_TYPES = {"llm", "claude_sdk", "remote"}
 
 
 def _validate_executor_type(
-    spec: AgentSpec, result: ValidationResult,
+    spec: AgentSpec,
+    result: ValidationResult,
 ) -> None:
     """
     Validate that all spec fields are valid for the declared executor type.
@@ -119,8 +120,7 @@ def _validate_executor_type(
     if etype not in _VALID_EXECUTOR_TYPES:
         result.add(
             "executor.type",
-            f"must be one of {sorted(_VALID_EXECUTOR_TYPES)}, "
-            f"got {etype!r}",
+            f"must be one of {sorted(_VALID_EXECUTOR_TYPES)}, got {etype!r}",
         )
         return
 
@@ -133,7 +133,8 @@ def _validate_executor_type(
 
 
 def _validate_remote_executor(
-    spec: AgentSpec, result: ValidationResult,
+    spec: AgentSpec,
+    result: ValidationResult,
 ) -> None:
     """
     Validate fields for ``executor.type: remote``.
@@ -167,7 +168,8 @@ def _validate_remote_executor(
 
 
 def _validate_claude_sdk_executor(
-    spec: AgentSpec, result: ValidationResult,
+    spec: AgentSpec,
+    result: ValidationResult,
 ) -> None:
     """
     Validate fields for ``executor.type: claude_sdk``.
@@ -186,8 +188,7 @@ def _validate_claude_sdk_executor(
     if spec.executor.request_timeout is not None:
         result.add(
             "executor.request_timeout",
-            "not supported when executor.type is 'claude_sdk'"
-            " — use llm.request_timeout instead",
+            "not supported when executor.type is 'claude_sdk' — use llm.request_timeout instead",
         )
     if spec.llm is not None and spec.llm.connection is not None:
         result.add(
@@ -202,7 +203,8 @@ def _validate_claude_sdk_executor(
 
 
 def _validate_llm_executor(
-    spec: AgentSpec, result: ValidationResult,
+    spec: AgentSpec,
+    result: ValidationResult,
 ) -> None:
     """
     Validate fields for ``executor.type: llm``.
@@ -221,8 +223,7 @@ def _validate_llm_executor(
     if spec.executor.request_timeout is not None:
         result.add(
             "executor.request_timeout",
-            "not supported when executor.type is 'llm'"
-            " — use llm.request_timeout instead",
+            "not supported when executor.type is 'llm' — use llm.request_timeout instead",
         )
 
 

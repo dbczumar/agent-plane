@@ -30,7 +30,8 @@ import shutil
 import threading
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any
 
@@ -64,7 +65,7 @@ def _ensure_sdk() -> Any:
     :raises ImportError: If the package is not installed.
     """
     try:
-        import claude_agent_sdk  # type: ignore[import-untyped]
+        import claude_agent_sdk  # type: ignore[import-not-found]
 
         return claude_agent_sdk
     except ImportError as exc:
@@ -171,10 +172,7 @@ def _build_history_prompt(
             content = json.dumps(content, ensure_ascii=False)
         lines.append(f"{role}: {content}")
     lines.append("")
-    lines.append(
-        "Respond to the latest user message, "
-        "using the conversation above as context."
-    )
+    lines.append("Respond to the latest user message, using the conversation above as context.")
     return "\n".join(lines)
 
 
@@ -348,10 +346,20 @@ async def _async_turn(
 
     mcp_server = _build_client_tool_mcp_server(sdk, tools, context)
     options = _build_sdk_options(
-        sdk, executor, system_prompt, llm_config, context, mcp_server, tools,
+        sdk,
+        executor,
+        system_prompt,
+        llm_config,
+        context,
+        mcp_server,
+        tools,
     )
     client = await _get_or_create_client(
-        sdk, executor, conv_id, options, llm_config,
+        sdk,
+        executor,
+        conv_id,
+        options,
+        llm_config,
     )
 
     try:
@@ -419,10 +427,13 @@ def _build_client_tool_mcp_server(
         tool_desc = schema.get("description", "")
         # OpenAI tool schemas always include "parameters"; the empty
         # object fallback matches the SDK's expectation for no-arg tools.
-        tool_params = schema.get("parameters", {
-            "type": "object",
-            "properties": {},
-        })
+        tool_params = schema.get(
+            "parameters",
+            {
+                "type": "object",
+                "properties": {},
+            },
+        )
 
         handler = _make_client_tool_handler(tool_name, context)
         decorated = sdk.tool(tool_name, tool_desc, tool_params)(handler)
@@ -468,7 +479,9 @@ def _make_client_tool_handler(
         loop = asyncio.get_running_loop()
         # await_tool_output is sync (blocking) — run in thread
         result: ToolResult = await loop.run_in_executor(
-            None, context.await_tool_output, call,
+            None,
+            context.await_tool_output,
+            call,
         )
         response: dict[str, Any] = {
             "content": [{"type": "text", "text": result.content}],
@@ -590,7 +603,9 @@ async def _consume_sdk_stream(
     :param client: The connected ``ClaudeSDKClient``.
     :param event_queue: Queue for pushing executor events.
     """
-    from claude_agent_sdk.types import StreamEvent as _StreamEvent
+    from claude_agent_sdk.types import (  # type: ignore[import-not-found]
+        StreamEvent as _StreamEvent,
+    )
 
     state = _StreamState()
     message_stream = client.receive_response()
@@ -644,7 +659,8 @@ def _handle_stream_event(
             tool_id = block.get("id", "")
             tool_name = block.get("name", "unknown")
             state.pending[tool_id] = _PendingToolCall(
-                name=tool_name, start_time=time.monotonic(),
+                name=tool_name,
+                start_time=time.monotonic(),
             )
             state.args_buffers[tool_id] = []
 
@@ -717,7 +733,8 @@ def _handle_assistant_message(
             event_queue.put(TextChunk(text=block.text))
         elif isinstance(block, sdk.ToolUseBlock):
             state.pending[block.id] = _PendingToolCall(
-                name=block.name, start_time=time.monotonic(),
+                name=block.name,
+                start_time=time.monotonic(),
             )
             state.args_buffers[block.id] = [json.dumps(block.input)]
 
@@ -766,8 +783,7 @@ def _emit_tool_call_observed(
         start = pending_call.start_time
     else:
         _logger.warning(
-            "ToolResultBlock for unknown tool_use_id %s — "
-            "tool call tracking may be out of sync",
+            "ToolResultBlock for unknown tool_use_id %s — tool call tracking may be out of sync",
             tool_id,
         )
         name = "unknown"
@@ -777,14 +793,16 @@ def _emit_tool_call_observed(
     arguments = _reconstruct_tool_args(state.args_buffers.pop(tool_id, []))
     result_text = _extract_tool_result_text(block.content)
 
-    event_queue.put(ToolCallObserved(
-        call_id=tool_id,
-        name=name,
-        arguments=arguments,
-        result=result_text,
-        status="error" if block.is_error else "success",
-        duration_ms=duration_ms,
-    ))
+    event_queue.put(
+        ToolCallObserved(
+            call_id=tool_id,
+            name=name,
+            arguments=arguments,
+            result=result_text,
+            status="error" if block.is_error else "success",
+            duration_ms=duration_ms,
+        )
+    )
 
 
 def _reconstruct_tool_args(fragments: list[str]) -> dict[str, Any]:
@@ -798,7 +816,8 @@ def _reconstruct_tool_args(fragments: list[str]) -> dict[str, Any]:
     if not args_str:
         return {}
     try:
-        return json.loads(args_str)
+        parsed: dict[str, Any] = json.loads(args_str)
+        return parsed
     except json.JSONDecodeError:
         return {}
 
@@ -816,9 +835,7 @@ def _extract_tool_result_text(result_content: Any) -> str:
     if isinstance(result_content, str):
         return result_content
     if isinstance(result_content, list):
-        parts = [
-            part.text for part in result_content if hasattr(part, "text")
-        ]
+        parts = [part.text for part in result_content if hasattr(part, "text")]
         return "\n".join(parts) if parts else str(result_content)
     return str(result_content)
 
@@ -839,8 +856,7 @@ def _check_terminal_error(message: Any) -> ExecutorError | None:
     if status in {401, 403}:
         return ExecutorError(
             message=(
-                f"Claude SDK auth failed ({error}, status={status}). "
-                "Check ANTHROPIC_API_KEY."
+                f"Claude SDK auth failed ({error}, status={status}). Check ANTHROPIC_API_KEY."
             ),
             code="auth_failed",
         )
@@ -906,5 +922,5 @@ def _extract_claude_tools(spec: AgentSpec) -> list[str]:
     for builtin in spec.tools.builtins:
         name = builtin.name
         if name.startswith("claude:"):
-            result.append(name[len("claude:"):])
+            result.append(name[len("claude:") :])
     return result
