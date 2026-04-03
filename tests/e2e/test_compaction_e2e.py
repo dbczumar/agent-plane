@@ -59,7 +59,10 @@ def compaction_server(
         "OPENAI_API_KEY": api_key,
         "AP_DB_URI": f"sqlite:///{db_path}",
         # Small context window so proactive compaction fires quickly.
-        "AP_CONTEXT_WINDOW_OVERRIDE": "4096",
+        # 32768 * 0.05 = 1638 token budget — fires after ~2 turns
+        # of normal conversation, with enough room for the compacted
+        # summary + recent message to fit after compaction.
+        "AP_CONTEXT_WINDOW_OVERRIDE": "32768",
     }
     # Remove stale DBOS system DB so the server starts fresh
     # (avoids reusing cached agent bundles from prior runs).
@@ -239,7 +242,7 @@ def test_compaction_fires_and_agent_continues(
 
     assert len(compaction_items) >= 1, (
         f"Expected >= 1 compaction item after 2 turns with "
-        f"4096-token window and 1% threshold. "
+        f"32768-token window and 2% threshold (655 token budget). "
         f"Found {len(compaction_items)}. "
         f"Item types: {[i.get('type') for i in items]}. "
         f"If 0, AP_CONTEXT_WINDOW_OVERRIDE may not have reached "

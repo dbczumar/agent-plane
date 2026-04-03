@@ -99,12 +99,16 @@ class _CompactionState:
         ``None`` to use defaults.
     :param model: The LLM model string used for tiktoken estimation,
         e.g. ``"openai/gpt-4o"``.
+    :param connection: Per-provider connection overrides (api_key,
+        base_url, etc.) for the summarization LLM call. ``None``
+        means use environment variable defaults.
     """
 
     context_window: int | None
     last_summary: SummaryMetadata | None
     config: CompactionConfig | None
     model: str
+    connection: dict[str, str] | None = None
 
 
 def count_tokens(messages: list[dict[str, Any]], model: str) -> int:
@@ -290,6 +294,7 @@ def summarize_history(
     messages_to_summarize: list[dict[str, Any]],
     llm_client: Any,  # llms.Client — typed as Any to avoid circular import
     model: str,
+    connection: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     Layer 2: call the LLM to summarise conversation messages.
@@ -305,6 +310,9 @@ def summarize_history(
     :param llm_client: The LLM client to use, e.g. an instance of
         ``llms.Client``.
     :param model: The LLM model string, e.g. ``"openai/gpt-4o"``.
+    :param connection: Per-provider connection overrides (api_key,
+        base_url, etc.) from the agent spec. ``None`` means use
+        environment variable defaults.
     :returns: A dict with ``"text"`` (the summary) and
         ``"token_count"`` (approximate token count).
     """
@@ -314,6 +322,7 @@ def summarize_history(
         input=messages_to_summarize,
         instructions=system_prompt,
         tools=[],
+        connection_params=connection,
     )
     summary_text = _extract_summary_text(resp)
     token_count = count_tokens([{"role": "assistant", "content": summary_text}], model)
@@ -465,6 +474,7 @@ def compact(
     model: str,
     task_id: str,
     llm_client: Any,  # llms.Client — typed as Any to avoid circular import
+    connection: dict[str, str] | None = None,
 ) -> CompactionResult:
     """
     Apply layered compaction to a messages list to fit within the
@@ -527,6 +537,7 @@ def compact(
         model,
         task_id,
         llm_client,
+        connection=connection,
     )
     if summary_metadata is not None:
         summary_messages = _summary_to_messages(summary_metadata)
@@ -596,6 +607,7 @@ def _run_layer2(
     model: str,
     task_id: str,
     llm_client: Any,
+    connection: dict[str, str] | None = None,
 ) -> SummaryMetadata | None:
     """
     Attempt Layer 2 LLM summarisation.
@@ -612,6 +624,8 @@ def _run_layer2(
     :param model: LLM model string.
     :param task_id: Task identifier for SSE event emission.
     :param llm_client: LLM client instance.
+    :param connection: Per-provider connection overrides (api_key,
+        base_url, etc.) passed through to the summarization call.
     :returns: :class:`SummaryMetadata` on success, ``None`` on failure.
     """
     _emit_compaction_event(task_id)
@@ -625,7 +639,12 @@ def _run_layer2(
         _clear_binary_content(to_summarize, len(to_summarize))
 
     try:
-        result = summarize_history(to_summarize, llm_client, model)
+        result = summarize_history(
+            to_summarize,
+            llm_client,
+            model,
+            connection=connection,
+        )
     except Exception:
         _logger.warning(
             "Layer 2 summarisation failed for task %s — falling back to Layer 3",

@@ -34,8 +34,9 @@ from agent_plane.entities.conversation import (
 from agent_plane.stores.task_store.sqlalchemy_store import (
     SqlAlchemyTaskStore,
 )
-from tests.server.conftest import ControllableMockClient
+from tests.server.conftest import ControllableMockClient, MockCall
 from tests.server.helpers import (
+    build_agent_bundle,
     create_test_agent,
     create_test_response,
 )
@@ -1015,6 +1016,210 @@ async def test_foreground_steering_returns_immediately(
     # 2 LLM calls: original + steering continuation
     assert mock_llm.call_count == 2, (
         f"Expected 2 LLM calls (original + steering continuation), got {mock_llm.call_count}"
+    )
+
+
+# ── Steering during auto-collect ─────────────────────────
+
+
+def _identify_parent_and_sub(
+    call_a: MockCall,
+    call_b: MockCall,
+) -> tuple[MockCall, MockCall]:
+    """
+    Identify which blocked MockCall belongs to the parent and
+    which to the sub-agent.
+
+    The sub-agent's first LLM input contains the user message
+    from ``spawn_one`` (``"Do work"``). The parent's input
+    contains the ``function_call_output`` from the spawn tool.
+
+    :param call_a: First blocked call.
+    :param call_b: Second blocked call.
+    :returns: ``(parent_call, sub_call)``.
+    """
+    import json
+
+    def _is_sub_agent(call: MockCall) -> bool:
+        for item in call.received_kwargs.get("input", []):
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "input_text":
+                if "Do work" in item.get("text", ""):
+                    return True
+        return False
+
+    if _is_sub_agent(call_a):
+        return call_b, call_a
+    return call_a, call_b
+
+
+async def test_steering_during_auto_collect(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Steer a message while the parent is blocked in auto-collect.
+
+    Race window: the parent LLM produces a final response (no
+    tool calls) while a sub-agent is still running. Auto-collect
+    polls ``get_sync`` + ``time.sleep`` until the sub-agent
+    finishes. A steering message arrives during this window.
+
+    The parent must detect the steering during the auto-collect
+    poll, break early, and include the steering text in a
+    subsequent LLM call's input.
+
+    Synchronization (deterministic — no FIFO ordering guesses):
+    1. Call 1 (parent): spawn tool call — consumed first since
+       the parent workflow starts before the sub-agent.
+    2. Calls 2–3: BOTH block. Parent and sub-agent each consume
+       one (order is non-deterministic).
+    3. Test waits for both ``call_event``s, then inspects
+       ``received_kwargs`` to identify which is which.
+    4. Release the parent — it gets a text response (no tool
+       calls), enters auto-collect, starts polling.
+    5. Send the steering message. Auto-collect's next poll
+       cycle detects it via ``fetch_all_items`` and breaks.
+    6. Release the sub-agent — it completes.
+    7. Assert: the steering text appears in a subsequent
+       parent LLM call's ``received_kwargs.input``.
+
+    Breakage this catches:
+    - Auto-collect blocks indefinitely in ``wait_sync``, so
+      the steering message is never seen by the LLM.
+    - Auto-collect detects steering but doesn't break early.
+    - Parent completes without an LLM turn that includes the
+      steered message in its input.
+    """
+    import json
+
+    bundle = build_agent_bundle(
+        name="steer-collect",
+        sub_agents=[
+            {"name": "worker", "description": "Background worker"},
+        ],
+    )
+    resp = await client.post(
+        "/api/agents",
+        files={
+            "bundle": ("agent.tar.gz", bundle, "application/gzip"),
+        },
+    )
+    assert resp.status_code == 201
+
+    # Call 1 (parent): spawn the worker sub-agent.
+    spawn_args = json.dumps(
+        {"agents": [{"name": "worker", "input": "Do work"}]},
+    )
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_spawn",
+                "name": "spawn_sub_agents",
+                "arguments": spawn_args,
+            },
+        ],
+    )
+
+    # Calls 2–3: BOTH block. Parent and sub-agent each get one
+    # (order is non-deterministic). We identify them afterward
+    # via received_kwargs.
+    call_a = mock_llm.add_call(
+        text="Generic response",
+        block=True,
+    )
+    call_b = mock_llm.add_call(
+        text="Generic response",
+        block=True,
+    )
+
+    # Post-steering LLM calls (parent sees collected results +
+    # steering message and produces a final answer).
+    mock_llm.add_call(text="Post-collect answer.")
+    mock_llm.add_call(text="Steered final answer.")
+
+    first = await create_test_response(
+        client,
+        model="steer-collect",
+        input_text="Start the worker",
+    )
+    first_id = first.body["id"]
+    conv_id = first.body["conversation"]["id"]
+
+    # Gate: both blocked calls are entered. Now we know the
+    # parent and sub-agent are each sitting on a blocked call.
+    call_a.call_event.wait(timeout=10)
+    call_b.call_event.wait(timeout=10)
+
+    parent_call, sub_call = _identify_parent_and_sub(
+        call_a, call_b,
+    )
+
+    # Release the PARENT only. It receives a text response
+    # (no tool calls) → triggers auto-collect → starts polling
+    # for the sub-agent (which is still blocked).
+    parent_call.release()
+
+    # Give the parent time to enter the auto-collect poll loop.
+    # One poll cycle is _COLLECT_POLL_S = 0.5s.
+    await asyncio.sleep(0.3)
+
+    # Concurrent action: steer while parent is in the
+    # auto-collect poll loop.
+    steer = await create_test_response(
+        client,
+        model="steer-collect",
+        input_text="ABORT: cancel the worker immediately",
+        previous_response_id=first_id,
+    )
+    # Steering returns the SAME response (not a new task).
+    assert steer.body["id"] == first_id
+
+    # Release the sub-agent so it completes. Auto-collect
+    # should have already detected the steering and broken
+    # early, but releasing ensures no deadlock either way.
+    sub_call.release()
+
+    # Poll until parent completes.
+    for _ in range(100):
+        resp = await client.get(f"/v1/responses/{first_id}")
+        if resp.json()["status"] in ("completed", "failed"):
+            break
+        await asyncio.sleep(0.1)
+
+    body = resp.json()
+    assert body["status"] == "completed", (
+        f"Expected completed, got {body['status']}. "
+        f"Output: {body.get('output')}"
+    )
+
+    # Content-based assertion: the steering text must appear
+    # in the input of at least one LLM call AFTER the parent
+    # was released. This proves the parent's workflow thread
+    # saw the steering message and fed it to the LLM — not
+    # just that the message was persisted in the DB.
+    steering_seen_by_llm = False
+    for call in mock_llm._calls:
+        if call.received_kwargs is None:
+            continue
+        input_str = json.dumps(
+            call.received_kwargs.get("input", []),
+        )
+        if "ABORT: cancel the worker immediately" in input_str:
+            steering_seen_by_llm = True
+            break
+
+    assert steering_seen_by_llm, (
+        "Steering message was never included in any LLM call's "
+        "input. The auto-collect poll loop blocked the workflow "
+        "thread, preventing _sync_history from picking up the "
+        "steered message. LLM inputs received: "
+        + str([
+            json.dumps(c.received_kwargs.get("input", []))[:200]
+            for c in mock_llm._calls
+            if c.received_kwargs is not None
+        ])
     )
 
 

@@ -611,7 +611,7 @@ def test_layer2_triggers_when_layer1_insufficient(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr("agent_plane.runtime.compaction.count_tokens", mock_count_tokens)
     monkeypatch.setattr(
         "agent_plane.runtime.compaction.summarize_history",
-        lambda msgs, llm_client, model: {
+        lambda msgs, llm_client, model, connection=None: {
             "text": "Summary of earlier conversation",
             "token_count": 50,
         },
@@ -922,7 +922,7 @@ def test_layer2_emits_compaction_sse_event(
     )
     monkeypatch.setattr(
         "agent_plane.runtime.compaction.summarize_history",
-        lambda msgs, llm_client, model: {
+        lambda msgs, llm_client, model, connection=None: {
             "text": "Summary",
             "token_count": 10,
         },
@@ -991,7 +991,7 @@ def test_layer3_truncation_preserves_tool_call_pairs(
     # Layer 2 fails so we fall through to Layer 3.
     monkeypatch.setattr(
         "agent_plane.runtime.compaction.summarize_history",
-        lambda msgs, llm_client, model: (_ for _ in ()).throw(
+        lambda msgs, llm_client, model, connection=None: (_ for _ in ()).throw(
             RuntimeError("Simulated Layer 2 failure"),
         ),
     )

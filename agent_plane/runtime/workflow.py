@@ -1074,6 +1074,7 @@ def _reactive_compact_from_overflow(
         model=compaction_state.model,
         task_id=task_id,
         llm_client=_get_llm_client(),
+        connection=compaction_state.connection,
     )
     if result.summary_metadata is not None:
         compaction_state.last_summary = result.summary_metadata
@@ -1793,40 +1794,201 @@ def _track_spawn_collect(
                     collected_ids.add(rid)
 
 
+@dataclass
+class _AutoCollectResult:
+    """
+    Result of :func:`_auto_collect_sub_agents`.
+
+    :param last_seen: The store cursor after persisting any
+        collected results, e.g. ``"msg_abc123"``.
+    :param collected_ids: The set of sub-agent response IDs
+        that actually reached a terminal status and were
+        collected. May be a subset of the requested IDs if
+        a steering message interrupted the wait.
+    """
+
+    last_seen: str
+    collected_ids: set[str]
+
+
+# Interval between polls when waiting for sub-agents during
+# auto-collect. Short enough to detect steering promptly.
+_COLLECT_POLL_S = 0.5
+
+
 def _auto_collect_sub_agents(
     task_id: str,
     conversation_id: str,
     response_ids: list[str],
+    last_seen: str,
     history: list[ConversationItem],
     output_items: list[dict[str, Any]],
     conv_store: ConversationStore,
-) -> str:
+) -> _AutoCollectResult:
     """
     Auto-collect outstanding sub-agents before turn completion.
 
-    Waits for all sub-agents to finish, then injects their
-    results as a synthetic ``function_call_output`` into the
-    conversation so the LLM can see them on the next iteration.
+    Polls sub-agents with short timeouts, checking for steering
+    messages between each poll. If all sub-agents finish, injects
+    their results as a synthetic message. If a steering message
+    arrives first, injects partial results (for any sub-agents
+    that completed so far) and returns early so the agent loop
+    can process the steering.
 
     :param task_id: The parent task ID.
     :param conversation_id: The parent's conversation ID.
     :param response_ids: Sub-agent response IDs to collect.
+    :param last_seen: The current store cursor for detecting
+        new items (steering), e.g. ``"msg_abc123"``.
     :param history: Mutable conversation history.
     :param output_items: Mutable output items list.
     :param conv_store: ConversationStore for persistence.
-    :returns: The last_seen cursor after persisting results.
+    :returns: An :class:`_AutoCollectResult` with the updated
+        cursor and the set of actually-collected IDs.
+    """
+    results, collected = _poll_subagents_with_steering_check(
+        response_ids,
+        conversation_id,
+        last_seen,
+        conv_store,
+    )
+    return _inject_collect_results(
+        task_id,
+        conversation_id,
+        last_seen,
+        results,
+        collected,
+        history,
+        output_items,
+        conv_store,
+    )
+
+
+def _poll_subagents_with_steering_check(
+    response_ids: list[str],
+    conversation_id: str,
+    last_seen: str,
+    conv_store: ConversationStore,
+) -> tuple[list[dict[str, str]], set[str]]:
+    """
+    Poll sub-agents for terminal status, checking for steering
+    between each poll cycle.
+
+    :param response_ids: Sub-agent response IDs to wait for.
+    :param conversation_id: Parent's conversation ID for
+        steering detection.
+    :param last_seen: Store cursor for detecting new items.
+    :param conv_store: ConversationStore for steering checks.
+    :returns: ``(results, collected_ids)`` — results dicts for
+        sub-agents that finished, and their IDs.
+    """
+
+    task_store = get_task_store()
+    pending = set(response_ids)
+    results: list[dict[str, str]] = []
+    collected: set[str] = set()
+
+    poll_count = 0
+    while pending:
+        newly_done = _check_terminal(
+            pending,
+            task_store,
+            results,
+        )
+        collected.update(newly_done)
+        pending -= newly_done
+
+        if not pending:
+            _logger.debug(
+                "auto-collect: all sub-agents terminal after %d polls",
+                poll_count,
+            )
+            break
+
+        # Check for steering messages before sleeping.
+        new_items = fetch_all_items(
+            conv_store,
+            conversation_id,
+            after=last_seen,
+        )
+        _logger.debug(
+            "auto-collect poll %d: pending=%s, new_items=%d, last_seen=%s",
+            poll_count,
+            pending,
+            len(new_items),
+            last_seen,
+        )
+        if new_items:
+            _logger.debug(
+                "steering detected during auto-collect, returning %d partial results",
+                len(results),
+            )
+            break
+
+        poll_count += 1
+        time.sleep(_COLLECT_POLL_S)
+
+    return results, collected
+
+
+def _check_terminal(
+    pending: set[str],
+    task_store: TaskStore,
+    results: list[dict[str, str]],
+) -> set[str]:
+    """
+    Non-blocking check for sub-agents that reached terminal status.
+
+    :param pending: Set of sub-agent IDs still being waited on.
+    :param task_store: For fetching current task status.
+    :param results: Mutable list — appends a result dict for
+        each newly-terminal sub-agent.
+    :returns: Set of IDs that became terminal this poll cycle.
     """
     from agent_plane.tools.builtins.spawn import _task_to_result
 
-    task_store = get_task_store()
-    results: list[dict[str, str]] = []
-    for rid in response_ids:
-        task = task_store.wait_sync(rid, timeout=None)
-        results.append(_task_to_result(task))
-    result_json = json.dumps({"results": results})
+    newly_done: set[str] = set()
+    for rid in list(pending):
+        task = task_store.get_sync(rid)
+        if task is not None and task.status in TERMINAL_STATUSES:
+            results.append(_task_to_result(task))
+            newly_done.add(rid)
+    return newly_done
 
-    # Persist as a system-injected message so the LLM sees
-    # the sub-agent results on the next iteration.
+
+def _inject_collect_results(
+    task_id: str,
+    conversation_id: str,
+    last_seen: str,
+    results: list[dict[str, str]],
+    collected: set[str],
+    history: list[ConversationItem],
+    output_items: list[dict[str, Any]],
+    conv_store: ConversationStore,
+) -> _AutoCollectResult:
+    """
+    Persist collected sub-agent results as a system message.
+
+    If no sub-agents completed, returns the original cursor
+    without persisting anything.
+
+    :param task_id: The parent task ID.
+    :param conversation_id: The parent's conversation ID.
+    :param last_seen: Current store cursor.
+    :param results: Result dicts from completed sub-agents.
+    :param collected: IDs of completed sub-agents.
+    :param history: Mutable conversation history.
+    :param output_items: Mutable output items list.
+    :param conv_store: ConversationStore for persistence.
+    :returns: An :class:`_AutoCollectResult`.
+    """
+    if not results:
+        return _AutoCollectResult(
+            last_seen=last_seen,
+            collected_ids=collected,
+        )
+
+    result_json = json.dumps({"results": results})
     new_items = [
         NewConversationItem(
             type="message",
@@ -1842,9 +2004,18 @@ def _auto_collect_sub_agents(
             ),
         ),
     ]
-    persisted = _persist_and_stream(task_id, conv_store, conversation_id, new_items, output_items)
+    persisted = _persist_and_stream(
+        task_id,
+        conv_store,
+        conversation_id,
+        new_items,
+        output_items,
+    )
     history.extend(persisted)
-    return persisted[-1].id
+    return _AutoCollectResult(
+        last_seen=persisted[-1].id,
+        collected_ids=collected,
+    )
 
 
 def _park_for_client_tools(
@@ -2264,6 +2435,7 @@ def _proactive_compact_if_needed(
         model=compaction_state.model,
         task_id=task_id,
         llm_client=_get_llm_client(),
+        connection=compaction_state.connection,
     )
     if result.summary_metadata is not None:
         compaction_state.last_summary = result.summary_metadata
@@ -2322,6 +2494,7 @@ def _reactive_compact(
         model=compaction_state.model,
         task_id=task_id,
         llm_client=_get_llm_client(),
+        connection=compaction_state.connection,
     )
     if result.summary_metadata is not None:
         compaction_state.last_summary = result.summary_metadata
@@ -2629,6 +2802,7 @@ def _run_agent_loop(
         last_summary=None,
         config=spec.compaction,
         model=llm_config.model,
+        connection=llm_config.connection,
     )
     # Build executor context for lifecycle hooks and run_turn.
     executor_context = _build_executor_context(
@@ -2676,17 +2850,27 @@ def _run_agent_loop(
                 # Auto-collect outstanding sub-agents before completing.
                 uncollected = spawned_ids - collected_ids
                 if uncollected:
-                    last_seen = _auto_collect_sub_agents(
+                    # last_seen is always set after the first
+                    # iteration (spawn persisted items).
+                    assert last_seen is not None
+                    collect_result = _auto_collect_sub_agents(
                         task_id,
                         conversation_id,
                         list(uncollected),
+                        last_seen,
                         history,
                         output_items,
                         conv_store,
                     )
-                    collected_ids.update(uncollected)
-                    # Re-run the LLM so it can see the collect
-                    # results and synthesize a final answer.
+                    last_seen = collect_result.last_seen
+                    # Only mark actually-collected IDs — partial
+                    # collection (steering interrupt) leaves the
+                    # rest for the next auto-collect cycle.
+                    collected_ids.update(
+                        collect_result.collected_ids,
+                    )
+                    # Re-run the LLM so it can see collected
+                    # results and any steered messages.
                     continue
                 result = _handle_final_response(
                     task_id,
