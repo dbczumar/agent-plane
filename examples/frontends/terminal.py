@@ -450,7 +450,7 @@ class ChatApp(App[None]):
     """
 
     BINDINGS = [
-        Binding("ctrl+c", "quit", "Quit"),
+        Binding("ctrl+c", "interrupt", "Cancel/Quit"),
         Binding("ctrl+l", "clear_log", "Clear"),
         Binding("ctrl+r", "toggle_reasoning", "Reasoning"),
         Binding("ctrl+v", "paste_files", "Paste", show=False),
@@ -497,7 +497,7 @@ class ChatApp(App[None]):
         yield VerticalScroll(id="chat-scroll")
         yield Input(
             id="user-input",
-            placeholder="Type a message… (Enter to send, Esc to cancel, Ctrl+C to quit)",
+            placeholder="Type a message… (Enter to send, Ctrl+C to cancel/quit)",
         )
         yield Footer()
 
@@ -850,6 +850,19 @@ class ChatApp(App[None]):
                 )
             )
         scroll.scroll_end()
+
+    def action_interrupt(self) -> None:
+        """
+        Handle Ctrl+C — context-sensitive.
+
+        If the assistant is currently streaming, cancel the
+        in-progress response via the cancel API. Otherwise,
+        quit the application.
+        """
+        if self._streaming and self._current_response_id is not None:
+            self._cancel_response()
+            return
+        self.exit()
 
     def action_toggle_browse(self) -> None:
         """
