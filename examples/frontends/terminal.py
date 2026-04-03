@@ -888,31 +888,32 @@ class ChatApp(App[None]):
             # Return to input mode
             inp.focus()
 
-    @work(thread=True, group="cancel")
-    def _cancel_response(self) -> None:
+    @work(group="cancel")
+    async def _cancel_response(self) -> None:
         """
         Cancel the in-progress response via the server API.
 
         Sends ``POST /v1/responses/{id}/cancel`` and displays
-        a status message. The SSE stream will terminate naturally
-        when the workflow observes the cancellation at its next
-        checkpoint.
+        a status message. Must be async (not thread) because
+        ``scroll.mount()`` requires the Textual event loop.
+        The SSE stream terminates naturally when the workflow
+        observes the cancellation at its next checkpoint.
         """
         response_id = self._current_response_id
         if response_id is None:
             return
         scroll = self.query_one("#chat-scroll", VerticalScroll)
         try:
-            resp = httpx.post(
-                f"{BASE_URL}/v1/responses/{response_id}/cancel",
-                timeout=10.0,
-            )
-            resp.raise_for_status()
-            scroll.mount(
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    f"{BASE_URL}/v1/responses/{response_id}/cancel",
+                )
+                resp.raise_for_status()
+            await scroll.mount(
                 SystemInfo(Text.from_markup("[dim yellow]⏹ response cancelled[/dim yellow]"))
             )
         except httpx.HTTPStatusError as exc:
-            scroll.mount(
+            await scroll.mount(
                 SystemInfo(
                     Text.from_markup(
                         f"[dim red]cancel failed: {exc.response.status_code}[/dim red]"
@@ -920,7 +921,7 @@ class ChatApp(App[None]):
                 )
             )
         except (httpx.ConnectError, httpx.TimeoutException) as exc:
-            scroll.mount(
+            await scroll.mount(
                 SystemInfo(
                     Text.from_markup(f"[dim red]cancel failed: {escape(str(exc))}[/dim red]")
                 )
