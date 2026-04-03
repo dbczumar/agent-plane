@@ -702,7 +702,9 @@ async def _stream_events(
         if not background and not completed_normally:
             current = await task_store.get(task.id)
             if current and current.status not in TERMINAL_STATUSES:
-                task_store.cancel(task.id)
+                # cancel() is sync (DBOS cancel_workflow) — offload
+                # to avoid "called while event loop is running" error.
+                await asyncio.to_thread(task_store.cancel, task.id)
 
 
 async def _handle_blocking_wait(
@@ -737,8 +739,10 @@ async def _handle_blocking_wait(
     if wait_coro in done:
         return _build_response_object(wait_coro.result())
 
-    # Client disconnected — cancel the foreground task
-    cancelled = task_store.cancel(task.id)
+    # Client disconnected — cancel the foreground task.
+    # cancel() is sync (DBOS cancel_workflow) — offload to avoid
+    # "called while event loop is running" error.
+    cancelled = await asyncio.to_thread(task_store.cancel, task.id)
     return _build_response_object(cancelled)
 
 
@@ -961,7 +965,12 @@ def create_responses_router(
             raise AgentPlaneError("Response not found", code=ErrorCode.NOT_FOUND)
         if task.status in TERMINAL_STATUSES:
             return _build_response_object(task)
-        cancelled_task = task_store.cancel(response_id)
+        # cancel() is sync (DBOS cancel_workflow) — offload to
+        # avoid "called while event loop is running" error.
+        cancelled_task = await asyncio.to_thread(
+            task_store.cancel,
+            response_id,
+        )
         return _build_response_object(cancelled_task)
 
     # ── DELETE /responses/{response_id} ──────────────────────────

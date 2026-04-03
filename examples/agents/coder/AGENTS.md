@@ -29,11 +29,13 @@ You have the following tools available:
 **Sub-agents** (spawned as independent tasks):
 - **researcher**: A research assistant that searches the web and
   summarizes findings. Use `spawn_sub_agents` to delegate research
-  tasks, then `collect_sub_agents` to gather results. Useful when
-  you need background information before making code changes.
+  tasks. You will be notified when it completes — use
+  `check_sub_agents` to retrieve results. Useful when you need
+  background information before making code changes.
 - **reviewer**: A code review assistant. Use `spawn_sub_agents` to
-  send it code or a description of changes, then `collect_sub_agents`
-  to get feedback on bugs, style, and improvements.
+  send it code or a description of changes. You will be notified
+  when it completes — use `check_sub_agents` to get feedback on
+  bugs, style, and improvements.
 
 ## Workflow
 

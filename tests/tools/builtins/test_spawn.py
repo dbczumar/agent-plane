@@ -174,29 +174,31 @@ def test_task_to_result_completed_with_output() -> None:
 
 
 def test_task_to_result_completed_empty_output() -> None:
-    """Completed but empty output — falls back to 'did not complete' message."""
+    """Completed but empty output — falls back to 'finished with status' message."""
     task = _make_task(output=[])
     result = _task_to_result(task)
+    # Status is preserved as-is from the task.
     assert result["status"] == "completed"
-    # Empty output list is falsy, so fallback message is used.
-    assert "did not complete" in result["output"]
+    # Empty output list is falsy, so the terminal fallback message
+    # is used instead of extracting text from output items.
+    assert "finished with status: completed" in result["output"]
 
 
 def test_task_to_result_failed() -> None:
-    """Failed task — status 'failed', fallback output message."""
+    """Failed task — status 'failed', terminal fallback message."""
     task = _make_task(status=TaskStatus.FAILED)
     result = _task_to_result(task)
     assert result["status"] == "failed"
-    assert "did not complete" in result["output"]
-    assert "failed" in result["output"]
+    # Terminal status produces a "finished with status" message.
+    assert "finished with status: failed" in result["output"]
 
 
 def test_task_to_result_cancelled() -> None:
-    """Cancelled task — status 'cancelled', fallback output message."""
+    """Cancelled task — status 'cancelled', terminal fallback message."""
     task = _make_task(status=TaskStatus.CANCELLED)
     result = _task_to_result(task)
     assert result["status"] == "cancelled"
-    assert "did not complete" in result["output"]
+    assert "finished with status: cancelled" in result["output"]
 
 
 @pytest.mark.parametrize(
@@ -204,16 +206,19 @@ def test_task_to_result_cancelled() -> None:
     [TaskStatus.QUEUED, TaskStatus.IN_PROGRESS],
     ids=["queued", "in_progress"],
 )
-def test_task_to_result_non_terminal_is_incomplete(status: str) -> None:
-    """Non-terminal status (timed out) — mapped to 'incomplete'."""
+def test_task_to_result_non_terminal_is_still_running(status: str) -> None:
+    """Non-terminal status — preserves real status, 'still running' message."""
     task = _make_task(status=status)
     result = _task_to_result(task)
-    assert result["status"] == "incomplete"
-    assert "did not complete" in result["output"]
+    # Status is preserved as-is (not remapped to "incomplete").
+    assert result["status"] == status
+    # Non-terminal tasks get a "still running" message.
+    assert "is still running" in result["output"]
 
 
 def test_task_to_result_includes_agent_name_in_fallback() -> None:
     """Fallback message includes the agent name for debuggability."""
     task = _make_task(status=TaskStatus.FAILED, agent_name="my-agent")
     result = _task_to_result(task)
+    # Agent name appears in the fallback message (repr-quoted).
     assert "my-agent" in result["output"]

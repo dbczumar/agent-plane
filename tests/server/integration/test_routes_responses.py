@@ -1770,24 +1770,31 @@ async def test_spawn_sub_agent_creates_child_task(
     )
 
 
-async def test_spawn_and_collect_sub_agent(
+async def test_spawn_and_auto_collect_sub_agent(
     client: httpx.AsyncClient,
     mock_llm: ControllableMockClient,
     task_store: SqlAlchemyTaskStore,
 ) -> None:
     """
-    Parent spawns a sub-agent and then collects its results via
-    ``collect_sub_agents``. Verifies that ``wait_sync`` polling
-    works end-to-end (this caught a ``dbos_sleep`` bug where
-    ``wait_sync`` was called from a ``@step`` context).
+    Parent spawns a sub-agent; auto-collect injects results before
+    the parent completes.
+
+    Verifies that ``wait_sync`` polling works end-to-end (this
+    caught a ``dbos_sleep`` bug where ``wait_sync`` was called
+    from a ``@step`` context).
 
     Flow:
     1. Parent LLM calls ``spawn_sub_agents``.
     2. Sub-agent LLM produces text.
-    3. Parent LLM calls ``collect_sub_agents`` with the
-       dynamically generated response_ids.
-    4. Parent LLM produces final text incorporating collected
-       results.
+    3. Parent LLM produces text (triggers auto-collect since
+       there are uncollected sub-agents).
+    4. Auto-collect waits for sub-agent, injects results.
+    5. Parent LLM produces final text incorporating results.
+
+    Calls 2–3 are consumed by the sub-agent and parent in
+    non-deterministic order (the mock client serves them FIFO
+    from a thread-safe queue). The test passes regardless of
+    which agent consumes which call.
     """
     bundle = build_agent_bundle(
         name="collector",
@@ -1802,7 +1809,9 @@ async def test_spawn_and_collect_sub_agent(
     assert resp.status_code == 201
 
     # Mock call 1 (parent): spawn researcher
-    spawn_args = json.dumps({"agents": [{"name": "researcher", "input": "What is Rust?"}]})
+    spawn_args = json.dumps(
+        {"agents": [{"name": "researcher", "input": "What is Rust?"}]},
+    )
     mock_llm.add_call(
         tool_calls=[
             {
@@ -1813,50 +1822,17 @@ async def test_spawn_and_collect_sub_agent(
         ],
     )
 
-    def _maybe_collect(
-        kwargs: dict[str, Any],
-    ) -> list[dict[str, str]] | None:
-        """
-        If the LLM input contains the spawn output (with
-        response_ids), return a ``collect_sub_agents`` tool call.
-        Otherwise return ``None`` to fall back to text — this
-        handles the sub-agent's call which has no spawn output.
+    # Mock calls 2–3: consumed by sub-agent and parent in
+    # non-deterministic order. Parent's text triggers auto-collect
+    # (uncollected sub-agents). Either scheduling order is valid.
+    mock_llm.add_call(text="Rust is a systems programming language.")
+    mock_llm.add_call(text="Rust is a systems programming language.")
 
-        :param kwargs: The ``create()`` kwargs.
-        :returns: Tool calls list, or ``None`` for text fallback.
-        """
-        for item in kwargs.get("input", []):
-            if (
-                isinstance(item, dict)
-                and item.get("type") == "function_call_output"
-                and item.get("call_id") == "call_spawn"
-            ):
-                output = json.loads(item["output"])
-                response_ids = output["response_ids"]
-                return [
-                    {
-                        "call_id": "call_collect",
-                        "name": "collect_sub_agents",
-                        "arguments": json.dumps({"response_ids": response_ids, "timeout": 30}),
-                    },
-                ]
-        return None
-
-    # Mock calls 2 and 3 race (sub-agent text vs parent collect).
-    # Both use tool_calls_fn: if input has spawn output → collect;
-    # otherwise → text (sub-agent response). This handles either
-    # scheduling order.
+    # Mock call 4 (parent after auto-collect injects results):
+    # final answer incorporating the sub-agent's findings.
     mock_llm.add_call(
-        text="Rust is a systems programming language.",
-        tool_calls_fn=_maybe_collect,
+        text="Rust is a systems language focused on safety.",
     )
-    mock_llm.add_call(
-        text="Rust is a systems programming language.",
-        tool_calls_fn=_maybe_collect,
-    )
-
-    # Mock call 4 (parent, after collect result): final text
-    mock_llm.add_call(text="Rust is a systems language focused on safety.")
 
     result = await create_test_response(
         client,
@@ -1870,9 +1846,10 @@ async def test_spawn_and_collect_sub_agent(
     assert result.body["status"] == "completed"
 
     # Verify output has the final text from mock call 4,
-    # proving the full spawn→collect→final pipeline completed.
+    # proving the full spawn → auto-collect → final pipeline.
     output = result.body["output"]
     text_items = [item for item in output if item.get("type") == "message"]
+    # At least one message output proves the parent completed.
     assert len(text_items) >= 1, f"Expected at least one message in output, got: {output}"
     actual_texts = set()
     for msg in text_items:
@@ -1880,22 +1857,28 @@ async def test_spawn_and_collect_sub_agent(
             if c.get("text"):
                 actual_texts.add(c["text"])
 
-    expected = {
-        "Rust is a systems programming language.",
-        "Rust is a systems language focused on safety.",
-    }
-    assert actual_texts & expected, f"Expected one of {expected} in output, got: {actual_texts}"
+    # The final text from mock call 4 must appear, proving the
+    # parent saw the auto-collected sub-agent results and ran
+    # one more LLM turn.
+    assert "Rust is a systems language focused on safety." in actual_texts, (
+        f"Expected final text in output. If missing, auto-collect "
+        f"did not inject sub-agent results or the parent did not "
+        f"get an additional LLM turn. Got: {actual_texts}"
+    )
 
-    # Verify collect_sub_agents was called (appears in output
-    # as a function_call item).
-    collect_calls = [
+    # Verify spawn_sub_agents was called (appears in output as
+    # a function_call item).
+    spawn_calls = [
         item
         for item in output
-        if item.get("type") == "function_call" and item.get("name") == "collect_sub_agents"
+        if item.get("type") == "function_call" and item.get("name") == "spawn_sub_agents"
     ]
-    # At least 1 collect call proves collect_sub_agents ran.
-    assert len(collect_calls) >= 1, (
-        f"Expected collect_sub_agents in output, got: "
+    # Exactly 1 spawn call proves the parent initiated the
+    # sub-agent. 0 means spawn was never called; >1 means the
+    # parent re-spawned unexpectedly.
+    assert len(spawn_calls) == 1, (
+        f"Expected exactly 1 spawn_sub_agents call, got "
+        f"{len(spawn_calls)}: "
         f"{[i.get('name') for i in output if i.get('type') == 'function_call']}"
     )
 

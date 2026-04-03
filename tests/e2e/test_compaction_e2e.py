@@ -84,9 +84,7 @@ def compaction_server(
     else:
         proc.kill()
         stdout = proc.stdout.read().decode() if proc.stdout else ""
-        raise RuntimeError(
-            f"Compaction e2e server didn't start within 30s.\n{stdout}"
-        )
+        raise RuntimeError(f"Compaction e2e server didn't start within 30s.\n{stdout}")
 
     yield base_url
 
@@ -110,15 +108,38 @@ def compaction_client(
 
 def _upload_agent(client: httpx.Client, agent_dir: Path) -> str:
     """
-    Upload an agent bundle and return its name.
+    Upload an agent bundle with a unique name to avoid stale cache.
+
+    Rewrites the config.yaml name to a unique value so each test
+    run gets a fresh agent, even if DBOS replays prior state.
 
     :param client: HTTP client.
     :param agent_dir: Path to the agent directory.
-    :returns: The agent name.
+    :returns: The unique agent name.
     """
+    import uuid
+
+    import yaml
+
+    unique_name = f"compact-{uuid.uuid4().hex[:8]}"
+    config_path = agent_dir / "config.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    config["name"] = unique_name
+    modified_yaml = yaml.dump(config)
+
     with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
         with tarfile.open(tmp.name, "w:gz") as tar:
-            tar.add(str(agent_dir), arcname=".")
+            # Add the modified config.yaml
+            import io
+
+            config_bytes = modified_yaml.encode()
+            info = tarfile.TarInfo(name="config.yaml")
+            info.size = len(config_bytes)
+            tar.addfile(info, io.BytesIO(config_bytes))
+            # Add AGENTS.md if it exists
+            agents_md = agent_dir / "AGENTS.md"
+            if agents_md.exists():
+                tar.add(str(agents_md), arcname="AGENTS.md")
         tmp_path = tmp.name
     try:
         with open(tmp_path, "rb") as f:
@@ -126,8 +147,6 @@ def _upload_agent(client: httpx.Client, agent_dir: Path) -> str:
                 "/api/agents",
                 files={"bundle": ("agent.tar.gz", f, "application/gzip")},
             )
-        if resp.status_code == 409:
-            return agent_dir.name
         resp.raise_for_status()
         return resp.json()["name"]
     finally:
@@ -228,12 +247,8 @@ def test_compaction_fires_and_agent_continues(
     )
 
     cmp = compaction_items[-1]
-    assert isinstance(cmp.get("summary"), str), (
-        f"Compaction item missing 'summary': {cmp}"
-    )
-    assert len(cmp["summary"]) > 10, (
-        f"Summary too short: {cmp['summary']!r}"
-    )
+    assert isinstance(cmp.get("summary"), str), f"Compaction item missing 'summary': {cmp}"
+    assert len(cmp["summary"]) > 10, f"Summary too short: {cmp['summary']!r}"
     all_ids = {i["id"] for i in items}
     assert cmp.get("last_item_id") in all_ids, (
         f"last_item_id={cmp.get('last_item_id')!r} not in items."
@@ -261,10 +276,6 @@ def test_compaction_fires_and_agent_continues(
     combined = " ".join(texts).lower()
     # The agent should reference countries/capitals — proving
     # the compaction summary provided context.
-    assert any(
-        kw in combined
-        for kw in ["countr", "capital", "list", "nation", "asked"]
-    ), (
-        f"Post-compaction response doesn't reference prior context. "
-        f"Response: {combined[:300]}"
+    assert any(kw in combined for kw in ["countr", "capital", "list", "nation", "asked"]), (
+        f"Post-compaction response doesn't reference prior context. Response: {combined[:300]}"
     )

@@ -20,6 +20,7 @@ from agent_plane.entities import (
 )
 from agent_plane.entities.task import TERMINAL_STATUSES
 from agent_plane.spec import AgentSpec
+from agent_plane.stores import ConversationStore
 from agent_plane.tools.base import Tool, ToolContext
 
 _logger = logging.getLogger(__name__)
@@ -694,7 +695,9 @@ def _project_activity_item(
     :returns: A compact dict with ``role``, ``type``, and
         content fields.
     """
-    data = item.data
+    # Convert Pydantic model to dict so .get() works uniformly
+    # across all data types (MessageData, FunctionCallData, etc.).
+    data = item.data.model_dump()
     if item.type == "function_call":
         return {
             "role": "assistant",

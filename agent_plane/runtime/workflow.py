@@ -22,6 +22,7 @@ from agent_plane.entities import (
     MessageData,
     NewConversationItem,
 )
+from agent_plane.entities.task import TERMINAL_STATUSES
 from agent_plane.errors import AgentPlaneError, ErrorCode
 from agent_plane.llms import Client as LLMClient
 from agent_plane.llms.errors import (
@@ -1753,7 +1754,9 @@ def _track_spawn_collect(
 
     Parses ``function_call_output`` items whose corresponding
     ``function_call`` was ``spawn_sub_agents`` or
-    ``collect_sub_agents`` to extract response IDs.
+    ``check_sub_agents`` to extract response IDs. Only marks
+    sub-agents as collected when their check result shows a
+    terminal status.
 
     :param output_items: The accumulated output items list.
     :param spawned_ids: Mutable set of spawned response IDs.
@@ -1783,7 +1786,10 @@ def _track_spawn_collect(
         elif name == CheckSubAgentsTool.name():
             for r in parsed.get("results", []):
                 rid = r.get("response_id", "")
-                if rid:
+                status = r.get("status")
+                # Only mark as collected when terminal — in-progress
+                # sub-agents still need auto-collect at turn end.
+                if rid and status in TERMINAL_STATUSES:
                     collected_ids.add(rid)
 
 
@@ -1810,9 +1816,13 @@ def _auto_collect_sub_agents(
     :param conv_store: ConversationStore for persistence.
     :returns: The last_seen cursor after persisting results.
     """
-    from agent_plane.tools.builtins.spawn import _collect_all
+    from agent_plane.tools.builtins.spawn import _task_to_result
 
-    results = _collect_all(response_ids, timeout=None)
+    task_store = get_task_store()
+    results: list[dict[str, str]] = []
+    for rid in response_ids:
+        task = task_store.wait_sync(rid, timeout=None)
+        results.append(_task_to_result(task))
     result_json = json.dumps({"results": results})
 
     # Persist as a system-injected message so the LLM sees

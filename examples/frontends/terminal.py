@@ -290,11 +290,18 @@ def register_agent(client: httpx.Client, bundle: bytes) -> str:
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
     )
     if resp.status_code == 409:
-        resp = client.get(f"{BASE_URL}/api/agents")
-        for agent in resp.json()["data"]:
+        # Agent with same name already exists — delete the stale
+        # registration and re-upload so the latest bundle (with
+        # updated AGENTS.md, tools, etc.) takes effect.
+        list_resp = client.get(f"{BASE_URL}/api/agents")
+        for agent in list_resp.json()["data"]:
             if agent["name"] == AGENT_NAME:
-                return agent["id"]
-        raise RuntimeError("Agent exists but not found in list")
+                client.delete(f"{BASE_URL}/api/agents/{agent['id']}")
+                break
+        resp = client.post(
+            f"{BASE_URL}/api/agents",
+            files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+        )
     if resp.is_error:
         raise RuntimeError(f"Agent upload failed ({resp.status_code}): {resp.text}")
     return resp.json()["id"]

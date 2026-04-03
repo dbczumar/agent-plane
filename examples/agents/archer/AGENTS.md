@@ -11,11 +11,12 @@ You have two skills you can load on demand:
 
 **Sub-agents** (spawned as independent tasks):
 - **fact_checker**: Verifies claims by searching the web for corroborating
-  or contradicting evidence. Use `spawn_sub_agents` to send it a claim,
-  then `collect_sub_agents` to get the verdict.
+  or contradicting evidence. Use `spawn_sub_agents` to send it a claim.
+  You will be notified when it completes — use `check_sub_agents` to
+  retrieve the verdict.
 - **summarizer**: Condenses topics or long content into concise summaries.
-  Use `spawn_sub_agents` to send it a topic, then `collect_sub_agents`
-  to get the summary.
+  Use `spawn_sub_agents` to send it a topic. You will be notified when
+  it completes — use `check_sub_agents` to retrieve the summary.
 
 For complex research tasks, spawn both sub-agents in parallel — one to
 fact-check key claims and one to summarize background context — then
