@@ -570,7 +570,7 @@ def test_open_stream_with_retry_succeeds_first_attempt(
     expected_stream = iter([ResponseTextDeltaEvent(delta="hi")])
 
     monkeypatch.setattr(
-        "agent_plane.runtime.executor._create_stream",
+        "agent_plane.runtime.executors.default._create_stream",
         lambda *_args, **_kw: expected_stream,
     )
 
@@ -615,7 +615,7 @@ def test_open_stream_with_retry_retries_on_transient(
         return expected_stream
 
     monkeypatch.setattr(
-        "agent_plane.runtime.executor._create_stream",
+        "agent_plane.runtime.executors.default._create_stream",
         _failing_then_succeeding,
     )
 
@@ -660,7 +660,7 @@ def test_open_stream_with_retry_raises_permanent_error(
         raise httpx.HTTPStatusError("unauthorized", request=request, response=response)
 
     monkeypatch.setattr(
-        "agent_plane.runtime.executor._create_stream",
+        "agent_plane.runtime.executors.default._create_stream",
         _permanent_failure,
     )
 
@@ -704,7 +704,7 @@ def test_open_stream_with_retry_raises_context_window_exceeded(
         )
 
     monkeypatch.setattr(
-        "agent_plane.runtime.executor._create_stream",
+        "agent_plane.runtime.executors.default._create_stream",
         _context_overflow,
     )
 
@@ -741,7 +741,7 @@ def test_run_streaming_turn_yields_events_on_success(
     ]
 
     monkeypatch.setattr(
-        "agent_plane.runtime.executor._open_stream_with_retry",
+        "agent_plane.runtime.executors.default._open_stream_with_retry",
         lambda *_args, **_kw: iter(stream),
     )
 
@@ -789,7 +789,7 @@ def test_run_streaming_turn_context_window_exceeded(
         )
 
     monkeypatch.setattr(
-        "agent_plane.runtime.executor._open_stream_with_retry",
+        "agent_plane.runtime.executors.default._open_stream_with_retry",
         _overflow,
     )
 
@@ -832,7 +832,7 @@ def test_run_streaming_turn_permanent_error(
         raise PermanentLLMError("unauthorized", code="401")
 
     monkeypatch.setattr(
-        "agent_plane.runtime.executor._open_stream_with_retry",
+        "agent_plane.runtime.executors.default._open_stream_with_retry",
         _auth_fail,
     )
 
@@ -873,7 +873,7 @@ def test_run_streaming_turn_retryable_error_exhausted(
         raise RetryableLLMError("rate limited", code="429")
 
     monkeypatch.setattr(
-        "agent_plane.runtime.executor._open_stream_with_retry",
+        "agent_plane.runtime.executors.default._open_stream_with_retry",
         _retryable_fail,
     )
 
@@ -936,7 +936,7 @@ def test_max_context_tokens_returns_value(
     When the model is known, max_context_tokens returns the window size.
     """
     monkeypatch.setattr(
-        "agent_plane.runtime.executor._get_model_context_window",
+        "agent_plane.runtime.executors.default._get_model_context_window",
         lambda model: 128000,
     )
 
@@ -955,7 +955,7 @@ def test_max_context_tokens_returns_none_for_unknown_model(
     When the model is not in the registry, max_context_tokens returns None.
     """
     monkeypatch.setattr(
-        "agent_plane.runtime.executor._get_model_context_window",
+        "agent_plane.runtime.executors.default._get_model_context_window",
         lambda model: None,
     )
 
@@ -985,7 +985,7 @@ def test_run_turn_yields_events(
     ]
 
     monkeypatch.setattr(
-        "agent_plane.runtime.executor._create_stream",
+        "agent_plane.runtime.executors.default._create_stream",
         lambda *_args, **_kw: iter(stream),
     )
 
@@ -1033,7 +1033,7 @@ def test_run_turn_context_window_overflow(
         )
 
     monkeypatch.setattr(
-        "agent_plane.runtime.executor._create_stream",
+        "agent_plane.runtime.executors.default._create_stream",
         _overflow,
     )
 

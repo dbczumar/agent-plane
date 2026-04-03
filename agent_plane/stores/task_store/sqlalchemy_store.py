@@ -53,6 +53,7 @@ from agent_plane.runtime.durability import (
     WorkflowHandleAsync,
     WorkflowStatus,
     WorkflowStatusString,
+    cancel_workflow,
     cancel_workflow_async,
     ensure_dbos,
     get_workflow_status,
@@ -624,9 +625,13 @@ class SqlAlchemyTaskStore(TaskStore):
 
     # ── Cancel / Delete ───────────────────────────────────
 
-    async def cancel(self, task_id: str) -> Task:
+    def cancel(self, task_id: str) -> Task:
         """
         Cancel a task by stopping its DBOS workflow.
+
+        Uses the sync DBOS ``cancel_workflow`` primitive — a
+        single DB UPDATE, non-blocking. The workflow observes
+        the cancellation on its next checkpoint.
 
         :param task_id: Unique task identifier,
             e.g. ``"task_abc123"``.
@@ -634,8 +639,8 @@ class SqlAlchemyTaskStore(TaskStore):
         :raises LookupError: If the task does not exist after
             cancellation.
         """
-        await cancel_workflow_async(task_id)
-        task = await self.get(task_id)
+        cancel_workflow(task_id)
+        task = self.get_sync(task_id)
         if task is None:
             raise LookupError(f"task {task_id!r} not found")
         return task

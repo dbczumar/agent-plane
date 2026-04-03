@@ -277,18 +277,18 @@ class TaskStore(ABC):
         ...
 
     @abstractmethod
-    async def cancel(self, task_id: str) -> Task:
+    def cancel(self, task_id: str) -> Task:
         """
         Stop execution and mark the task as cancelled.
 
-        If in progress, stops the workflow and waits for the
-        finally block to complete (close_stream, inbox drain).
-        Sets status to "cancelled". The task record is preserved
-        -- :meth:`get` still works, and the response can be
+        Sets the DBOS workflow status to ``CANCELLED`` via a
+        single DB UPDATE — non-blocking. The workflow observes
+        the cancellation on its next DBOS checkpoint and winds
+        down (close_stream, inbox drain happen in the workflow's
+        finally block). The task record is preserved —
+        :meth:`get` still works, and the response can be
         referenced as ``previous_response_id`` to continue or
-        redirect the conversation. Async because stopping an
-        in-progress workflow may block while the finally block
-        runs.
+        redirect the conversation.
 
         :param task_id: Unique task identifier,
             e.g. ``"task_abc123"``.

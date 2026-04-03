@@ -97,7 +97,7 @@ from agent_plane.spec.types import LLMConfig, RetryConfig, ToolsConfig
 from agent_plane.stores import ConversationStore, TaskStore
 from agent_plane.tools import ToolManager
 from agent_plane.tools.base import ToolContext
-from agent_plane.tools.builtins import CollectTool, SpawnTool
+from agent_plane.tools.builtins import CheckSubAgentsTool, SpawnTool
 from agent_plane.tools.client_specified import (
     ClientSideToolSpec,
     parse_client_side_tool_specs,
@@ -1780,7 +1780,7 @@ def _track_spawn_collect(
         if name == SpawnTool.name():
             for rid in parsed.get("response_ids", []):
                 spawned_ids.add(rid)
-        elif name == CollectTool.name():
+        elif name == CheckSubAgentsTool.name():
             for r in parsed.get("results", []):
                 rid = r.get("response_id", "")
                 if rid:

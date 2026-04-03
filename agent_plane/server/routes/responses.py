@@ -702,7 +702,7 @@ async def _stream_events(
         if not background and not completed_normally:
             current = await task_store.get(task.id)
             if current and current.status not in TERMINAL_STATUSES:
-                await asyncio.shield(task_store.cancel(task.id))
+                task_store.cancel(task.id)
 
 
 async def _handle_blocking_wait(
@@ -738,7 +738,7 @@ async def _handle_blocking_wait(
         return _build_response_object(wait_coro.result())
 
     # Client disconnected — cancel the foreground task
-    cancelled = await task_store.cancel(task.id)
+    cancelled = task_store.cancel(task.id)
     return _build_response_object(cancelled)
 
 
@@ -961,7 +961,7 @@ def create_responses_router(
             raise AgentPlaneError("Response not found", code=ErrorCode.NOT_FOUND)
         if task.status in TERMINAL_STATUSES:
             return _build_response_object(task)
-        cancelled_task = await task_store.cancel(response_id)
+        cancelled_task = task_store.cancel(response_id)
         return _build_response_object(cancelled_task)
 
     # ── DELETE /responses/{response_id} ──────────────────────────

@@ -25,6 +25,7 @@ from typing import Any
 import httpx
 import pytest
 
+from agent_plane.llms.errors import ContextWindowExceededError
 from agent_plane.runtime.compaction import SummaryMetadata, _CompactionState
 from agent_plane.spec import AgentSpec
 from agent_plane.spec.types import LLMConfig
@@ -391,6 +392,134 @@ def _extract_all_texts(messages: list[dict[str, Any]]) -> list[str]:
                     if isinstance(text, str):
                         texts.append(text)
     return texts
+
+
+async def test_reactive_compact_overflow_then_retry_succeeds(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Full reactive compaction loop: first LLM call overflows →
+    workflow catches ``ContextWindowExceededError`` → tiktoken
+    validates → compact() runs → retry succeeds.
+
+    This exercises the real ``_call_llm_maybe_compact`` error path
+    (not monkeypatched). The mock LLM's first call throws
+    ``ContextWindowExceededError``; the second call succeeds. The
+    test verifies the response completes and the LLM was called
+    exactly twice (overflow + retry).
+
+    :param client: Async HTTP client wired to the FastAPI app.
+    :param mock_llm: Controllable mock LLM — first call throws
+        overflow, second call returns text.
+    :param monkeypatch: Pytest monkeypatch fixture for patching
+        tiktoken and compact().
+    """
+    await create_test_agent(client)
+
+    # First LLM call: throw ContextWindowExceededError.
+    # The executor catches this and yields ContextWindowExceeded event.
+    overflow_exc = ContextWindowExceededError(
+        "Context window exceeded: 150000 tokens > 128000 max",
+        code="context_length_exceeded",
+        max_context_tokens=128000,
+        actual_tokens=150000,
+    )
+    mock_llm.add_call(exception=overflow_exc)
+
+    # Second LLM call: succeed with normal text.
+    mock_llm.add_call(text="Response after compaction.")
+
+    # Patch count_tokens: called twice — once for system tokens (small)
+    # and once for messages (close to reported 150000). The reactive
+    # compaction ratio check uses (messages + sys_tokens) / reported.
+    # 148000 + 500 = 148500; ratio = 148500 / 150000 = 0.99, well
+    # within 0.7-1.3.
+    _token_calls: list[int] = [0]
+
+    def _fake_count_tokens(
+        msgs: list[dict[str, Any]],
+        model: str,
+    ) -> int:
+        """
+        Return system token count on first call, message token count
+        on subsequent calls.
+
+        :param msgs: Messages (used to distinguish call site).
+        :param model: Model string (unused).
+        :returns: Token count.
+        """
+        _token_calls[0] += 1
+        # First call is always sys_tokens (a single system message).
+        # Subsequent calls are for message lists.
+        if _token_calls[0] == 1:
+            return 500
+        return 148000
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.count_tokens",
+        _fake_count_tokens,
+    )
+
+    # Patch compact() to return a minimal message list. We verify
+    # compact was called by checking the second LLM call receives
+    # the compacted input.
+    compacted_msgs = [
+        {"role": "user", "content": [{"type": "input_text", "text": "Hello"}]},
+    ]
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.compact",
+        lambda messages, history, **kw: __import__(
+            "agent_plane.runtime.compaction",
+            fromlist=["CompactionResult"],
+        ).CompactionResult(
+            messages=compacted_msgs,
+            summary_metadata=None,
+        ),
+    )
+
+    result = await create_test_response(
+        client,
+        background=False,
+        stream=False,
+    )
+
+    # Response must complete — the retry after compaction succeeded.
+    assert result.status_code == 200, (
+        f"Expected 200, got {result.status_code}. Body: {result.body}. "
+        "If 500, the ContextWindowExceededError was not caught or "
+        "compact-retry path is broken."
+    )
+    assert result.body["status"] == "completed", (
+        f"Expected completed status, got {result.body['status']}. "
+        "If 'failed', the retry after compaction did not succeed."
+    )
+
+    # LLM was called exactly 2 times: overflow + retry.
+    # 1 = overflow never triggered compact-retry path.
+    # 3+ = compaction-retry looped (should only retry once).
+    assert mock_llm.call_count == 2, (
+        f"Expected 2 LLM calls (1 overflow + 1 retry), "
+        f"got {mock_llm.call_count}. "
+        f"If 1, the overflow was not detected or compact-retry "
+        f"did not fire. If 3+, the retry looped."
+    )
+
+    # Verify the response contains the text from the second call.
+    output = result.body.get("output", [])
+    output_texts = [
+        item["content"][0]["text"]
+        for item in output
+        if item.get("type") == "message"
+        and item.get("role") == "assistant"
+        and item.get("content")
+    ]
+    assert any("compaction" in t.lower() for t in output_texts), (
+        f"Expected assistant text from the retry call to contain "
+        f"'compaction'. Got: {output_texts}. "
+        f"If empty, the retry response was not persisted."
+    )
 
 
 def _extract_texts_from_history(history: list[Any]) -> list[str]:

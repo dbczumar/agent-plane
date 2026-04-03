@@ -17,7 +17,8 @@ from agent_plane.errors import AgentPlaneError, ErrorCode
 from agent_plane.spec import AgentSpec
 from agent_plane.tools.base import Tool, ToolContext, is_valid_tool_name
 from agent_plane.tools.builtins import (
-    CollectTool,
+    CancelSubAgentTool,
+    CheckSubAgentsTool,
     LoadSkillTool,
     ReadSkillFileTool,
     SpawnTool,
@@ -137,7 +138,7 @@ class ToolManager:
 
         Builds a name-to-spec lookup from the agent's
         ``sub_agents`` list and registers :class:`SpawnTool` and
-        :class:`CollectTool`.
+        :class:`CheckSubAgentsTool`.
         """
         if not self._spec.tools.agents:
             return
@@ -145,7 +146,8 @@ class ToolManager:
         sub_specs = {sa.name: sa for sa in self._spec.sub_agents if sa.name is not None}
         spawn = SpawnTool(sub_specs=sub_specs)
         self._tools[SpawnTool.name()] = spawn
-        self._tools[CollectTool.name()] = CollectTool()
+        self._tools[CheckSubAgentsTool.name()] = CheckSubAgentsTool()
+        self._tools[CancelSubAgentTool.name()] = CancelSubAgentTool()
 
     def _register_local_tools(self, workdir: Path | None) -> None:
         """

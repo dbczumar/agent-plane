@@ -18,6 +18,7 @@ from agent_plane.runtime.executor import DefaultExecutor
 from agent_plane.runtime.workflow import (
     _load_initial_history,
     _maybe_persist_compaction_item,
+    _proactive_compact_if_needed,
     _reactive_compact,
     _run_agent_loop,
     _split_tool_calls,
@@ -26,6 +27,7 @@ from agent_plane.runtime.workflow import (
 )
 from agent_plane.spec.types import (
     AgentSpec,
+    CompactionConfig,
     ExecutorSpec,
     LLMConfig,
     RetryConfig,
@@ -881,6 +883,243 @@ def test_reactive_compact_implausible_overflow_raises_permanent(
     assert state.context_window == 128000, (
         "context_window should be cached even when validation fails — "
         "the window was discovered from the error before the ratio check."
+    )
+
+
+# ── _proactive_compact_if_needed ──────────────────────────────────────────────
+
+
+def test_proactive_compact_skips_when_context_window_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When ``context_window`` is None (no overflow seen yet),
+    proactive compaction returns messages unchanged.
+    """
+    messages = [{"role": "user", "content": "hello"}]
+    state = _CompactionState(
+        context_window=None,
+        last_summary=None,
+        config=None,
+        model="openai/gpt-4o",
+    )
+
+    result = _proactive_compact_if_needed(
+        messages,
+        [],
+        100,
+        state,
+        "task_001",
+    )
+
+    # Messages returned unchanged — proactive path not taken because
+    # context_window is None (no prior overflow to establish the window).
+    assert result is messages, (
+        "Expected original messages returned (identity check). "
+        "If a copy was returned, proactive compaction ran when "
+        "context_window is None — it should have skipped."
+    )
+
+
+def test_proactive_compact_skips_when_under_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When estimated tokens are below the trigger threshold,
+    proactive compaction returns messages unchanged.
+    """
+    # 5000 tokens + 100 sys_tokens = 5100, well under 128000 * 0.8 = 102400
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.count_tokens",
+        lambda msgs, model: 5000,
+    )
+
+    messages = [{"role": "user", "content": "short message"}]
+    state = _CompactionState(
+        context_window=128000,
+        last_summary=None,
+        config=CompactionConfig(trigger_threshold=0.8),
+        model="openai/gpt-4o",
+    )
+
+    result = _proactive_compact_if_needed(
+        messages,
+        [],
+        100,
+        state,
+        "task_001",
+    )
+
+    # 5000 + 100 = 5100 < 102400 threshold — no compaction needed.
+    assert result is messages, (
+        "Expected original messages returned unchanged. "
+        "If compaction ran, the threshold check is broken — "
+        "5100 tokens should be well under the 102400 budget."
+    )
+
+
+def test_proactive_compact_fires_when_over_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When estimated tokens exceed the trigger threshold,
+    proactive compaction runs and returns compacted messages.
+    """
+    # 110000 + 1000 sys_tokens = 111000, over 128000 * 0.8 = 102400
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.count_tokens",
+        lambda msgs, model: 110000,
+    )
+    compacted = [{"role": "user", "content": "compacted"}]
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.compact",
+        lambda messages, history, **kw: CompactionResult(
+            messages=compacted,
+            summary_metadata=None,
+        ),
+    )
+
+    class _RaisesIfCalled:
+        """Stub — compact() is patched so LLM must not be reached."""
+
+        class responses:
+            """Responses namespace."""
+
+            @staticmethod
+            def create(**kwargs: Any) -> None:
+                """Raise — compact() is patched."""
+                raise AssertionError("LLM client reached unexpectedly")
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._get_llm_client",
+        lambda: _RaisesIfCalled(),
+    )
+
+    messages = [{"role": "user", "content": "long history..."}]
+    state = _CompactionState(
+        context_window=128000,
+        last_summary=None,
+        config=CompactionConfig(trigger_threshold=0.8),
+        model="openai/gpt-4o",
+    )
+
+    result = _proactive_compact_if_needed(
+        messages,
+        [],
+        1000,
+        state,
+        "task_001",
+    )
+
+    # 110000 + 1000 = 111000 > 102400 — compact() must have fired.
+    assert result == compacted, (
+        f"Expected compacted messages, got {result!r}. "
+        "If original messages returned, the threshold check "
+        "didn't trigger compaction at 111000 tokens vs 102400 budget."
+    )
+
+
+def test_proactive_compact_updates_last_summary_on_layer2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When proactive compaction triggers Layer 2, the summary metadata
+    is stored in ``compaction_state.last_summary`` for end-of-execution
+    persistence.
+    """
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.count_tokens",
+        lambda msgs, model: 110000,
+    )
+    summary = SummaryMetadata(
+        text="Proactive summary.",
+        last_item_id="msg_099",
+        model="openai/gpt-4o",
+        token_count=200,
+    )
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.compact",
+        lambda messages, history, **kw: CompactionResult(
+            messages=[{"role": "assistant", "content": "summary"}],
+            summary_metadata=summary,
+        ),
+    )
+
+    class _RaisesIfCalled:
+        """Stub — compact() is patched so LLM must not be reached."""
+
+        class responses:
+            """Responses namespace."""
+
+            @staticmethod
+            def create(**kwargs: Any) -> None:
+                """Raise — compact() is patched."""
+                raise AssertionError("LLM client reached unexpectedly")
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._get_llm_client",
+        lambda: _RaisesIfCalled(),
+    )
+
+    state = _CompactionState(
+        context_window=128000,
+        last_summary=None,
+        config=CompactionConfig(trigger_threshold=0.8),
+        model="openai/gpt-4o",
+    )
+
+    _proactive_compact_if_needed(
+        [{"role": "user", "content": "long"}],
+        [],
+        1000,
+        state,
+        "task_001",
+    )
+
+    # last_summary must be populated so _maybe_persist_compaction_item
+    # writes it at the end of execution.
+    assert state.last_summary is summary, (
+        "Expected last_summary to be set to the Layer 2 summary. "
+        "If None, proactive compaction didn't propagate summary_metadata "
+        "to the state — it would be lost and never persisted."
+    )
+
+
+def test_proactive_compact_uses_config_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Proactive compaction respects the configured trigger_threshold,
+    not just the 0.8 default.
+    """
+    # With threshold=0.5: budget = 128000 * 0.5 = 64000
+    # 60000 + 1000 = 61000 < 64000 → should NOT compact
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.count_tokens",
+        lambda msgs, model: 60000,
+    )
+
+    messages = [{"role": "user", "content": "medium history"}]
+    state = _CompactionState(
+        context_window=128000,
+        last_summary=None,
+        config=CompactionConfig(trigger_threshold=0.5),
+        model="openai/gpt-4o",
+    )
+
+    result = _proactive_compact_if_needed(
+        messages,
+        [],
+        1000,
+        state,
+        "task_001",
+    )
+
+    # 61000 < 64000 — under the custom 50% threshold.
+    assert result is messages, (
+        "Expected no compaction with 50% threshold. "
+        "61000 tokens is under the 64000 budget. "
+        "If compacted, threshold config was ignored."
     )
 
 

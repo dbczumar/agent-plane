@@ -1,9 +1,9 @@
-"""Spawn and collect tools for sub-agent lifecycle management.
+"""Spawn and check tools for sub-agent lifecycle management.
 
 SpawnTool launches sub-agents as independent tasks via the
-TaskStore interface. CollectTool waits for spawned sub-agents to
-complete and returns their results. See designs/SUBAGENT.md for
-the full design.
+TaskStore interface. CheckSubAgentsTool returns their current
+status without blocking. CancelSubAgentTool stops a running
+sub-agent. See designs/STEERABLE_SUBAGENTS.md for the full design.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import logging
 from typing import Any
 
 from agent_plane.entities import (
+    ConversationItem,
     MessageData,
     NewConversationItem,
     Task,
@@ -23,8 +24,13 @@ from agent_plane.tools.base import Tool, ToolContext
 
 _logger = logging.getLogger(__name__)
 
-# Polling / wait timeout used by CollectTool's wait_sync calls.
-_COLLECT_POLL_INTERVAL_S = 0.5
+# Maximum number of recent conversation items to include in
+# check_sub_agents activity for non-completed sub-agents.
+_ACTIVITY_TAIL = 5
+
+# Maximum characters per content field in activity items.
+# Longer content is truncated with a " [truncated]" suffix.
+_ACTIVITY_MAX_CHARS = 300
 
 
 def _extract_output_text(output: list[dict[str, Any]]) -> str:
@@ -60,8 +66,8 @@ class SpawnTool(Tool):
 
     The LLM calls ``spawn_sub_agents`` with a list of
     ``{name, input}`` pairs. Each sub-agent gets its own
-    conversation and task. Returns response IDs immediately —
-    use ``collect_sub_agents`` to gather results.
+    conversation and task. Returns response IDs immediately.
+    Use ``check_sub_agents`` to retrieve results.
 
     :param sub_specs: Name-to-AgentSpec mapping for available
         sub-agents, e.g. ``{"researcher": AgentSpec(...)}``.
@@ -128,22 +134,24 @@ class SpawnTool(Tool):
         )
 
 
-class CollectTool(Tool):
+class CheckSubAgentsTool(Tool):
     """
-    Wait for spawned sub-agent tasks to complete and return
-    their results.
+    Non-blocking status check for specified sub-agents.
 
-    Uses ``TaskStore.wait_sync`` and ``TaskStore.get_sync`` to
-    block until sub-agents finish. Runs inside a synchronous
-    workflow context.
+    Checks only the sub-agents whose response IDs are passed
+    in — the caller need not check all spawned sub-agents at
+    once. Returns immediately with each sub-agent's current
+    status. Completed sub-agents include their extracted
+    output text; in-progress sub-agents include recent
+    conversation activity.
     """
 
     @classmethod
     def name(cls) -> str:
         """
-        :returns: ``"collect_sub_agents"``.
+        :returns: ``"check_sub_agents"``.
         """
-        return "collect_sub_agents"
+        return "check_sub_agents"
 
     def get_schema(self) -> dict[str, Any]:
         """
@@ -152,30 +160,110 @@ class CollectTool(Tool):
         :returns: A dict with ``"type": "function"`` and a
             ``"function"`` sub-dict.
         """
-        return _build_collect_schema()
+        return _build_check_schema()
 
     def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
-        Collect results from spawned sub-agents.
+        Check status of specified sub-agents.
 
-        Blocks until all sub-agents reach a terminal state or
-        the timeout expires.
+        Returns immediately with each sub-agent's current
+        status. No blocking, no waiting.
 
         :param arguments: JSON-encoded arguments string, e.g.
-            ``'{"response_ids": ["resp_1"], "timeout": 60}'``.
+            ``'{"response_ids": ["resp_1", "resp_2"]}'``.
         :param ctx: Server-side execution context (unused by
-            collect, required by the :class:`Tool` interface).
+            check, required by the :class:`Tool` interface).
         :returns: JSON with results per sub-agent.
         """
-        args = _parse_collect_args(arguments)
+        args = _parse_check_args(arguments)
         if isinstance(args, str):
             return args
 
         response_ids: list[str] = args["response_ids"]
-        timeout: float | None = args.get("timeout")
 
-        results = _collect_all(response_ids, timeout)
+        from agent_plane.runtime import (
+            get_conversation_store,
+            get_task_store,
+        )
+
+        task_store = get_task_store()
+        conv_store = get_conversation_store()
+
+        results: list[dict[str, Any]] = []
+        for tid in response_ids:
+            task = task_store.get_sync(tid)
+            if task is None:
+                results.append(
+                    {
+                        "response_id": tid,
+                        "status": "not_found",
+                        "output": None,
+                        "recent_activity": None,
+                    }
+                )
+                continue
+            results.append(
+                _task_to_check_result(task, conv_store),
+            )
         return json.dumps({"results": results})
+
+
+class CancelSubAgentTool(Tool):
+    """
+    Cancel a running sub-agent task.
+
+    Delegates to ``task_store.cancel`` — non-blocking.
+    The sub-agent workflow observes the cancellation on its
+    next DBOS checkpoint and winds down.
+    """
+
+    @classmethod
+    def name(cls) -> str:
+        """
+        :returns: ``"cancel_sub_agent"``.
+        """
+        return "cancel_sub_agent"
+
+    def get_schema(self) -> dict[str, Any]:
+        """
+        Return the OpenAI-format tool schema.
+
+        :returns: A dict with ``"type": "function"`` and a
+            ``"function"`` sub-dict.
+        """
+        return _build_cancel_schema()
+
+    def invoke(self, arguments: str, ctx: ToolContext) -> str:
+        """
+        Cancel a running sub-agent.
+
+        :param arguments: JSON-encoded arguments string, e.g.
+            ``'{"response_id": "resp_1"}'``.
+        :param ctx: Server-side execution context (unused by
+            cancel, required by the :class:`Tool` interface).
+        :returns: JSON with cancellation confirmation.
+        """
+        try:
+            args = json.loads(arguments)
+        except (json.JSONDecodeError, TypeError) as exc:
+            return json.dumps({"error": f"invalid arguments: {exc}"})
+
+        response_id = args.get("response_id")
+        if not response_id:
+            return json.dumps(
+                {"error": "missing required field: response_id"},
+            )
+
+        from agent_plane.runtime import get_task_store
+
+        task_store = get_task_store()
+        task_store.cancel(response_id)
+        return json.dumps(
+            {
+                "status": "cancelled",
+                "response_id": response_id,
+            }
+        )
 
 
 # ── Schema builders ───────────────────────────────────
@@ -194,7 +282,7 @@ def _build_spawn_schema(
     desc_lines = [
         "Launch one or more sub-agents as independent "
         "parallel tasks. Returns response IDs immediately. "
-        "Use collect_sub_agents() to gather results.",
+        "Use check_sub_agents() to retrieve results.",
         "",
         "Available sub-agents:",
     ]
@@ -237,18 +325,24 @@ def _build_spawn_schema(
     }
 
 
-def _build_collect_schema() -> dict[str, Any]:
+def _build_check_schema() -> dict[str, Any]:
     """
-    Build the OpenAI-format schema for collect_sub_agents.
+    Build the OpenAI-format schema for check_sub_agents.
 
     :returns: The tool schema dict.
     """
     return {
         "type": "function",
         "function": {
-            "name": "collect_sub_agents",
+            "name": "check_sub_agents",
             "description": (
-                "Wait for spawned sub-agent tasks to complete and return their results."
+                "Check the current status of one or more spawned "
+                "sub-agent tasks. Pass only the response IDs you "
+                "want to check — you do not need to check all "
+                "spawned sub-agents at once. Returns immediately "
+                "with each specified sub-agent's current status, "
+                "output (if completed), and recent conversation "
+                "activity (if still running). Does not wait."
             ),
             "parameters": {
                 "type": "object",
@@ -256,14 +350,41 @@ def _build_collect_schema() -> dict[str, Any]:
                     "response_ids": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": ("Response IDs returned by spawn_sub_agents()."),
-                    },
-                    "timeout": {
-                        "type": "integer",
-                        "description": ("Maximum seconds to wait. Omit to wait indefinitely."),
+                        "description": (
+                            "One or more response IDs returned by spawn_sub_agents to check."
+                        ),
                     },
                 },
                 "required": ["response_ids"],
+            },
+        },
+    }
+
+
+def _build_cancel_schema() -> dict[str, Any]:
+    """
+    Build the OpenAI-format schema for cancel_sub_agent.
+
+    :returns: The tool schema dict.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": "cancel_sub_agent",
+            "description": (
+                "Cancel a running sub-agent task. The sub-agent "
+                "will stop execution and its status will become "
+                "'cancelled'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "response_id": {
+                        "type": "string",
+                        "description": ("The response ID of the sub-agent to cancel."),
+                    },
+                },
+                "required": ["response_id"],
             },
         },
     }
@@ -293,11 +414,11 @@ def _parse_spawn_args(
     return result
 
 
-def _parse_collect_args(
+def _parse_check_args(
     arguments: str,
 ) -> dict[str, Any] | str:
     """
-    Parse and validate CollectTool arguments.
+    Parse and validate CheckSubAgentsTool arguments.
 
     :param arguments: Raw JSON string from the LLM.
     :returns: Parsed dict on success, or a JSON error string
@@ -455,80 +576,168 @@ def _spawn_one(
     return task.id
 
 
-# ── Collect implementation ────────────────────────────
-
-
-def _collect_all(
-    response_ids: list[str],
-    timeout: float | None,
-) -> list[dict[str, str]]:
-    """
-    Wait for all sub-agent tasks to complete and extract results.
-
-    Delegates to ``TaskStore.wait_sync`` per task, splitting the
-    remaining timeout budget across tasks sequentially.
-
-    :param response_ids: List of task/response IDs to collect.
-    :param timeout: Maximum seconds to wait across all tasks.
-        ``None`` means no deadline.
-    :returns: List of result dicts with ``response_id``,
-        ``agent_name``, ``status``, and ``output`` keys.
-    """
-    import time
-
-    from agent_plane.runtime import get_task_store
-
-    task_store = get_task_store()
-    deadline = time.monotonic() + timeout if timeout is not None else None
-
-    results: list[dict[str, str]] = []
-    for task_id in response_ids:
-        remaining = _remaining_timeout(deadline)
-        task = task_store.wait_sync(task_id, timeout=remaining)
-        results.append(_task_to_result(task))
-    return results
-
-
-def _remaining_timeout(
-    deadline: float | None,
-) -> float | None:
-    """
-    Compute remaining seconds until the deadline.
-
-    :param deadline: Absolute monotonic deadline, or ``None``
-        for no deadline.
-    :returns: Seconds remaining (clamped to 0), or ``None``.
-    """
-    if deadline is None:
-        return None
-    import time
-
-    return max(0.0, deadline - time.monotonic())
+# ── Check / result helpers ────────────────────────────
 
 
 def _task_to_result(task: Task) -> dict[str, str]:
     """
-    Convert a :class:`Task` to a collect-result dict.
+    Convert a :class:`Task` to a status-result dict.
 
-    :param task: The enriched task, possibly in a terminal or
+    Returns the real task status (e.g. ``"in_progress"``,
+    ``"completed"``, ``"failed"``). For completed tasks with
+    output, extracts the final text. For all others, returns
+    a descriptive message.
+
+    :param task: The task, possibly in a terminal or
         non-terminal state.
     :returns: A dict with ``response_id``, ``agent_name``,
         ``status``, and ``output`` keys.
     """
-    if task.status in TERMINAL_STATUSES:
-        status = task.status
-    else:
-        # Timed out — task is still running.
-        status = "incomplete"
-
     if task.status == "completed" and task.output:
         output_text = _extract_output_text(task.output)
+    elif task.status in TERMINAL_STATUSES:
+        output_text = f"Sub-agent {task.agent_name!r} finished with status: {task.status}."
     else:
-        output_text = f"Sub-agent {task.agent_name!r} did not complete (status: {status})."
+        output_text = f"Sub-agent {task.agent_name!r} is still running."
 
     return {
         "response_id": task.id,
         "agent_name": task.agent_name,
-        "status": status,
+        "status": task.status,
         "output": output_text,
     }
+
+
+def _task_to_check_result(
+    task: Task,
+    conv_store: ConversationStore,
+) -> dict[str, Any]:
+    """
+    Build a check result for a single sub-agent.
+
+    Completed sub-agents get extracted output text and no
+    activity. All others get recent conversation activity
+    so the parent LLM can see what the sub-agent is doing
+    (or what it was doing when it failed).
+
+    :param task: The sub-agent's task.
+    :param conv_store: For fetching recent conversation items.
+    :returns: Result dict with ``response_id``, ``agent_name``,
+        ``status``, ``output``, and ``recent_activity`` fields.
+    """
+    if task.status == "completed" and task.output:
+        return {
+            "response_id": task.id,
+            "agent_name": task.agent_name,
+            "status": task.status,
+            "output": _extract_output_text(task.output),
+            "recent_activity": None,
+        }
+
+    # Non-completed: include recent activity
+    activity = _get_recent_activity(
+        task.conversation_id,
+        conv_store,
+    )
+    output: str | None = None
+    if task.status in TERMINAL_STATUSES:
+        output = f"Sub-agent {task.agent_name!r} finished with status: {task.status}."
+
+    return {
+        "response_id": task.id,
+        "agent_name": task.agent_name,
+        "status": task.status,
+        "output": output,
+        "recent_activity": activity,
+    }
+
+
+def _get_recent_activity(
+    conversation_id: str,
+    conv_store: ConversationStore,
+) -> list[dict[str, str | None]]:
+    """
+    Fetch the last few conversation items and project them
+    into a compact format for the parent LLM.
+
+    :param conversation_id: The sub-agent's conversation ID,
+        e.g. ``"conv_sub1"``.
+    :param conv_store: For fetching items.
+    :returns: List of compact activity dicts, chronological
+        order, each content field truncated to
+        ``_ACTIVITY_MAX_CHARS``.
+    """
+    page = conv_store.list_items(
+        conversation_id,
+        limit=_ACTIVITY_TAIL,
+        order="desc",
+    )
+    # Reverse to chronological order (list_items desc gives
+    # newest first).
+    items = list(reversed(page.data))
+    return [_project_activity_item(item) for item in items]
+
+
+def _project_activity_item(
+    item: ConversationItem,
+) -> dict[str, str | None]:
+    """
+    Project a conversation item into a compact dict.
+
+    Handles three item types: messages (user/assistant text),
+    function calls (tool name + args), and function call
+    outputs (tool name + result). All content fields are
+    truncated to ``_ACTIVITY_MAX_CHARS``.
+
+    :param item: A conversation item from the sub-agent's
+        conversation.
+    :returns: A compact dict with ``role``, ``type``, and
+        content fields.
+    """
+    data = item.data
+    if item.type == "function_call":
+        return {
+            "role": "assistant",
+            "type": "tool_call",
+            "name": data.get("name"),
+            "args": _truncate(
+                data.get("arguments", ""),
+            ),
+        }
+    if item.type == "function_call_output":
+        return {
+            "role": "tool",
+            "type": "tool_result",
+            "name": data.get("name"),
+            "content": _truncate(
+                data.get("output", ""),
+            ),
+        }
+    # Message item — extract role and text content.
+    role = data.get("role", "unknown")
+    text_parts: list[str] = []
+    for block in data.get("content", []):
+        if isinstance(block, dict):
+            text = block.get("text") or block.get("output_text")
+            if text:
+                text_parts.append(text)
+        elif isinstance(block, str):
+            text_parts.append(block)
+    return {
+        "role": role,
+        "type": "text",
+        "content": _truncate("\n".join(text_parts)),
+    }
+
+
+def _truncate(text: str) -> str:
+    """
+    Truncate text to ``_ACTIVITY_MAX_CHARS``.
+
+    :param text: The input string.
+    :returns: The original string if short enough, or a
+        truncated version with ``" [truncated]"`` suffix.
+    """
+    if len(text) <= _ACTIVITY_MAX_CHARS:
+        return text
+    return text[:_ACTIVITY_MAX_CHARS] + " [truncated]"
