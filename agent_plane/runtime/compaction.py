@@ -241,9 +241,9 @@ def _truncate_oldest(
     fits within *budget*.
 
     Preserves tool call pair integrity — never drops a
-    ``function_call_output`` without also dropping its preceding
-    ``function_call``, and vice versa. Drops from the front of the
-    list.
+    ``function_call`` without also dropping its matching
+    ``function_call_output``, and vice versa. Drops from the front
+    of the list.
 
     :param messages: The messages list to truncate.
     :param budget: Maximum token count for the returned list,
@@ -253,32 +253,36 @@ def _truncate_oldest(
     """
     result = list(messages)
     while result and count_tokens(result, model) > budget:
-        drop_idx = _find_safe_drop_index(result)
-        if drop_idx >= len(result):
+        drop_count = _pair_aware_drop_count(result)
+        if drop_count == 0:
             break
-        result = result[drop_idx + 1 :]
+        result = result[drop_count:]
     return result
 
 
-def _find_safe_drop_index(messages: list[dict[str, Any]]) -> int:
+def _pair_aware_drop_count(messages: list[dict[str, Any]]) -> int:
     """
-    Find the first index that can be safely dropped without
+    Return how many items to drop from the front to avoid
     orphaning a tool call pair.
 
-    After Layer 1 clearing, tool call pairs may already be logically
-    broken (bodies cleared). Dropping from index 0 is safe — the
-    output item will be orphaned only in the structural sense, but
-    the cleared body marker already communicates the loss of context.
+    If the first item is a ``function_call`` and the second is its
+    matching ``function_call_output``, both are dropped together.
+    Otherwise, a single item is dropped.
 
-    :param messages: The messages list.
-    :returns: The index of the first safely droppable item.
+    :param messages: The messages list (must be non-empty).
+    :returns: Number of items to drop (1 or 2), or 0 if the list
+        is empty.
     """
     if not messages:
         return 0
-    # Drop from the front; orphaned function_call_output items after
-    # Layer 1 clearing are acceptable since their bodies are already
-    # replaced with the clearing marker.
-    return 0
+    if (
+        len(messages) >= 2
+        and messages[0].get("type") == "function_call"
+        and messages[1].get("type") == "function_call_output"
+        and messages[0].get("call_id") == messages[1].get("call_id")
+    ):
+        return 2
+    return 1
 
 
 @step()

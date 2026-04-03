@@ -18,6 +18,8 @@ from agent_plane.llms.types import MessageOutput, OutputText, Response
 from agent_plane.runtime.compaction import (
     _BINARY_CONTENT_CLEARED,
     _TOOL_RESULT_CLEARED,
+    _pair_aware_drop_count,
+    _truncate_oldest,
     compact,
     compaction_to_history_items,
     count_tokens,
@@ -878,3 +880,290 @@ def test_count_tokens_unknown_model_falls_back() -> None:
     # Should not raise even for completely unknown model names.
     result = count_tokens(messages, "unknown/totally-fake-model-xyz")
     assert result > 0
+
+
+def test_layer2_emits_compaction_sse_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When Layer 2 fires, ``_emit_compaction_event`` is called exactly
+    once before the summarization LLM call.
+
+    This overrides the autouse ``patch_compaction_side_effects`` fixture
+    with a capturing version to verify the event is emitted.
+    """
+    emitted_task_ids: list[str] = []
+    monkeypatch.setattr(
+        "agent_plane.runtime.compaction._emit_compaction_event",
+        lambda task_id: emitted_task_ids.append(task_id),
+    )
+
+    call_counts = [0]
+
+    def mock_count_tokens(
+        msgs: list[dict[str, Any]],
+        model: str,
+    ) -> int:
+        """
+        First call above budget to trigger Layer 2, then below.
+
+        :param msgs: Messages (unused for logic).
+        :param model: Model string (unused).
+        :returns: Token count.
+        """
+        call_counts[0] += 1
+        if call_counts[0] == 1:
+            return 10001
+        return 50
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.compaction.count_tokens",
+        mock_count_tokens,
+    )
+    monkeypatch.setattr(
+        "agent_plane.runtime.compaction.summarize_history",
+        lambda msgs, llm_client, model: {
+            "text": "Summary",
+            "token_count": 10,
+        },
+    )
+
+    history = [
+        _user_msg("msg_u1"),
+        _assistant_msg("msg_a1"),
+        _user_msg("msg_u2"),
+        _assistant_msg("msg_a2"),
+    ]
+    messages = [
+        _user_msg_dict(),
+        _assistant_msg_dict(),
+        _user_msg_dict(),
+        _assistant_msg_dict(),
+    ]
+
+    compact(
+        messages,
+        history,
+        config=CompactionConfig(trigger_threshold=0.8, recent_window=1),
+        context_window=12500,
+        system_token_budget=0,
+        model="openai/gpt-4o",
+        task_id="task_sse_test",
+        llm_client=_RaisesIfCalled(),
+    )
+
+    # _emit_compaction_event must be called exactly once with our task_id.
+    # If 0, Layer 2 didn't emit the event (client can't show progress).
+    # If >1, it was emitted multiple times (duplicate SSE events).
+    assert emitted_task_ids == ["task_sse_test"], (
+        f"Expected exactly one _emit_compaction_event call with "
+        f"task_id='task_sse_test', got: {emitted_task_ids}. "
+        f"If empty, _run_layer2 didn't call _emit_compaction_event."
+    )
+
+
+def test_layer3_truncation_preserves_tool_call_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Layer 3 truncation drops tool call pairs together — never
+    orphans a ``function_call`` without its ``function_call_output``.
+    """
+
+    def mock_count_tokens(
+        msgs: list[dict[str, Any]],
+        model: str,
+    ) -> int:
+        """
+        Simulates shrinking token count as messages are truncated.
+
+        :param msgs: Messages list (length used to simulate shrinking).
+        :param model: Model string (unused).
+        :returns: Token count proportional to message count.
+        """
+        # Each message ~ 5000 tokens. Budget is 10000, so need <= 2 msgs.
+        return len(msgs) * 5000
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.compaction.count_tokens",
+        mock_count_tokens,
+    )
+    # Layer 2 fails so we fall through to Layer 3.
+    monkeypatch.setattr(
+        "agent_plane.runtime.compaction.summarize_history",
+        lambda msgs, llm_client, model: (_ for _ in ()).throw(
+            RuntimeError("Simulated Layer 2 failure"),
+        ),
+    )
+
+    # Layout: user, fc+fco pair, assistant, user, assistant
+    # 6 messages x 5000 = 30000 > budget 10000
+    # Layer 3 must drop from front but keep fc+fco together.
+    history = [
+        _user_msg("msg_u1"),
+        _fc_item("msg_fc1", "c1"),
+        _fco_item("msg_fco1", "c1"),
+        _assistant_msg("msg_a1"),
+        _user_msg("msg_u2"),
+        _assistant_msg("msg_a2"),
+    ]
+    messages = [
+        _user_msg_dict(),
+        _fc_dict("c1"),
+        _fco_dict("c1"),
+        _assistant_msg_dict(),
+        _user_msg_dict(),
+        _assistant_msg_dict(),
+    ]
+
+    result = compact(
+        messages,
+        history,
+        config=CompactionConfig(trigger_threshold=0.8, recent_window=1),
+        context_window=12500,  # budget = 10000
+        system_token_budget=0,
+        model="openai/gpt-4o",
+        task_id="task_trunc",
+        llm_client=_RaisesIfCalled(),
+    )
+
+    # After truncation, remaining messages must not have orphaned pairs.
+    # An orphaned function_call_output without its function_call is a bug.
+    remaining_types = [m.get("type", m.get("role", "unknown")) for m in result.messages]
+
+    for i, msg in enumerate(result.messages):
+        if msg.get("type") == "function_call_output":
+            # The preceding message must be its matching function_call.
+            assert i > 0, "function_call_output at index 0 is orphaned without its function_call."
+            prev = result.messages[i - 1]
+            assert prev.get("type") == "function_call", (
+                f"function_call_output at index {i} is preceded by "
+                f"{prev.get('type', prev.get('role'))!r}, not "
+                f"'function_call'. The pair was broken by truncation. "
+                f"Remaining types: {remaining_types}"
+            )
+            assert prev.get("call_id") == msg.get("call_id"), (
+                f"function_call.call_id={prev.get('call_id')!r} doesn't "
+                f"match function_call_output.call_id="
+                f"{msg.get('call_id')!r} at index {i}."
+            )
+
+    # Must have truncated at least 2 messages (budget fits <= 2).
+    # Original had 6 messages x 5000 = 30000 > 10000 budget.
+    assert len(result.messages) <= 2, (
+        f"Expected <= 2 messages after truncation (budget=10000, "
+        f"5000 tokens/msg), got {len(result.messages)}. "
+        f"Layer 3 didn't truncate enough."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Layer 3: pair-aware truncation
+# ---------------------------------------------------------------------------
+
+
+def test_pair_aware_drop_count_drops_both_when_pair_at_front() -> None:
+    """
+    When the first two messages are a function_call followed by its
+    matching function_call_output, both must be dropped together.
+
+    If only one were dropped, the LLM would see an orphaned
+    function_call_output without its parent call (or vice versa).
+    """
+    messages = [
+        {"type": "function_call", "call_id": "c1", "name": "grep", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "result"},
+        _user_msg_dict("after the pair"),
+    ]
+    assert _pair_aware_drop_count(messages) == 2, (
+        "Expected 2 (drop both halves of the tool call pair). "
+        "If 1, the function_call_output would be orphaned."
+    )
+
+
+def test_pair_aware_drop_count_drops_one_for_non_pair() -> None:
+    """
+    When the front message is not part of a tool call pair, only
+    one item should be dropped.
+    """
+    messages = [
+        _user_msg_dict("hello"),
+        _assistant_msg_dict("world"),
+    ]
+    assert _pair_aware_drop_count(messages) == 1, (
+        "Expected 1 for a plain user message at the front."
+    )
+
+
+def test_pair_aware_drop_count_drops_one_for_mismatched_call_ids() -> None:
+    """
+    A function_call followed by a function_call_output with a
+    *different* call_id is not a pair — drop only the first item.
+    """
+    messages = [
+        {"type": "function_call", "call_id": "c1", "name": "grep", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c2", "output": "result"},
+    ]
+    assert _pair_aware_drop_count(messages) == 1, (
+        "Expected 1 — mismatched call_ids means these are not a "
+        "pair, so only the first item should be dropped."
+    )
+
+
+def test_pair_aware_drop_count_returns_zero_for_empty() -> None:
+    """Empty list returns 0 — nothing to drop."""
+    assert _pair_aware_drop_count([]) == 0
+
+
+def test_truncate_oldest_preserves_tool_call_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    _truncate_oldest drops function_call + function_call_output
+    together, never leaving an orphaned half.
+
+    Uses a mock token counter that returns above-budget on the
+    first call (triggering one drop) then below-budget so
+    truncation stops.
+    """
+    call_count = [0]
+
+    def mock_count_tokens(msgs: list[dict[str, Any]], model: str) -> int:
+        """
+        Above budget on first call to trigger one truncation round,
+        then below budget so the loop exits.
+
+        :param msgs: Messages list.
+        :param model: Model string (unused).
+        :returns: Token count.
+        """
+        call_count[0] += 1
+        # First call: above budget. After dropping the pair (2 items),
+        # second call: below budget.
+        return 10000 if call_count[0] == 1 else 50
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.compaction.count_tokens",
+        mock_count_tokens,
+    )
+
+    messages = [
+        {"type": "function_call", "call_id": "c1", "name": "grep", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "grep result"},
+        _user_msg_dict("kept message"),
+    ]
+
+    result = _truncate_oldest(messages, budget=100, model="test")
+
+    # The pair (indices 0-1) must be dropped together, leaving
+    # only the user message. If the pair were split, we'd see
+    # an orphaned function_call_output at index 0.
+    assert len(result) == 1, (
+        f"Expected 1 message after dropping the tool call pair, "
+        f"got {len(result)}. If 2, only one half of the pair was "
+        f"dropped (orphaned tool call)."
+    )
+    assert result[0]["role"] == "user", (
+        f"Expected the surviving message to be the user message, "
+        f"got type={result[0].get('type')!r} role={result[0].get('role')!r}."
+    )
