@@ -169,6 +169,18 @@ def coder_agent(http_client: httpx.Client) -> str:
 
 
 @pytest.fixture(scope="session")
+def archer_agent(http_client: httpx.Client) -> str:
+    """
+    Upload the archer agent (with fact_checker and summarizer
+    sub-agents) and return its name.
+
+    :param http_client: HTTP client pointed at the server.
+    :returns: The agent name, e.g. ``"archer"``.
+    """
+    return _upload_agent(http_client, _ARCHER_DIR)
+
+
+@pytest.fixture(scope="session")
 def sample_code_dir(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Path:

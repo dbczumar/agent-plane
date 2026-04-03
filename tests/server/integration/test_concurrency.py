@@ -1038,7 +1038,6 @@ def _identify_parent_and_sub(
     :param call_b: Second blocked call.
     :returns: ``(parent_call, sub_call)``.
     """
-    import json
 
     def _is_sub_agent(call: MockCall) -> bool:
         for item in call.received_kwargs.get("input", []):
@@ -1145,7 +1144,6 @@ async def test_steering_during_auto_collect(
         input_text="Start the worker",
     )
     first_id = first.body["id"]
-    conv_id = first.body["conversation"]["id"]
 
     # Gate: both blocked calls are entered. Now we know the
     # parent and sub-agent are each sitting on a blocked call.
@@ -1153,7 +1151,8 @@ async def test_steering_during_auto_collect(
     call_b.call_event.wait(timeout=10)
 
     parent_call, sub_call = _identify_parent_and_sub(
-        call_a, call_b,
+        call_a,
+        call_b,
     )
 
     # Release the PARENT only. It receives a text response
@@ -1190,8 +1189,7 @@ async def test_steering_during_auto_collect(
 
     body = resp.json()
     assert body["status"] == "completed", (
-        f"Expected completed, got {body['status']}. "
-        f"Output: {body.get('output')}"
+        f"Expected completed, got {body['status']}. Output: {body.get('output')}"
     )
 
     # Content-based assertion: the steering text must appear
@@ -1215,11 +1213,13 @@ async def test_steering_during_auto_collect(
         "input. The auto-collect poll loop blocked the workflow "
         "thread, preventing _sync_history from picking up the "
         "steered message. LLM inputs received: "
-        + str([
-            json.dumps(c.received_kwargs.get("input", []))[:200]
-            for c in mock_llm._calls
-            if c.received_kwargs is not None
-        ])
+        + str(
+            [
+                json.dumps(c.received_kwargs.get("input", []))[:200]
+                for c in mock_llm._calls
+                if c.received_kwargs is not None
+            ]
+        )
     )
 
 

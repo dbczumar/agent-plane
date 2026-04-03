@@ -1799,8 +1799,11 @@ class _AutoCollectResult:
     """
     Result of :func:`_auto_collect_sub_agents`.
 
-    :param last_seen: The store cursor after persisting any
-        collected results, e.g. ``"msg_abc123"``.
+    :param last_seen: The **original** store cursor (unchanged
+        from the input). Not advanced past the injected system
+        message so that ``_sync_history`` on the next loop
+        iteration picks up both the message and any steering
+        that arrived during the poll, e.g. ``"msg_abc123"``.
     :param collected_ids: The set of sub-agent response IDs
         that actually reached a terminal status and were
         collected. May be a subset of the requested IDs if
@@ -1821,7 +1824,6 @@ def _auto_collect_sub_agents(
     conversation_id: str,
     response_ids: list[str],
     last_seen: str,
-    history: list[ConversationItem],
     output_items: list[dict[str, Any]],
     conv_store: ConversationStore,
 ) -> _AutoCollectResult:
@@ -1835,16 +1837,20 @@ def _auto_collect_sub_agents(
     that completed so far) and returns early so the agent loop
     can process the steering.
 
+    Does NOT modify ``history`` — the caller re-enters the loop
+    with ``continue``, and ``_sync_history`` picks up both the
+    injected results and any steering messages from the store.
+
     :param task_id: The parent task ID.
     :param conversation_id: The parent's conversation ID.
     :param response_ids: Sub-agent response IDs to collect.
     :param last_seen: The current store cursor for detecting
         new items (steering), e.g. ``"msg_abc123"``.
-    :param history: Mutable conversation history.
     :param output_items: Mutable output items list.
     :param conv_store: ConversationStore for persistence.
-    :returns: An :class:`_AutoCollectResult` with the updated
-        cursor and the set of actually-collected IDs.
+    :returns: An :class:`_AutoCollectResult` with the
+        **original** cursor and the set of actually-collected
+        IDs.
     """
     results, collected = _poll_subagents_with_steering_check(
         response_ids,
@@ -1858,7 +1864,6 @@ def _auto_collect_sub_agents(
         last_seen,
         results,
         collected,
-        history,
         output_items,
         conv_store,
     )
@@ -1962,7 +1967,6 @@ def _inject_collect_results(
     last_seen: str,
     results: list[dict[str, str]],
     collected: set[str],
-    history: list[ConversationItem],
     output_items: list[dict[str, Any]],
     conv_store: ConversationStore,
 ) -> _AutoCollectResult:
@@ -1972,15 +1976,23 @@ def _inject_collect_results(
     If no sub-agents completed, returns the original cursor
     without persisting anything.
 
+    Returns the **original** ``last_seen`` (not the newly
+    persisted item's ID) so that ``_sync_history`` on the next
+    loop iteration picks up both the collected-results message
+    AND any steering messages that arrived during the poll.
+    Advancing the cursor here would skip steering messages
+    whose positions fall between the original cursor and the
+    injected system message.
+
     :param task_id: The parent task ID.
     :param conversation_id: The parent's conversation ID.
-    :param last_seen: Current store cursor.
+    :param last_seen: Current store cursor — returned as-is.
     :param results: Result dicts from completed sub-agents.
     :param collected: IDs of completed sub-agents.
-    :param history: Mutable conversation history.
     :param output_items: Mutable output items list.
     :param conv_store: ConversationStore for persistence.
-    :returns: An :class:`_AutoCollectResult`.
+    :returns: An :class:`_AutoCollectResult` with the
+        **original** cursor.
     """
     if not results:
         return _AutoCollectResult(
@@ -2004,16 +2016,18 @@ def _inject_collect_results(
             ),
         ),
     ]
-    persisted = _persist_and_stream(
+    # Persist and stream to SSE/output_items, but do NOT add
+    # to history — _sync_history handles that on the next
+    # iteration, which also picks up any steering messages.
+    _persist_and_stream(
         task_id,
         conv_store,
         conversation_id,
         new_items,
         output_items,
     )
-    history.extend(persisted)
     return _AutoCollectResult(
-        last_seen=persisted[-1].id,
+        last_seen=last_seen,
         collected_ids=collected,
     )
 
@@ -2858,7 +2872,6 @@ def _run_agent_loop(
                         conversation_id,
                         list(uncollected),
                         last_seen,
-                        history,
                         output_items,
                         conv_store,
                     )
