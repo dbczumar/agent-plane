@@ -1,0 +1,18 @@
+spec_version: 1
+
+name: compaction-test
+description: A minimal agent with aggressive compaction settings for e2e testing.
+
+llm:
+  model: gpt-4.1-nano
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+compaction:
+  trigger_threshold: 0.8
+  recent_window: 1
+
+instructions: |
+  You are a helpful assistant used for compaction testing. When asked
+  to generate verbose output, produce long detailed responses. When
+  asked to summarize, be brief.
