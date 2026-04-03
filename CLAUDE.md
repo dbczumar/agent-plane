@@ -213,6 +213,14 @@ Check each file against this checklist:
     no longer exists. Never mark a test as skipped "until we rewrite
     it later."
 
+31. NO OVERENGINEERED COLLECTION LOGIC: Never use nested index loops
+    (`for i ... for j ...`) or O(n²) pairwise comparisons to check
+    a property that can be expressed with a simple set/sum/len
+    operation. For example, checking that N sets are disjoint should
+    be `len(union) == sum(len(s) for s in sets)`, not a nested loop
+    over all pairs. The simpler form is easier to read, harder to
+    get wrong, and produces a clearer error message.
+
 Report each finding as:
   [FILE:LINE] ISSUE — description of the problem and suggested fix
 
@@ -282,6 +290,11 @@ Check each test file against this checklist:
 
 12. NO DUPLICATE TESTS: Grep for the same API calls and assertions
     in other test files before writing a new test.
+
+13. NO OVERENGINEERED COLLECTION LOGIC: Never use nested index loops
+    or O(n²) pairwise comparisons for properties expressible with
+    simple set/sum/len operations. E.g. disjointness of N sets is
+    `len(union) == sum(len(s) for s in sets)`, not `for i for j`.
 
 Report each finding as:
   [FILE:LINE] ISSUE — description and suggested fix

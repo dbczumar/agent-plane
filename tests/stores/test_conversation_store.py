@@ -676,3 +676,118 @@ def test_list_items_type_filter_with_order_and_limit(
         f"got: {result.data[0].data.summary!r}. "
         "Failure means order=desc with limit=1 did not return the newest item."
     )
+
+
+# ── Sub-agent conversation isolation ────────────────
+
+
+def test_subagent_conversations_are_isolated(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Two sub-agent conversations created independently must have
+    fully isolated item sets. list_items on one must never return
+    items belonging to the other.
+
+    This is the foundational invariant that prevents sub-agent
+    "pollution": each sub-agent writes to its own conversation,
+    and the agent loop loads history via
+    ``list_items(conversation_id)`` — so items from sibling
+    sub-agents are structurally invisible.
+
+    A failure here means the WHERE clause on ``conversation_id``
+    in ``list_items`` is broken, which would cause sub-agents to
+    see each other's messages and produce incoherent LLM prompts.
+    """
+    conv_a = conversation_store.create_conversation(kind="sub_agent")
+    conv_b = conversation_store.create_conversation(kind="sub_agent")
+
+    # Append distinct items to each conversation.
+    conversation_store.append(
+        conv_a.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="task_a",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "alpha input"}],
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="task_a",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "alpha output"}],
+                    agent="researcher",
+                ),
+            ),
+        ],
+    )
+    conversation_store.append(
+        conv_b.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="task_b",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "bravo input"}],
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="task_b",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "bravo output"}],
+                    agent="researcher",
+                ),
+            ),
+        ],
+    )
+
+    # List items for conv_a — must contain only alpha items.
+    page_a = conversation_store.list_items(conv_a.id)
+    # 2 items: user + assistant for the alpha sub-agent.
+    assert len(page_a.data) == 2, (
+        f"Expected 2 items in conv_a, got {len(page_a.data)}. "
+        "If > 2, items from conv_b leaked into conv_a's listing."
+    )
+    texts_a = [item.data.content[0]["text"] for item in page_a.data]
+    assert texts_a == ["alpha input", "alpha output"], (
+        f"Expected alpha items only in conv_a, got {texts_a}. "
+        "If bravo items appear, the conversation_id filter is broken."
+    )
+    # Every item must carry the correct response_id.
+    for item in page_a.data:
+        assert item.response_id == "task_a", (
+            f"Item {item.id} in conv_a has response_id {item.response_id!r}, expected 'task_a'."
+        )
+
+    # List items for conv_b — must contain only bravo items.
+    page_b = conversation_store.list_items(conv_b.id)
+    # 2 items: user + assistant for the bravo sub-agent.
+    assert len(page_b.data) == 2, (
+        f"Expected 2 items in conv_b, got {len(page_b.data)}. "
+        "If > 2, items from conv_a leaked into conv_b's listing."
+    )
+    texts_b = [item.data.content[0]["text"] for item in page_b.data]
+    assert texts_b == ["bravo input", "bravo output"], (
+        f"Expected bravo items only in conv_b, got {texts_b}. "
+        "If alpha items appear, the conversation_id filter is broken."
+    )
+    for item in page_b.data:
+        assert item.response_id == "task_b", (
+            f"Item {item.id} in conv_b has response_id {item.response_id!r}, expected 'task_b'."
+        )
+
+    # Cross-check: item IDs must be disjoint.
+    ids_a = {item.id for item in page_a.data}
+    ids_b = {item.id for item in page_b.data}
+    assert ids_a.isdisjoint(ids_b), (
+        f"Item IDs overlap between conversations: "
+        f"{ids_a & ids_b}. Each conversation must have "
+        "unique item IDs."
+    )

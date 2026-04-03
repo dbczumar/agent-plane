@@ -2233,3 +2233,448 @@ async def test_auto_collect_at_turn_end(
             f"Child task {child.id} has status {child.status!r} — "
             f"auto-collect should have waited for it to finish."
         )
+
+
+# ── Parallel same-name sub-agent isolation tests ─────
+
+
+def _make_collect_router(
+    spawn_call_id: str,
+) -> Any:
+    """
+    Build a tool_calls_fn that emits collect_sub_agents when the
+    LLM input contains the spawn function_call_output, and falls
+    back to text otherwise (for sub-agent calls).
+
+    :param spawn_call_id: The call_id of the spawn tool call to
+        match, e.g. ``"call_spawn_multi"``.
+    :returns: A callable suitable for ``MockCall.tool_calls_fn``.
+    """
+
+    # Any: kwargs from responses.create() are heterogeneous dicts.
+    def _route(kwargs: dict[str, Any]) -> list[dict[str, str]] | None:
+        for item in kwargs.get("input", []):
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "function_call_output"
+                and item.get("call_id") == spawn_call_id
+            ):
+                output = json.loads(item["output"])
+                return [
+                    {
+                        "call_id": f"call_collect_{spawn_call_id}",
+                        "name": "collect_sub_agents",
+                        "arguments": json.dumps(
+                            {
+                                "response_ids": output["response_ids"],
+                                "timeout": 30,
+                            }
+                        ),
+                    }
+                ]
+        return None
+
+    return _route
+
+
+def _make_reader_router() -> Any:
+    """
+    Build a tool_calls_fn that returns a Read tool call with a
+    distinct call_id for alpha/bravo sub-agents, based on which
+    input string is present. Returns None for resumed calls
+    (containing function_call_output) so the mock falls back
+    to text.
+
+    :returns: A callable suitable for ``MockCall.tool_calls_fn``.
+    """
+
+    # Any: kwargs from responses.create() are heterogeneous dicts.
+    def _route(kwargs: dict[str, Any]) -> list[dict[str, str]] | None:
+        input_str = json.dumps(kwargs.get("input", []))
+        # Skip resumed calls — sub-agent already has tool result.
+        if "function_call_output" in input_str:
+            return None
+        if "read file alpha" in input_str:
+            return [
+                {
+                    "call_id": "call_read_alpha",
+                    "name": "Read",
+                    "arguments": '{"file_path": "/tmp/alpha.txt"}',
+                }
+            ]
+        if "read file bravo" in input_str:
+            return [
+                {
+                    "call_id": "call_read_bravo",
+                    "name": "Read",
+                    "arguments": '{"file_path": "/tmp/bravo.txt"}',
+                }
+            ]
+        return None
+
+    return _route
+
+
+async def _patch_pending_tool_calls(
+    client: httpx.AsyncClient,
+    response_id: str,
+    expected_outputs: dict[str, str],
+) -> None:
+    """
+    Poll for pending tool calls and PATCH their results. Handles
+    the case where sub-agents park at different times by polling
+    in rounds until all expected call_ids have been patched.
+
+    :param client: The HTTP test client.
+    :param response_id: The root response ID to poll.
+    :param expected_outputs: Mapping of call_id to tool output
+        string, e.g. ``{"call_read_alpha": "alpha content"}``.
+    """
+    patched: set[str] = set()
+    # 2 rounds: sub-agents may park at different times, so the
+    # first poll may surface only one pending call.
+    for _ in range(2):
+        pending = await _poll_for_pending(client, response_id)
+        for item in pending:
+            call_id = item["call_id"]
+            if call_id in patched:
+                continue
+            assert call_id in expected_outputs, (
+                f"Unexpected call_id {call_id!r}. Expected one of {set(expected_outputs)}."
+            )
+            patch_resp = await client.patch(
+                f"/v1/responses/{response_id}",
+                json={
+                    "tool_results": [
+                        {
+                            "call_id": call_id,
+                            "output": expected_outputs[call_id],
+                        },
+                    ],
+                },
+            )
+            assert patch_resp.status_code == 200, (
+                f"PATCH for {call_id} failed with "
+                f"{patch_resp.status_code}. Tool result delivery "
+                "to the sub-agent may be broken."
+            )
+            patched.add(call_id)
+        if patched == set(expected_outputs):
+            return
+
+
+async def _assert_child_task_isolation(
+    task_store: SqlAlchemyTaskStore,
+    parent_task_id: str,
+    expected_count: int,
+    expected_agent_name: str,
+) -> None:
+    """
+    Verify that child tasks are isolated: distinct IDs, distinct
+    conversations, separate from the parent, and conversation
+    contents are disjoint.
+
+    :param task_store: The task store to query.
+    :param parent_task_id: The parent response/task ID.
+    :param expected_count: How many child tasks to expect.
+    :param expected_agent_name: The agent_name all children share.
+    """
+    all_tasks = await task_store.list_tasks()
+    child_tasks = [t for t in all_tasks if t.root_task_id == parent_task_id]
+    _assert_child_task_identity(
+        all_tasks,
+        child_tasks,
+        parent_task_id,
+        expected_count,
+        expected_agent_name,
+    )
+    _assert_child_conversation_contents_disjoint(child_tasks)
+
+
+def _assert_child_task_identity(
+    all_tasks: list[Any],
+    child_tasks: list[Any],
+    parent_task_id: str,
+    expected_count: int,
+    expected_agent_name: str,
+) -> None:
+    """
+    Verify child task counts, names, IDs, and conversation IDs.
+
+    :param all_tasks: All tasks from the store.
+    :param child_tasks: Tasks whose root_task_id matches parent.
+    :param parent_task_id: The parent response/task ID.
+    :param expected_count: How many child tasks to expect.
+    :param expected_agent_name: The agent_name all children share.
+    """
+    assert len(child_tasks) == expected_count, (
+        f"Expected {expected_count} child tasks with "
+        f"root_task_id={parent_task_id}, got {len(child_tasks)}. "
+        f"If fewer, a spawn was deduplicated by agent_name "
+        f"(wrong — task_id is identity)."
+    )
+
+    child_names = {t.agent_name for t in child_tasks}
+    assert child_names == {expected_agent_name}, (
+        f"Expected all children named {expected_agent_name!r}, got {child_names}"
+    )
+    child_ids = {t.id for t in child_tasks}
+    assert len(child_ids) == expected_count, (
+        "Child task IDs must be distinct — each spawn creates a new task regardless of agent_name."
+    )
+
+    child_conv_ids = {t.conversation_id for t in child_tasks}
+    assert len(child_conv_ids) == expected_count, (
+        f"Expected {expected_count} distinct conversation IDs, "
+        f"got {len(child_conv_ids)}. If fewer, sub-agents share "
+        "a conversation, which would cause prompt pollution."
+    )
+
+    parent_task = next(t for t in all_tasks if t.id == parent_task_id)
+    assert parent_task.conversation_id not in child_conv_ids, (
+        "Parent conversation_id must differ from child "
+        "conversation_ids — they are independent threads."
+    )
+
+
+def _assert_child_conversation_contents_disjoint(
+    child_tasks: list[Any],
+) -> None:
+    """
+    Verify that conversation items across child tasks are fully
+    disjoint: no item ID appears in more than one conversation,
+    and each conversation's items reference only its own task's
+    response_id.
+
+    This is the content-level isolation check — structural ID
+    uniqueness alone doesn't prove that ``list_items`` actually
+    returns the right items for each conversation.
+
+    :param child_tasks: Child task objects with ``id`` and
+        ``conversation_id`` attributes.
+    """
+    from agent_plane.runtime import get_conversation_store
+
+    conv_store = get_conversation_store()
+
+    # Collect item IDs and response_ids per child conversation.
+    all_item_ids: list[set[str]] = []
+    for child in child_tasks:
+        page = conv_store.list_items(child.conversation_id)
+        # Each sub-agent conversation must have at least the
+        # initial user message appended by _spawn_one.
+        assert len(page.data) >= 1, (
+            f"Child {child.id} conversation {child.conversation_id} "
+            f"is empty — _spawn_one should have appended the user "
+            f"input as the first message."
+        )
+        item_ids = {item.id for item in page.data}
+        all_item_ids.append(item_ids)
+
+        # Every item in this conversation must carry this child's
+        # task ID as its response_id. If an item from a sibling
+        # leaked in, its response_id would be wrong.
+        for item in page.data:
+            assert item.response_id == child.id, (
+                f"Item {item.id} in child {child.id}'s conversation "
+                f"has response_id={item.response_id!r}, expected "
+                f"{child.id!r}. An item from a sibling sub-agent "
+                f"leaked into this conversation."
+            )
+
+    # Item IDs across child conversations must be disjoint.
+    # Hardcoded for 2 children — callers always pass exactly 2.
+    assert all_item_ids[0].isdisjoint(all_item_ids[1]), (
+        f"Item IDs overlap between child conversations: "
+        f"{all_item_ids[0] & all_item_ids[1]}. "
+        f"An item leaked from one sub-agent's conversation into "
+        f"another's."
+    )
+
+
+async def test_parallel_same_name_subagents_have_isolated_conversations(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+    task_store: SqlAlchemyTaskStore,
+) -> None:
+    """
+    Spawn two instances of the same sub-agent spec ("researcher")
+    in a single spawn_sub_agents call. Verify each gets a distinct
+    task ID, distinct conversation ID, and the parent conversation
+    is separate from both.
+
+    Catches regressions where agent_name is used as a unique key
+    (it shouldn't be — task_id is the identity), or where
+    conversation creation reuses an existing sub-agent conversation.
+    """
+    bundle = build_agent_bundle(
+        name="multi-spawn",
+        sub_agents=[
+            {"name": "researcher", "description": "Research helper"},
+        ],
+    )
+    resp = await client.post(
+        "/api/agents",
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert resp.status_code == 201
+
+    # Mock call 1 (parent): spawn two researchers in one call.
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_spawn_multi",
+                "name": "spawn_sub_agents",
+                "arguments": json.dumps(
+                    {
+                        "agents": [
+                            {"name": "researcher", "input": "Tell me about Python"},
+                            {"name": "researcher", "input": "Tell me about Rust"},
+                        ],
+                    }
+                ),
+            }
+        ],
+    )
+
+    route = _make_collect_router("call_spawn_multi")
+    # Calls 2-4: race between 2 sub-agents and parent collect.
+    mock_llm.add_call(text="Python is a dynamic language.", tool_calls_fn=route)
+    mock_llm.add_call(text="Rust is a systems language.", tool_calls_fn=route)
+    mock_llm.add_call(text="Sub-agent fallback text.", tool_calls_fn=route)
+    # Call 5 (parent, after collect): final text.
+    mock_llm.add_call(text="Research complete: Python and Rust.")
+
+    result = await create_test_response(
+        client,
+        model="multi-spawn",
+        input_text="Research Python and Rust",
+        background=False,
+        stream=False,
+    )
+
+    assert result.status_code == 200, f"Expected 200, got {result.status_code}: {result.body}"
+    assert result.body["status"] == "completed", (
+        f"Workflow did not complete: {result.body.get('error')}"
+    )
+
+    await _assert_child_task_isolation(
+        task_store,
+        result.body["id"],
+        expected_count=2,
+        expected_agent_name="researcher",
+    )
+
+
+async def test_parallel_subagents_park_and_patch_independently(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+    task_store: SqlAlchemyTaskStore,
+) -> None:
+    """
+    Spawn two sub-agents that both park on client-side tool calls.
+    Verify that PATCHing a tool result for one sub-agent wakes
+    only that sub-agent, and both complete independently.
+
+    Tests the tool-call routing invariant: pending_tool_calls are
+    keyed by call_id and routed by task_id, so two sub-agents
+    parking simultaneously never cross-contaminate.
+
+    A failure means PATCH delivered a tool result to the wrong
+    sub-agent (e.g. routing by agent_name instead of task_id).
+    """
+    bundle = build_agent_bundle(
+        name="dual-park-parent",
+        sub_agents=[{"name": "reader", "description": "File reader"}],
+    )
+    resp = await client.post(
+        "/api/agents",
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert resp.status_code == 201
+
+    # Mock call 1 (parent): spawn two reader instances.
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_sp_dual",
+                "name": "spawn_sub_agents",
+                "arguments": json.dumps(
+                    {
+                        "agents": [
+                            {"name": "reader", "input": "read file alpha"},
+                            {"name": "reader", "input": "read file bravo"},
+                        ],
+                    }
+                ),
+            }
+        ],
+    )
+
+    # Calls 2-4: sub-agents park on Read tool calls.
+    reader_route = _make_reader_router()
+    mock_llm.add_call(text="parent placeholder", tool_calls_fn=reader_route)
+    mock_llm.add_call(text="parent placeholder", tool_calls_fn=reader_route)
+    mock_llm.add_call(text="parent placeholder", tool_calls_fn=reader_route)
+    # After PATCH: sub-agents resume and produce final text.
+    mock_llm.add_call(text="Alpha file says: alpha content")
+    mock_llm.add_call(text="Bravo file says: bravo content")
+    # Parent after auto-collect: final answer.
+    mock_llm.add_call(text="Files read: alpha and bravo content.")
+
+    # Client-side tool schema for Read.
+    read_tool: dict[str, Any] = {
+        "type": "function",
+        "function": {
+            "name": "Read",
+            "description": "Read a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}},
+                "required": ["file_path"],
+            },
+        },
+    }
+
+    result = await create_test_response(
+        client,
+        model="dual-park-parent",
+        input_text="Read alpha and bravo files",
+        background=True,
+        tools=[read_tool],
+    )
+    response_id = result.body["id"]
+
+    # Poll and PATCH both pending tool calls.
+    await _patch_pending_tool_calls(
+        client,
+        response_id,
+        {
+            "call_read_alpha": "alpha content",
+            "call_read_bravo": "bravo content",
+        },
+    )
+
+    # Wait for the full workflow to complete.
+    final = await _poll_until_terminal(client, response_id)
+    assert final["status"] == "completed", (
+        f"Expected completed, got {final['status']}. Error: {final.get('error')}"
+    )
+
+    # Verify both children completed and have isolated conversations.
+    await _assert_child_task_isolation(
+        task_store,
+        response_id,
+        expected_count=2,
+        expected_agent_name="reader",
+    )
+    # Verify both children are in completed state (not just
+    # created) — proves each received its own tool result.
+    all_tasks = await task_store.list_tasks()
+    child_tasks = [t for t in all_tasks if t.root_task_id == response_id]
+    for child in child_tasks:
+        assert child.status == "completed", (
+            f"Child {child.id} has status {child.status!r}, "
+            "expected 'completed'. Tool result may have been "
+            "delivered to the wrong sub-agent."
+        )
