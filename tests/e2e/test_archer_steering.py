@@ -14,7 +14,6 @@ Exercises:
 from __future__ import annotations
 
 import time
-from typing import Any
 
 import httpx
 
@@ -43,20 +42,14 @@ def _wait_for_spawn(
         resp = client.get(f"/v1/responses/{response_id}")
         body = resp.json()
         for item in body.get("output", []):
-            if (
-                item.get("type") == "function_call"
-                and item.get("name") == "spawn_sub_agents"
-            ):
+            if item.get("type") == "function_call" and item.get("name") == "spawn_sub_agents":
                 return
         if body["status"] in ("completed", "failed"):
             raise AssertionError(
-                "Response completed without spawning a sub-agent. "
-                f"Output: {body.get('output')}"
+                f"Response completed without spawning a sub-agent. Output: {body.get('output')}"
             )
         time.sleep(0.5)
-    raise AssertionError(
-        f"spawn_sub_agents not found in output within {timeout}s"
-    )
+    raise AssertionError(f"spawn_sub_agents not found in output within {timeout}s")
 
 
 def test_steering_during_auto_collect(
@@ -131,22 +124,16 @@ def test_steering_during_auto_collect(
 
     # Step 5: assert.
     assert final["status"] == "completed", (
-        f"Expected completed, got {final['status']}. "
-        f"Error: {final.get('error')}"
+        f"Expected completed, got {final['status']}. Error: {final.get('error')}"
     )
 
     if steered_into_running:
         # Steering was accepted into the running task — the
         # agent must have processed it. Check that PINEAPPLE
         # appears in the output text.
-        text_items = [
-            item for item in final["output"]
-            if item.get("type") == "message"
-        ]
+        text_items = [item for item in final["output"] if item.get("type") == "message"]
         all_text = " ".join(
-            c.get("text", "")
-            for item in text_items
-            for c in item.get("content", [])
+            c.get("text", "") for item in text_items for c in item.get("content", [])
         ).upper()
         # The LLM should have produced "PINEAPPLE" in at least
         # one of its output messages. If it didn't, either the
