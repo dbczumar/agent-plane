@@ -2,44 +2,136 @@
 
 Requires ``--llm-api-key`` and a real server. Run with::
 
-    pytest tests/e2e/test_compaction_e2e.py \\
+    pytest tests/e2e/test_compaction_e2e.py \
         --llm-api-key $(cat /tmp/mykey) -v
 
+Uses ``AP_CONTEXT_WINDOW_OVERRIDE=4096`` so the server thinks the
+model has a tiny context window. With ``trigger_threshold: 0.01``
+in the agent spec, proactive compaction fires on the second turn
+(the first turn's response alone exceeds 1% of 4096 = 41 tokens).
+
 Exercises:
-- Multi-turn conversation that fills the context window
-- Reactive compaction (overflow → compact → retry)
-- Proactive compaction (subsequent turns stay under budget)
+- Proactive compaction (estimated tokens > threshold after turn 1)
 - Compaction item persisted to conversation store
-- Cursor-based history loading on follow-up turns
-- Agent continues to function after compaction
+- Cursor-based history loading on follow-up turn
+- Agent continues to function after compaction (summary context)
 """
 
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
+import tarfile
+import tempfile
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
-from tests.e2e.conftest import (
-    _upload_agent,
-    poll_until_terminal,
-)
-
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _COMPACTION_AGENT_DIR = _REPO_ROOT / "examples" / "agents" / "compaction-test"
 
 
-@pytest.fixture(scope="session")
-def compaction_agent(http_client: httpx.Client) -> str:
+@pytest.fixture(scope="module")
+def compaction_server(
+    request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[str]:
     """
-    Upload the compaction-test agent and return its name.
+    Start a real server with ``AP_CONTEXT_WINDOW_OVERRIDE=4096``.
 
-    :param http_client: HTTP client pointed at the live server.
-    :returns: The agent name, e.g. ``"compaction-test"``.
+    Uses a separate port (18502) to avoid conflicts with the
+    session-scoped e2e server on 18501.
+
+    :param request: Pytest request (for CLI options).
+    :param tmp_path_factory: Pytest temp path factory.
+    :returns: The server's base URL.
     """
-    return _upload_agent(http_client, _COMPACTION_AGENT_DIR)
+    api_key: str = request.config.getoption("--llm-api-key")
+    port = 18502
+    db_path = tmp_path_factory.mktemp("compaction_e2e") / "compaction.db"
+    env = {
+        **os.environ,
+        "OPENAI_API_KEY": api_key,
+        "AP_DB_URI": f"sqlite:///{db_path}",
+        # Small context window so proactive compaction fires quickly.
+        "AP_CONTEXT_WINDOW_OVERRIDE": "4096",
+    }
+    # Remove stale DBOS system DB so the server starts fresh
+    # (avoids reusing cached agent bundles from prior runs).
+    for stale in Path(".").glob("dbos_system.db*"):
+        stale.unlink(missing_ok=True)
+    proc = subprocess.Popen(
+        ["ap", "server", "--port", str(port)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    base_url = f"http://localhost:{port}"
+
+    for _ in range(60):
+        try:
+            resp = httpx.get(f"{base_url}/health", timeout=2)
+            if resp.status_code == 200:
+                break
+        except httpx.ConnectError:
+            pass
+        time.sleep(0.5)
+    else:
+        proc.kill()
+        stdout = proc.stdout.read().decode() if proc.stdout else ""
+        raise RuntimeError(
+            f"Compaction e2e server didn't start within 30s.\n{stdout}"
+        )
+
+    yield base_url
+
+    proc.send_signal(signal.SIGTERM)
+    proc.wait(timeout=10)
+
+
+@pytest.fixture(scope="module")
+def compaction_client(
+    compaction_server: str,
+) -> Iterator[httpx.Client]:
+    """
+    HTTP client pointed at the compaction e2e server.
+
+    :param compaction_server: The server's base URL.
+    :returns: An ``httpx.Client`` with long timeout.
+    """
+    with httpx.Client(base_url=compaction_server, timeout=300) as client:
+        yield client
+
+
+def _upload_agent(client: httpx.Client, agent_dir: Path) -> str:
+    """
+    Upload an agent bundle and return its name.
+
+    :param client: HTTP client.
+    :param agent_dir: Path to the agent directory.
+    :returns: The agent name.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+        with tarfile.open(tmp.name, "w:gz") as tar:
+            tar.add(str(agent_dir), arcname=".")
+        tmp_path = tmp.name
+    try:
+        with open(tmp_path, "rb") as f:
+            resp = client.post(
+                "/api/agents",
+                files={"bundle": ("agent.tar.gz", f, "application/gzip")},
+            )
+        if resp.status_code == 409:
+            return agent_dir.name
+        resp.raise_for_status()
+        return resp.json()["name"]
+    finally:
+        os.unlink(tmp_path)
 
 
 def _create_turn(
@@ -51,11 +143,10 @@ def _create_turn(
     """
     Create a response and poll until terminal.
 
-    :param client: HTTP client pointed at the live server.
+    :param client: HTTP client.
     :param model: Agent name.
     :param user_input: User message text.
-    :param previous_response_id: ID of the previous response
-        for multi-turn conversations, or ``None`` for the first turn.
+    :param previous_response_id: Previous response ID, or ``None``.
     :returns: The terminal response body dict.
     """
     payload: dict[str, Any] = {
@@ -68,163 +159,112 @@ def _create_turn(
     resp = client.post("/v1/responses", json=payload)
     resp.raise_for_status()
     response_id = resp.json()["id"]
-    return poll_until_terminal(client, response_id, timeout=120)
+
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        resp = client.get(f"/v1/responses/{response_id}")
+        resp.raise_for_status()
+        body = resp.json()
+        if body["status"] in ("completed", "failed"):
+            return body
+        time.sleep(0.5)
+    raise AssertionError(
+        f"Response {response_id} didn't complete within 120s",
+    )
 
 
-def _get_conversation_items(
-    client: httpx.Client,
-    conversation_id: str,
-) -> list[dict[str, Any]]:
-    """
-    Fetch all items in a conversation.
-
-    :param client: HTTP client pointed at the live server.
-    :param conversation_id: The conversation ID.
-    :returns: List of conversation item dicts.
-    """
-    resp = client.get(f"/v1/conversations/{conversation_id}/items")
-    resp.raise_for_status()
-    return resp.json()["data"]
-
-
-# Long prompt designed to consume a large chunk of the context window.
-# gpt-4.1-nano has a 1M token window, so we need substantial content.
-# Each turn asks for verbose output to fill the window faster.
-_VERBOSE_PROMPT = (
-    "List every country in the world, its capital city, population, "
-    "GDP, official languages, currency, and a brief history of its "
-    "founding. Be as detailed as possible. Include all 195 UN member "
-    "states. Format as a numbered list with sub-bullets for each field."
-)
-
-
-def test_compaction_fires_after_multi_turn_overflow(
-    http_client: httpx.Client,
-    compaction_agent: str,
+def test_compaction_fires_and_agent_continues(
+    compaction_client: httpx.Client,
 ) -> None:
     """
-    Multiple turns of verbose output eventually trigger compaction.
-    After compaction fires, the agent continues to function and a
-    compaction item is persisted to the conversation store.
+    With a 4096-token context window override and 1% trigger
+    threshold, proactive compaction fires on the second turn.
 
-    This test sends several turns of verbose prompts to fill the
-    context window, then verifies:
-    1. The agent still completes responses (compaction didn't break it)
-    2. A compaction item exists in the conversation store
-    3. A follow-up turn after compaction loads from the cursor
-       (the agent can reference prior context via the summary)
-
-    :param http_client: HTTP client pointed at the live server.
-    :param compaction_agent: The uploaded agent name.
+    :param compaction_client: HTTP client pointed at the
+        compaction e2e server.
     """
-    # --- Turn 1: Start conversation with verbose output ---
+    agent_name = _upload_agent(compaction_client, _COMPACTION_AGENT_DIR)
+
+    # --- Turn 1: seed the conversation ---
     turn_1 = _create_turn(
-        http_client,
-        compaction_agent,
-        _VERBOSE_PROMPT,
+        compaction_client,
+        agent_name,
+        "List 10 countries and their capitals with brief descriptions.",
     )
     assert turn_1["status"] == "completed", (
-        f"Turn 1 failed: {turn_1.get('status')}. "
-        f"The compaction-test agent must complete its first turn."
+        f"Turn 1 failed: {turn_1.get('status')}. Body: {turn_1}"
     )
     response_id = turn_1["id"]
     conv_id = turn_1["conversation"]["id"]
 
-    # --- Turns 2-5: Build up context ---
-    for i in range(2, 6):
-        turn = _create_turn(
-            http_client,
-            compaction_agent,
-            f"Turn {i}: {_VERBOSE_PROMPT} Also summarize what you said in previous turns.",
-            previous_response_id=response_id,
-        )
-        assert turn["status"] == "completed", (
-            f"Turn {i} failed: {turn.get('status')}. "
-            f"The agent must continue completing turns as context grows."
-        )
-        response_id = turn["id"]
-
-    # --- Check for compaction item ---
-    items = _get_conversation_items(http_client, conv_id)
-    compaction_items = [i for i in items if i.get("type") == "compaction"]
-
-    # With gpt-4.1-nano (1M context) and 5 verbose turns, compaction
-    # may or may not fire depending on actual output length. If it
-    # didn't fire, we send more turns.
-    if not compaction_items:
-        for i in range(6, 11):
-            turn = _create_turn(
-                http_client,
-                compaction_agent,
-                f"Turn {i}: {_VERBOSE_PROMPT} "
-                f"Repeat all your previous answers verbatim, "
-                f"then add new countries you missed.",
-                previous_response_id=response_id,
-            )
-            assert turn["status"] == "completed", f"Turn {i} failed: {turn.get('status')}."
-            response_id = turn["id"]
-
-        items = _get_conversation_items(http_client, conv_id)
-        compaction_items = [i for i in items if i.get("type") == "compaction"]
-
-    # At this point compaction should have fired at least once.
-    # If not, the model's context window is too large for this test
-    # to overflow with 10 turns. Mark as expected failure.
-    if not compaction_items:
-        pytest.skip(
-            "Compaction did not fire after 10 turns — the model's "
-            "context window may be too large to overflow with this "
-            "test's prompt volume. Try with a smaller-context model."
-        )
-
-    # --- Verify compaction item structure ---
-    cmp = compaction_items[-1]
-    assert "summary" in cmp, f"Compaction item missing 'summary' field: {cmp}"
-    assert "last_item_id" in cmp, f"Compaction item missing 'last_item_id' field: {cmp}"
-    # Summary must be non-empty text.
-    assert isinstance(cmp["summary"], str) and len(cmp["summary"]) > 10, (
-        f"Compaction summary is empty or too short: {cmp['summary']!r}"
-    )
-    # last_item_id must point to a real conversation item.
-    all_item_ids = {i["id"] for i in items}
-    assert cmp["last_item_id"] in all_item_ids, (
-        f"Compaction last_item_id={cmp['last_item_id']!r} does not match any conversation item."
-    )
-
-    # --- Follow-up turn: agent works after compaction ---
-    follow_up = _create_turn(
-        http_client,
-        compaction_agent,
-        "What was the first thing I asked you about? Give a one-sentence summary.",
+    # --- Turn 2: triggers proactive compaction ---
+    turn_2 = _create_turn(
+        compaction_client,
+        agent_name,
+        "Now list 10 more countries not in the previous list.",
         previous_response_id=response_id,
     )
-    assert follow_up["status"] == "completed", (
-        f"Follow-up turn after compaction failed: "
-        f"{follow_up.get('status')}. The agent must still function "
-        f"after compaction fires."
+    assert turn_2["status"] == "completed", (
+        f"Turn 2 failed: {turn_2.get('status')}. "
+        f"If 'failed', compaction may have broken the retry path."
+    )
+    response_id = turn_2["id"]
+
+    # --- Verify compaction item exists ---
+    items_resp = compaction_client.get(
+        f"/v1/conversations/{conv_id}/items",
+    )
+    items_resp.raise_for_status()
+    items: list[dict[str, Any]] = items_resp.json()["data"]
+    compaction_items = [i for i in items if i.get("type") == "compaction"]
+
+    assert len(compaction_items) >= 1, (
+        f"Expected >= 1 compaction item after 2 turns with "
+        f"4096-token window and 1% threshold. "
+        f"Found {len(compaction_items)}. "
+        f"Item types: {[i.get('type') for i in items]}. "
+        f"If 0, AP_CONTEXT_WINDOW_OVERRIDE may not have reached "
+        f"the server or proactive compaction didn't fire."
     )
 
-    # The follow-up response should reference countries/capitals
-    # (from the summary), proving the compaction summary provided
-    # useful context to the agent.
-    follow_up_output = follow_up.get("output", [])
-    follow_up_texts = [
+    cmp = compaction_items[-1]
+    assert isinstance(cmp.get("summary"), str), (
+        f"Compaction item missing 'summary': {cmp}"
+    )
+    assert len(cmp["summary"]) > 10, (
+        f"Summary too short: {cmp['summary']!r}"
+    )
+    all_ids = {i["id"] for i in items}
+    assert cmp.get("last_item_id") in all_ids, (
+        f"last_item_id={cmp.get('last_item_id')!r} not in items."
+    )
+
+    # --- Turn 3: agent works after compaction ---
+    turn_3 = _create_turn(
+        compaction_client,
+        agent_name,
+        "What was the first thing I asked you about?",
+        previous_response_id=response_id,
+    )
+    assert turn_3["status"] == "completed", (
+        f"Turn 3 (post-compaction) failed: {turn_3.get('status')}."
+    )
+
+    output = turn_3.get("output", [])
+    texts = [
         item["content"][0]["text"]
-        for item in follow_up_output
+        for item in output
         if item.get("type") == "message"
         and item.get("role") == "assistant"
         and item.get("content")
     ]
-    assert follow_up_texts, (
-        "Follow-up turn produced no assistant text. The agent should respond after compaction."
-    )
-    # The agent should mention countries or capitals — proving it
-    # has context from the summary.
-    combined = " ".join(follow_up_texts).lower()
+    combined = " ".join(texts).lower()
+    # The agent should reference countries/capitals — proving
+    # the compaction summary provided context.
     assert any(
-        keyword in combined for keyword in ["countr", "capital", "list", "nation", "asked"]
+        kw in combined
+        for kw in ["countr", "capital", "list", "nation", "asked"]
     ), (
-        f"Follow-up response doesn't reference the prior conversation "
-        f"context. The compaction summary may not have been loaded. "
-        f"Response: {combined[:200]}"
+        f"Post-compaction response doesn't reference prior context. "
+        f"Response: {combined[:300]}"
     )

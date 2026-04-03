@@ -2610,11 +2610,12 @@ def _run_agent_loop(
     # completing the turn.
     spawned_ids: set[str] = set()
     collected_ids: set[str] = set()
-    # Per-execution compaction state. context_window is None until
-    # the first reactive overflow reveals the model's limit; then
-    # subsequent iterations check proactively via tiktoken.
+    # Per-execution compaction state. context_window is seeded from
+    # the executor's known limit (if any) so proactive compaction
+    # can fire from the first iteration. Falls back to None when the
+    # executor doesn't know its window (discovered on first overflow).
     compaction_state = _CompactionState(
-        context_window=None,
+        context_window=executor.max_context_tokens(),
         last_summary=None,
         config=spec.compaction,
         model=llm_config.model,
