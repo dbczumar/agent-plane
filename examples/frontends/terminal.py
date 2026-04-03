@@ -454,7 +454,7 @@ class ChatApp(App[None]):
         Binding("ctrl+l", "clear_log", "Clear"),
         Binding("ctrl+r", "toggle_reasoning", "Reasoning"),
         Binding("ctrl+v", "paste_files", "Paste", show=False),
-        Binding("escape", "toggle_browse", "Browse", show=False),
+        Binding("escape", "toggle_browse", "Cancel/Browse", show=False),
     ]
 
     def __init__(
@@ -497,7 +497,7 @@ class ChatApp(App[None]):
         yield VerticalScroll(id="chat-scroll")
         yield Input(
             id="user-input",
-            placeholder="Type a message… (Enter to send, Ctrl+C to quit)",
+            placeholder="Type a message… (Enter to send, Esc to cancel, Ctrl+C to quit)",
         )
         yield Footer()
 
@@ -853,11 +853,16 @@ class ChatApp(App[None]):
 
     def action_toggle_browse(self) -> None:
         """
-        Toggle between input mode and browse mode (Escape).
+        Handle Escape key — context-sensitive.
 
-        In browse mode, Up/Down navigates collapsibles and
-        Enter toggles them. Escape returns to input mode.
+        If the assistant is currently streaming, cancel the
+        in-progress response via the cancel API. Otherwise,
+        toggle between input mode and browse mode.
         """
+        if self._streaming and self._current_response_id is not None:
+            self._cancel_response()
+            return
+
         from textual.widgets import Collapsible
 
         inp = self.query_one("#user-input", Input)
@@ -869,6 +874,44 @@ class ChatApp(App[None]):
         else:
             # Return to input mode
             inp.focus()
+
+    @work(thread=True, group="cancel")
+    def _cancel_response(self) -> None:
+        """
+        Cancel the in-progress response via the server API.
+
+        Sends ``POST /v1/responses/{id}/cancel`` and displays
+        a status message. The SSE stream will terminate naturally
+        when the workflow observes the cancellation at its next
+        checkpoint.
+        """
+        response_id = self._current_response_id
+        if response_id is None:
+            return
+        scroll = self.query_one("#chat-scroll", VerticalScroll)
+        try:
+            resp = httpx.post(
+                f"{BASE_URL}/v1/responses/{response_id}/cancel",
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            scroll.mount(
+                SystemInfo(Text.from_markup("[dim yellow]⏹ response cancelled[/dim yellow]"))
+            )
+        except httpx.HTTPStatusError as exc:
+            scroll.mount(
+                SystemInfo(
+                    Text.from_markup(
+                        f"[dim red]cancel failed: {exc.response.status_code}[/dim red]"
+                    )
+                )
+            )
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            scroll.mount(
+                SystemInfo(
+                    Text.from_markup(f"[dim red]cancel failed: {escape(str(exc))}[/dim red]")
+                )
+            )
 
     def on_key(self, event: events.Key) -> None:
         """
