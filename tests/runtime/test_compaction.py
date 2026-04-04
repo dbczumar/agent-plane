@@ -1057,6 +1057,258 @@ def test_layer3_truncation_preserves_tool_call_pairs(
     )
 
 
+def test_layer2_receives_cleared_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When Layer 2 fires, ``summarize_history`` receives messages
+    that already have tool result bodies cleared by Layer 1.
+
+    Captures the messages passed to ``summarize_history`` and
+    verifies the tool result body was replaced with the clearing
+    marker before summarization.
+    """
+    call_counts = [0]
+
+    def mock_count_tokens(
+        msgs: list[dict[str, Any]],
+        model: str,
+    ) -> int:
+        """
+        First call above budget to trigger Layer 2, then below.
+
+        :param msgs: Messages (unused).
+        :param model: Model string (unused).
+        :returns: Token count.
+        """
+        call_counts[0] += 1
+        if call_counts[0] == 1:
+            return 10001
+        return 50
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.compaction.count_tokens",
+        mock_count_tokens,
+    )
+
+    captured_inputs: list[list[dict[str, Any]]] = []
+
+    def _capturing_summarize(
+        msgs: list[dict[str, Any]],
+        llm_client: Any,
+        model: str,
+        connection: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Capture the messages passed to summarize_history.
+
+        :param msgs: The messages to summarize — should have
+            cleared tool result bodies.
+        :param llm_client: LLM client (unused).
+        :param model: Model string (unused).
+        :param connection: Connection params (unused).
+        :returns: Fake summary result.
+        """
+        captured_inputs.append(list(msgs))
+        return {"text": "Summary", "token_count": 10}
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.compaction.summarize_history",
+        _capturing_summarize,
+    )
+
+    # History with a tool call pair OUTSIDE the recent window.
+    history = [
+        _user_msg("msg_u1"),
+        _fc_item("msg_fc1", "c1"),
+        _fco_item("msg_fco1", "c1", output="verbose tool output"),
+        _assistant_msg("msg_a1"),
+        _user_msg("msg_u2"),
+        _assistant_msg("msg_a2"),
+    ]
+    messages = [
+        _user_msg_dict(),
+        _fc_dict("c1"),
+        _fco_dict("c1", "verbose tool output"),
+        _assistant_msg_dict(),
+        _user_msg_dict(),
+        _assistant_msg_dict(),
+    ]
+
+    compact(
+        messages,
+        history,
+        config=CompactionConfig(trigger_threshold=0.8, recent_window=1),
+        context_window=12500,
+        system_token_budget=0,
+        model="openai/gpt-4o",
+        task_id="task_layer1_feeds_layer2",
+        llm_client=_RaisesIfCalled(),
+    )
+
+    # summarize_history must have been called exactly once.
+    assert len(captured_inputs) == 1, (
+        f"Expected 1 call to summarize_history, got {len(captured_inputs)}."
+    )
+
+    # The tool result body in the summarization input must be cleared.
+    # Layer 1 runs before Layer 2, so fco at index 2 (outside window)
+    # should have its output replaced with the clearing marker.
+    summarized = captured_inputs[0]
+    fco_in_summary = [m for m in summarized if m.get("type") == "function_call_output"]
+    assert len(fco_in_summary) >= 1, (
+        "Expected at least 1 function_call_output in summarization input."
+    )
+    assert fco_in_summary[0]["output"] == _TOOL_RESULT_CLEARED, (
+        f"Tool result body should be cleared before reaching "
+        f"summarize_history, got: {fco_in_summary[0]['output']!r}. "
+        f"If it contains 'verbose tool output', Layer 1 didn't "
+        f"clear before passing to Layer 2."
+    )
+
+
+def test_layer3_fires_when_summary_plus_recent_exceeds_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Layer 3 fires as the primary path (not fallback) when Layer 2
+    succeeds but the summary + recent messages together still
+    exceed the budget.
+
+    This differs from ``test_layer2_failure_falls_back_to_layer3``
+    which tests Layer 3 after Layer 2 failure. Here Layer 2
+    succeeds but its output is still too large.
+    """
+    call_counts = [0]
+
+    def mock_count_tokens(
+        msgs: list[dict[str, Any]],
+        model: str,
+    ) -> int:
+        """
+        Always above budget so Layer 3 must truncate.
+
+        :param msgs: Messages (length-based estimate).
+        :param model: Model string (unused).
+        :returns: Token count.
+        """
+        call_counts[0] += 1
+        # First call (after Layer 1): above budget → Layer 2 fires
+        if call_counts[0] == 1:
+            return 10001
+        # Second call (inside _run_layer2 size check): below budget
+        # so summarization input fits the model
+        if call_counts[0] == 2:
+            return 50
+        # Third call (summary + recent budget check): ABOVE budget
+        # → Layer 2 output doesn't fit, fall through to Layer 3
+        if call_counts[0] == 3:
+            return 10001
+        # Layer 3 truncation calls: shrink per message
+        return len(msgs) * 3000
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.compaction.count_tokens",
+        mock_count_tokens,
+    )
+    monkeypatch.setattr(
+        "agent_plane.runtime.compaction.summarize_history",
+        lambda msgs, llm_client, model, connection=None: {
+            "text": "A very long summary that still exceeds budget",
+            "token_count": 9000,
+        },
+    )
+
+    history = [
+        _user_msg("msg_u1"),
+        _assistant_msg("msg_a1"),
+        _user_msg("msg_u2"),
+        _assistant_msg("msg_a2"),
+        _user_msg("msg_u3"),
+        _assistant_msg("msg_a3"),
+    ]
+    messages = [
+        _user_msg_dict("m1"),
+        _assistant_msg_dict("a1"),
+        _user_msg_dict("m2"),
+        _assistant_msg_dict("a2"),
+        _user_msg_dict("m3"),
+        _assistant_msg_dict("a3"),
+    ]
+
+    result = compact(
+        messages,
+        history,
+        config=CompactionConfig(trigger_threshold=0.8, recent_window=1),
+        context_window=12500,
+        system_token_budget=0,
+        model="openai/gpt-4o",
+        task_id="task_layer3_primary",
+        llm_client=_RaisesIfCalled(),
+    )
+
+    # Layer 2 succeeded (summary was produced) but the combined
+    # result was too large. Layer 3 must have truncated further.
+    # The result should have fewer messages than summary + recent.
+    assert len(result.messages) < 6, (
+        f"Expected Layer 3 truncation to reduce message count "
+        f"below 6, got {len(result.messages)}. "
+        f"If 6, Layer 3 didn't fire after Layer 2's output "
+        f"exceeded the budget."
+    )
+    # The first message should be the synthetic summary user
+    # message (from Layer 2's output), possibly truncated further.
+    assert result.messages[0]["role"] == "user", (
+        f"First message should be the summary user message, "
+        f"got role={result.messages[0].get('role')!r}."
+    )
+
+
+def test_no_compaction_event_when_under_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When token count is within budget (no compaction needed),
+    ``_emit_compaction_event`` must NOT be called.
+
+    Overrides the autouse fixture to capture calls.
+    """
+    emitted_task_ids: list[str] = []
+    monkeypatch.setattr(
+        "agent_plane.runtime.compaction._emit_compaction_event",
+        lambda task_id: emitted_task_ids.append(task_id),
+    )
+    # count_tokens returns well under budget — no compaction fires.
+    monkeypatch.setattr(
+        "agent_plane.runtime.compaction.count_tokens",
+        lambda msgs, model: 50,
+    )
+
+    history = [_user_msg("msg_u1"), _assistant_msg("msg_a1")]
+    messages = [_user_msg_dict(), _assistant_msg_dict()]
+
+    result = compact(
+        messages,
+        history,
+        config=CompactionConfig(trigger_threshold=0.8, recent_window=1),
+        context_window=100000,
+        system_token_budget=0,
+        model="openai/gpt-4o",
+        task_id="task_no_event",
+        llm_client=_RaisesIfCalled(),
+    )
+
+    # No Layer 2 should fire → no compaction event emitted.
+    assert emitted_task_ids == [], (
+        f"Expected no _emit_compaction_event calls when under "
+        f"threshold, got: {emitted_task_ids}. "
+        f"If non-empty, the event was emitted even though "
+        f"compaction was not needed."
+    )
+    # Confirm no summarization happened.
+    assert result.summary_metadata is None, "summary_metadata should be None when under threshold."
+
+
 # ---------------------------------------------------------------------------
 # Layer 3: pair-aware truncation
 # ---------------------------------------------------------------------------

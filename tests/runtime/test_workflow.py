@@ -22,6 +22,7 @@ from agent_plane.runtime.workflow import (
     _reactive_compact,
     _run_agent_loop,
     _split_tool_calls,
+    _sync_history,
     _ToolCall,
     fetch_all_items,
 )
@@ -1382,4 +1383,106 @@ def test_maybe_persist_compaction_item_different_task_ids_produce_separate_items
     )
     assert by_response_id["task_002"].data.last_item_id == "msg_002", (
         "task_002 last_item_id mismatch"
+    )
+
+
+# ── _sync_history compaction filter ──────────────────────────────────────────
+
+
+def test_sync_history_filters_compaction_items(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``_sync_history`` must exclude ``type=compaction`` items from
+    the history list while still advancing ``last_seen`` past them.
+
+    If the filter were removed, compaction items would be appended
+    to history and eventually passed to the LLM prompt builder,
+    which would silently skip them — but the history list should
+    never contain items the prompt builder ignores.
+
+    :param conversation_store: Real SQLAlchemy store for the test.
+    """
+    conv = conversation_store.create_conversation()
+
+    # Append a user message, then a compaction item, then another
+    # user message. This simulates: execution 1 produces a
+    # compaction item, then execution 2 appends a new user message.
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_001",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "msg before compact"}],
+                ),
+            ),
+        ],
+    )
+    first_items = conversation_store.list_items(conv.id, limit=1)
+    first_id = first_items.data[0].id
+
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id="resp_001",
+                data=CompactionData(
+                    summary="Summary of prior context.",
+                    last_item_id=first_id,
+                    model="openai/gpt-4o",
+                    token_count=50,
+                ),
+            ),
+        ],
+    )
+
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_002",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "msg after compact"}],
+                ),
+            ),
+        ],
+    )
+
+    # Start with last_seen pointing at the first message.
+    # _sync_history should pick up the compaction item AND the
+    # second message, but only add the message to history.
+    history: list[Any] = []
+    new_last_seen = _sync_history(
+        conversation_store,
+        conv.id,
+        first_id,
+        history,
+    )
+
+    # History must contain ONLY the second user message — the
+    # compaction item must be filtered out.
+    assert len(history) == 1, (
+        f"Expected 1 item in history (the post-compaction message), "
+        f"got {len(history)}. "
+        f"Types: {[h.type for h in history]}. "
+        f"If 2, the compaction item was not filtered out."
+    )
+    assert history[0].type == "message", (
+        f"Expected message type, got {history[0].type!r}. If 'compaction', the filter is broken."
+    )
+    assert history[0].data.content[0]["text"] == "msg after compact", (
+        "Expected the post-compaction user message."
+    )
+
+    # last_seen must advance past the compaction item so it's
+    # not re-fetched on the next sync.
+    assert new_last_seen is not None, "last_seen must be advanced."
+    assert new_last_seen != first_id, (
+        "last_seen must advance past the compaction item, not stay at the first message."
     )
