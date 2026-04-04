@@ -1794,6 +1794,80 @@ def _track_spawn_collect(
                     collected_ids.add(rid)
 
 
+def _recover_spawn_state(
+    history: list[ConversationItem],
+) -> tuple[set[str], set[str]]:
+    """
+    Reconstruct ``spawned_ids`` and ``collected_ids`` from the
+    conversation history.
+
+    When client-side tools cause ``_complete_for_client_tools``,
+    each tool-call round-trip creates a NEW response (workflow).
+    The new workflow starts with empty ``spawned_ids`` and
+    ``collected_ids``. Without recovery, auto-collect never runs
+    for sub-agents spawned in previous responses.
+
+    Scans ``function_call`` / ``function_call_output`` items
+    in history and also auto-collected-results system messages.
+
+    :param history: The loaded conversation history.
+    :returns: ``(spawned_ids, collected_ids)`` reconstructed
+        from the conversation.
+    """
+    # Build call_id → tool_name from function_call items.
+    call_names: dict[str, str] = {}
+    for item in history:
+        if item.type == "function_call" and isinstance(item.data, FunctionCallData):
+            call_names[item.data.call_id] = item.data.name
+
+    spawned: set[str] = set()
+    collected: set[str] = set()
+
+    for item in history:
+        if item.type == "function_call_output" and isinstance(item.data, FunctionCallOutputData):
+            name = call_names.get(item.data.call_id, "")
+            output_str = item.data.output
+            if not output_str:
+                continue
+            try:
+                parsed = json.loads(output_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if name == SpawnTool.name():
+                for rid in parsed.get("response_ids", []):
+                    spawned.add(rid)
+            elif name == CheckSubAgentsTool.name():
+                for r in parsed.get("results", []):
+                    rid = r.get("response_id", "")
+                    status = r.get("status")
+                    if rid and status in TERMINAL_STATUSES:
+                        collected.add(rid)
+
+        # Auto-collected results are persisted as user messages
+        # with "[System: auto-collected sub-agent results]".
+        if item.type == "message" and isinstance(item.data, MessageData):
+            for block in item.data.content:
+                if not isinstance(block, dict):
+                    continue
+                text = block.get("text", "")
+                if not text.startswith("[System: auto-collected sub-agent results]"):
+                    continue
+                # Parse the JSON after the prefix line.
+                json_part = text.split("\n", 1)
+                if len(json_part) < 2:
+                    continue
+                try:
+                    payload = json.loads(json_part[1])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                for r in payload.get("results", []):
+                    rid = r.get("response_id", "")
+                    if rid:
+                        collected.add(rid)
+
+    return spawned, collected
+
+
 @dataclass
 class _AutoCollectResult:
     """
@@ -1817,6 +1891,61 @@ class _AutoCollectResult:
 # Interval between polls when waiting for sub-agents during
 # auto-collect. Short enough to detect steering promptly.
 _COLLECT_POLL_S = 0.5
+
+
+def _persist_text_before_auto_collect(
+    task_id: str,
+    conversation_id: str,
+    llm_resp: dict[str, Any],
+    agent_name: str,
+    uncollected_ids: list[str],
+    history: list[ConversationItem],
+    output_items: list[dict[str, Any]],
+    conv_store: ConversationStore,
+) -> _AutoCollectResult:
+    """
+    Persist the LLM text then run auto-collect.
+
+    Without this, the LLM's text is streamed to SSE but never
+    persisted (ghost tokens). Subsequent LLM calls do not see
+    the text in the conversation, causing the LLM to re-generate
+    or ignore it. This is especially damaging for steering:
+    the LLM's response to a steering message is lost, so
+    the next LLM call sees only the auto-collect results and
+    ignores the steering instruction.
+
+    :param task_id: The parent task ID, e.g. ``"task_abc123"``.
+    :param conversation_id: The conversation ID.
+    :param llm_resp: The LLM response dict with text content.
+    :param agent_name: The agent's registered name, e.g.
+        ``"research-agent"``.
+    :param uncollected_ids: Sub-agent response IDs to collect.
+    :param history: Mutable conversation history list.
+    :param output_items: Mutable output items list.
+    :param conv_store: ConversationStore for persistence.
+    :returns: An :class:`_AutoCollectResult` from auto-collect.
+    """
+    text = _get_text_content(llm_resp)
+    item = _build_assistant_item(task_id, agent_name, text)
+    persisted = _persist_and_stream(
+        task_id,
+        conv_store,
+        conversation_id,
+        [item],
+        output_items,
+    )
+    history.extend(persisted)
+    return _auto_collect_sub_agents(
+        task_id,
+        conversation_id,
+        uncollected_ids,
+        # Cursor after the persisted text — steering detection
+        # starts here so only messages arriving DURING
+        # auto-collect are detected.
+        persisted[-1].id,
+        output_items,
+        conv_store,
+    )
 
 
 def _auto_collect_sub_agents(
@@ -2805,8 +2934,10 @@ def _run_agent_loop(
     # When the LLM produces a final response without collecting,
     # the loop auto-collects outstanding sub-agents before
     # completing the turn.
-    spawned_ids: set[str] = set()
-    collected_ids: set[str] = set()
+    # Recover state from history so sub-agents spawned in
+    # previous responses (before a client-tool round-trip) are
+    # still tracked for auto-collect.
+    spawned_ids, collected_ids = _recover_spawn_state(history)
     # Per-execution compaction state. context_window is seeded from
     # the executor's known limit (if any) so proactive compaction
     # can fire from the first iteration. Falls back to None when the
@@ -2867,11 +2998,18 @@ def _run_agent_loop(
                     # last_seen is always set after the first
                     # iteration (spawn persisted items).
                     assert last_seen is not None
-                    collect_result = _auto_collect_sub_agents(
+                    # Persist the LLM text BEFORE auto-collect.
+                    # Without this, text is streamed to SSE but
+                    # never committed — ghost tokens that break
+                    # steering (the LLM's steering response is
+                    # lost and subsequent calls ignore the steer).
+                    collect_result = _persist_text_before_auto_collect(
                         task_id,
                         conversation_id,
+                        llm_resp,
+                        agent_name,
                         list(uncollected),
-                        last_seen,
+                        history,
                         output_items,
                         conv_store,
                     )

@@ -1883,6 +1883,188 @@ async def test_spawn_and_auto_collect_sub_agent(
     )
 
 
+async def test_spawn_recovery_across_client_tool_boundary(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Sub-agent spawned in one response is auto-collected in the
+    next response after a client-tool round-trip.
+
+    When the parent LLM calls both ``spawn_sub_agents``
+    (server-side) and a client-side tool in one turn,
+    ``_complete_for_client_tools`` completes the response.
+    A new response starts when the client sends tool results.
+    The new workflow must recover ``spawned_ids`` from
+    conversation history so auto-collect runs for the
+    sub-agent spawned in the previous response.
+
+    Without ``_recover_spawn_state``, ``spawned_ids`` is empty
+    in the new workflow. Auto-collect never runs. The sub-agent
+    is orphaned.
+
+    Breakage this catches:
+    - ``spawned_ids`` not recovered from history → no
+      auto-collect, output lacks collected results.
+    - ``_recover_spawn_state`` misparses history items →
+      same symptom.
+    """
+    bundle = build_agent_bundle(
+        name="cross-boundary",
+        sub_agents=[
+            {"name": "helper", "description": "Background helper"},
+        ],
+    )
+    resp = await client.post(
+        "/api/agents",
+        files={
+            "bundle": ("agent.tar.gz", bundle, "application/gzip"),
+        },
+    )
+    assert resp.status_code == 201
+
+    # Call 1 (parent): spawn helper AND call Read (client-side).
+    # Server executes spawn, sees Read is client-side, calls
+    # _complete_for_client_tools → response completes with the
+    # unexecuted Read function_call in the output.
+    spawn_args = json.dumps(
+        {"agents": [{"name": "helper", "input": "Do background work"}]},
+    )
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_spawn",
+                "name": "spawn_sub_agents",
+                "arguments": spawn_args,
+            },
+            {
+                "call_id": "call_read",
+                "name": "Read",
+                "arguments": '{"file_path": "/tmp/test.txt"}',
+            },
+        ],
+    )
+
+    # Call 2 (sub-agent): block=True so we can guarantee the
+    # sub-agent has consumed this call before response 2 starts.
+    # Without this gate, response 2 might race and steal call 2.
+    call_2 = mock_llm.add_call(
+        text="Background work done: result XYZ",
+        block=True,
+    )
+
+    # Call 3 (parent, response 2 first turn): text response.
+    # Auto-collect detects uncollected sub-agent → polls until
+    # complete → injects results → triggers call 4.
+    mock_llm.add_call(text="Checking results...")
+
+    # Call 4 (parent after auto-collect injects results): final
+    # answer incorporating collected sub-agent output.
+    mock_llm.add_call(
+        text="Final: helper returned result XYZ",
+    )
+
+    read_tool: dict[str, Any] = {
+        "type": "function",
+        "function": {
+            "name": "Read",
+            "description": "Read a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                },
+                "required": ["file_path"],
+            },
+        },
+    }
+
+    # Response 1: foreground (background=False). Blocks until
+    # _complete_for_client_tools completes the response.
+    # Top-level tasks with client-side tools do NOT create
+    # pending_tool_calls rows — they complete immediately with
+    # the function_call items in the output.
+    r1 = await create_test_response(
+        client,
+        model="cross-boundary",
+        input_text="Spawn helper and read /tmp/test.txt",
+        background=False,
+        tools=[read_tool],
+    )
+    # _complete_for_client_tools sets status to "completed".
+    assert r1.status_code == 200, f"Expected 200, got {r1.status_code}: {r1.body}"
+    assert r1.body["status"] == "completed", (
+        f"Expected completed, got {r1.body['status']}. Output: {r1.body.get('output')}"
+    )
+
+    # Verify the output contains the Read function_call.
+    r1_output = r1.body["output"]
+    read_calls = [
+        item
+        for item in r1_output
+        if (item.get("type") == "function_call" and item.get("name") == "Read")
+    ]
+    # 1 Read call = the client-side tool returned by the LLM.
+    # If 0, spawn consumed both tool calls or the function_call
+    # items were not persisted in the output.
+    assert len(read_calls) == 1, (
+        f"Expected 1 Read function_call in output, got "
+        f"{len(read_calls)}: "
+        f"{[i.get('name') for i in r1_output if i.get('type') == 'function_call']}"
+    )
+
+    # Synchronization gate: wait for sub-agent to consume call 2,
+    # then release it so it completes before response 2 starts.
+    # This guarantees mock call ordering (call 3 goes to the
+    # parent's second workflow, not the sub-agent).
+    call_2.call_event.wait(timeout=10)
+    call_2.release()
+
+    # Response 2: send tool results as a new request.
+    # This creates a NEW workflow that must recover spawned_ids
+    # from conversation history so auto-collect runs.
+    r1_id = r1.body["id"]
+    r2_resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "cross-boundary",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_read",
+                    "output": "file contents: hello world",
+                },
+            ],
+            "previous_response_id": r1_id,
+            "background": False,
+            "stream": False,
+        },
+    )
+    r2 = r2_resp.json()
+
+    # Response 2 completes — its workflow recovered spawned_ids,
+    # ran auto-collect, and produced a final answer.
+    assert r2_resp.status_code == 200, f"Expected 200, got {r2_resp.status_code}: {r2}"
+    assert r2["status"] == "completed", (
+        f"Expected completed, got {r2['status']}. Output: {r2.get('output')}"
+    )
+
+    # The final output must contain "result XYZ" — this proves
+    # auto-collect ran in response 2 and injected the sub-agent's
+    # output into the parent's history, which the LLM then
+    # incorporated into its final answer. If missing,
+    # _recover_spawn_state failed to reconstruct spawned_ids.
+    text_items = [item for item in r2["output"] if item.get("type") == "message"]
+    all_text = " ".join(c.get("text", "") for item in text_items for c in item.get("content", []))
+    assert "result XYZ" in all_text, (
+        "Auto-collect did not run in the second response. "
+        "The sub-agent's output ('result XYZ') was not "
+        "included in the parent's final answer. This means "
+        "_recover_spawn_state failed to reconstruct "
+        f"spawned_ids from history. Output: {all_text[:300]}"
+    )
+
+
 # ── Sub-agent parking and tunneling tests ──────────────
 
 

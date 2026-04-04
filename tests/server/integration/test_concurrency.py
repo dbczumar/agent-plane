@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import socket
 import subprocess
 import sys
@@ -1091,8 +1092,6 @@ async def test_steering_during_auto_collect(
     - Parent completes without an LLM turn that includes the
       steered message in its input.
     """
-    import json
-
     bundle = build_agent_bundle(
         name="steer-collect",
         sub_agents=[
@@ -1220,6 +1219,157 @@ async def test_steering_during_auto_collect(
                 if c.received_kwargs is not None
             ]
         )
+    )
+
+
+# ── Ghost text persistence ────────────────────────────────
+
+
+async def test_ghost_text_persisted_before_auto_collect(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    LLM text is persisted BEFORE auto-collect starts polling.
+
+    Ghost text bug: when the parent LLM returns text (no tool
+    calls) while sub-agents are still running, the old code
+    entered auto-collect before ``_handle_final_response`` could
+    persist the text. The text was streamed to SSE but never
+    committed to the conversation store — a "ghost" that
+    subsequent LLM calls could not see.
+
+    Synchronization:
+    1. Call 1 (parent): spawn tool call.
+    2. Calls 2–3: BOTH block. Parent and sub-agent each get
+       one (order non-deterministic).
+    3. Release the parent → text ``"GHOST_MARKER"`` → enters
+       ``_persist_text_before_auto_collect`` → persists text
+       → enters auto-collect → polls (sub-agent still blocked).
+    4. While auto-collect polls, query conversation items API.
+    5. Assert ``"GHOST_MARKER"`` IS in persisted assistant items.
+    6. Release sub-agent → auto-collect finishes.
+
+    Breakage this catches:
+    - Text streamed to SSE but not persisted in conversation
+      store (the original ghost text bug).
+    - Subsequent LLM calls cannot see the parent's text
+      response, breaking steering (steering response is lost).
+    """
+    bundle = build_agent_bundle(
+        name="ghost-text",
+        sub_agents=[
+            {"name": "bg-worker", "description": "Background worker"},
+        ],
+    )
+    resp = await client.post(
+        "/api/agents",
+        files={
+            "bundle": ("agent.tar.gz", bundle, "application/gzip"),
+        },
+    )
+    assert resp.status_code == 201
+
+    # Call 1 (parent): spawn the sub-agent.
+    spawn_args = json.dumps(
+        {"agents": [{"name": "bg-worker", "input": "Do work"}]},
+    )
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_spawn_ghost",
+                "name": "spawn_sub_agents",
+                "arguments": spawn_args,
+            },
+        ],
+    )
+
+    # Calls 2–3: BOTH block. Parent and sub-agent each consume
+    # one (order non-deterministic).
+    call_a = mock_llm.add_call(
+        text="GHOST_MARKER",
+        block=True,
+    )
+    call_b = mock_llm.add_call(
+        text="GHOST_MARKER",
+        block=True,
+    )
+
+    # Post-auto-collect LLM call (parent sees collected results
+    # and produces a final answer).
+    mock_llm.add_call(text="Final answer after collect.")
+
+    first = await create_test_response(
+        client,
+        model="ghost-text",
+        input_text="Start the worker",
+    )
+    first_id = first.body["id"]
+    conv_id = first.body["conversation"]["id"]
+
+    # Gate: both blocked calls are entered.
+    call_a.call_event.wait(timeout=10)
+    call_b.call_event.wait(timeout=10)
+
+    parent_call, sub_call = _identify_parent_and_sub(
+        call_a,
+        call_b,
+    )
+
+    # Release the PARENT only. It receives text "GHOST_MARKER"
+    # (no tool calls) → _persist_text_before_auto_collect
+    # persists the text → enters auto-collect → polls for the
+    # sub-agent (still blocked).
+    parent_call.release()
+
+    # KEY ASSERTION: poll conversation items until GHOST_MARKER
+    # appears. The text MUST be persisted before auto-collect
+    # starts. Before the fix, this text was only in SSE
+    # (streamed but not persisted) and would never appear.
+    # Poll instead of sleep for deterministic synchronization.
+    ghost_found = False
+    for _ in range(50):
+        items_resp = await client.get(
+            f"/v1/conversations/{conv_id}/items",
+            params={"limit": 100},
+        )
+        items = items_resp.json()["data"]
+        assistant_texts = [
+            block.get("text", "")
+            for item in items
+            if item.get("role") == "assistant"
+            for block in item.get("content", [])
+        ]
+        if any("GHOST_MARKER" in t for t in assistant_texts):
+            ghost_found = True
+            break
+        await asyncio.sleep(0.1)
+
+    # "GHOST_MARKER" must be persisted in the conversation store
+    # while auto-collect is still running (sub-agent is still
+    # blocked). If absent, the text was ghost — streamed to SSE
+    # but never committed.
+    assert ghost_found, (
+        f"Parent text 'GHOST_MARKER' not found in persisted "
+        f"assistant items during auto-collect. This means text "
+        f"was streamed to SSE but not committed to the "
+        f"conversation store (ghost text bug). "
+        f"Assistant texts: {assistant_texts}"
+    )
+
+    # Release the sub-agent → completes → auto-collect finishes.
+    sub_call.release()
+
+    # Poll until parent completes.
+    for _ in range(100):
+        resp = await client.get(f"/v1/responses/{first_id}")
+        if resp.json()["status"] in ("completed", "failed"):
+            break
+        await asyncio.sleep(0.1)
+
+    body = resp.json()
+    assert body["status"] == "completed", (
+        f"Expected completed, got {body['status']}. Output: {body.get('output')}"
     )
 
 
