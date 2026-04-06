@@ -1360,6 +1360,16 @@ def _handle_sse(
     if event_type == "response.created":
         _extract_response_id(data, app)
 
+    elif event_type == "response.compaction.in_progress":
+        live = _ensure_live(app, scroll, live)
+        live.update(
+            Text.from_markup(
+                "[bold green]assistant>[/bold green]"
+                " [dim magenta]compacting conversation…[/dim magenta]"
+            )
+        )
+        scroll.scroll_end()
+
     elif event_type == "response.reasoning.started":
         if not acc.in_reasoning:
             live = _ensure_live(app, scroll, live)
