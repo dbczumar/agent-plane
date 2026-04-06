@@ -5,6 +5,7 @@ Covers pagination, execution timeout, and tool call splitting.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -22,15 +23,19 @@ from agent_plane.entities import (
 from agent_plane.llms.errors import ContextWindowExceededError, PermanentLLMError
 from agent_plane.runtime.caps import RuntimeCaps
 from agent_plane.runtime.compaction import CompactionResult, SummaryMetadata, _CompactionState
-from agent_plane.runtime.executor import DefaultExecutor
+from agent_plane.runtime.executor import DefaultExecutor, ToolCallRequested, ToolResult
 from agent_plane.runtime.workflow import (
+    _build_await_tool_output,
     _cleanup_executor_storage,
     _load_initial_history,
     _maybe_persist_compaction_item,
     _persist_executor_storage,
+    _poll_for_tool_result,
     _proactive_compact_if_needed,
+    _publish_client_tool_call,
     _reactive_compact,
     _recover_spawn_state,
+    _register_client_tool_call,
     _restore_executor_storage,
     _run_agent_loop,
     _split_tool_calls,
@@ -46,9 +51,11 @@ from agent_plane.spec.types import (
     RetryConfig,
     ToolsConfig,
 )
+from agent_plane.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from agent_plane.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from agent_plane.stores.task_store.sqlalchemy_store import SqlAlchemyTaskStore
 from agent_plane.tools.client_specified import ClientSideToolSpec
 from agent_plane.tools.manager import ToolManager
 
@@ -56,6 +63,28 @@ from agent_plane.tools.manager import ToolManager
 @pytest.fixture()
 def conversation_store(db_uri: str) -> SqlAlchemyConversationStore:
     return SqlAlchemyConversationStore(db_uri)
+
+
+@pytest.fixture()
+def task_store(db_uri: str) -> SqlAlchemyTaskStore:
+    """
+    Task store backed by the shared test database.
+
+    :param db_uri: File-based SQLite URI from conftest.
+    :returns: A real SqlAlchemyTaskStore instance.
+    """
+    return SqlAlchemyTaskStore(db_uri)
+
+
+@pytest.fixture()
+def agent_store(db_uri: str) -> SqlAlchemyAgentStore:
+    """
+    Agent store backed by the shared test database.
+
+    :param db_uri: File-based SQLite URI from conftest.
+    :returns: A real SqlAlchemyAgentStore instance.
+    """
+    return SqlAlchemyAgentStore(db_uri)
 
 
 def _make_user_message(index: int) -> NewConversationItem:
@@ -1877,3 +1906,332 @@ def test_executor_storage_skip_persist_when_empty(
     assert not store.exists("executor_storage/conv_empty.tar.gz"), (
         "Empty directories should not produce an artifact."
     )
+
+
+# ── await_tool_output tests ────────────────────────────────
+
+
+def _make_tool_call_requested(
+    call_id: str = "call_test_1",
+    name: str = "Read",
+    arguments: dict[str, Any] | None = None,
+) -> ToolCallRequested:
+    """
+    Build a :class:`ToolCallRequested` for testing.
+
+    :param call_id: Tool call ID, e.g. ``"call_test_1"``.
+    :param name: Tool name, e.g. ``"Read"``.
+    :param arguments: Tool arguments dict, defaults to
+        ``{"file_path": "/tmp/test.py"}``.
+    :returns: A ToolCallRequested instance.
+    """
+    if arguments is None:
+        arguments = {"file_path": "/tmp/test.py"}
+    return ToolCallRequested(
+        call_id=call_id,
+        name=name,
+        arguments=arguments,
+    )
+
+
+def _create_task_pair(
+    task_store: SqlAlchemyTaskStore,
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> tuple[str, str]:
+    """
+    Create a root task and sub-task with all required parent
+    rows (agent, conversation) for pending tool call tests.
+
+    :param task_store: Task store for creating tasks.
+    :param agent_store: Agent store for creating the agent.
+    :param conversation_store: Conversation store for creating
+        the conversation.
+    :returns: ``(root_task_id, sub_task_id)`` tuple.
+    """
+    agent = agent_store.create(name="test-agent")
+    conv = conversation_store.create_conversation()
+    root = task_store.create(
+        conversation_id=conv.id,
+        agent_id=agent.id,
+        agent_name="test-agent",
+    )
+    sub = task_store.create(
+        conversation_id=conv.id,
+        agent_id=agent.id,
+        agent_name="test-sub-agent",
+        root_task_id=root.id,
+    )
+    return root.id, sub.id
+
+
+def test_register_client_tool_call_creates_pending_row(
+    db_uri: str,
+    task_store: SqlAlchemyTaskStore,
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``_register_client_tool_call`` inserts a pending tool call
+    row with the correct fields. Verified by querying the store
+    afterwards.
+    """
+    root_id, sub_id = _create_task_pair(
+        task_store,
+        agent_store,
+        conversation_store,
+    )
+    call = _make_tool_call_requested(call_id="call_reg_1")
+    _register_client_tool_call(
+        call,
+        root_task_id=root_id,
+        task_id=sub_id,
+        task_store=task_store,
+    )
+
+    rows = task_store.list_pending_tool_calls(call_id="call_reg_1")
+    # Exactly one row should exist for this call_id.
+    assert len(rows) == 1, (
+        f"Expected 1 pending row, got {len(rows)}. If 0, create_pending_tool_call silently failed."
+    )
+    row = rows[0]
+    assert row.root_task_id == root_id
+    assert row.task_id == sub_id
+    assert row.tool_name == "Read"
+    assert row.status == "action_required"
+    # Arguments are JSON-serialized by _register_client_tool_call.
+    assert '"file_path"' in row.arguments
+
+
+def test_publish_client_tool_call_sends_sse_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_publish_client_tool_call`` calls ``_live_publish`` with
+    the correct event structure and target task ID.
+    """
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def _fake_publish(
+        task_id: str,
+        event: dict[str, Any],
+    ) -> None:
+        captured.append((task_id, event))
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._live_publish",
+        _fake_publish,
+    )
+
+    call = _make_tool_call_requested(
+        call_id="call_pub_1",
+        name="Bash",
+    )
+    _publish_client_tool_call(call, publish_task_id="root_task_1")
+
+    assert len(captured) == 1, f"Expected 1 SSE publish, got {len(captured)}."
+    target_id, event = captured[0]
+    # Published to the root task's SSE stream.
+    assert target_id == "root_task_1"
+    item = event["item"]
+    assert item["type"] == "function_call"
+    assert item["call_id"] == "call_pub_1"
+    assert item["name"] == "Bash"
+    # Status must be "action_required" so the client knows to
+    # execute the tool and PATCH the result.
+    assert item["status"] == "action_required"
+
+
+def test_poll_for_tool_result_returns_completed(
+    db_uri: str,
+    task_store: SqlAlchemyTaskStore,
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_poll_for_tool_result`` returns immediately when the
+    pending tool call is already completed in the store.
+    """
+    root_id, sub_id = _create_task_pair(
+        task_store,
+        agent_store,
+        conversation_store,
+    )
+    # _is_task_terminal queries DBOS workflow status, which requires
+    # a running DBOS instance. Patching it avoids the DBOS dependency
+    # while still exercising the real store's complete_pending_tool_call
+    # and list_pending_tool_calls logic.
+    monkeypatch.setattr(
+        task_store,
+        "_is_task_terminal",
+        lambda _task_id: False,
+    )
+
+    call_id = "call_poll_1"
+    task_store.create_pending_tool_call(
+        call_id=call_id,
+        root_task_id=root_id,
+        task_id=sub_id,
+        tool_name="Read",
+        arguments='{"file_path": "/tmp/test.py"}',
+    )
+    task_store.complete_pending_tool_call(
+        call_id,
+        "file contents here",
+    )
+
+    result = _poll_for_tool_result(call_id, task_store)
+    # Content must match the PATCH result.
+    assert result.content == "file contents here", (
+        f"Expected PATCH result, got {result.content!r}."
+    )
+    assert result.status == "success"
+
+
+def test_poll_for_tool_result_timeout(
+    db_uri: str,
+    task_store: SqlAlchemyTaskStore,
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_poll_for_tool_result`` returns a timeout error when the
+    pending tool call is never completed.
+    """
+    root_id, sub_id = _create_task_pair(
+        task_store,
+        agent_store,
+        conversation_store,
+    )
+    # Set timeout to near-zero so the test completes quickly.
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._TOOL_POLL_TIMEOUT_SECONDS",
+        0.1,
+    )
+
+    call_id = "call_timeout_1"
+    task_store.create_pending_tool_call(
+        call_id=call_id,
+        root_task_id=root_id,
+        task_id=sub_id,
+        tool_name="Read",
+        arguments="{}",
+    )
+    # Never complete the call — should timeout.
+
+    result = _poll_for_tool_result(call_id, task_store)
+    assert result.status == "error"
+    assert "Timeout" in result.content
+    assert call_id in result.content
+
+
+def test_build_await_tool_output_end_to_end(
+    db_uri: str,
+    task_store: SqlAlchemyTaskStore,
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_build_await_tool_output`` for a sub-agent builds a callback
+    that registers, publishes to root SSE, and returns the result.
+    Full end-to-end through the real task store.
+    """
+    root_id, sub_id = _create_task_pair(
+        task_store,
+        agent_store,
+        conversation_store,
+    )
+    # See test_poll_for_tool_result_returns_completed for why
+    # _is_task_terminal is patched (avoids DBOS dependency).
+    monkeypatch.setattr(
+        task_store,
+        "_is_task_terminal",
+        lambda _task_id: False,
+    )
+    # Capture SSE publishes.
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._live_publish",
+        lambda tid, evt: published.append((tid, evt)),
+    )
+
+    callback = _build_await_tool_output(
+        task_id=sub_id,
+        root_task_id=root_id,
+        task_store=task_store,
+    )
+
+    call = _make_tool_call_requested(call_id="call_e2e_1")
+    _invoke_callback_with_completion(
+        callback,
+        call,
+        task_store,
+        "search result",
+    )
+
+    # Verify SSE was published to the root task's stream.
+    assert len(published) == 1, f"Expected 1 SSE publish, got {len(published)}."
+    # Published to root_id, not sub_id — the client listens
+    # on the root task's stream.
+    assert published[0][0] == root_id
+
+
+def _invoke_callback_with_completion(
+    callback: Callable[[ToolCallRequested], ToolResult],
+    call: ToolCallRequested,
+    task_store: SqlAlchemyTaskStore,
+    result_text: str,
+) -> None:
+    """
+    Start the ``await_tool_output`` callback in a thread, wait
+    for the pending row to appear, complete it, and assert the
+    callback returns the expected result.
+
+    Uses a ``threading.Event`` to synchronize: the callback's
+    ``create_pending_tool_call`` signals the event so the main
+    thread knows the row is ready to complete.
+
+    :param callback: The ``await_tool_output`` callback.
+    :param call: The tool call to submit.
+    :param task_store: Task store for completing the call.
+    :param result_text: The tool result text to deliver.
+    """
+    import threading
+
+    registered = threading.Event()
+    result_holder: list[ToolResult] = []
+
+    # Wrap create_pending_tool_call to signal when the row exists.
+    original_create = task_store.create_pending_tool_call
+
+    def _create_and_signal(**kwargs: Any) -> None:
+        original_create(**kwargs)
+        registered.set()
+
+    task_store.create_pending_tool_call = _create_and_signal  # type: ignore[assignment]
+
+    def _run() -> None:
+        result_holder.append(callback(call))
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+
+    # Block until the callback registers the pending row.
+    assert registered.wait(timeout=5), "Callback did not register the pending row within 5s."
+    task_store.create_pending_tool_call = original_create  # type: ignore[assignment]
+
+    task_store.complete_pending_tool_call(
+        call.call_id,
+        result_text,
+    )
+    thread.join(timeout=10)
+
+    # The callback must have returned with the delivered result.
+    assert len(result_holder) == 1, "Callback did not return within timeout."
+    assert result_holder[0].content == result_text, (
+        f"Expected {result_text!r}, got {result_holder[0].content!r}."
+    )
+    assert result_holder[0].status == "success"

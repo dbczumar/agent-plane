@@ -10,7 +10,7 @@ import io
 import json
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -82,6 +82,7 @@ from agent_plane.runtime.executor import (
     ReasoningChunk,
     TextChunk,
     ToolCallRequested,
+    ToolResult,
     TurnComplete,
     dict_to_event,
     event_to_dict,
@@ -2921,15 +2922,17 @@ def _build_executor_context(
     task_id: str,
     conversation_id: str,
     storage_dir: Path,
+    root_task_id: str | None,
+    task_store: TaskStore,
 ) -> ExecutorContext:
     """
     Build an :class:`ExecutorContext` for an agent execution.
 
-    The ``await_tool_output`` callback is a placeholder that raises
-    if called — ``DefaultExecutor`` never invokes it because it
-    yields ``ToolCallRequested`` events for the workflow to dispatch.
-    Future executor types (Claude SDK, Remote) will provide a real
-    implementation that bridges to the client-side tool mechanism.
+    The ``await_tool_output`` callback bridges client-side tool
+    calls from internal executors (Claude SDK) to the client.
+    It registers a pending tool call, publishes to the SSE
+    stream, and polls the task store until the client PATCHes
+    the result.
 
     :param task_id: Current task identifier, e.g. ``"task_abc123"``.
     :param conversation_id: Current conversation identifier,
@@ -2937,22 +2940,181 @@ def _build_executor_context(
     :param storage_dir: Per-conversation working directory for
         executors that need persistent local state (e.g. Claude
         SDK session transcripts).
+    :param root_task_id: The root task ID for sub-agents, or
+        ``None`` for root-level tasks. Determines which SSE
+        stream receives the ``function_call`` event.
+    :param task_store: Task store for pending tool call operations.
     :returns: A configured ExecutorContext.
     """
-    from agent_plane.runtime.executor import ToolCallRequested as _TCR
-    from agent_plane.runtime.executor import ToolResult
-
-    def _await_tool_output_not_supported(call: _TCR) -> ToolResult:
-        raise NotImplementedError(
-            "await_tool_output is not supported for workflow-managed executors. "
-            "Tools should be dispatched via ToolCallRequested events."
-        )
-
+    callback = _build_await_tool_output(
+        task_id,
+        root_task_id,
+        task_store,
+    )
     return ExecutorContext(
         task_id=task_id,
         conversation_id=conversation_id,
         storage_dir=storage_dir,
-        await_tool_output=_await_tool_output_not_supported,
+        await_tool_output=callback,
+    )
+
+
+# ── await_tool_output implementation ───────────────────────
+
+
+# Polling interval for client tool result delivery.
+_TOOL_POLL_INTERVAL_SECONDS = 0.5
+# Maximum time to wait for a client tool result.
+_TOOL_POLL_TIMEOUT_SECONDS = 600
+
+
+def _build_await_tool_output(
+    task_id: str,
+    root_task_id: str | None,
+    task_store: TaskStore,
+) -> Callable[[ToolCallRequested], ToolResult]:
+    """
+    Build a callback that parks a client-side tool call until
+    the client delivers a result via PATCH.
+
+    Used by internal executors (Claude SDK) whose tool handlers
+    need to block until the client completes the tool. The
+    callback runs in the executor's thread (not the DBOS workflow
+    thread), so it uses direct DB operations and live SSE publish
+    instead of DBOS primitives.
+
+    :param task_id: The current task ID, used as the sub-agent ID
+        in pending tool call rows, e.g. ``"task_sub2"``.
+    :param root_task_id: The root task ID for SSE routing, or
+        ``None`` for root-level tasks (publishes to own stream).
+    :param task_store: Task store for pending tool call operations.
+    :returns: A blocking callback suitable for
+        ``ExecutorContext.await_tool_output``.
+    """
+    # Sub-agents tunnel to the root task's stream; root tasks
+    # publish to their own.
+    publish_target = root_task_id if root_task_id is not None else task_id
+
+    def _callback(call: ToolCallRequested) -> ToolResult:
+        """
+        Register, publish, and wait for a client-side tool call.
+
+        :param call: The tool call to park.
+        :returns: The client's tool result.
+        """
+        _register_client_tool_call(
+            call,
+            publish_target,
+            task_id,
+            task_store,
+        )
+        _publish_client_tool_call(call, publish_target)
+        return _poll_for_tool_result(call.call_id, task_store)
+
+    return _callback
+
+
+def _register_client_tool_call(
+    call: ToolCallRequested,
+    root_task_id: str,
+    task_id: str,
+    task_store: TaskStore,
+) -> None:
+    """
+    Insert a pending tool call row so the PATCH handler can
+    route the client's result back.
+
+    :param call: The tool call to register.
+    :param root_task_id: The root task ID for the pending row,
+        e.g. ``"task_root1"``.
+    :param task_id: The parked task's ID (may be the same as
+        root_task_id for root-level tasks).
+    :param task_store: Task store for pending tool call operations.
+    """
+    task_store.create_pending_tool_call(
+        call_id=call.call_id,
+        root_task_id=root_task_id,
+        task_id=task_id,
+        tool_name=call.name,
+        arguments=json.dumps(call.arguments),
+    )
+
+
+def _publish_client_tool_call(
+    call: ToolCallRequested,
+    publish_task_id: str,
+) -> None:
+    """
+    Publish a ``function_call`` item to the SSE stream so the
+    client knows to execute the tool.
+
+    Uses ``_live_publish`` directly instead of ``_write_output``
+    because this runs in the executor's thread, not the DBOS
+    workflow thread. The DBOS durable stream is not written — if
+    the client reconnects, the GET endpoint queries
+    ``pending_tool_calls`` for in-flight calls.
+
+    :param call: The tool call to publish.
+    :param publish_task_id: The task ID whose SSE stream
+        receives the event, e.g. ``"task_root1"``.
+    """
+    _live_publish(
+        publish_task_id,
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": call.call_id,
+                "name": call.name,
+                "arguments": json.dumps(call.arguments),
+                "status": "action_required",
+            },
+        },
+    )
+
+
+def _poll_for_tool_result(
+    call_id: str,
+    task_store: TaskStore,
+) -> ToolResult:
+    """
+    Poll the task store until the pending tool call is completed.
+
+    The PATCH handler updates the row's status to ``"completed"``
+    and writes the result. This function polls until that update
+    is visible. Runs in the executor's thread pool (not the DBOS
+    thread pool), so ``time.sleep`` does not cause workflow thread
+    exhaustion.
+
+    :param call_id: The tool call ID to wait for,
+        e.g. ``"call_abc123"``.
+    :param task_store: Task store for querying pending tool calls.
+    :returns: The client's tool result, or a timeout error.
+    """
+    deadline = time.monotonic() + _TOOL_POLL_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        rows = task_store.list_pending_tool_calls(
+            call_id=call_id,
+            status="completed",
+        )
+        if rows:
+            result_text = rows[0].result
+            if result_text is None:
+                # complete_pending_tool_call always sets a non-None
+                # result string. None here means the row was somehow
+                # completed without a result — fail loud.
+                raise ValueError(f"Pending tool call {call_id} completed with None result")
+            return ToolResult(
+                content=result_text,
+                status="success",
+            )
+        time.sleep(_TOOL_POLL_INTERVAL_SECONDS)
+    return ToolResult(
+        content=(
+            f"Timeout: client did not deliver result for"
+            f" {call_id} within {_TOOL_POLL_TIMEOUT_SECONDS}s"
+        ),
+        status="error",
     )
 
 
@@ -3055,6 +3217,8 @@ def _run_agent_loop(
         task_id,
         conversation_id,
         storage_dir,
+        root_task_id,
+        task_store,
     )
     executor.on_task_start(executor_context)
 
