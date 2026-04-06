@@ -23,11 +23,14 @@ from agent_plane.runtime.caps import RuntimeCaps
 from agent_plane.runtime.compaction import CompactionResult, SummaryMetadata, _CompactionState
 from agent_plane.runtime.executor import DefaultExecutor
 from agent_plane.runtime.workflow import (
+    _cleanup_executor_storage,
     _load_initial_history,
     _maybe_persist_compaction_item,
+    _persist_executor_storage,
     _proactive_compact_if_needed,
     _reactive_compact,
     _recover_spawn_state,
+    _restore_executor_storage,
     _run_agent_loop,
     _split_tool_calls,
     _sync_history,
@@ -1765,3 +1768,109 @@ def test_recover_spawn_state_empty_history() -> None:
 
     assert spawned == set(), f"Expected no spawned IDs for non-spawn history, got {spawned}."
     assert collected == set(), f"Expected no collected IDs for non-spawn history, got {collected}."
+
+
+# ── Executor storage ──────────────────────────────────────
+
+
+def test_executor_storage_round_trip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Persist and restore executor storage via the artifact store.
+
+    Creates a temp directory with files, persists it to a
+    ``LocalArtifactStore``, then restores into a fresh directory.
+    The restored files must match the originals.
+    """
+    from agent_plane.stores.artifact_store.local import (
+        LocalArtifactStore,
+    )
+
+    store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.get_artifact_store",
+        lambda: store,
+    )
+
+    # Create a storage dir with some files.
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "session.json").write_text('{"turn": 1}')
+    claude_dir = source / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "transcript.txt").write_text("Hello world")
+
+    # Persist to artifact store.
+    conv_id = "conv_test_123"
+    _persist_executor_storage(conv_id, source)
+
+    # Restore into a fresh directory.
+    restored = _restore_executor_storage(conv_id)
+
+    # session.json must survive the round-trip.
+    assert (restored / "session.json").read_text() == '{"turn": 1}', (
+        "session.json content lost during persist/restore round-trip."
+    )
+    # .claude/transcript.txt must survive (nested directory).
+    assert (restored / ".claude" / "transcript.txt").read_text() == "Hello world", (
+        ".claude/transcript.txt content lost during round-trip. "
+        "Nested directories must be preserved."
+    )
+
+    _cleanup_executor_storage(restored)
+    # Temp dir must be removed after cleanup.
+    assert not restored.exists(), "cleanup should remove the temp directory."
+
+
+def test_executor_storage_fresh_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    First conversation turn — no snapshot in artifact store.
+
+    ``_restore_executor_storage`` must return an empty temp
+    directory without raising.
+    """
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.get_artifact_store",
+        lambda: None,
+    )
+
+    storage_dir = _restore_executor_storage("conv_new")
+
+    # Directory exists and is empty.
+    assert storage_dir.exists()
+    assert list(storage_dir.iterdir()) == [], "Fresh storage dir should be empty."
+
+    _cleanup_executor_storage(storage_dir)
+
+
+def test_executor_storage_skip_persist_when_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Empty storage directory — ``_persist_executor_storage`` must
+    skip the upload to avoid storing empty tarballs.
+    """
+    from agent_plane.stores.artifact_store.local import (
+        LocalArtifactStore,
+    )
+
+    store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.get_artifact_store",
+        lambda: store,
+    )
+
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+
+    _persist_executor_storage("conv_empty", empty_dir)
+
+    # No artifact should have been created.
+    assert not store.exists("executor_storage/conv_empty.tar.gz"), (
+        "Empty directories should not produce an artifact."
+    )
