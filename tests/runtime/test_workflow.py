@@ -5,6 +5,7 @@ Covers pagination, execution timeout, and tool call splitting.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -1773,6 +1774,22 @@ def test_recover_spawn_state_empty_history() -> None:
 # ── Executor storage ──────────────────────────────────────
 
 
+def _populate_executor_dir(base: Path) -> Path:
+    """
+    Create a storage dir with nested files for round-trip tests.
+
+    :param base: Parent directory to create source dir in.
+    :returns: Path to the populated source directory.
+    """
+    source = base / "source"
+    source.mkdir()
+    (source / "session.json").write_text('{"turn": 1}')
+    claude_dir = source / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "transcript.txt").write_text("Hello world")
+    return source
+
+
 def test_executor_storage_round_trip(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1780,9 +1797,8 @@ def test_executor_storage_round_trip(
     """
     Persist and restore executor storage via the artifact store.
 
-    Creates a temp directory with files, persists it to a
-    ``LocalArtifactStore``, then restores into a fresh directory.
-    The restored files must match the originals.
+    The restored files must match the originals, including
+    nested directories like ``.claude/``.
     """
     from agent_plane.stores.artifact_store.local import (
         LocalArtifactStore,
@@ -1794,33 +1810,19 @@ def test_executor_storage_round_trip(
         lambda: store,
     )
 
-    # Create a storage dir with some files.
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "session.json").write_text('{"turn": 1}')
-    claude_dir = source / ".claude"
-    claude_dir.mkdir()
-    (claude_dir / "transcript.txt").write_text("Hello world")
-
-    # Persist to artifact store.
+    source = _populate_executor_dir(tmp_path)
     conv_id = "conv_test_123"
     _persist_executor_storage(conv_id, source)
-
-    # Restore into a fresh directory.
     restored = _restore_executor_storage(conv_id)
 
-    # session.json must survive the round-trip.
     assert (restored / "session.json").read_text() == '{"turn": 1}', (
-        "session.json content lost during persist/restore round-trip."
+        "session.json content lost during round-trip."
     )
-    # .claude/transcript.txt must survive (nested directory).
     assert (restored / ".claude" / "transcript.txt").read_text() == "Hello world", (
-        ".claude/transcript.txt content lost during round-trip. "
-        "Nested directories must be preserved."
+        ".claude/transcript.txt lost — nested dirs must be preserved."
     )
 
     _cleanup_executor_storage(restored)
-    # Temp dir must be removed after cleanup.
     assert not restored.exists(), "cleanup should remove the temp directory."
 
 
@@ -1845,6 +1847,7 @@ def test_executor_storage_fresh_conversation(
     assert list(storage_dir.iterdir()) == [], "Fresh storage dir should be empty."
 
     _cleanup_executor_storage(storage_dir)
+    assert not storage_dir.exists(), "cleanup should remove the temp directory."
 
 
 def test_executor_storage_skip_persist_when_empty(
