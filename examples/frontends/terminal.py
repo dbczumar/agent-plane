@@ -47,7 +47,21 @@ from textual.widgets import Footer, Header, Input, Static
 
 # ── Configuration ─────────────────────────────────────
 
-PORT = 18401
+def _find_free_port() -> int:
+    """
+    Find a free TCP port by binding to port 0 and reading the
+    OS-assigned port number.
+
+    :returns: An available port number.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+PORT = _find_free_port()
 BASE_URL = f"http://127.0.0.1:{PORT}"
 # Set by main() after parsing the agent's config.yaml.
 AGENT_NAME: str = "agent"
@@ -1918,11 +1932,23 @@ def main() -> None:
     bundle = _load_agent_bundle(agent_path)
     AGENT_NAME = _extract_agent_name(bundle)
 
-    server_proc = _start_server()
+    server_proc = _start_server(agent_path)
     try:
         wait_for_server(server_proc)
+        # The --agent flag pre-registered the agent at startup.
+        # Look up the agent ID by name instead of uploading.
         with httpx.Client() as client:
-            agent_id = register_agent(client, bundle)
+            agents_resp = client.get(f"{BASE_URL}/api/agents")
+            agents_resp.raise_for_status()
+            agent_id = None
+            for agent in agents_resp.json()["data"]:
+                if agent["name"] == AGENT_NAME:
+                    agent_id = agent["id"]
+                    break
+            if agent_id is None:
+                raise RuntimeError(
+                    f"Agent '{AGENT_NAME}' not found after server startup"
+                )
     except Exception:
         server_proc.kill()
         raise
@@ -1978,10 +2004,14 @@ def _print_usage() -> None:
     print("  python terminal.py ../agents/archer/ --auto-send 'say hello'")
 
 
-def _start_server() -> subprocess.Popen[bytes]:
+def _start_server(agent_path: str) -> subprocess.Popen[bytes]:
     """
-    Launch a temporary agent-plane server.
+    Launch a temporary agent-plane server with a fresh DB.
 
+    Uses ``--agent`` to pre-register the agent at startup,
+    avoiding the separate HTTP upload step and stale cache issues.
+
+    :param agent_path: Path to the agent directory or tarball.
     :returns: The server subprocess.
     """
     tmpdir = tempfile.mkdtemp(prefix="agent-plane-tui-")
@@ -2002,6 +2032,8 @@ def _start_server() -> subprocess.Popen[bytes]:
             db_uri,
             "--artifact-location",
             art_loc,
+            "--agent",
+            agent_path,
         ],
         env={**os.environ},
         stdout=subprocess.PIPE,
