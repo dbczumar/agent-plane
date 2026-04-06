@@ -2307,16 +2307,16 @@ def _complete_for_client_tools(
     inbox at the post-persist cursor so ``try_deliver`` cannot
     inject messages after the response completes.
 
-    Known gap: unlike ``_handle_final_response``, this function
-    uses the post-persist cursor (``fc_last_seen``) rather than
-    the pre-LLM cursor. A steered message delivered during LLM
-    streaming gets a position *between* those two cursors, so
-    ``close_inbox`` won't see it. We can't retry the loop here
-    because we must return the client-side tool calls immediately.
-    The steered message is not lost — it is persisted in the
-    conversation store and will be included in the prompt on the
-    next request (when the client continues via
-    ``previous_response_id``). See LOOPGAPS.md.
+    Steering note: unlike ``_handle_final_response``, this uses
+    the post-persist cursor (``fc_last_seen``) — so a steered
+    message delivered during LLM streaming won't be detected by
+    ``close_inbox``. This is acceptable because the response
+    contains client-side tool calls: the client MUST send tool
+    results via ``previous_response_id`` to continue, and that
+    next request loads the full conversation history including
+    the steered message. The LLM addresses it on that turn.
+    Retrying the loop here is impossible — there are no tool
+    results yet, so the LLM cannot proceed.
 
     :param task_id: The task identifier, e.g. ``"task_abc123"``.
     :param conversation_id: The conversation ID, e.g.
