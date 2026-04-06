@@ -341,14 +341,11 @@ def _validate_sub_agents(
     """
     Validate sub-agent declarations.
 
-    Checks:
-    1. Every name in ``tools.agents`` has a corresponding parsed
-       sub-agent directory.
-    2. Callable sub-agents (referenced in ``tools.agents``) must
-       have ``llm.model`` configured.
-    3. Sub-agent names must be unique across the entire spec tree.
-    4. Agent names must not contain ``.`` (reserved as the
-       delimiter in tunneled output ``model`` fields).
+    Each sub-agent is validated independently as if it were a
+    top-level spec — its own ``executor.type`` determines which
+    fields are valid. The parent only checks structural references
+    (every name in ``tools.agents`` has a matching directory) and
+    tree-wide uniqueness.
 
     :param spec: The agent spec to check.
     :param result: Accumulator for any validation errors found.
@@ -356,19 +353,22 @@ def _validate_sub_agents(
     sub_specs = {sa.name: sa for sa in spec.sub_agents if sa.name is not None}
 
     for agent_ref in spec.tools.agents:
-        sub = sub_specs.get(agent_ref)
-        if sub is None:
+        if agent_ref not in sub_specs:
             result.add(
                 "tools.agents",
                 f"references sub-agent {agent_ref!r} but no "
                 f"matching directory found under agents/",
             )
-            continue
-        # Callable sub-agents must have llm.model
-        if sub.llm is None or not sub.llm.model:
+
+    # Validate each sub-agent independently — its own executor.type
+    # determines which fields are required/invalid.
+    for sa in spec.sub_agents:
+        sa_result = validate(sa)
+        for err in sa_result.errors:
+            sa_name = sa.name or "unnamed"
             result.add(
-                f"sub_agents[{agent_ref!r}].llm",
-                "callable sub-agent must have llm.model configured",
+                f"sub_agents[{sa_name!r}].{err.path}",
+                err.message,
             )
 
     # Agent name characters (dots, slashes, whitespace, empty)
