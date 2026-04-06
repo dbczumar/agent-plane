@@ -9,6 +9,7 @@ import pytest
 from agent_plane.entities.task import Task, TaskStatus
 from agent_plane.tools.builtins.spawn import (
     _extract_output_text,
+    _format_terminal_message,
     _task_to_result,
 )
 
@@ -55,6 +56,7 @@ def _make_task(
     status: str = TaskStatus.COMPLETED,
     output: list[dict[str, Any]] | None = None,
     agent_name: str = "researcher",
+    error: dict[str, str] | None = None,
 ) -> Task:
     """
     Build a minimal Task for testing.
@@ -63,6 +65,8 @@ def _make_task(
     :param output: Output items list, or ``None`` for default
         empty list.
     :param agent_name: Agent name for the task.
+    :param error: Error details dict, e.g.
+        ``{"code": "server_error", "message": "..."}``.
     :returns: A :class:`Task` instance.
     """
     return Task(
@@ -73,6 +77,7 @@ def _make_task(
         agent_name=agent_name,
         created_at=1000,
         output=output if output is not None else [],
+        error=error,
     )
 
 
@@ -222,3 +227,95 @@ def test_task_to_result_includes_agent_name_in_fallback() -> None:
     result = _task_to_result(task)
     # Agent name appears in the fallback message (repr-quoted).
     assert "my-agent" in result["output"]
+
+
+# ── _format_terminal_message tests ──────────────────────
+
+
+def test_format_terminal_message_failed_with_error() -> None:
+    """
+    Failed task with error details — message includes error
+    code and description so the parent LLM can decide whether
+    to retry.
+    """
+    task = _make_task(
+        status=TaskStatus.FAILED,
+        error={
+            "code": "context_window_exceeded",
+            "message": "Input exceeds 128k token limit.",
+        },
+    )
+    msg = _format_terminal_message(task)
+    # Base status message is present.
+    assert "finished with status: failed" in msg
+    # Error code helps the parent LLM classify the failure.
+    assert "context_window_exceeded" in msg, (
+        "Error code missing — parent LLM cannot distinguish retryable errors from permanent ones."
+    )
+    # Error message gives actionable detail.
+    assert "Input exceeds 128k token limit" in msg, (
+        "Error message missing — parent LLM cannot adjust its retry strategy."
+    )
+
+
+def test_format_terminal_message_failed_without_error() -> None:
+    """
+    Failed task with no error details — falls back to generic
+    status message without crashing.
+    """
+    task = _make_task(status=TaskStatus.FAILED)
+    msg = _format_terminal_message(task)
+    assert "finished with status: failed" in msg
+    # No "Error:" suffix when task.error is None.
+    assert "Error:" not in msg
+
+
+def test_format_terminal_message_cancelled() -> None:
+    """Cancelled task — no error details appended."""
+    task = _make_task(status=TaskStatus.CANCELLED)
+    msg = _format_terminal_message(task)
+    assert "finished with status: cancelled" in msg
+    assert "Error:" not in msg
+
+
+def test_format_terminal_message_error_code_only() -> None:
+    """
+    Error dict with code but empty message — includes code
+    without a trailing dash-space.
+    """
+    task = _make_task(
+        status=TaskStatus.FAILED,
+        error={"code": "server_error", "message": ""},
+    )
+    msg = _format_terminal_message(task)
+    assert "server_error" in msg
+    # Empty message → "Error: server_error." not "Error: server_error — "
+    assert "server_error." in msg
+
+
+def test_task_to_result_failed_propagates_error() -> None:
+    """
+    ``_task_to_result`` for a failed task with error details
+    includes error info in the output string.
+
+    Before the fix, the output was a generic "finished with
+    status: failed" with no error details — the parent LLM
+    had no information about why the sub-agent failed.
+    """
+    task = _make_task(
+        status=TaskStatus.FAILED,
+        error={
+            "code": "invalid_tool_call",
+            "message": "Unknown tool: nonexistent_tool",
+        },
+    )
+    result = _task_to_result(task)
+    assert result["status"] == "failed"
+    # Error details must appear in output so the parent LLM
+    # can make an informed decision.
+    assert "invalid_tool_call" in result["output"], (
+        "Error code not propagated to _task_to_result output."
+    )
+    assert "nonexistent_tool" in result["output"], (
+        "Error message not propagated to _task_to_result output."
+    )

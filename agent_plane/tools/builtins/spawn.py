@@ -580,6 +580,31 @@ def _spawn_one(
 # ── Check / result helpers ────────────────────────────
 
 
+def _format_terminal_message(task: Task) -> str:
+    """
+    Build a human-readable message for a terminal sub-agent.
+
+    Includes error details when available so the parent LLM can
+    decide whether to retry, adjust input, or give up.
+
+    :param task: A task in a terminal status (``"failed"``,
+        ``"cancelled"``, etc.).
+    :returns: A message like ``"Sub-agent 'X' failed:
+        context_window_exceeded — Input too long."``.
+    """
+    base = f"Sub-agent {task.agent_name!r} finished with status: {task.status}."
+    if task.error:
+        # Defensive: task.error is dict[str, str] but may come
+        # from DB JSON — missing keys get readable fallbacks so
+        # the formatted message is always valid for the parent LLM.
+        code = task.error.get("code", "unknown")
+        message = task.error.get("message", "")
+        # Append error details so the parent LLM can make an
+        # informed decision (retry with shorter input, skip, etc.).
+        base += f" Error: {code} — {message}" if message else f" Error: {code}."
+    return base
+
+
 def _task_to_result(task: Task) -> dict[str, str]:
     """
     Convert a :class:`Task` to a status-result dict.
@@ -597,7 +622,7 @@ def _task_to_result(task: Task) -> dict[str, str]:
     if task.status == "completed" and task.output:
         output_text = _extract_output_text(task.output)
     elif task.status in TERMINAL_STATUSES:
-        output_text = f"Sub-agent {task.agent_name!r} finished with status: {task.status}."
+        output_text = _format_terminal_message(task)
     else:
         output_text = f"Sub-agent {task.agent_name!r} is still running."
 
@@ -642,7 +667,7 @@ def _task_to_check_result(
     )
     output: str | None = None
     if task.status in TERMINAL_STATUSES:
-        output = f"Sub-agent {task.agent_name!r} finished with status: {task.status}."
+        output = _format_terminal_message(task)
 
     return {
         "response_id": task.id,
