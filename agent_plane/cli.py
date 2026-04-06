@@ -27,6 +27,59 @@ _DEFAULT_DB_URI = "sqlite:///agent_plane.db"
 _DEFAULT_ARTIFACT_LOCATION = "./artifacts"
 
 
+def _preregister_agent(
+    agent_dir: Path,
+    agent_store: Any,
+    artifact_store: Any,
+) -> None:
+    """
+    Register an agent from a directory, replacing it if it already exists.
+
+    Builds a tarball from the directory, validates the spec, and
+    creates or replaces the agent in the store. This runs at server
+    startup for each ``--agent`` flag.
+
+    :param agent_dir: Path to the agent image directory containing
+        ``config.yaml``.
+    :param agent_store: The AgentStore for agent metadata.
+    :param artifact_store: The ArtifactStore for bundle storage.
+    """
+    import io
+    import tarfile
+
+    from agent_plane.spec import load
+
+    # Build tarball in memory.
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(str(agent_dir), arcname=".")
+    bundle_bytes = buf.getvalue()
+
+    # Validate spec.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec = load(bundle_bytes, dest=Path(tmpdir) / "agent")
+
+    if spec.name is None:
+        click.echo(f"  warning: {agent_dir} has no name, skipping")
+        return
+
+    # Delete existing agent with the same name so the new bundle
+    # replaces it — avoids stale config when iterating locally.
+    existing = agent_store.get_by_name(spec.name)
+    if existing is not None:
+        artifact_store.delete(existing.id)
+        agent_store.delete(existing.id)
+
+    agent = agent_store.create(
+        name=spec.name,
+        description=spec.description,
+    )
+    artifact_store.put(agent.id, bundle_bytes)
+    click.echo(f"  agent: {spec.name} (from {agent_dir})")
+
+
 @click.group()
 def cli() -> None:
     """agent-plane CLI."""
@@ -71,6 +124,17 @@ def cli() -> None:
     type=int,
     help="Max wall-clock seconds per agent execution.  [default: 7200]",
 )
+@click.option(
+    "--agent",
+    "agent_dirs",
+    multiple=True,
+    type=click.Path(exists=True),
+    help=(
+        "Pre-register an agent from a directory at startup. "
+        "Can be repeated. If the agent name already exists, "
+        "the bundle is replaced."
+    ),
+)
 def server(
     host: str,
     port: int,
@@ -78,6 +142,7 @@ def server(
     artifact_location: str | None,
     config_path: str | None,
     execution_timeout: int | None,
+    agent_dirs: tuple[str, ...],
 ) -> None:
     """Start the agent-plane server."""
     import uvicorn
@@ -140,6 +205,14 @@ def server(
         conversation_store=conversation_store,
         artifact_store=artifact_store,
     )
+
+    # Pre-register agents from --agent directories.
+    for agent_dir in agent_dirs:
+        _preregister_agent(
+            Path(agent_dir),
+            agent_store,
+            artifact_store,
+        )
 
     click.echo(f"Starting agent-plane server on {host}:{port}")
     click.echo(f"  database:  {db_uri}")
