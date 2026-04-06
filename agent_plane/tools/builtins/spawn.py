@@ -31,7 +31,11 @@ _ACTIVITY_TAIL = 5
 
 # Maximum characters per content field in activity items.
 # Longer content is truncated with a " [truncated]" suffix.
-_ACTIVITY_MAX_CHARS = 300
+# Enough to capture a meaningful tool call or result (e.g. a
+# code snippet, search output, or structured JSON arguments)
+# without bloating the parent's prompt. At 5 items × 2000 chars
+# the activity section is bounded to ~10k chars.
+_ACTIVITY_MAX_CHARS = 2000
 
 
 def _extract_output_text(output: list[dict[str, Any]]) -> str:
