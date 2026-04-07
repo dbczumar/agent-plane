@@ -47,6 +47,7 @@ from textual.widgets import Footer, Header, Input, Static
 
 # ── Configuration ─────────────────────────────────────
 
+
 def _find_free_port() -> int:
     """
     Find a free TCP port by binding to port 0 and reading the
@@ -1946,9 +1947,7 @@ def main() -> None:
                     agent_id = agent["id"]
                     break
             if agent_id is None:
-                raise RuntimeError(
-                    f"Agent '{AGENT_NAME}' not found after server startup"
-                )
+                raise RuntimeError(f"Agent '{AGENT_NAME}' not found after server startup")
     except Exception:
         server_proc.kill()
         raise

@@ -9,7 +9,7 @@ llm:
     api_key: ${OPENAI_API_KEY}
 
 compaction:
-  trigger_threshold: 0.02
+  trigger_threshold: 0.1
   recent_window: 1
 
 instructions: |
