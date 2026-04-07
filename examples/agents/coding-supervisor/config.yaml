@@ -8,7 +8,7 @@ description: >
   Agent SDK with built-in file tools for implementation.
 
 llm:
-  model: gpt-4o-mini
+  model: gpt-5.4
   connection:
     api_key: ${OPENAI_API_KEY}
 
