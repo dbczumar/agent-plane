@@ -19,11 +19,9 @@ Usage::
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import httpx
-import pytest
 
 from tests.e2e.conftest import poll_until_terminal
 
@@ -67,6 +65,7 @@ def _has_tool_call_named(body: dict[str, Any], substring: str) -> bool:
 def test_claude_coder_remembers_tool_calls(
     http_client: httpx.Client,
     claude_coder_agent: str,
+    llm_api_key: str,
 ) -> None:
     """
     Multi-turn test: Claude SDK subprocess retains tool call context.
@@ -105,9 +104,7 @@ def test_claude_coder_remembers_tool_calls(
     response_1_id = resp_1.json()["id"]
 
     body_1 = poll_until_terminal(http_client, response_1_id, timeout=120)
-    assert body_1["status"] == "completed", (
-        f"Turn 1 failed: {body_1.get('error', 'unknown')}"
-    )
+    assert body_1["status"] == "completed", f"Turn 1 failed: {body_1.get('error', 'unknown')}"
 
     # Sanity: turn 1 should have used a Bash tool call.
     text_1 = _extract_all_text(body_1)
@@ -129,21 +126,21 @@ def test_claude_coder_remembers_tool_calls(
     response_2_id = resp_2.json()["id"]
 
     body_2 = poll_until_terminal(http_client, response_2_id, timeout=120)
-    assert body_2["status"] == "completed", (
-        f"Turn 2 failed: {body_2.get('error', 'unknown')}"
-    )
+    assert body_2["status"] == "completed", f"Turn 2 failed: {body_2.get('error', 'unknown')}"
 
     text_2 = _extract_all_text(body_2)
-    assert len(text_2) > 10, (
-        f"Turn 2 produced no meaningful output. Text: {text_2!r}"
-    )
+    assert len(text_2) > 10, f"Turn 2 produced no meaningful output. Text: {text_2!r}"
 
     # ── LLM judge: did Claude articulate the tools used? ────
     #
-    # We need OPENAI_API_KEY for the judge (it uses gpt-4.1-mini).
-    # The e2e server already has it in the environment; we just
-    # need it in this test process too.
+    # The judge uses gpt-4.1-mini via OpenAI. Set the key in this
+    # process (the server subprocess already has it, but the judge
+    # runs in the test process).
+    import os
+
     from mlflow.genai.judges import make_judge
+
+    os.environ["OPENAI_API_KEY"] = llm_api_key
 
     judge = make_judge(
         name="tool_awareness",
