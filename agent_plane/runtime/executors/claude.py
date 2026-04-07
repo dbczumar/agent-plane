@@ -98,6 +98,10 @@ class _ClientState:
     """
     Per-conversation SDK client state.
 
+    Does not own the event loop — the ``_ClientRegistry`` manages
+    loop lifecycle separately so that ``_get_or_create_client`` (which
+    builds this) doesn't need to know about threading.
+
     :param client: The connected ``ClaudeSDKClient`` instance.
     :param model: Model name the client was created with, or ``None``
         if using the SDK default.
@@ -117,10 +121,9 @@ class _ClientRegistry:
     """
     Process-lifetime registry of SDK clients keyed by conversation ID.
 
-    Owns a single shared asyncio event loop running in a background
-    thread. All SDK clients are created and queried in this loop so
-    that async objects (connections, streams) are never moved between
-    loops.
+    Each conversation gets its own event loop and background thread,
+    isolating conversations from each other. A slow SDK call in one
+    conversation does not block others.
 
     SDK subprocesses persist across tasks so bash session state (cwd,
     env vars, running processes) survives between conversation turns.
@@ -135,25 +138,16 @@ class _ClientRegistry:
     """
 
     def __init__(self, ttl_seconds: float = 3600.0) -> None:
-        self._clients: dict[str, _ClientState] = {}
         self._lock = threading.Lock()
         self._ttl = ttl_seconds
-        self._loop = asyncio.new_event_loop()
-        self._loop_thread = threading.Thread(
-            target=self._loop.run_forever,
-            daemon=True,
-            name="sdk-event-loop",
-        )
-        self._loop_thread.start()
-
-    @property
-    def loop(self) -> asyncio.AbstractEventLoop:
-        """
-        The shared event loop all SDK clients run in.
-
-        :returns: The asyncio event loop.
-        """
-        return self._loop
+        # Per-conversation event loops. Created by get_or_create_loop
+        # on first task, persist until eviction.
+        self._loops: dict[
+            str,
+            tuple[asyncio.AbstractEventLoop, threading.Thread],
+        ] = {}
+        # SDK client state, set once the client connects.
+        self._clients: dict[str, _ClientState] = {}
 
     def get(self, conv_id: str) -> _ClientState | None:
         """
@@ -163,6 +157,37 @@ class _ClientRegistry:
         :returns: Existing ``_ClientState``, or ``None``.
         """
         return self._clients.get(conv_id)
+
+    def get_or_create_loop(
+        self,
+        conv_id: str,
+    ) -> asyncio.AbstractEventLoop:
+        """
+        Return the event loop for ``conv_id``, creating one if needed.
+
+        If no ``_ClientState`` exists yet (first task), a new loop and
+        background thread are spun up and a placeholder state is NOT
+        created — the loop is returned directly, and ``_async_turn``
+        will call ``register`` once the SDK client is connected.
+
+        If a ``_ClientState`` already exists, its loop is returned.
+
+        :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
+        :returns: The per-conversation asyncio event loop.
+        """
+        existing = self._loops.get(conv_id)
+        if existing is not None:
+            return existing[0]
+        # First task for this conversation — create a dedicated loop.
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(
+            target=loop.run_forever,
+            daemon=True,
+            name=f"sdk-loop-{conv_id}",
+        )
+        thread.start()
+        self._loops[conv_id] = (loop, thread)
+        return loop
 
     def register(self, conv_id: str, state: _ClientState) -> None:
         """
@@ -174,15 +199,38 @@ class _ClientRegistry:
         with self._lock:
             self._clients[conv_id] = state
 
-    def remove(self, conv_id: str) -> _ClientState | None:
+    def remove_client(self, conv_id: str) -> _ClientState | None:
         """
-        Remove and return the state for ``conv_id``, or ``None`` if absent.
+        Remove client state only, keeping the event loop alive.
+
+        Used on error from within the conversation's event loop —
+        stopping the loop from inside it would deadlock. The loop
+        stays alive for the current turn to finish; it will be
+        reused if a new client connects, or cleaned up by eviction.
 
         :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
         :returns: The removed ``_ClientState``, or ``None``.
         """
         with self._lock:
             return self._clients.pop(conv_id, None)
+
+    def remove(self, conv_id: str) -> _ClientState | None:
+        """
+        Remove client state AND stop the conversation's event loop.
+
+        Must NOT be called from within the conversation's loop.
+
+        :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
+        :returns: The removed ``_ClientState``, or ``None``.
+        """
+        with self._lock:
+            state = self._clients.pop(conv_id, None)
+            loop_entry = self._loops.pop(conv_id, None)
+        if loop_entry is not None:
+            loop, thread = loop_entry
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5.0)
+        return state
 
     def touch(self, conv_id: str) -> None:
         """
@@ -207,8 +255,8 @@ class _ClientRegistry:
         """
         Disconnect and remove clients idle longer than ``ttl_seconds``.
 
-        Submits disconnect coroutines to the shared event loop so they
-        run in the same context the clients were created in.
+        Stops each evicted conversation's event loop and joins its
+        background thread.
         """
         now = time.monotonic()
         with self._lock:
@@ -217,13 +265,20 @@ class _ClientRegistry:
                 for conv_id, state in self._clients.items()
                 if now - state.last_used > self._ttl
             ]
-            evicted = [self._clients.pop(conv_id) for conv_id in stale]
-        for state in evicted:
+            evicted: list[tuple[_ClientState, asyncio.AbstractEventLoop, threading.Thread]] = []
+            for conv_id in stale:
+                state = self._clients.pop(conv_id)
+                loop_entry = self._loops.pop(conv_id, None)
+                if loop_entry is not None:
+                    evicted.append((state, loop_entry[0], loop_entry[1]))
+        for state, loop, thread in evicted:
             _logger.debug(
                 "evicting stale SDK client (idle %.0fs)",
                 now - state.last_used,
             )
-            _disconnect_in_loop(state.client, self._loop)
+            _disconnect_in_loop(state.client, loop)
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5.0)
 
 
 # Process-lifetime singleton — persists across executor instances.
@@ -435,9 +490,11 @@ class ClaudeAgentsExecutor(Executor):
         event_queue: queue.Queue[ExecutorEvent | None] = queue.Queue(
             maxsize=256,
         )
-        # All SDK operations run in the registry's shared event loop
-        # so async objects (connections, streams) are never moved
-        # between loops.
+        # Each conversation has its own event loop so conversations
+        # are isolated — a slow SDK call in one can't starve others.
+        loop = _client_registry.get_or_create_loop(
+            context.conversation_id,
+        )
         asyncio.run_coroutine_threadsafe(
             _async_turn(
                 executor=self,
@@ -448,7 +505,7 @@ class ClaudeAgentsExecutor(Executor):
                 context=context,
                 event_queue=event_queue,
             ),
-            _client_registry.loop,
+            loop,
         )
         while True:
             event = event_queue.get()
@@ -1059,7 +1116,9 @@ async def _close_client_async(conv_id: str) -> None:
 
     :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
     """
-    state = _client_registry.remove(conv_id)
+    # remove_client (not remove) — we're running inside this
+    # conversation's event loop; stopping it here would deadlock.
+    state = _client_registry.remove_client(conv_id)
     if state is not None:
         try:
             await state.client.disconnect()
