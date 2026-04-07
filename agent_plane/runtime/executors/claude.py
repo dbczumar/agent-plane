@@ -199,38 +199,16 @@ class _ClientRegistry:
         with self._lock:
             self._clients[conv_id] = state
 
-    def remove_client(self, conv_id: str) -> _ClientState | None:
+    def remove(self, conv_id: str) -> _ClientState | None:
         """
-        Remove client state only, keeping the event loop alive.
-
-        Used on error from within the conversation's event loop —
-        stopping the loop from inside it would deadlock. The loop
-        stays alive for the current turn to finish; it will be
-        reused if a new client connects, or cleaned up by eviction.
+        Remove client state. The event loop stays alive — it is only
+        stopped by ``evict_stale``.
 
         :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
         :returns: The removed ``_ClientState``, or ``None``.
         """
         with self._lock:
             return self._clients.pop(conv_id, None)
-
-    def remove(self, conv_id: str) -> _ClientState | None:
-        """
-        Remove client state AND stop the conversation's event loop.
-
-        Must NOT be called from within the conversation's loop.
-
-        :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
-        :returns: The removed ``_ClientState``, or ``None``.
-        """
-        with self._lock:
-            state = self._clients.pop(conv_id, None)
-            loop_entry = self._loops.pop(conv_id, None)
-        if loop_entry is not None:
-            loop, thread = loop_entry
-            loop.call_soon_threadsafe(loop.stop)
-            thread.join(timeout=5.0)
-        return state
 
     def touch(self, conv_id: str) -> None:
         """
@@ -1116,9 +1094,7 @@ async def _close_client_async(conv_id: str) -> None:
 
     :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
     """
-    # remove_client (not remove) — we're running inside this
-    # conversation's event loop; stopping it here would deadlock.
-    state = _client_registry.remove_client(conv_id)
+    state = _client_registry.remove(conv_id)
     if state is not None:
         try:
             await state.client.disconnect()
