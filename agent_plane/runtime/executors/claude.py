@@ -93,28 +93,10 @@ class _CallbackHolder:
     callback: Callable[[ToolCallRequested], ToolResult] | None = None
 
 
-# TTL after which an idle SDK subprocess is disconnected and evicted.
-_CLIENT_TTL_SECONDS: float = 3600.0
-
-# Module-level client registry: keyed by conversation_id.
-# Lives for the process lifetime so SDK subprocesses persist across tasks,
-# preserving bash session state (cwd, env vars, running processes).
-#
-# DBOS serializes tasks per conversation_id (one task at a time), so
-# _CLIENTS[conv_id] is only mutated by one thread at a time for a given
-# key. The lock below guards cross-conversation writes (e.g. eviction
-# iterating the dict while another conversation creates a new entry).
-_CLIENTS: dict[str, _ClientState] = {}
-_CLIENTS_LOCK = threading.Lock()
-
-
 @dataclass
 class _ClientState:
     """
     Per-conversation SDK client state.
-
-    Stored at module scope (``_CLIENTS``) so the SDK subprocess outlives
-    any single executor instance.
 
     :param client: The connected ``ClaudeSDKClient`` instance.
     :param model: Model name the client was created with, or ``None``
@@ -135,29 +117,102 @@ class _ClientState:
     last_used: float
 
 
-def _evict_stale_clients() -> None:
+class _ClientRegistry:
     """
-    Disconnect and remove SDK clients idle longer than ``_CLIENT_TTL_SECONDS``.
+    Process-lifetime registry of SDK clients keyed by conversation ID.
 
-    Called from ``on_task_end`` so each task completion sweeps expired
-    clients. Iterates ``_CLIENTS`` once — O(n) in active conversations,
-    negligible in practice.
+    SDK subprocesses persist across tasks so bash session state (cwd,
+    env vars, running processes) survives between conversation turns.
+
+    DBOS serializes tasks per ``conversation_id`` (one task at a time),
+    so each key is mutated by only one thread at a time. The internal
+    lock guards cross-conversation operations such as eviction iterating
+    the dict while another conversation registers a new entry.
+
+    :param ttl_seconds: Idle time after which a client is disconnected
+        and evicted, e.g. ``3600.0``.
     """
-    now = time.monotonic()
-    with _CLIENTS_LOCK:
-        stale = [
-            conv_id
-            for conv_id, state in _CLIENTS.items()
-            if now - state.last_used > _CLIENT_TTL_SECONDS
-        ]
-        evicted = [_CLIENTS.pop(conv_id) for conv_id in stale]
-    for state in evicted:
-        _logger.debug(
-            "evicting stale SDK client for conversation %s (idle %.0fs)",
-            state.storage_dir,
-            now - state.last_used,
-        )
-        _disconnect_client(state.client)
+
+    def __init__(self, ttl_seconds: float = 3600.0) -> None:
+        self._clients: dict[str, _ClientState] = {}
+        self._lock = threading.Lock()
+        self._ttl = ttl_seconds
+
+    def get(self, conv_id: str) -> _ClientState | None:
+        """
+        Return the state for ``conv_id``, or ``None`` if absent.
+
+        :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
+        :returns: Existing ``_ClientState``, or ``None``.
+        """
+        return self._clients.get(conv_id)
+
+    def register(self, conv_id: str, state: _ClientState) -> None:
+        """
+        Store a newly connected client state.
+
+        :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
+        :param state: The ``_ClientState`` to register.
+        """
+        with self._lock:
+            self._clients[conv_id] = state
+
+    def remove(self, conv_id: str) -> _ClientState | None:
+        """
+        Remove and return the state for ``conv_id``, or ``None`` if absent.
+
+        :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
+        :returns: The removed ``_ClientState``, or ``None``.
+        """
+        with self._lock:
+            return self._clients.pop(conv_id, None)
+
+    def touch(self, conv_id: str) -> None:
+        """
+        Update the ``last_used`` timestamp for ``conv_id``.
+
+        :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
+        """
+        state = self._clients.get(conv_id)
+        if state is not None:
+            state.last_used = time.monotonic()
+
+    def __contains__(self, conv_id: str) -> bool:
+        """
+        Return True if a client is registered for ``conv_id``.
+
+        :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
+        :returns: True if present.
+        """
+        return conv_id in self._clients
+
+    def evict_stale(self) -> None:
+        """
+        Disconnect and remove clients idle longer than ``ttl_seconds``.
+
+        Called from ``on_task_end`` so each task completion sweeps expired
+        clients. Iterates the registry once — O(n) in active conversations,
+        negligible in practice.
+        """
+        now = time.monotonic()
+        with self._lock:
+            stale = [
+                conv_id
+                for conv_id, state in self._clients.items()
+                if now - state.last_used > self._ttl
+            ]
+            evicted = [self._clients.pop(conv_id) for conv_id in stale]
+        for state in evicted:
+            _logger.debug(
+                "evicting stale SDK client for conversation %s (idle %.0fs)",
+                state.storage_dir,
+                now - state.last_used,
+            )
+            _disconnect_client(state.client)
+
+
+# Process-lifetime singleton — persists across executor instances.
+_client_registry = _ClientRegistry()
 
 
 @dataclass
@@ -330,15 +385,13 @@ class ClaudeAgentsExecutor(Executor):
 
         Does NOT disconnect the live client — the subprocess keeps running
         so bash session state (cwd, env vars, running processes) persists
-        into the next task. Stale clients (idle > ``_CLIENT_TTL_SECONDS``)
+        into the next task. Stale clients (idle > the registry TTL)
         are disconnected here to bound resource usage.
 
         :param context: Agent-plane capabilities and identifiers.
         """
-        state = _CLIENTS.get(context.conversation_id)
-        if state is not None:
-            state.last_used = time.monotonic()
-        _evict_stale_clients()
+        _client_registry.touch(context.conversation_id)
+        _client_registry.evict_stale()
 
     def holds_storage(self, conversation_id: str) -> bool:
         """
@@ -349,9 +402,9 @@ class ClaudeAgentsExecutor(Executor):
 
         :param conversation_id: Conversation identifier, e.g.
             ``"conv_abc123"``.
-        :returns: True if ``_CLIENTS`` has an entry for this conversation.
+        :returns: True if the registry has an entry for this conversation.
         """
-        return conversation_id in _CLIENTS
+        return conversation_id in _client_registry
 
     def get_storage_dir(self, conversation_id: str) -> Path | None:
         """
@@ -365,7 +418,7 @@ class ClaudeAgentsExecutor(Executor):
             ``"conv_abc123"``.
         :returns: Stable path to the storage dir, or None if no live client.
         """
-        state = _CLIENTS.get(conversation_id)
+        state = _client_registry.get(conversation_id)
         return state.storage_dir if state is not None else None
 
     def run_turn(
@@ -450,7 +503,7 @@ async def _async_turn(
     """
     sdk = _ensure_sdk()
     conv_id = context.conversation_id
-    existing = _CLIENTS.get(conv_id)
+    existing = _client_registry.get(conv_id)
     is_continuing = existing is not None
 
     prompt = _build_prompt(messages, context.storage_dir, is_continuing)
@@ -695,7 +748,7 @@ async def _get_or_create_client(
     Create and register a new SDK client for a conversation.
 
     Only called on first task for a given ``conv_id`` — subsequent tasks
-    find the existing entry in ``_CLIENTS`` and skip this function.
+    find the existing entry in ``_client_registry`` and skip this function.
 
     :param sdk: The ``claude_agent_sdk`` module.
     :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
@@ -709,14 +762,16 @@ async def _get_or_create_client(
     client = sdk.ClaudeSDKClient(options)
     await client.connect()
     model = llm_config.model
-    with _CLIENTS_LOCK:
-        _CLIENTS[conv_id] = _ClientState(
+    _client_registry.register(
+        conv_id,
+        _ClientState(
             client=client,
             model=model,
             callback_holder=holder,
             storage_dir=storage_dir,
             last_used=time.monotonic(),
-        )
+        ),
+    )
     return client
 
 
@@ -1025,8 +1080,7 @@ async def _close_client_async(conv_id: str) -> None:
 
     :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
     """
-    with _CLIENTS_LOCK:
-        state = _CLIENTS.pop(conv_id, None)
+    state = _client_registry.remove(conv_id)
     if state is not None:
         try:
             await state.client.disconnect()
