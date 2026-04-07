@@ -3390,10 +3390,16 @@ def _run_agent_loop(
         model=llm_config.model,
         connection=llm_config.connection,
     )
-    # Create a per-conversation temp directory for executor state
-    # (e.g. Claude SDK session transcripts). Restored from artifact
-    # store if a previous snapshot exists; persisted back on exit.
-    storage_dir = _restore_executor_storage(conversation_id)
+    # If the executor has a live subprocess for this conversation,
+    # reuse its stable storage dir directly — no tempdir creation or
+    # artifact store restore needed; the subprocess still has the
+    # directory open with current state.
+    # Otherwise, create a fresh temp dir and restore from artifact store.
+    existing_storage = executor.get_storage_dir(conversation_id)
+    if existing_storage is not None:
+        storage_dir = existing_storage
+    else:
+        storage_dir = _restore_executor_storage(conversation_id)
     executor_context = _build_executor_context(
         task_id,
         conversation_id,
@@ -3577,10 +3583,13 @@ def _run_agent_loop(
     finally:
         executor.on_task_end(executor_context)
         # Snapshot executor storage to artifact store so it
-        # survives server restarts (e.g. Claude SDK session
-        # state). Then clean up the temp directory.
+        # survives server restarts (e.g. Claude SDK session state).
         _persist_executor_storage(conversation_id, storage_dir)
-        _cleanup_executor_storage(storage_dir)
+        # Only clean up the temp dir if no live subprocess is still
+        # using it. Persistent executors (e.g. ClaudeAgentsExecutor)
+        # keep the subprocess's cwd alive between tasks.
+        if not executor.holds_storage(conversation_id):
+            _cleanup_executor_storage(storage_dir)
         # Persist a compaction item if Layer 2 ran during this
         # execution. Idempotent — safe to call on crash recovery
         # replay because _maybe_persist_compaction_item checks

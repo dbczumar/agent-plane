@@ -29,7 +29,7 @@ import queue
 import shutil
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from pathlib import Path
@@ -76,17 +76,88 @@ def _ensure_sdk() -> Any:
 
 
 @dataclass
+class _CallbackHolder:
+    """
+    Mutable holder for the current task's ``await_tool_output`` callback.
+
+    Shared between the long-lived MCP server handlers and per-task setup.
+    Updated to the current task's callback before each ``client.query()``
+    call; cleared to ``None`` after the query completes. MCP handlers read
+    it at call time (not at creation time), so they always route to the
+    current task's parking infrastructure.
+
+    :param callback: The current task's ``await_tool_output`` function,
+        or ``None`` between tasks (no active query running).
+    """
+
+    callback: Callable[[ToolCallRequested], ToolResult] | None = None
+
+
+# TTL after which an idle SDK subprocess is disconnected and evicted.
+_CLIENT_TTL_SECONDS: float = 3600.0
+
+# Module-level client registry: keyed by conversation_id.
+# Lives for the process lifetime so SDK subprocesses persist across tasks,
+# preserving bash session state (cwd, env vars, running processes).
+#
+# DBOS serializes tasks per conversation_id (one task at a time), so
+# _CLIENTS[conv_id] is only mutated by one thread at a time for a given
+# key. The lock below guards cross-conversation writes (e.g. eviction
+# iterating the dict while another conversation creates a new entry).
+_CLIENTS: dict[str, _ClientState] = {}
+_CLIENTS_LOCK = threading.Lock()
+
+
+@dataclass
 class _ClientState:
     """
     Per-conversation SDK client state.
 
-    :param client: The ``ClaudeSDKClient`` instance.
+    Stored at module scope (``_CLIENTS``) so the SDK subprocess outlives
+    any single executor instance.
+
+    :param client: The connected ``ClaudeSDKClient`` instance.
     :param model: Model name the client was created with, or ``None``
         if using the SDK default.
+    :param callback_holder: Updated each task so MCP tool handlers
+        route to the current task's ``await_tool_output``.
+    :param storage_dir: The subprocess's working directory. Stable
+        across tasks — the workflow must not clean it up while this
+        state exists.
+    :param last_used: ``time.monotonic()`` timestamp of the last
+        ``on_task_end`` call. Used for TTL-based eviction.
     """
 
     client: Any
     model: str | None
+    callback_holder: _CallbackHolder
+    storage_dir: Path
+    last_used: float
+
+
+def _evict_stale_clients() -> None:
+    """
+    Disconnect and remove SDK clients idle longer than ``_CLIENT_TTL_SECONDS``.
+
+    Called from ``on_task_end`` so each task completion sweeps expired
+    clients. Iterates ``_CLIENTS`` once — O(n) in active conversations,
+    negligible in practice.
+    """
+    now = time.monotonic()
+    with _CLIENTS_LOCK:
+        stale = [
+            conv_id
+            for conv_id, state in _CLIENTS.items()
+            if now - state.last_used > _CLIENT_TTL_SECONDS
+        ]
+        evicted = [_CLIENTS.pop(conv_id) for conv_id in stale]
+    for state in evicted:
+        _logger.debug(
+            "evicting stale SDK client for conversation %s (idle %.0fs)",
+            state.storage_dir,
+            now - state.last_used,
+        )
+        _disconnect_client(state.client)
 
 
 @dataclass
@@ -184,10 +255,7 @@ def _build_history_prompt(
             content = json.dumps(content, ensure_ascii=False)
         lines.append(f"{role}: {content}")
     lines.append("")
-    lines.append(
-        "Respond to the latest user message,"
-        " using the conversation above as context."
-    )
+    lines.append("Respond to the latest user message, using the conversation above as context.")
     return "\n".join(lines)
 
 
@@ -232,7 +300,6 @@ class ClaudeAgentsExecutor(Executor):
     ) -> None:
         self._allowed_tools = allowed_tools
         self._model = model
-        self._clients: dict[str, _ClientState] = {}
 
     @classmethod
     def from_spec(cls, spec: AgentSpec) -> Self:
@@ -259,16 +326,47 @@ class ClaudeAgentsExecutor(Executor):
 
     def on_task_end(self, context: ExecutorContext) -> None:
         """
-        Disconnect the SDK client for this conversation.
+        Mark the conversation's SDK client as idle and evict stale clients.
 
-        Session state in ``storage_dir`` is persisted by the workflow
-        after this hook returns.
+        Does NOT disconnect the live client — the subprocess keeps running
+        so bash session state (cwd, env vars, running processes) persists
+        into the next task. Stale clients (idle > ``_CLIENT_TTL_SECONDS``)
+        are disconnected here to bound resource usage.
 
         :param context: Agent-plane capabilities and identifiers.
         """
-        state = self._clients.pop(context.conversation_id, None)
+        state = _CLIENTS.get(context.conversation_id)
         if state is not None:
-            _disconnect_client(state.client)
+            state.last_used = time.monotonic()
+        _evict_stale_clients()
+
+    def holds_storage(self, conversation_id: str) -> bool:
+        """
+        Return True when a live SDK subprocess is using the storage dir.
+
+        Tells the workflow not to delete the temp directory at task end —
+        the subprocess's cwd must remain intact between tasks.
+
+        :param conversation_id: Conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :returns: True if ``_CLIENTS`` has an entry for this conversation.
+        """
+        return conversation_id in _CLIENTS
+
+    def get_storage_dir(self, conversation_id: str) -> Path | None:
+        """
+        Return the live subprocess's storage directory, or None.
+
+        When non-None, the workflow skips tempdir creation and artifact
+        store restore — the subprocess already has the directory open with
+        its current state.
+
+        :param conversation_id: Conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :returns: Stable path to the storage dir, or None if no live client.
+        """
+        state = _CLIENTS.get(conversation_id)
+        return state.storage_dir if state is not None else None
 
     def run_turn(
         self,
@@ -352,37 +450,52 @@ async def _async_turn(
     """
     sdk = _ensure_sdk()
     conv_id = context.conversation_id
-    is_continuing = conv_id in executor._clients
+    existing = _CLIENTS.get(conv_id)
+    is_continuing = existing is not None
 
     prompt = _build_prompt(messages, context.storage_dir, is_continuing)
     if prompt is None:
         event_queue.put(TurnComplete(text=None))
         return
 
-    mcp_server = _build_client_tool_mcp_server(sdk, tools, context)
-    options = _build_sdk_options(
-        sdk,
-        executor,
-        system_prompt,
-        llm_config,
-        context,
-        mcp_server,
-        tools,
-    )
-    client = await _get_or_create_client(
-        sdk,
-        executor,
-        conv_id,
-        options,
-        llm_config,
-    )
+    if existing is not None:
+        client = existing.client
+        holder = existing.callback_holder
+    else:
+        holder = _CallbackHolder()
+        mcp_server = _build_client_tool_mcp_server(sdk, tools, holder)
+        options = _build_sdk_options(
+            sdk,
+            executor,
+            system_prompt,
+            llm_config,
+            context,
+            mcp_server,
+            tools,
+        )
+        client = await _get_or_create_client(
+            sdk,
+            conv_id,
+            options,
+            llm_config,
+            holder,
+            context.storage_dir,
+        )
 
+    # Point the MCP server's callback at this task before querying.
+    # Safe: _async_turn runs in a single asyncio event loop thread.
+    # The MCP handler (which reads holder.callback) only fires during
+    # client.query(), so set→query→clear is strictly sequential.
+    # Cleared in finally so stale callbacks never route to a dead task.
+    holder.callback = context.await_tool_output
     try:
         await client.query(prompt, session_id=conv_id)
         await _consume_sdk_stream(sdk, client, event_queue)
     except Exception as exc:
-        await _close_client_async(executor, conv_id)
+        await _close_client_async(conv_id)
         event_queue.put(ExecutorError(message=f"Claude SDK error: {exc}"))
+    finally:
+        holder.callback = None
 
 
 def _build_prompt(
@@ -417,20 +530,21 @@ def _build_prompt(
 def _build_client_tool_mcp_server(
     sdk: Any,
     tools: list[dict[str, Any]],
-    context: ExecutorContext,
+    callback_holder: _CallbackHolder,
 ) -> Any | None:
     """
     Build an in-process MCP server for client-side tools.
 
-    Each client-side tool becomes an MCP tool whose handler calls
-    ``context.await_tool_output()``. This parks the call through
-    agent-plane's infrastructure and blocks until the client returns
-    a result.
+    Each client-side tool becomes an MCP tool whose handler reads the
+    current task's callback from ``callback_holder`` at call time.
+    Because the holder is updated before each ``client.query()`` and
+    cleared after, tool calls always route to the active task's parking
+    infrastructure even when the SDK client is reused across tasks.
 
     :param sdk: The ``claude_agent_sdk`` module.
     :param tools: Client-side tool schemas (OpenAI format).
-    :param context: Agent-plane capabilities (provides
-        ``await_tool_output``).
+    :param callback_holder: Mutable holder for the current task's
+        ``await_tool_output`` callback.
     :returns: An MCP server object, or ``None`` if no client tools.
     """
     if not tools:
@@ -450,7 +564,7 @@ def _build_client_tool_mcp_server(
             },
         )
 
-        handler = _make_client_tool_handler(tool_name, context)
+        handler = _make_client_tool_handler(tool_name, callback_holder)
         decorated = sdk.tool(tool_name, tool_desc, tool_params)(handler)
         mcp_tools.append(decorated)
 
@@ -463,19 +577,19 @@ def _build_client_tool_mcp_server(
 
 def _make_client_tool_handler(
     tool_name: str,
-    context: ExecutorContext,
+    callback_holder: _CallbackHolder,
 ) -> Any:
     """
     Create an async MCP tool handler for a client-side tool.
 
-    The handler calls ``context.await_tool_output()`` which blocks
-    until the client delivers the result via PATCH. The handler runs
-    inside the SDK's async event loop but ``await_tool_output`` is
-    sync (it polls ``pending_tool_calls`` in the workflow thread),
-    so we run it in a thread executor.
+    The handler reads ``callback_holder.callback`` at call time, not at
+    creation time. This allows the same MCP server (and SDK client) to be
+    reused across tasks: the caller updates ``callback_holder.callback``
+    before each ``client.query()`` and clears it after.
 
     :param tool_name: The tool name, e.g. ``"Read"``.
-    :param context: Agent-plane capabilities.
+    :param callback_holder: Mutable holder for the current task's
+        ``await_tool_output`` callback.
     :returns: An async callable for the SDK's ``@tool`` decorator.
     """
 
@@ -486,6 +600,12 @@ def _make_client_tool_handler(
         :param args: Tool arguments from the SDK.
         :returns: MCP-format result dict.
         """
+        cb = callback_holder.callback
+        if cb is None:
+            raise RuntimeError(
+                f"No active task callback for tool '{tool_name}'."
+                " Tool called outside of an active query."
+            )
         call = ToolCallRequested(
             call_id=f"sdk_{tool_name}_{int(time.monotonic() * 1000)}",
             name=tool_name,
@@ -493,11 +613,7 @@ def _make_client_tool_handler(
         )
         loop = asyncio.get_running_loop()
         # await_tool_output is sync (blocking) — run in thread
-        result: ToolResult = await loop.run_in_executor(
-            None,
-            context.await_tool_output,
-            call,
-        )
+        result: ToolResult = await loop.run_in_executor(None, cb, call)
         response: dict[str, Any] = {
             "content": [{"type": "text", "text": result.content}],
         }
@@ -569,32 +685,38 @@ def _build_sdk_options(
 
 async def _get_or_create_client(
     sdk: Any,
-    executor: ClaudeAgentsExecutor,
     conv_id: str,
     options: Any,
     llm_config: LLMConfig,
+    holder: _CallbackHolder,
+    storage_dir: Path,
 ) -> Any:
     """
-    Return or create a persistent SDK client for a conversation.
+    Create and register a new SDK client for a conversation.
 
-    Clients are reused across turns — the SDK subprocess keeps
-    conversation context in memory.
+    Only called on first task for a given ``conv_id`` — subsequent tasks
+    find the existing entry in ``_CLIENTS`` and skip this function.
 
     :param sdk: The ``claude_agent_sdk`` module.
-    :param executor: The executor instance.
-    :param conv_id: Conversation identifier.
+    :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
     :param options: ``ClaudeAgentOptions`` for client creation.
     :param llm_config: LLM configuration (for model tracking).
-    :returns: A ``ClaudeSDKClient`` instance.
+    :param holder: The callback holder to store with the client state.
+    :param storage_dir: The subprocess's working directory. Stored so
+        the workflow can return the same path on subsequent tasks.
+    :returns: The connected ``ClaudeSDKClient`` instance.
     """
-    state = executor._clients.get(conv_id)
-    if state is not None:
-        return state.client
-
     client = sdk.ClaudeSDKClient(options)
     await client.connect()
-    model = executor._model or llm_config.model
-    executor._clients[conv_id] = _ClientState(client=client, model=model)
+    model = llm_config.model
+    with _CLIENTS_LOCK:
+        _CLIENTS[conv_id] = _ClientState(
+            client=client,
+            model=model,
+            callback_holder=holder,
+            storage_dir=storage_dir,
+            last_used=time.monotonic(),
+        )
     return client
 
 
@@ -633,7 +755,10 @@ async def _consume_sdk_stream(
             elif isinstance(message, sdk.AssistantMessage):
                 if not state.got_stream_events:
                     _handle_assistant_message(
-                        sdk, message, state, event_queue,
+                        sdk,
+                        message,
+                        state,
+                        event_queue,
                     )
 
             elif isinstance(message, sdk.UserMessage):
@@ -800,8 +925,7 @@ def _emit_tool_call_observed(
         start = pending_call.start_time
     else:
         _logger.warning(
-            "ToolResultBlock for unknown tool_use_id %s"
-            " — tool call tracking may be out of sync",
+            "ToolResultBlock for unknown tool_use_id %s — tool call tracking may be out of sync",
             tool_id,
         )
         name = "unknown"
@@ -855,9 +979,7 @@ def _extract_tool_result_text(result_content: Any) -> str:
     if isinstance(result_content, str):
         return result_content
     if isinstance(result_content, list):
-        parts = [
-            part.text for part in result_content if hasattr(part, "text")
-        ]
+        parts = [part.text for part in result_content if hasattr(part, "text")]
         return "\n".join(parts) if parts else str(result_content)
     return str(result_content)
 
@@ -878,8 +1000,7 @@ def _check_terminal_error(message: Any) -> ExecutorError | None:
     if status in {401, 403}:
         return ExecutorError(
             message=(
-                f"Claude SDK auth failed ({error}, status={status})."
-                " Check ANTHROPIC_API_KEY."
+                f"Claude SDK auth failed ({error}, status={status}). Check ANTHROPIC_API_KEY."
             ),
             code="auth_failed",
         )
@@ -895,17 +1016,17 @@ def _check_terminal_error(message: Any) -> ExecutorError | None:
     return None
 
 
-async def _close_client_async(
-    executor: ClaudeAgentsExecutor,
-    conv_id: str,
-) -> None:
+async def _close_client_async(conv_id: str) -> None:
     """
     Disconnect and remove the SDK client for a conversation.
 
-    :param executor: The executor instance.
-    :param conv_id: Conversation identifier.
+    Called on error so a broken subprocess doesn't persist into the
+    next task.
+
+    :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
     """
-    state = executor._clients.pop(conv_id, None)
+    with _CLIENTS_LOCK:
+        state = _CLIENTS.pop(conv_id, None)
     if state is not None:
         try:
             await state.client.disconnect()
@@ -946,5 +1067,5 @@ def _extract_claude_tools(spec: AgentSpec) -> list[str]:
     for builtin in spec.tools.builtins:
         name = builtin.name
         if name.startswith("claude:"):
-            result.append(name[len("claude:"):])
+            result.append(name[len("claude:") :])
     return result
