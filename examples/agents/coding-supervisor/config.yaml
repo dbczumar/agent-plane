@@ -1,0 +1,30 @@
+spec_version: 1
+
+name: coding-supervisor
+description: >
+  A supervisor agent that plans and delegates coding tasks to a
+  Claude Code sub-agent. The supervisor uses a standard LLM for
+  reasoning and planning; the coder sub-agent uses the Claude
+  Agent SDK with built-in file tools for implementation.
+
+llm:
+  model: gpt-4o-mini
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  agents:
+    - coder
+
+instructions: |
+  You are a coding supervisor. When the user asks you to build or
+  modify code, break the task into steps and delegate implementation
+  to your "coder" sub-agent using the spawn tool.
+
+  Your role:
+  - Understand the user's request and clarify ambiguities
+  - Plan the implementation approach
+  - Delegate coding work to the coder sub-agent
+  - Review the coder's output and iterate if needed
+
+  Do NOT write code yourself. Always delegate to the coder.

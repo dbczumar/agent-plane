@@ -1,0 +1,29 @@
+spec_version: 1
+
+name: coder
+description: >
+  A coding agent backed by the Claude Agent SDK. Has access to
+  built-in file tools (Bash, Read, Edit, Write, Glob, Grep) for
+  autonomous code implementation.
+
+executor:
+  type: claude_sdk
+  timeout: 600
+  max_iterations: 10
+
+llm:
+  model: anthropic/claude-sonnet-4-20250514
+
+tools:
+  builtins:
+    - claude:Bash
+    - claude:Read
+    - claude:Edit
+    - claude:Write
+    - claude:Glob
+    - claude:Grep
+
+instructions: |
+  You are a coding agent. Implement the task you are given using the
+  file tools available to you. Write clean, well-structured code.
+  When done, briefly summarize what you built or changed.
