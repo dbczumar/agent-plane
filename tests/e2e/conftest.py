@@ -29,6 +29,7 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CODER_DIR = _REPO_ROOT / "examples" / "agents" / "coder"
 _ARCHER_DIR = _REPO_ROOT / "examples" / "agents" / "archer"
+_CLAUDE_CODER_DIR = _REPO_ROOT / "examples" / "agents" / "claude-coder"
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -42,6 +43,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store",
         required=True,
         help="OpenAI API key for real LLM calls.",
+    )
+    parser.addoption(
+        "--anthropic-api-key",
+        action="store",
+        default=None,
+        help="Anthropic API key for Claude SDK tests.",
     )
 
 
@@ -58,8 +65,20 @@ def llm_api_key(request: pytest.FixtureRequest) -> str:
 
 
 @pytest.fixture(scope="session")
+def anthropic_api_key(request: pytest.FixtureRequest) -> str | None:
+    """
+    The Anthropic API key from ``--anthropic-api-key``.
+
+    :param request: Pytest request object.
+    :returns: The API key string, or ``None`` if not provided.
+    """
+    return request.config.getoption("--anthropic-api-key")
+
+
+@pytest.fixture(scope="session")
 def live_server(
     llm_api_key: str,
+    anthropic_api_key: str | None,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[str]:
     """
@@ -69,7 +88,9 @@ def live_server(
     for the health endpoint before yielding, and kills the
     process on teardown.
 
-    :param llm_api_key: The API key for the LLM.
+    :param llm_api_key: The OpenAI API key for the LLM.
+    :param anthropic_api_key: The Anthropic API key for Claude SDK
+        agents, or ``None`` if not provided.
     :param tmp_path_factory: Pytest temp path factory for the DB.
     :returns: The server's base URL, e.g. ``"http://localhost:18501"``.
     """
@@ -80,6 +101,8 @@ def live_server(
         "OPENAI_API_KEY": llm_api_key,
         "AP_DB_URI": f"sqlite:///{db_path}",
     }
+    if anthropic_api_key is not None:
+        env["ANTHROPIC_API_KEY"] = anthropic_api_key
     proc = subprocess.Popen(
         ["ap", "server", "--port", str(port)],
         env=env,
@@ -178,6 +201,26 @@ def archer_agent(http_client: httpx.Client) -> str:
     :returns: The agent name, e.g. ``"archer"``.
     """
     return _upload_agent(http_client, _ARCHER_DIR)
+
+
+@pytest.fixture(scope="session")
+def claude_coder_agent(
+    http_client: httpx.Client,
+    anthropic_api_key: str | None,
+) -> str:
+    """
+    Upload the claude-coder agent and return its name.
+
+    Requires ``--anthropic-api-key`` to be provided. Tests using
+    this fixture are skipped if the key is not available.
+
+    :param http_client: HTTP client pointed at the server.
+    :param anthropic_api_key: The Anthropic API key, or ``None``.
+    :returns: The agent name, ``"claude-coder"``.
+    """
+    if anthropic_api_key is None:
+        pytest.skip("--anthropic-api-key not provided")
+    return _upload_agent(http_client, _CLAUDE_CODER_DIR)
 
 
 @pytest.fixture(scope="session")
