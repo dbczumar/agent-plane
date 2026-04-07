@@ -3008,32 +3008,58 @@ def _handle_execution_timeout(
 
 _EXECUTOR_STORAGE_KEY_PREFIX = "executor_storage"
 
+# Base directory for executor storage on disk. Each (conversation, agent)
+# pair gets a stable subdirectory that persists across tasks.
+_EXECUTOR_STORAGE_BASE = Path.home() / ".agent-plane" / "executor_storage"
 
-def _restore_executor_storage(conversation_id: str) -> Path:
+
+def _storage_artifact_key(
+    conversation_id: str,
+    agent_name: str,
+) -> str:
     """
-    Create a temp directory and restore executor storage from
-    the artifact store if a previous snapshot exists.
+    Artifact store key for an executor's storage snapshot.
 
-    The directory is scoped to the conversation so multiple
-    concurrent conversations never collide. The caller is
-    responsible for calling :func:`_persist_executor_storage`
-    when the task ends and cleaning up the directory.
-
-    :param conversation_id: The conversation ID, e.g.
-        ``"conv_abc123"``.
-    :returns: Path to the restored (or fresh) temp directory.
+    :param conversation_id: e.g. ``"conv_abc123"``.
+    :param agent_name: e.g. ``"research-agent"``.
+    :returns: Key string, e.g.
+        ``"executor_storage/conv_abc123/research-agent.tar.gz"``.
     """
-    import tempfile
+    return f"{_EXECUTOR_STORAGE_KEY_PREFIX}/{conversation_id}/{agent_name}.tar.gz"
 
-    storage_dir = Path(
-        tempfile.mkdtemp(prefix=f"ap_exec_{conversation_id}_"),
-    )
+
+def _get_or_restore_executor_storage(
+    conversation_id: str,
+    agent_name: str,
+) -> Path:
+    """
+    Return a stable storage directory for ``(conversation_id, agent_name)``.
+
+    Idempotent: if the directory already exists on disk with content,
+    it is returned as-is (no artifact store round-trip). Otherwise,
+    the directory is created and populated from the artifact store
+    snapshot if one exists.
+
+    The directory is never deleted between tasks — it lives for as
+    long as the conversation is active.
+
+    :param conversation_id: e.g. ``"conv_abc123"``.
+    :param agent_name: e.g. ``"research-agent"``.
+    :returns: Path to the storage directory.
+    """
+    storage_dir = _EXECUTOR_STORAGE_BASE / conversation_id / agent_name
+    storage_dir.mkdir(parents=True, exist_ok=True)
+
+    # If the directory already has content, the previous task left it
+    # intact — no need to restore from the artifact store.
+    if any(storage_dir.iterdir()):
+        return storage_dir
 
     artifact_store = get_artifact_store()
     if artifact_store is None:
         return storage_dir
 
-    key = f"{_EXECUTOR_STORAGE_KEY_PREFIX}/{conversation_id}.tar.gz"
+    key = _storage_artifact_key(conversation_id, agent_name)
     if not artifact_store.exists(key):
         return storage_dir
 
@@ -3043,33 +3069,32 @@ def _restore_executor_storage(conversation_id: str) -> Path:
     with tarfile.open(fileobj=io.BytesIO(snapshot), mode="r:gz") as tf:
         tf.extractall(storage_dir)  # noqa: S202 — trusted internal data
     _logger.debug(
-        "restored executor storage for %s from artifact store",
+        "restored executor storage for %s/%s from artifact store",
         conversation_id,
+        agent_name,
     )
     return storage_dir
 
 
 def _persist_executor_storage(
     conversation_id: str,
+    agent_name: str,
     storage_dir: Path,
 ) -> None:
     """
-    Snapshot the executor storage directory and upload it to
-    the artifact store.
+    Snapshot the executor storage directory to the artifact store.
 
-    Skips persistence if the artifact store is not configured
-    or the directory is empty.
+    Called after every task so the artifact store stays current for
+    server restart recovery. The directory itself is NOT deleted.
 
-    :param conversation_id: The conversation ID, e.g.
-        ``"conv_abc123"``.
-    :param storage_dir: The executor's working directory to
-        snapshot.
+    :param conversation_id: e.g. ``"conv_abc123"``.
+    :param agent_name: e.g. ``"research-agent"``.
+    :param storage_dir: The executor's working directory to snapshot.
     """
     artifact_store = get_artifact_store()
     if artifact_store is None:
         return
 
-    # Skip if the directory is empty (nothing to persist).
     if not any(storage_dir.iterdir()):
         return
 
@@ -3079,24 +3104,14 @@ def _persist_executor_storage(
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         for child in storage_dir.iterdir():
             tf.add(child, arcname=child.name)
-    key = f"{_EXECUTOR_STORAGE_KEY_PREFIX}/{conversation_id}.tar.gz"
+    key = _storage_artifact_key(conversation_id, agent_name)
     artifact_store.put(key, buf.getvalue())
     _logger.debug(
-        "persisted executor storage for %s (%d bytes)",
+        "persisted executor storage for %s/%s (%d bytes)",
         conversation_id,
+        agent_name,
         buf.tell(),
     )
-
-
-def _cleanup_executor_storage(storage_dir: Path) -> None:
-    """
-    Remove the temporary executor storage directory.
-
-    :param storage_dir: The temp directory to remove.
-    """
-    import shutil
-
-    shutil.rmtree(storage_dir, ignore_errors=True)
 
 
 def _build_executor_context(
@@ -3390,16 +3405,13 @@ def _run_agent_loop(
         model=llm_config.model,
         connection=llm_config.connection,
     )
-    # If the executor has a live subprocess for this conversation,
-    # reuse its stable storage dir directly — no tempdir creation or
-    # artifact store restore needed; the subprocess still has the
-    # directory open with current state.
-    # Otherwise, create a fresh temp dir and restore from artifact store.
-    existing_storage = executor.get_storage_dir(conversation_id)
-    if existing_storage is not None:
-        storage_dir = existing_storage
-    else:
-        storage_dir = _restore_executor_storage(conversation_id)
+    # Stable storage dir scoped to (conversation, agent). Reused across
+    # tasks — only restored from artifact store if empty (first task or
+    # server restart).
+    storage_dir = _get_or_restore_executor_storage(
+        conversation_id,
+        agent_name,
+    )
     executor_context = _build_executor_context(
         task_id,
         conversation_id,
@@ -3582,14 +3594,13 @@ def _run_agent_loop(
         )
     finally:
         executor.on_task_end(executor_context)
-        # Snapshot executor storage to artifact store so it
-        # survives server restarts (e.g. Claude SDK session state).
-        _persist_executor_storage(conversation_id, storage_dir)
-        # Only clean up the temp dir if no live subprocess is still
-        # using it. Persistent executors (e.g. ClaudeAgentsExecutor)
-        # keep the subprocess's cwd alive between tasks.
-        if not executor.holds_storage(conversation_id):
-            _cleanup_executor_storage(storage_dir)
+        # Snapshot to artifact store for server restart recovery.
+        # The directory itself stays on disk for the next task.
+        _persist_executor_storage(
+            conversation_id,
+            agent_name,
+            storage_dir,
+        )
         # Persist a compaction item if Layer 2 ran during this
         # execution. Idempotent — safe to call on crash recovery
         # replay because _maybe_persist_compaction_item checks

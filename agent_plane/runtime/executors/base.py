@@ -20,7 +20,6 @@ from typing_extensions import Self
 from agent_plane.spec import AgentSpec
 from agent_plane.spec.types import LLMConfig
 
-
 # ── Event types ────────────────────────────────────────────
 
 
@@ -365,37 +364,5 @@ class Executor(abc.ABC):
         skips both compaction and the ``@step`` wrapper.
 
         :returns: Token limit (e.g. ``128000``) or None.
-        """
-        return None
-
-    def holds_storage(self, conversation_id: str) -> bool:
-        """
-        Return True if this executor has a live subprocess using
-        ``storage_dir`` for ``conversation_id``.
-
-        When True, the workflow skips ``_cleanup_executor_storage``
-        so the subprocess's working directory is not deleted between
-        tasks.
-
-        :param conversation_id: Conversation identifier, e.g.
-            ``"conv_abc123"``.
-        :returns: False by default; overridden by executors with
-            persistent subprocesses.
-        """
-        return False
-
-    def get_storage_dir(self, conversation_id: str) -> Path | None:
-        """
-        Return the stable storage directory for ``conversation_id``
-        if a live subprocess is using it, else None.
-
-        When non-None, the workflow skips ``_restore_executor_storage``
-        (no tempdir creation or artifact store restore needed — the
-        subprocess still has the directory open).
-
-        :param conversation_id: Conversation identifier, e.g.
-            ``"conv_abc123"``.
-        :returns: Path to the live storage directory, or None if no
-            persistent subprocess exists.
         """
         return None

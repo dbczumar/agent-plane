@@ -103,9 +103,6 @@ class _ClientState:
         if using the SDK default.
     :param callback_holder: Updated each task so MCP tool handlers
         route to the current task's ``await_tool_output``.
-    :param storage_dir: The subprocess's working directory. Stable
-        across tasks — the workflow must not clean it up while this
-        state exists.
     :param last_used: ``time.monotonic()`` timestamp of the last
         ``on_task_end`` call. Used for TTL-based eviction.
     """
@@ -113,13 +110,17 @@ class _ClientState:
     client: Any
     model: str | None
     callback_holder: _CallbackHolder
-    storage_dir: Path
     last_used: float
 
 
 class _ClientRegistry:
     """
     Process-lifetime registry of SDK clients keyed by conversation ID.
+
+    Owns a single shared asyncio event loop running in a background
+    thread. All SDK clients are created and queried in this loop so
+    that async objects (connections, streams) are never moved between
+    loops.
 
     SDK subprocesses persist across tasks so bash session state (cwd,
     env vars, running processes) survives between conversation turns.
@@ -137,6 +138,22 @@ class _ClientRegistry:
         self._clients: dict[str, _ClientState] = {}
         self._lock = threading.Lock()
         self._ttl = ttl_seconds
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(
+            target=self._loop.run_forever,
+            daemon=True,
+            name="sdk-event-loop",
+        )
+        self._loop_thread.start()
+
+    @property
+    def loop(self) -> asyncio.AbstractEventLoop:
+        """
+        The shared event loop all SDK clients run in.
+
+        :returns: The asyncio event loop.
+        """
+        return self._loop
 
     def get(self, conv_id: str) -> _ClientState | None:
         """
@@ -190,9 +207,8 @@ class _ClientRegistry:
         """
         Disconnect and remove clients idle longer than ``ttl_seconds``.
 
-        Called from ``on_task_end`` so each task completion sweeps expired
-        clients. Iterates the registry once — O(n) in active conversations,
-        negligible in practice.
+        Submits disconnect coroutines to the shared event loop so they
+        run in the same context the clients were created in.
         """
         now = time.monotonic()
         with self._lock:
@@ -204,11 +220,10 @@ class _ClientRegistry:
             evicted = [self._clients.pop(conv_id) for conv_id in stale]
         for state in evicted:
             _logger.debug(
-                "evicting stale SDK client for conversation %s (idle %.0fs)",
-                state.storage_dir,
+                "evicting stale SDK client (idle %.0fs)",
                 now - state.last_used,
             )
-            _disconnect_client(state.client)
+            _disconnect_in_loop(state.client, self._loop)
 
 
 # Process-lifetime singleton — persists across executor instances.
@@ -393,34 +408,6 @@ class ClaudeAgentsExecutor(Executor):
         _client_registry.touch(context.conversation_id)
         _client_registry.evict_stale()
 
-    def holds_storage(self, conversation_id: str) -> bool:
-        """
-        Return True when a live SDK subprocess is using the storage dir.
-
-        Tells the workflow not to delete the temp directory at task end —
-        the subprocess's cwd must remain intact between tasks.
-
-        :param conversation_id: Conversation identifier, e.g.
-            ``"conv_abc123"``.
-        :returns: True if the registry has an entry for this conversation.
-        """
-        return conversation_id in _client_registry
-
-    def get_storage_dir(self, conversation_id: str) -> Path | None:
-        """
-        Return the live subprocess's storage directory, or None.
-
-        When non-None, the workflow skips tempdir creation and artifact
-        store restore — the subprocess already has the directory open with
-        its current state.
-
-        :param conversation_id: Conversation identifier, e.g.
-            ``"conv_abc123"``.
-        :returns: Stable path to the storage dir, or None if no live client.
-        """
-        state = _client_registry.get(conversation_id)
-        return state.storage_dir if state is not None else None
-
     def run_turn(
         self,
         messages: list[dict[str, Any]],
@@ -448,30 +435,26 @@ class ClaudeAgentsExecutor(Executor):
         event_queue: queue.Queue[ExecutorEvent | None] = queue.Queue(
             maxsize=256,
         )
-
-        def _run() -> None:
-            """Run the async turn in a dedicated event loop."""
-            asyncio.run(
-                _async_turn(
-                    executor=self,
-                    messages=messages,
-                    tools=tools,
-                    system_prompt=system_prompt,
-                    llm_config=llm_config,
-                    context=context,
-                    event_queue=event_queue,
-                )
-            )
-            event_queue.put(None)
-
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
+        # All SDK operations run in the registry's shared event loop
+        # so async objects (connections, streams) are never moved
+        # between loops.
+        asyncio.run_coroutine_threadsafe(
+            _async_turn(
+                executor=self,
+                messages=messages,
+                tools=tools,
+                system_prompt=system_prompt,
+                llm_config=llm_config,
+                context=context,
+                event_queue=event_queue,
+            ),
+            _client_registry.loop,
+        )
         while True:
             event = event_queue.get()
             if event is None:
                 break
             yield event
-        thread.join()
 
 
 # ── Async implementation (runs in the bridge thread) ──────
@@ -489,11 +472,12 @@ async def _async_turn(
     """
     Async implementation of one SDK turn.
 
-    Builds the prompt, configures the SDK client, sends the query,
-    and maps the SDK stream events into executor events pushed to
-    the queue.
+    Runs in the registry's shared event loop. Builds the prompt,
+    configures the SDK client (on first task), sends the query, and
+    maps the SDK stream events into executor events pushed to the
+    queue. Puts ``None`` on ``event_queue`` when done.
 
-    :param executor: The executor instance (for client state).
+    :param executor: The executor instance.
     :param messages: Responses API input items.
     :param tools: Client-side tool schemas.
     :param system_prompt: System instructions.
@@ -509,6 +493,7 @@ async def _async_turn(
     prompt = _build_prompt(messages, context.storage_dir, is_continuing)
     if prompt is None:
         event_queue.put(TurnComplete(text=None))
+        event_queue.put(None)
         return
 
     if existing is not None:
@@ -532,14 +517,12 @@ async def _async_turn(
             options,
             llm_config,
             holder,
-            context.storage_dir,
         )
 
     # Point the MCP server's callback at this task before querying.
-    # Safe: _async_turn runs in a single asyncio event loop thread.
-    # The MCP handler (which reads holder.callback) only fires during
-    # client.query(), so set→query→clear is strictly sequential.
-    # Cleared in finally so stale callbacks never route to a dead task.
+    # Safe: runs in a single event loop thread. The MCP handler reads
+    # holder.callback only during client.query(), so the sequence
+    # set → query → clear is strictly sequential.
     holder.callback = context.await_tool_output
     try:
         await client.query(prompt, session_id=conv_id)
@@ -549,6 +532,7 @@ async def _async_turn(
         event_queue.put(ExecutorError(message=f"Claude SDK error: {exc}"))
     finally:
         holder.callback = None
+        event_queue.put(None)
 
 
 def _build_prompt(
@@ -742,7 +726,6 @@ async def _get_or_create_client(
     options: Any,
     llm_config: LLMConfig,
     holder: _CallbackHolder,
-    storage_dir: Path,
 ) -> Any:
     """
     Create and register a new SDK client for a conversation.
@@ -755,20 +738,16 @@ async def _get_or_create_client(
     :param options: ``ClaudeAgentOptions`` for client creation.
     :param llm_config: LLM configuration (for model tracking).
     :param holder: The callback holder to store with the client state.
-    :param storage_dir: The subprocess's working directory. Stored so
-        the workflow can return the same path on subsequent tasks.
     :returns: The connected ``ClaudeSDKClient`` instance.
     """
     client = sdk.ClaudeSDKClient(options)
     await client.connect()
-    model = llm_config.model
     _client_registry.register(
         conv_id,
         _ClientState(
             client=client,
-            model=model,
+            model=llm_config.model,
             callback_holder=holder,
-            storage_dir=storage_dir,
             last_used=time.monotonic(),
         ),
     )
@@ -1092,14 +1071,26 @@ async def _close_client_async(conv_id: str) -> None:
             )
 
 
-def _disconnect_client(client: Any) -> None:
+def _disconnect_in_loop(
+    client: Any,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
     """
-    Synchronously disconnect an SDK client.
+    Disconnect an SDK client by submitting to the shared event loop.
+
+    Used during TTL eviction (called from a workflow thread, not the
+    event loop thread). Does not stop the loop — it's shared across
+    all conversations.
 
     :param client: The ``ClaudeSDKClient`` to disconnect.
+    :param loop: The shared event loop to submit to.
     """
     try:
-        asyncio.run(client.disconnect())
+        future = asyncio.run_coroutine_threadsafe(
+            client.disconnect(),
+            loop,
+        )
+        future.result(timeout=5.0)
     except Exception:
         _logger.warning(
             "Failed to disconnect Claude SDK client",

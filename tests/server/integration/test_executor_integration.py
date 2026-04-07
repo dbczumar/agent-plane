@@ -303,22 +303,24 @@ async def test_executor_storage_persists_across_tasks(
     are restored from the artifact store and available during task 2
     on the same conversation.
 
-    Exercises the full lifecycle: ``_restore_executor_storage`` →
+    Exercises the full lifecycle: ``_get_or_restore_executor_storage`` →
     executor writes marker → ``_persist_executor_storage`` →
-    ``_cleanup_executor_storage`` → next task restores marker.
+    next task finds marker on disk (or restores from artifact store).
 
     **What breaks if the feature is removed:**
 
-    - If ``_persist_executor_storage`` is deleted, the marker file
-      is lost after task 1 ends → ``marker_found_on_restore`` is
-      False on task 2 → assertion fails.
-    - If ``_restore_executor_storage`` is deleted, the artifact
-      snapshot is never extracted → same failure.
-    - If ``_cleanup_executor_storage`` leaves the temp dir around
-      but the artifact store is empty, a fresh temp dir on
-      task 2 won't have the marker.
+    - If ``_persist_executor_storage`` is deleted, the artifact
+      snapshot is lost after server restart → storage is empty.
+    - If ``_get_or_restore_executor_storage`` is deleted, the
+      stable directory is never created → executor has no storage.
     """
     await create_test_agent(client)
+
+    # Use tmp_path so tests don't write to ~/.agent-plane.
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._EXECUTOR_STORAGE_BASE",
+        tmp_path / "exec_storage",
+    )
 
     # Task 1: executor writes marker, workflow persists it.
     probe_1 = _StorageProbe()
@@ -346,7 +348,7 @@ async def test_executor_storage_persists_across_tasks(
 
     # Verify the artifact store has the snapshot.
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    artifact_key = f"executor_storage/{conv_id}.tar.gz"
+    artifact_key = f"executor_storage/{conv_id}/test-agent.tar.gz"
     assert artifact_store.exists(artifact_key), (
         "Artifact snapshot not found after task 1. "
         "_persist_executor_storage did not run or the key "

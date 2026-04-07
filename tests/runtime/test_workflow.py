@@ -26,7 +26,7 @@ from agent_plane.runtime.compaction import CompactionResult, SummaryMetadata, _C
 from agent_plane.runtime.executor import DefaultExecutor, ToolCallRequested, ToolResult
 from agent_plane.runtime.workflow import (
     _build_await_tool_output,
-    _cleanup_executor_storage,
+    _get_or_restore_executor_storage,
     _load_initial_history,
     _maybe_persist_compaction_item,
     _persist_executor_storage,
@@ -36,7 +36,6 @@ from agent_plane.runtime.workflow import (
     _reactive_compact,
     _recover_spawn_state,
     _register_client_tool_call,
-    _restore_executor_storage,
     _run_agent_loop,
     _split_tool_calls,
     _sync_history,
@@ -1838,11 +1837,19 @@ def test_executor_storage_round_trip(
         "agent_plane.runtime.workflow.get_artifact_store",
         lambda: store,
     )
+    # Use tmp_path as the storage base so the test gets a clean directory.
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._EXECUTOR_STORAGE_BASE",
+        tmp_path / "storage_base",
+    )
 
     source = _populate_executor_dir(tmp_path)
     conv_id = "conv_test_123"
-    _persist_executor_storage(conv_id, source)
-    restored = _restore_executor_storage(conv_id)
+    agent_name = "test-agent"
+    _persist_executor_storage(conv_id, agent_name, source)
+
+    # Restore into a fresh directory (empty = triggers artifact restore).
+    restored = _get_or_restore_executor_storage(conv_id, agent_name)
 
     assert (restored / "session.json").read_text() == '{"turn": 1}', (
         "session.json content lost during round-trip."
@@ -1851,32 +1858,31 @@ def test_executor_storage_round_trip(
         ".claude/transcript.txt lost — nested dirs must be preserved."
     )
 
-    _cleanup_executor_storage(restored)
-    assert not restored.exists(), "cleanup should remove the temp directory."
-
 
 def test_executor_storage_fresh_conversation(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     First conversation turn — no snapshot in artifact store.
 
-    ``_restore_executor_storage`` must return an empty temp
+    ``_get_or_restore_executor_storage`` must return an empty
     directory without raising.
     """
     monkeypatch.setattr(
         "agent_plane.runtime.workflow.get_artifact_store",
         lambda: None,
     )
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._EXECUTOR_STORAGE_BASE",
+        tmp_path / "storage_base",
+    )
 
-    storage_dir = _restore_executor_storage("conv_new")
+    storage_dir = _get_or_restore_executor_storage("conv_new", "test-agent")
 
     # Directory exists and is empty.
     assert storage_dir.exists()
     assert list(storage_dir.iterdir()) == [], "Fresh storage dir should be empty."
-
-    _cleanup_executor_storage(storage_dir)
-    assert not storage_dir.exists(), "cleanup should remove the temp directory."
 
 
 def test_executor_storage_skip_persist_when_empty(
@@ -1900,10 +1906,10 @@ def test_executor_storage_skip_persist_when_empty(
     empty_dir = tmp_path / "empty"
     empty_dir.mkdir()
 
-    _persist_executor_storage("conv_empty", empty_dir)
+    _persist_executor_storage("conv_empty", "test-agent", empty_dir)
 
     # No artifact should have been created.
-    assert not store.exists("executor_storage/conv_empty.tar.gz"), (
+    assert not store.exists("executor_storage/conv_empty/test-agent.tar.gz"), (
         "Empty directories should not produce an artifact."
     )
 
