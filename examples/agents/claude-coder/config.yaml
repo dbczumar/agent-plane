@@ -1,0 +1,25 @@
+spec_version: 1
+
+name: claude-coder
+description: A coding assistant powered by the Claude Agent SDK (Claude Code).
+
+executor:
+  type: claude_sdk
+
+llm:
+  # Model used by the Claude Agent SDK under the hood.
+  model: claude-sonnet-4-20250514
+
+tools:
+  builtins:
+    # "claude:" prefix maps to Claude Code's built-in tools.
+    # These are executed server-side by the SDK, not tunneled
+    # to the client.
+    - claude:Bash
+    - claude:Read
+    - claude:Edit
+    - claude:Write
+    - claude:Glob
+    - claude:Grep
+
+instructions: INSTRUCTIONS.md

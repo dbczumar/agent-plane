@@ -695,37 +695,71 @@ def _checkpointed_turn(
     return events
 
 
+def _event_to_sse_dict(event: ExecutorEvent) -> dict[str, Any] | None:
+    """
+    Convert a streaming executor event to an SSE event dict.
+
+    Returns ``None`` for event types that are not streamed (e.g.
+    ``TurnComplete``, ``ToolCallObserved``) — those are handled
+    by the loop body, not the SSE stream.
+
+    :param event: The executor event to convert.
+    :returns: An SSE-ready dict, or ``None`` if not streamable.
+    """
+    if isinstance(event, TextChunk):
+        return {"type": "response.output_text.delta", "delta": event.text}
+    if isinstance(event, ReasoningChunk):
+        sse_type = _EXECUTOR_REASONING_SSE_TYPES[event.event_type]
+        payload: dict[str, Any] = {"type": sse_type}
+        if event.delta:
+            payload["delta"] = event.delta
+        return payload
+    if isinstance(event, ExecutorNativeToolOutput):
+        return {"type": "response.output_item.done", "item": event.item}
+    return None
+
+
 def _emit_executor_streaming_event(
     task_id: str,
     event: ExecutorEvent,
 ) -> None:
     """
-    Emit an SSE event for a streaming executor event.
+    Emit an SSE event via the durable + live stream.
 
-    Only emits for ``TextChunk``, ``ReasoningChunk``, and
-    ``NativeToolOutput`` — other event types are handled by the
-    loop body, not the SSE stream.
+    Requires DBOS step context (used inside ``@step`` for
+    workflow-managed executors). For executor-managed executors
+    that skip ``@step``, use ``_emit_executor_live_only``
+    instead.
 
     :param task_id: Task identifier for SSE routing, e.g.
         ``"task_abc123"``.
     :param event: The executor event to potentially emit.
     """
-    if isinstance(event, TextChunk):
-        _write_output(
-            task_id,
-            {"type": "response.output_text.delta", "delta": event.text},
-        )
-    elif isinstance(event, ReasoningChunk):
-        sse_type = _EXECUTOR_REASONING_SSE_TYPES[event.event_type]
-        payload: dict[str, Any] = {"type": sse_type}
-        if event.delta:
-            payload["delta"] = event.delta
-        _write_output(task_id, payload)
-    elif isinstance(event, ExecutorNativeToolOutput):
-        _write_output(
-            task_id,
-            {"type": "response.output_item.done", "item": event.item},
-        )
+    sse = _event_to_sse_dict(event)
+    if sse is not None:
+        _write_output(task_id, sse)
+
+
+def _emit_executor_live_only(
+    task_id: str,
+    event: ExecutorEvent,
+) -> None:
+    """
+    Emit an SSE event via the live stream only (no durable stream).
+
+    Used by ``_consume_executor_live`` for executor-managed
+    executors (``max_context_tokens() is None``) that run outside
+    ``@step()``. ``write_stream`` requires a DBOS step context,
+    which is not available on this path. ``_live_publish`` is
+    thread-safe and context-free.
+
+    :param task_id: Task identifier for SSE routing, e.g.
+        ``"task_abc123"``.
+    :param event: The executor event to potentially emit.
+    """
+    sse = _event_to_sse_dict(event)
+    if sse is not None:
+        _live_publish(task_id, sse)
 
 
 # ── Executor turn → response dict bridge ──────────────────
@@ -830,7 +864,9 @@ def _consume_executor_live(
         context,
     ):
         _logger.info("executor event: %s", type(event).__name__)
-        _emit_executor_streaming_event(task_id, event)
+        # Live-only: no DBOS step context on this path, so
+        # _write_output (which calls write_stream) would crash.
+        _emit_executor_live_only(task_id, event)
         events.append(event)
     _logger.info("total executor events: %d", len(events))
     return events
