@@ -81,6 +81,7 @@ from agent_plane.runtime.executor import (
     ExecutorEvent,
     ReasoningChunk,
     TextChunk,
+    ToolCallObserved,
     ToolCallRequested,
     ToolResult,
     TurnComplete,
@@ -719,6 +720,41 @@ def _event_to_sse_dict(event: ExecutorEvent) -> dict[str, Any] | None:
     return None
 
 
+def _observed_tool_call_sse_dicts(
+    event: ToolCallObserved,
+) -> list[dict[str, Any]]:
+    """
+    Convert a ``ToolCallObserved`` to two SSE event dicts.
+
+    The first is a ``function_call`` item (the tool invocation),
+    the second is a ``function_call_output`` item (the result).
+    Both are wrapped in ``response.output_item.done`` envelopes.
+
+    :param event: The observed tool call event.
+    :returns: Two-element list of SSE-ready dicts.
+    """
+    return [
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": event.call_id,
+                "name": event.name,
+                "arguments": json.dumps(event.arguments),
+                "status": "completed",
+            },
+        },
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call_output",
+                "call_id": event.call_id,
+                "output": event.result,
+            },
+        },
+    ]
+
+
 def _emit_executor_streaming_event(
     task_id: str,
     event: ExecutorEvent,
@@ -735,6 +771,10 @@ def _emit_executor_streaming_event(
         ``"task_abc123"``.
     :param event: The executor event to potentially emit.
     """
+    if isinstance(event, ToolCallObserved):
+        for obs_sse in _observed_tool_call_sse_dicts(event):
+            _write_output(task_id, obs_sse)
+        return
     sse = _event_to_sse_dict(event)
     if sse is not None:
         _write_output(task_id, sse)
@@ -757,6 +797,10 @@ def _emit_executor_live_only(
         ``"task_abc123"``.
     :param event: The executor event to potentially emit.
     """
+    if isinstance(event, ToolCallObserved):
+        for obs_sse in _observed_tool_call_sse_dicts(event):
+            _live_publish(task_id, obs_sse)
+        return
     sse = _event_to_sse_dict(event)
     if sse is not None:
         _live_publish(task_id, sse)
@@ -887,12 +931,14 @@ def _events_to_response_dict(
     :param events: Collected executor events from a single turn.
     :param model: The model identifier, e.g. ``"openai/gpt-4o"``.
     :returns: Response dict with ``"model"``, ``"text"``,
-        ``"tool_calls"``, ``"native_tool_items"`` keys, or
+        ``"tool_calls"``, ``"native_tool_items"``,
+        ``"observed_tool_calls"`` keys, or
         ``_ContextWindowOverflow``.
     :raises PermanentLLMError: On executor error events.
     """
     tool_calls: list[dict[str, Any]] = []
     native_items: list[dict[str, Any]] = []
+    observed: list[ToolCallObserved] = []
     turn_text: str | None = None
 
     for event in events:
@@ -907,6 +953,8 @@ def _events_to_response_dict(
             )
         elif isinstance(event, ExecutorNativeToolOutput):
             native_items.append(event.item)
+        elif isinstance(event, ToolCallObserved):
+            observed.append(event)
         elif isinstance(event, TurnComplete):
             turn_text = event.text
         elif isinstance(event, ExecutorContextWindowExceeded):
@@ -925,6 +973,7 @@ def _events_to_response_dict(
         "text": turn_text,
         "tool_calls": tool_calls,
         "native_tool_items": native_items,
+        "observed_tool_calls": observed,
     }
 
 
@@ -1330,6 +1379,99 @@ def _emit_native_tool_items(
                 "output_index": len(output_items) - 1,
             },
         )
+
+
+def _build_observed_tool_items(
+    task_id: str,
+    agent_name: str,
+    observed: list[ToolCallObserved],
+) -> list[NewConversationItem]:
+    """
+    Build conversation items for executor-observed tool calls.
+
+    Each observation produces a ``function_call`` / ``function_call_output``
+    pair. Mirrors the structure used by ``_build_function_call_items`` for
+    workflow-managed tool calls.
+
+    :param task_id: The task identifier used as ``response_id``,
+        e.g. ``"task_abc123"``.
+    :param agent_name: The agent's registered name, e.g.
+        ``"research-agent"``. Used as the ``agent`` field in
+        ``FunctionCallData``.
+    :param observed: List of observed tool call events.
+    :returns: Alternating function_call / function_call_output items.
+    """
+    items: list[NewConversationItem] = []
+    for obs in observed:
+        items.append(
+            NewConversationItem(
+                type="function_call",
+                response_id=task_id,
+                data=FunctionCallData(
+                    agent=agent_name,
+                    name=obs.name,
+                    arguments=json.dumps(obs.arguments),
+                    call_id=obs.call_id,
+                ),
+            )
+        )
+        items.append(
+            NewConversationItem(
+                type="function_call_output",
+                response_id=task_id,
+                data=FunctionCallOutputData(
+                    call_id=obs.call_id,
+                    output=obs.result,
+                ),
+            )
+        )
+    return items
+
+
+def _persist_observed_tool_calls(
+    task_id: str,
+    conversation_id: str,
+    agent_name: str,
+    llm_resp: dict[str, Any],
+    history: list[ConversationItem],
+    output_items: list[dict[str, Any]],
+    conv_store: ConversationStore,
+) -> str | None:
+    """
+    Persist executor-observed tool calls to the conversation store.
+
+    SSE emission already happened during the turn via
+    ``_emit_executor_live_only`` or ``_emit_executor_streaming_event``,
+    so this function only persists and extends ``history`` /
+    ``output_items`` — it does NOT re-emit SSE.
+
+    :param task_id: The task identifier used as ``response_id``,
+        e.g. ``"task_abc123"``.
+    :param conversation_id: The conversation to append to,
+        e.g. ``"conv_abc123"``.
+    :param agent_name: The agent's registered name, e.g.
+        ``"research-agent"``.
+    :param llm_resp: The response dict from
+        ``_events_to_response_dict``. The ``"observed_tool_calls"``
+        key is always present (never needs a fallback).
+    :param history: Mutable conversation history. Persisted items
+        are appended in place.
+    :param output_items: Mutable list of API-format output dicts.
+        Persisted items are appended in place.
+    :param conv_store: The ConversationStore to persist to.
+    :returns: The ID of the last persisted item (new cursor),
+        or ``None`` if nothing was persisted.
+    """
+    observed: list[ToolCallObserved] = llm_resp["observed_tool_calls"]
+    if not observed:
+        return None
+
+    new_items = _build_observed_tool_items(task_id, agent_name, observed)
+    persisted = conv_store.append(conversation_id, new_items)
+    for item in persisted:
+        history.append(item)
+        output_items.append(_item_to_output(item))
+    return persisted[-1].id
 
 
 # ── Extracted helpers ─────────────────────────────────────
@@ -3292,6 +3434,24 @@ def _run_agent_loop(
             # Emit provider-native tool items (e.g. web_search_call) to
             # output before handling function calls or final response.
             _emit_native_tool_items(task_id, llm_resp, output_items)
+
+            # Persist executor-observed tool calls (e.g. Claude SDK
+            # running tools internally). SSE was already emitted
+            # during the turn; this only persists to the store.
+            # Advance last_seen past the persisted items so
+            # _check_steering_inbox (inside _handle_final_response)
+            # doesn't treat them as late steered messages.
+            obs_cursor = _persist_observed_tool_calls(
+                task_id,
+                conversation_id,
+                agent_name,
+                llm_resp,
+                history,
+                output_items,
+                conv_store,
+            )
+            if obs_cursor is not None:
+                last_seen = obs_cursor
 
             if not _has_tool_calls(llm_resp):
                 # Auto-collect outstanding sub-agents before completing.

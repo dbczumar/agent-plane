@@ -9,7 +9,6 @@ through the HTTP server.
 from __future__ import annotations
 
 import asyncio
-import json
 import threading
 import time
 from collections.abc import Iterator
@@ -23,16 +22,17 @@ import pytest
 from agent_plane.runtime.executor import (
     Executor,
     ExecutorContext,
-    TextChunk,
+    ToolCallObserved,
     ToolCallRequested,
-    ToolResult,
     TurnComplete,
 )
 from agent_plane.spec import AgentSpec
 from agent_plane.spec.types import LLMConfig
 from agent_plane.stores.artifact_store.local import LocalArtifactStore
+from agent_plane.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
 from agent_plane.stores.task_store.sqlalchemy_store import SqlAlchemyTaskStore
-
 from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import create_test_agent, create_test_response
 
@@ -235,9 +235,7 @@ async def _poll_until_terminal(
         if body["status"] in ("completed", "failed"):
             return body
         await asyncio.sleep(0.1)
-    raise AssertionError(
-        f"Response {response_id} never reached terminal state"
-    )
+    raise AssertionError(f"Response {response_id} never reached terminal state")
 
 
 async def _poll_for_pending(
@@ -263,10 +261,7 @@ async def _poll_for_pending(
         pending = [
             item
             for item in body.get("output", [])
-            if (
-                item.get("type") == "function_call"
-                and item.get("status") == "action_required"
-            )
+            if (item.get("type") == "function_call" and item.get("status") == "action_required")
         ]
         if pending:
             return pending
@@ -334,7 +329,8 @@ async def test_executor_storage_persists_across_tasks(
     )
 
     resp_1 = await create_test_response(
-        client, input_text="First turn",
+        client,
+        input_text="First turn",
     )
     response_1_id = resp_1.body["id"]
     conv_id = resp_1.body["conversation"]["id"]
@@ -488,4 +484,199 @@ async def test_await_tool_output_park_patch_resume(
     assert probe.tool_result_received == "file contents here", (
         f"Probe shows executor got {probe.tool_result_received!r}. "
         f"_poll_for_tool_result returned wrong content."
+    )
+
+
+# ── ToolCallObserved executor stub ──────────────────────
+
+
+class _ObservedToolExecutor(Executor):
+    """
+    Executor that yields ``ToolCallObserved`` events to simulate
+    an executor (e.g. Claude SDK) running tools internally.
+
+    Returns ``None`` from ``max_context_tokens()`` so the workflow
+    uses the executor-managed (live-only) path.
+    """
+
+    @classmethod
+    def from_spec(cls, spec: AgentSpec) -> _ObservedToolExecutor:
+        """
+        Not used — instances are constructed directly by the test.
+
+        :param spec: Ignored.
+        :returns: Never called.
+        """
+        raise NotImplementedError
+
+    def run_turn(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        system_prompt: str,
+        llm_config: LLMConfig,
+        context: ExecutorContext,
+    ) -> Iterator[ToolCallObserved | TurnComplete]:
+        """
+        Yield two ``ToolCallObserved`` events and a ``TurnComplete``.
+
+        The observations simulate an executor that ran ``Read`` and
+        ``Bash`` tools internally before producing a final response.
+
+        :param messages: Ignored.
+        :param tools: Ignored.
+        :param system_prompt: Ignored.
+        :param llm_config: Ignored.
+        :param context: Ignored.
+        """
+        yield ToolCallObserved(
+            call_id="obs_read_1",
+            name="Read",
+            arguments={"file_path": "/tmp/test.txt"},
+            result="file contents here",
+            status="completed",
+            duration_ms=42.0,
+        )
+        yield ToolCallObserved(
+            call_id="obs_bash_1",
+            name="Bash",
+            arguments={"command": "echo hello"},
+            result="hello\n",
+            status="completed",
+            duration_ms=15.0,
+        )
+        yield TurnComplete(text="Done reading and running.")
+
+    def max_context_tokens(self) -> int | None:
+        """
+        Return None so the workflow uses the executor-managed path.
+
+        :returns: None.
+        """
+        return None
+
+
+# ── ToolCallObserved test ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_observed_tool_calls_persisted_and_in_output(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``ToolCallObserved`` events from an executor-managed executor
+    are persisted to the conversation store as ``function_call`` +
+    ``function_call_output`` pairs and appear in the GET response
+    output.
+
+    Exercises the full path: executor yields ``ToolCallObserved`` →
+    ``_emit_executor_live_only`` streams SSE → ``_events_to_response_dict``
+    collects into ``"observed_tool_calls"`` → ``_persist_observed_tool_calls``
+    writes to conversation store → GET rebuilds output from store.
+
+    **What breaks if the feature is removed:**
+
+    - If ``_emit_executor_live_only`` ignores ``ToolCallObserved``,
+      SSE clients never see tool call events during the turn.
+    - If ``_events_to_response_dict`` drops ``ToolCallObserved``,
+      ``_persist_observed_tool_calls`` has nothing to persist →
+      the GET response output is missing function_call items.
+    - If ``_persist_observed_tool_calls`` is deleted, the GET
+      response output lacks function_call items even though SSE
+      streamed them → assertion on output items fails.
+    """
+    await create_test_agent(client)
+
+    executor = _ObservedToolExecutor()
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._create_executor",
+        lambda _spec: executor,
+    )
+
+    resp = await create_test_response(
+        client,
+        input_text="Read the file and run the command",
+        background=True,
+    )
+    response_id = resp.body["id"]
+    assert resp.body["status"] == "queued"
+
+    body = await _poll_until_terminal(client, response_id)
+    assert body["status"] == "completed", (
+        f"Expected completed, got {body['status']}. The executor may have raised an error."
+    )
+
+    # Verify the final text made it through.
+    output_texts = _extract_output_texts(body)
+    assert any("Done reading and running." in t for t in output_texts), (
+        f"Expected 'Done reading and running.' in output, got "
+        f"{output_texts}. TurnComplete text was lost."
+    )
+
+    # Verify function_call items appear in the GET response output.
+    # 2 ToolCallObserved → 2 function_call + 2 function_call_output items.
+    fc_items = [item for item in body.get("output", []) if item.get("type") == "function_call"]
+    fc_output_items = [
+        item for item in body.get("output", []) if item.get("type") == "function_call_output"
+    ]
+    # 2 function_call items: one for Read (obs_read_1), one for Bash (obs_bash_1).
+    assert len(fc_items) == 2, (
+        f"Expected 2 function_call items (Read + Bash), got "
+        f"{len(fc_items)}. If 0, _persist_observed_tool_calls "
+        f"did not run or _events_to_response_dict dropped the events."
+    )
+    # 2 function_call_output items: one for each observation.
+    assert len(fc_output_items) == 2, (
+        f"Expected 2 function_call_output items, got "
+        f"{len(fc_output_items)}. Observations were partially persisted."
+    )
+
+    # Verify the function_call items have the correct tool names
+    # and call_ids — proves the data traversed from executor event
+    # through _persist_observed_tool_calls to the conversation store.
+    fc_names = {item["name"] for item in fc_items}
+    assert fc_names == {"Read", "Bash"}, (
+        f"Expected tool names {{'Read', 'Bash'}}, got {fc_names}. "
+        f"Tool metadata was lost during persistence."
+    )
+    fc_call_ids = {item["call_id"] for item in fc_items}
+    assert fc_call_ids == {"obs_read_1", "obs_bash_1"}, (
+        f"Expected call_ids {{'obs_read_1', 'obs_bash_1'}}, got "
+        f"{fc_call_ids}. Call IDs were mutated during persistence."
+    )
+
+    # Verify the function_call_output items have the correct results.
+    fc_output_by_call_id = {item["call_id"]: item["output"] for item in fc_output_items}
+    assert fc_output_by_call_id["obs_read_1"] == "file contents here", (
+        f"Read tool output mismatch: {fc_output_by_call_id.get('obs_read_1')!r}."
+    )
+    assert fc_output_by_call_id["obs_bash_1"] == "hello\n", (
+        f"Bash tool output mismatch: {fc_output_by_call_id.get('obs_bash_1')!r}."
+    )
+
+    # Verify persistence: items exist in the conversation store.
+    conv_id = body["conversation"]["id"]
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    fc_store_items = conv_store.list_items(
+        conv_id,
+        type="function_call",
+    )
+    fc_output_store_items = conv_store.list_items(
+        conv_id,
+        type="function_call_output",
+    )
+    # 2 function_call rows persisted to the store.
+    assert len(fc_store_items.data) == 2, (
+        f"Expected 2 function_call rows in store, got "
+        f"{len(fc_store_items.data)}. _persist_observed_tool_calls "
+        f"did not write to the conversation store."
+    )
+    # 2 function_call_output rows persisted to the store.
+    assert len(fc_output_store_items.data) == 2, (
+        f"Expected 2 function_call_output rows in store, got "
+        f"{len(fc_output_store_items.data)}. Observations were "
+        f"partially persisted."
     )
