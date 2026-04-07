@@ -1453,7 +1453,8 @@ def _persist_observed_tool_calls(
         ``"research-agent"``.
     :param llm_resp: The response dict from
         ``_events_to_response_dict``. The ``"observed_tool_calls"``
-        key is always present (never needs a fallback).
+        key is present for executor-managed turns; absent for
+        checkpointed turns that use ``_executor_turn_with_compaction``.
     :param history: Mutable conversation history. Persisted items
         are appended in place.
     :param output_items: Mutable list of API-format output dicts.
@@ -1462,7 +1463,9 @@ def _persist_observed_tool_calls(
     :returns: The ID of the last persisted item (new cursor),
         or ``None`` if nothing was persisted.
     """
-    observed: list[ToolCallObserved] = llm_resp["observed_tool_calls"]
+    # Key is present for executor-managed turns (_events_to_response_dict)
+    # but absent for checkpointed turns (_executor_turn_with_compaction).
+    observed: list[ToolCallObserved] = llm_resp.get("observed_tool_calls", [])
     if not observed:
         return None
 

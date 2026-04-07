@@ -281,7 +281,7 @@ def _extract_output_texts(body: dict[str, Any]) -> list[str]:
         blocks across all message items.
     """
     return [
-        block.get("text", "")
+        block["text"]
         for item in body.get("output", [])
         if item.get("type") == "message"
         for block in item.get("content", [])
@@ -679,4 +679,135 @@ async def test_observed_tool_calls_persisted_and_in_output(
         f"Expected 2 function_call_output rows in store, got "
         f"{len(fc_output_store_items.data)}. Observations were "
         f"partially persisted."
+    )
+
+
+class _TextOnlyExecutor(Executor):
+    """
+    Executor that yields only a ``TurnComplete`` with fixed text.
+
+    Returns ``None`` from ``max_context_tokens()`` so the workflow
+    uses the executor-managed path.
+
+    :param text: The response text to return.
+    """
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    @classmethod
+    def from_spec(cls, spec: AgentSpec) -> _TextOnlyExecutor:
+        """
+        Not used — instances are constructed directly by the test.
+
+        :param spec: Ignored.
+        :returns: Never called.
+        """
+        raise NotImplementedError
+
+    def run_turn(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        system_prompt: str,
+        llm_config: LLMConfig,
+        context: ExecutorContext,
+    ) -> Iterator[TurnComplete]:
+        """
+        Yield a single ``TurnComplete`` with the configured text.
+
+        :param messages: Ignored.
+        :param tools: Ignored.
+        :param system_prompt: Ignored.
+        :param llm_config: Ignored.
+        :param context: Ignored.
+        """
+        yield TurnComplete(text=self._text)
+
+    def max_context_tokens(self) -> int | None:
+        """
+        Return None so the workflow uses the executor-managed path.
+
+        :returns: None.
+        """
+        return None
+
+
+@pytest.mark.asyncio
+async def test_second_turn_works_after_observed_tool_calls(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A second turn on the same conversation succeeds when the first
+    turn persisted ``ToolCallObserved`` items (function_call +
+    function_call_output).
+
+    This catches regressions where persisted observed tool call
+    items in history break the second turn — e.g. the steering
+    inbox misinterpreting them as late messages, the executor
+    choking on function_call items in the message list, or
+    ``_handle_final_response`` failing because ``write_stream``
+    is called outside a step context.
+
+    **What breaks if the feature is wrong:**
+
+    - If ``_persist_observed_tool_calls`` doesn't advance
+      ``last_seen``, ``_check_steering_inbox`` sees the observed
+      items as steered messages → infinite loop (1000 iterations).
+    - If ``_handle_final_response`` / ``_persist_and_stream``
+      crashes on the executor-managed path, the second turn
+      fails with no output.
+    """
+    await create_test_agent(client)
+
+    # Turn 1: executor produces observed tool calls.
+    executor_1 = _ObservedToolExecutor()
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._create_executor",
+        lambda _spec: executor_1,
+    )
+
+    resp_1 = await create_test_response(
+        client,
+        input_text="Read the file",
+        background=True,
+    )
+    response_1_id = resp_1.body["id"]
+    body_1 = await _poll_until_terminal(client, response_1_id)
+    # First turn must complete for the test to be meaningful.
+    assert body_1["status"] == "completed", f"Turn 1 failed with status {body_1['status']}."
+
+    # Turn 2: same conversation, text-only response.
+    executor_2 = _TextOnlyExecutor("Second turn reply.")
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._create_executor",
+        lambda _spec: executor_2,
+    )
+
+    resp_2 = await create_test_response(
+        client,
+        input_text="Follow-up question",
+        previous_response_id=response_1_id,
+        background=True,
+    )
+    response_2_id = resp_2.body["id"]
+    body_2 = await _poll_until_terminal(client, response_2_id)
+
+    # Second turn must complete — not hang or fail.
+    assert body_2["status"] == "completed", (
+        f"Turn 2 failed with status {body_2['status']}. "
+        f"Observed tool call items from turn 1 may have broken "
+        f"the second turn (steering inbox, write_stream context, "
+        f"or message conversion)."
+    )
+
+    # Verify the response text proves the executor ran.
+    output_texts = _extract_output_texts(body_2)
+    assert any("Second turn reply." in t for t in output_texts), (
+        f"Expected 'Second turn reply.' in output, got "
+        f"{output_texts}. The second turn executor did not "
+        f"produce output."
     )
