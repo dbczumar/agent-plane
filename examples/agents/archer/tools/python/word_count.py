@@ -1,7 +1,12 @@
+# /// script
+# dependencies = ["ftfy>=6.0"]
+# ///
 """Count words, characters, and lines in text.
 
-A simple example of a local Python tool with no external dependencies.
-Demonstrates the ``SCHEMA`` + ``async def run()`` contract.
+Uses ``ftfy`` to fix encoding issues (mojibake, broken Unicode)
+before counting, so garbled input produces accurate results.
+Demonstrates PEP 723 inline dependencies — ``uv`` auto-installs
+``ftfy`` on first invocation.
 """
 
 from typing import Any
@@ -12,6 +17,7 @@ SCHEMA: dict[str, Any] = {
         "name": "word_count",
         "description": (
             "Count words, characters, and lines in a block of text. "
+            "Fixes encoding issues (mojibake) before counting. "
             "Useful for analyzing document length or meeting word limits."
         ),
         "parameters": {
@@ -30,14 +36,16 @@ SCHEMA: dict[str, Any] = {
 
 async def run(arguments: dict[str, Any]) -> str:
     """
-    Count words, characters, and lines.
+    Fix text encoding then count words, characters, and lines.
 
     :param arguments: Must contain ``"text"`` (str).
     :returns: JSON string with word_count, char_count, line_count.
     """
     import json
 
-    text = arguments.get("text", "")
+    import ftfy
+
+    text = ftfy.fix_text(arguments.get("text", ""))
     words = len(text.split())
     chars = len(text)
     lines = text.count("\n") + (1 if text else 0)

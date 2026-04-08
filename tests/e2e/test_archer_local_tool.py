@@ -103,7 +103,7 @@ def test_archer_calls_word_count_tool(
         "https://api.openai.com/v1/responses",
         headers={"Authorization": f"Bearer {llm_api_key}"},
         json={
-            "model": "gpt-4.1-nano",
+            "model": "gpt-5.4",
             "input": (
                 "You are a test judge. Answer PASS or FAIL only.\n\n"
                 f"The user asked an agent to count words in: '{test_phrase}'\n"

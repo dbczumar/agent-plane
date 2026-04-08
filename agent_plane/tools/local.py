@@ -149,9 +149,15 @@ class LocalPythonTool(Tool):
         # srt and Docker both wrap the command in their own process
         # chain, so the fd 3 pipe doesn't survive to the inner
         # Python process. Use the stdout protocol instead.
-        use_stdout = self._sandbox_config.docker_image is not None or (
-            self._srt_available and self._sandbox_config.enabled
+        # srt is skipped when the tool has inline deps (PEP 508
+        # specifiers break srt's bash -c wrapping), so check
+        # whether srt will actually be prepended.
+        srt_active = (
+            self._srt_available
+            and self._sandbox_config.enabled
+            and not (self._info.has_inline_deps and self._uv_available)
         )
+        use_stdout = self._sandbox_config.docker_image is not None or srt_active
         if use_stdout:
             return self._invoke_stdout(request)
         return self._invoke_subprocess(request)
@@ -239,6 +245,10 @@ class LocalPythonTool(Tool):
         """
         Prepend ``uv run --with`` if the tool has PEP 723 deps.
 
+        Uses ``python`` (not ``sys.executable``) so uv's ephemeral
+        venv Python is used — ``sys.executable`` would bypass the
+        venv and miss the installed deps.
+
         :param cmd: The base command to wrap.
         :returns: The wrapped command, or ``cmd`` unchanged.
         """
@@ -247,17 +257,30 @@ class LocalPythonTool(Tool):
         uv_args: list[str] = ["uv", "run"]
         for dep in self._info.inline_deps or []:
             uv_args.extend(["--with", dep])
-        uv_args.append("--")
-        return uv_args + cmd
+        # Use "python" (not sys.executable) so uv's venv Python
+        # is used and can see the installed deps.
+        uv_args.extend(["--", "python", _RUNNER_PATH])
+        return uv_args
 
     def _prepend_srt(self, cmd: list[str]) -> list[str]:
         """
         Prepend ``srt`` if sandbox is enabled and available.
 
+        Skipped when the tool has inline deps — srt wraps the
+        command in ``bash -c '...'`` which misinterprets shell
+        metacharacters in PEP 508 version specifiers (e.g.
+        ``>=``, ``!=``). uv's ephemeral venv provides sufficient
+        isolation for the dependency install.
+
         :param cmd: The base command to wrap.
         :returns: The wrapped command, or ``cmd`` unchanged.
         """
         if not (self._srt_available and self._sandbox_config.enabled):
+            return cmd
+        # srt's bash -c wrapping misinterprets PEP 508 specifiers
+        # like ">=6.0" as shell redirects. Skip srt when uv is
+        # handling deps.
+        if self._info.has_inline_deps and self._uv_available:
             return cmd
         return ["srt"] + cmd
 

@@ -408,7 +408,9 @@ def test_build_command_with_uv(tmp_path: Path) -> None:
     assert "--with" in cmd
     assert "requests>=2.28" in cmd
     assert "pandas" in cmd
-    assert cmd[-2:] == [sys.executable, _RUNNER_PATH]
+    # uv replaces sys.executable with "python" so the venv's
+    # Python is used and can see installed deps.
+    assert cmd[-2:] == ["python", _RUNNER_PATH]
 
 
 def test_build_command_with_srt(tmp_path: Path) -> None:
@@ -455,9 +457,11 @@ def test_build_command_srt_disabled(tmp_path: Path) -> None:
     assert cmd == [sys.executable, _RUNNER_PATH]
 
 
-def test_build_command_srt_plus_uv(tmp_path: Path) -> None:
+def test_build_command_srt_skipped_with_inline_deps(tmp_path: Path) -> None:
     """
-    When both srt and uv are active, srt wraps the uv command.
+    When both srt and uv are active but the tool has inline deps,
+    srt is skipped — PEP 508 specifiers like ``>=`` break srt's
+    bash -c wrapping. uv alone provides the command.
     """
     from agent_plane.spec.types import SandboxConfig
     from agent_plane.tools.local import LocalPythonTool
@@ -478,9 +482,9 @@ def test_build_command_srt_plus_uv(tmp_path: Path) -> None:
         uv_available=True,
     )
     cmd = tool._build_command()
-    # srt wraps everything: srt uv run --with httpx -- python _runner.py
-    assert cmd[0] == "srt"
-    assert cmd[1] == "uv"
+    # srt is NOT prepended — uv handles the command directly
+    assert cmd[0] == "uv"
+    assert "srt" not in cmd
 
 
 def test_build_command_docker(tmp_path: Path) -> None:
