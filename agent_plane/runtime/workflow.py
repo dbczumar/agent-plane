@@ -104,7 +104,7 @@ from agent_plane.spec.types import LLMConfig, RetryConfig, ToolsConfig
 from agent_plane.stores import ConversationStore, TaskStore
 from agent_plane.tools import ToolManager
 from agent_plane.tools.base import ToolContext
-from agent_plane.tools.builtins import CheckSubAgentsTool, SpawnTool
+from agent_plane.tools.builtins import SpawnTool
 from agent_plane.tools.client_specified import (
     ClientSideToolSpec,
     parse_client_side_tool_specs,
@@ -1254,6 +1254,7 @@ async def _call_tool(
     arguments: str,
     timeout: int,
     retry_config: RetryConfig,
+    workspace_path: str | None = None,
 ) -> str:
     """
     Route a tool call to the current workflow's ToolManager
@@ -1286,7 +1287,8 @@ async def _call_tool(
     def _blocking_call() -> str:
         """Execute the tool call in a thread."""
         mgr = get_tool_manager()
-        ctx = ToolContext(task_id=task_id, agent_id=agent_id)
+        ws = Path(workspace_path) if workspace_path else None
+        ctx = ToolContext(task_id=task_id, agent_id=agent_id, workspace=ws)
         tool = mgr.get_tool(tool_name)
         # Inject client-side tool schemas into spawn arguments so
         # sub-agents know which client tools are available.
@@ -1839,6 +1841,7 @@ async def _execute_tools(
     output_items: list[dict[str, Any]],
     conv_store: ConversationStore,
     agent_id: str,
+    workspace_path: str | None = None,
 ) -> str:
     """
     Execute tool calls in parallel and persist output in call order.
@@ -1876,6 +1879,7 @@ async def _execute_tools(
                 tc.arguments,
                 tools_config.timeout,
                 tools_config.retry,
+                workspace_path=workspace_path,
             )
         )
         for tc in tool_calls
@@ -1978,6 +1982,7 @@ async def _handle_tool_calls(
     output_items: list[dict[str, Any]],
     conv_store: ConversationStore,
     tool_mgr: ToolManager,
+    workspace_path: str | None = None,
 ) -> str | _ClientToolCallsPending:
     """
     Handle the tool execution path: build ``function_call`` items,
@@ -2038,6 +2043,7 @@ async def _handle_tool_calls(
             output_items,
             conv_store,
             agent_id=agent_id,
+            workspace_path=workspace_path,
         )
 
     if split.has_client:
@@ -2070,132 +2076,6 @@ def _strip_mcp_tool_prefix(name: str) -> str:
     if "__" in name:
         return name.rsplit("__", 1)[-1]
     return name
-
-
-def _track_spawn_collect(
-    output_items: list[dict[str, Any]],
-    spawned_ids: set[str],
-    collected_ids: set[str],
-) -> None:
-    """
-    Scan output items for spawn/collect tool results and update
-    the tracking sets.
-
-    Parses ``function_call_output`` items whose corresponding
-    ``function_call`` was ``spawn_sub_agents`` or
-    ``check_sub_agents`` to extract response IDs. Only marks
-    sub-agents as collected when their check result shows a
-    terminal status.
-
-    :param output_items: The accumulated output items list.
-    :param spawned_ids: Mutable set of spawned response IDs.
-    :param collected_ids: Mutable set of collected response IDs.
-    """
-    # Build call_id → tool_name lookup from function_call items.
-    call_names: dict[str, str] = {}
-    for item in output_items:
-        if item.get("type") == "function_call":
-            call_names[item.get("call_id", "")] = item.get("name", "")
-
-    for item in output_items:
-        if item.get("type") != "function_call_output":
-            continue
-        call_id = item.get("call_id", "")
-        name = call_names.get(call_id, "")
-        output_str = item.get("output", "")
-        if not output_str:
-            continue
-        try:
-            parsed = json.loads(output_str)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        bare_name = _strip_mcp_tool_prefix(name)
-        if bare_name == SpawnTool.name():
-            for rid in parsed.get("response_ids", []):
-                spawned_ids.add(rid)
-        elif bare_name == CheckSubAgentsTool.name():
-            for r in parsed.get("results", []):
-                rid = r.get("response_id", "")
-                status = r.get("status")
-                # Only mark as collected when terminal — in-progress
-                # sub-agents still need auto-collect at turn end.
-                if rid and status in TERMINAL_STATUSES:
-                    collected_ids.add(rid)
-
-
-def _recover_spawn_state(
-    history: list[ConversationItem],
-) -> tuple[set[str], set[str]]:
-    """
-    Reconstruct ``spawned_ids`` and ``collected_ids`` from the
-    conversation history.
-
-    When client-side tools cause ``_complete_for_client_tools``,
-    each tool-call round-trip creates a NEW response (workflow).
-    The new workflow starts with empty ``spawned_ids`` and
-    ``collected_ids``. Without recovery, auto-collect never runs
-    for sub-agents spawned in previous responses.
-
-    Scans ``function_call`` / ``function_call_output`` items
-    in history and also auto-collected-results system messages.
-
-    :param history: The loaded conversation history.
-    :returns: ``(spawned_ids, collected_ids)`` reconstructed
-        from the conversation.
-    """
-    # Build call_id → tool_name from function_call items.
-    call_names: dict[str, str] = {}
-    for item in history:
-        if item.type == "function_call" and isinstance(item.data, FunctionCallData):
-            call_names[item.data.call_id] = item.data.name
-
-    spawned: set[str] = set()
-    collected: set[str] = set()
-
-    for item in history:
-        if item.type == "function_call_output" and isinstance(item.data, FunctionCallOutputData):
-            name = call_names.get(item.data.call_id, "")
-            output_str = item.data.output
-            if not output_str:
-                continue
-            try:
-                parsed = json.loads(output_str)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            bare_name = _strip_mcp_tool_prefix(name)
-            if bare_name == SpawnTool.name():
-                for rid in parsed.get("response_ids", []):
-                    spawned.add(rid)
-            elif bare_name == CheckSubAgentsTool.name():
-                for r in parsed.get("results", []):
-                    rid = r.get("response_id", "")
-                    status = r.get("status")
-                    if rid and status in TERMINAL_STATUSES:
-                        collected.add(rid)
-
-        # Auto-collected results are persisted as user messages
-        # with "[System: auto-collected sub-agent results]".
-        if item.type == "message" and isinstance(item.data, MessageData):
-            for block in item.data.content:
-                if not isinstance(block, dict):
-                    continue
-                text = block.get("text", "")
-                if not text.startswith("[System: auto-collected sub-agent results]"):
-                    continue
-                # Parse the JSON after the prefix line.
-                json_part = text.split("\n", 1)
-                if len(json_part) < 2:
-                    continue
-                try:
-                    payload = json.loads(json_part[1])
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                for r in payload.get("results", []):
-                    rid = r.get("response_id", "")
-                    if rid:
-                        collected.add(rid)
-
-    return spawned, collected
 
 
 @dataclass
@@ -3309,7 +3189,13 @@ def _build_executor_context(
         root_task_id,
         task_store,
     )
-    tool_ctx = ToolContext(task_id=task_id, agent_id=agent_id)
+    workspace = storage_dir / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    tool_ctx = ToolContext(
+        task_id=task_id,
+        agent_id=agent_id,
+        workspace=workspace,
+    )
     server_names = frozenset(tool_mgr.get_tool_names())
 
     def _call_tool(call: ToolCallRequested) -> ToolResult:
@@ -3579,7 +3465,8 @@ async def _run_agent_loop(
     # Recover state from history so sub-agents spawned in
     # previous responses (before a client-tool round-trip) are
     # still tracked for auto-collect.
-    spawned_ids, collected_ids = _recover_spawn_state(history)
+    spawned_ids: set[str] = set()
+    collected_ids: set[str] = set()
     # Per-execution compaction state. context_window is seeded from
     # the executor's known limit (if any) so proactive compaction
     # can fire from the first iteration. Falls back to None when the
@@ -3661,23 +3548,18 @@ async def _run_agent_loop(
             )
             if obs_cursor is not None:
                 last_seen = obs_cursor
-                _track_spawn_collect(
-                    output_items,
-                    spawned_ids,
-                    collected_ids,
-                )
 
-            # Discover sub-agents spawned during this turn by
-            # querying the task store. MCP tool calls (e.g.
-            # spawn_sub_agents called by the Claude SDK) are
-            # invisible to the stream — ToolCallObserved is never
-            # emitted, so _track_spawn_collect can't detect them.
-            # The task store is the ground truth for spawns.
+            # Discover sub-agents by querying the task store — the
+            # single source of truth regardless of executor type.
+            # Terminal children go into both sets so auto-collect
+            # doesn't re-process them.
             child_tasks = await task_store.list_tasks(
                 root_task_id=task_id,
             )
             for ct in child_tasks:
                 spawned_ids.add(ct.id)
+                if ct.status in TERMINAL_STATUSES:
+                    collected_ids.add(ct.id)
 
             if not _has_tool_calls(llm_resp):
                 # Auto-collect outstanding sub-agents before completing.
@@ -3778,7 +3660,6 @@ async def _run_agent_loop(
                 )
             last_seen = handle_result
             # Track spawned/collected sub-agent IDs for auto-collect.
-            _track_spawn_collect(output_items, spawned_ids, collected_ids)
             # Check for steered messages that arrived between the
             # LLM call and tool completion. Use the pre-tool cursor
             # to catch messages with positions interleaved among

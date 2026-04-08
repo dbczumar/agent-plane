@@ -72,7 +72,9 @@ def test_claude_sdk_parks_client_tool_call(
 
     # Poll for the pending tool call.
     pending = poll_for_pending_tool_calls(
-        http_client, response_id, timeout=120,
+        http_client,
+        response_id,
+        timeout=120,
     )
 
     # The SDK should have called get_current_time, which parked.
@@ -129,10 +131,6 @@ def test_claude_sdk_parks_client_tool_call(
 
     combined = " ".join(output_texts).lower()
     # The agent should mention the time in its response.
-    assert any(
-        fragment in combined
-        for fragment in [current_time[:10], "time", "current"]
-    ), (
-        f"Expected the agent to reference the time in its response. "
-        f"Got: {combined[:300]}"
+    assert any(fragment in combined for fragment in [current_time[:10], "time", "current"]), (
+        f"Expected the agent to reference the time in its response. Got: {combined[:300]}"
     )

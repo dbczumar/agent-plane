@@ -83,12 +83,6 @@ class ExecutorSpec:
     request_timeout: int | None = None
 
 
-# Keep ExecutionConfig as a backwards-compat alias so that existing
-# imports don't break during migration.  Will be removed once all
-# consumers are updated.
-ExecutionConfig = ExecutorSpec
-
-
 @dataclass
 class CompactionConfig:
     """

@@ -95,9 +95,7 @@ def test_claude_coder_spawns_reviewer(
     resp_setup.raise_for_status()
     setup_id = resp_setup.json()["id"]
     body_setup = poll_until_terminal(http_client, setup_id, timeout=60)
-    assert body_setup["status"] == "completed", (
-        f"Setup failed: {body_setup.get('error')}"
-    )
+    assert body_setup["status"] == "completed", f"Setup failed: {body_setup.get('error')}"
 
     # Now ask claude-coder to delegate a review to the reviewer sub-agent.
     resp = http_client.post(
@@ -118,21 +116,16 @@ def test_claude_coder_spawns_reviewer(
     response_id = resp.json()["id"]
 
     body = poll_until_terminal(http_client, response_id, timeout=180)
-    assert body["status"] == "completed", (
-        f"Sub-agent task failed: {body.get('error')}"
-    )
+    assert body["status"] == "completed", f"Sub-agent task failed: {body.get('error')}"
 
     text = _extract_all_text(body)
-    assert len(text) > 50, (
-        f"Expected substantial review output, got: {text!r}"
-    )
+    assert len(text) > 50, f"Expected substantial review output, got: {text!r}"
 
     # Verify spawn_sub_agents was called. The tool appears in output
     # as an MCP tool call (mcp__agent_plane__spawn_sub_agents) or
     # as a ToolCallObserved (spawn_sub_agents). Check both.
-    spawned = (
-        _has_tool_call_named(body, "spawn_sub_agents")
-        or _has_tool_call_named(body, "mcp__agent_plane__spawn_sub_agents")
+    spawned = _has_tool_call_named(body, "spawn_sub_agents") or _has_tool_call_named(
+        body, "mcp__agent_plane__spawn_sub_agents"
     )
     assert spawned, (
         "Expected spawn_sub_agents tool call in output. "

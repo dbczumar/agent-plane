@@ -37,7 +37,7 @@ from agent_plane.llms.types import (
     ResponseTextDeltaEvent,
 )
 from agent_plane.llms.types import NativeToolOutput as LLMNativeToolOutput
-from agent_plane.runtime.executor import (
+from agent_plane.runtime.executors import (
     ContextWindowExceeded,
     DefaultExecutor,
     ExecutorContext,
@@ -222,7 +222,7 @@ def test_tool_call_observed_serialization_roundtrip() -> None:
     """
     ToolCallObserved has 6 fields — verify all survive the roundtrip.
     """
-    from agent_plane.runtime.executor import ToolCallObserved
+    from agent_plane.runtime.executors import ToolCallObserved
 
     event = ToolCallObserved(
         call_id="call_xyz",
@@ -574,7 +574,7 @@ def test_open_stream_with_retry_succeeds_first_attempt(
         lambda *_args, **_kw: expected_stream,
     )
 
-    from agent_plane.runtime.executor import _ResponsesCallArgs
+    from agent_plane.runtime.executors import _ResponsesCallArgs
 
     result = _open_stream_with_retry(
         input_items=[],
@@ -619,7 +619,7 @@ def test_open_stream_with_retry_retries_on_transient(
         _failing_then_succeeding,
     )
 
-    from agent_plane.runtime.executor import _ResponsesCallArgs
+    from agent_plane.runtime.executors import _ResponsesCallArgs
 
     result = _open_stream_with_retry(
         input_items=[],
@@ -664,7 +664,7 @@ def test_open_stream_with_retry_raises_permanent_error(
         _permanent_failure,
     )
 
-    from agent_plane.runtime.executor import _ResponsesCallArgs
+    from agent_plane.runtime.executors import _ResponsesCallArgs
 
     # 401 is not in the retryable list → PermanentLLMError must be raised
     # immediately without exhausting retries.
@@ -708,7 +708,7 @@ def test_open_stream_with_retry_raises_context_window_exceeded(
         _context_overflow,
     )
 
-    from agent_plane.runtime.executor import _ResponsesCallArgs
+    from agent_plane.runtime.executors import _ResponsesCallArgs
 
     with pytest.raises(ContextWindowExceededError) as exc_info:
         _open_stream_with_retry(
@@ -745,7 +745,7 @@ def test_run_streaming_turn_yields_events_on_success(
         lambda *_args, **_kw: iter(stream),
     )
 
-    from agent_plane.runtime.executor import _ResponsesCallArgs
+    from agent_plane.runtime.executors import _ResponsesCallArgs
 
     events = list(
         _run_streaming_turn(
@@ -793,7 +793,7 @@ def test_run_streaming_turn_context_window_exceeded(
         _overflow,
     )
 
-    from agent_plane.runtime.executor import _ResponsesCallArgs
+    from agent_plane.runtime.executors import _ResponsesCallArgs
 
     events = list(
         _run_streaming_turn(
@@ -836,7 +836,7 @@ def test_run_streaming_turn_permanent_error(
         _auth_fail,
     )
 
-    from agent_plane.runtime.executor import _ResponsesCallArgs
+    from agent_plane.runtime.executors import _ResponsesCallArgs
 
     events = list(
         _run_streaming_turn(
@@ -877,7 +877,7 @@ def test_run_streaming_turn_retryable_error_exhausted(
         _retryable_fail,
     )
 
-    from agent_plane.runtime.executor import _ResponsesCallArgs
+    from agent_plane.runtime.executors import _ResponsesCallArgs
 
     events = list(
         _run_streaming_turn(

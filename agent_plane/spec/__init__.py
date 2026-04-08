@@ -10,7 +10,6 @@ from agent_plane.spec.tar_utils import ExtractionError, extract_safe
 from agent_plane.spec.types import (
     AgentSpec,
     BuiltinToolConfig,
-    ExecutionConfig,
     ExecutorSpec,
     InteractionConfig,
     LLMConfig,
@@ -26,7 +25,6 @@ from agent_plane.spec.validator import ValidationResult, validate
 __all__ = [
     "AgentSpec",
     "BuiltinToolConfig",
-    "ExecutionConfig",
     "ExecutorSpec",
     "ExtractionError",
     "InteractionConfig",

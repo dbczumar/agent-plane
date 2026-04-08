@@ -5,6 +5,7 @@ from __future__ import annotations
 import abc
 import re
 from dataclasses import dataclass
+from pathlib import Path  # used by ToolContext.workspace type hint
 from typing import Any
 
 # Tool name constraint: alphanumeric plus ``_`` and ``-``, up to
@@ -31,17 +32,22 @@ class ToolContext:
 
     Provides server-side metadata that tools may need but
     which the LLM does not supply (task identity, agent
-    identity). Individual tools read the fields they need
-    and ignore the rest.
+    identity, workspace path). Individual tools read the
+    fields they need and ignore the rest.
 
     :param task_id: The current task/workflow ID,
         e.g. ``"task_abc123"``.
     :param agent_id: The registered agent ID,
         e.g. ``"ag_xyz789"``.
+    :param workspace: Per-conversation persistent working
+        directory. ``code_sandbox`` uses it as subprocess cwd,
+        ``upload_file`` resolves paths against it. ``None``
+        when no workspace is available (e.g. tests).
     """
 
     task_id: str
     agent_id: str
+    workspace: Path | None = None
 
 
 class Tool(abc.ABC):

@@ -79,9 +79,7 @@ def test_claude_coder_lists_and_loads_skills(
     response_id = resp.json()["id"]
 
     body = poll_until_terminal(http_client, response_id, timeout=120)
-    assert body["status"] == "completed", (
-        f"Task failed: {body.get('error')}"
-    )
+    assert body["status"] == "completed", f"Task failed: {body.get('error')}"
 
     text = _extract_all_text(body)
 

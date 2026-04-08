@@ -221,6 +221,15 @@ Check each file against this checklist:
     over all pairs. The simpler form is easier to read, harder to
     get wrong, and produces a clearer error message.
 
+32. NO BACKWARDS COMPATIBILITY SHIMS: This project has NO external
+    consumers yet. Never add backwards-compat aliases (`OldName =
+    NewName`), re-export shim modules, deprecation wrappers,
+    `warnings.warn(DeprecationWarning)`, or any code whose sole
+    purpose is keeping old import paths or old names working. When
+    renaming or moving a symbol, update ALL consumers in the same
+    change and delete the old path. No "will be removed once all
+    consumers are updated" — update them NOW.
+
 Report each finding as:
   [FILE:LINE] ISSUE — description of the problem and suggested fix
 

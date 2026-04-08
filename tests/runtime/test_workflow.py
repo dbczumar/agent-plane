@@ -9,22 +9,19 @@ import asyncio
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from agent_plane.entities import (
     CompactionData,
-    ConversationItem,
-    FunctionCallData,
-    FunctionCallOutputData,
     MessageData,
     NewConversationItem,
 )
 from agent_plane.llms.errors import ContextWindowExceededError, PermanentLLMError
 from agent_plane.runtime.caps import RuntimeCaps
 from agent_plane.runtime.compaction import CompactionResult, SummaryMetadata, _CompactionState
-from agent_plane.runtime.executor import DefaultExecutor, ToolCallRequested, ToolResult
+from agent_plane.runtime.executors import DefaultExecutor, ToolCallRequested, ToolResult
 from agent_plane.runtime.workflow import (
     _build_await_tool_output,
     _get_or_restore_executor_storage,
@@ -35,7 +32,6 @@ from agent_plane.runtime.workflow import (
     _proactive_compact_if_needed,
     _publish_client_tool_call,
     _reactive_compact,
-    _recover_spawn_state,
     _register_client_tool_call,
     _run_agent_loop,
     _split_tool_calls,
@@ -323,8 +319,10 @@ def _patch_agent_loop_deps(
         lambda: mock_conv_store,
     )
 
-    # Stub task store — not reached in the timeout path
+    # Stub task store — list_tasks must be async-compatible
+    # since the agent loop awaits it for spawn discovery.
     mock_task_store = MagicMock()
+    mock_task_store.list_tasks = AsyncMock(return_value=[])
     monkeypatch.setattr(
         "agent_plane.runtime.workflow.get_task_store",
         lambda: mock_task_store,
@@ -1544,277 +1542,6 @@ def test_sync_history_filters_compaction_items(
     assert new_last_seen != first_id, (
         "last_seen must advance past the compaction item, not stay at the first message."
     )
-
-
-# ── _recover_spawn_state ──────────────────────────────────
-
-
-def _make_conversation_item(
-    item_id: str,
-    item_type: str,
-    data: MessageData | FunctionCallData | FunctionCallOutputData,
-) -> ConversationItem:
-    """
-    Build a ConversationItem with minimal required fields.
-
-    :param item_id: Store-assigned item ID, e.g. ``"msg_001"``.
-    :param item_type: Item type, e.g. ``"function_call"``.
-    :param data: The typed data payload.
-    :returns: A ConversationItem ready for use in tests.
-    """
-    return ConversationItem(
-        id=item_id,
-        type=item_type,
-        status="completed",
-        response_id="resp_test",
-        created_at=1000,
-        data=data,
-    )
-
-
-def test_recover_spawn_state_from_spawn_output() -> None:
-    """
-    ``_recover_spawn_state`` extracts spawned IDs from
-    ``spawn_sub_agents`` function_call_output items.
-
-    A function_call with name ``spawn_sub_agents`` paired with
-    a function_call_output whose JSON contains ``response_ids``
-    populates ``spawned_ids``.
-
-    If the spawn output is absent or malformed, spawned_ids
-    should be empty — the function must not crash.
-    """
-    history = [
-        # function_call: spawn_sub_agents
-        _make_conversation_item(
-            "fc_1",
-            "function_call",
-            FunctionCallData(
-                agent="parent",
-                name="spawn_sub_agents",
-                arguments='{"agents": [{"name": "worker"}]}',
-                call_id="call_spawn_1",
-            ),
-        ),
-        # function_call_output: spawn result with response_ids
-        _make_conversation_item(
-            "fco_1",
-            "function_call_output",
-            FunctionCallOutputData(
-                call_id="call_spawn_1",
-                output='{"response_ids": ["resp_sub_A", "resp_sub_B"]}',
-            ),
-        ),
-    ]
-
-    spawned, collected = _recover_spawn_state(history)
-
-    # 2 sub-agent IDs from the spawn output.
-    assert spawned == {"resp_sub_A", "resp_sub_B"}, (
-        f"Expected spawned IDs from spawn output, got {spawned}. "
-        f"If empty, the function failed to parse the "
-        f"spawn_sub_agents output JSON."
-    )
-    # No collect calls → nothing collected.
-    assert collected == set(), f"Expected no collected IDs, got {collected}."
-
-
-def test_recover_spawn_state_from_check_output() -> None:
-    """
-    ``_recover_spawn_state`` extracts collected IDs from
-    ``check_sub_agents`` function_call_output items.
-
-    A function_call with name ``check_sub_agents`` paired with
-    a function_call_output whose JSON contains ``results`` with
-    terminal statuses populates ``collected_ids``.
-    """
-    history = [
-        # spawn call + output
-        _make_conversation_item(
-            "fc_1",
-            "function_call",
-            FunctionCallData(
-                agent="parent",
-                name="spawn_sub_agents",
-                arguments='{"agents": [{"name": "w1"}]}',
-                call_id="call_spawn",
-            ),
-        ),
-        _make_conversation_item(
-            "fco_1",
-            "function_call_output",
-            FunctionCallOutputData(
-                call_id="call_spawn",
-                output='{"response_ids": ["resp_sub_1"]}',
-            ),
-        ),
-        # check call + output with terminal status
-        _make_conversation_item(
-            "fc_2",
-            "function_call",
-            FunctionCallData(
-                agent="parent",
-                name="check_sub_agents",
-                arguments='{"response_ids": ["resp_sub_1"]}',
-                call_id="call_check",
-            ),
-        ),
-        _make_conversation_item(
-            "fco_2",
-            "function_call_output",
-            FunctionCallOutputData(
-                call_id="call_check",
-                output=('{"results": [{"response_id": "resp_sub_1", "status": "completed"}]}'),
-            ),
-        ),
-    ]
-
-    spawned, collected = _recover_spawn_state(history)
-
-    assert spawned == {"resp_sub_1"}, f"Expected 1 spawned ID, got {spawned}."
-    # check_sub_agents reported "completed" → collected.
-    assert collected == {"resp_sub_1"}, (
-        f"Expected resp_sub_1 in collected (terminal status), "
-        f"got {collected}. If empty, the function failed to "
-        f"parse the check_sub_agents output."
-    )
-
-
-def test_recover_spawn_state_from_auto_collect_message() -> None:
-    """
-    ``_recover_spawn_state`` extracts collected IDs from
-    auto-collected system messages.
-
-    Auto-collect persists results as user messages with prefix
-    ``[System: auto-collected sub-agent results]`` followed by
-    a JSON line. The function parses these to populate
-    ``collected_ids``.
-    """
-    auto_collect_text = (
-        '[System: auto-collected sub-agent results]\n{"results": [{"response_id": "resp_auto_1"}]}'
-    )
-    history = [
-        # spawn call + output
-        _make_conversation_item(
-            "fc_1",
-            "function_call",
-            FunctionCallData(
-                agent="parent",
-                name="spawn_sub_agents",
-                arguments='{"agents": [{"name": "w"}]}',
-                call_id="call_sp",
-            ),
-        ),
-        _make_conversation_item(
-            "fco_1",
-            "function_call_output",
-            FunctionCallOutputData(
-                call_id="call_sp",
-                output='{"response_ids": ["resp_auto_1"]}',
-            ),
-        ),
-        # Auto-collected system message
-        _make_conversation_item(
-            "msg_auto",
-            "message",
-            MessageData(
-                role="user",
-                content=[{"type": "input_text", "text": auto_collect_text}],
-            ),
-        ),
-    ]
-
-    spawned, collected = _recover_spawn_state(history)
-
-    assert spawned == {"resp_auto_1"}, f"Expected 1 spawned ID, got {spawned}."
-    # Auto-collect message → collected.
-    assert collected == {"resp_auto_1"}, (
-        f"Expected resp_auto_1 collected via auto-collect "
-        f"message, got {collected}. If empty, the function "
-        f"failed to parse the system message prefix."
-    )
-
-
-def test_recover_spawn_state_partial_collection() -> None:
-    """
-    ``_recover_spawn_state`` correctly handles partial
-    collection: some sub-agents collected, others still running.
-
-    This is the common case when steering interrupts
-    auto-collect before all sub-agents finish.
-    """
-    history = [
-        # spawn: 2 sub-agents
-        _make_conversation_item(
-            "fc_1",
-            "function_call",
-            FunctionCallData(
-                agent="parent",
-                name="spawn_sub_agents",
-                arguments='{"agents": [{"name": "a"}, {"name": "b"}]}',
-                call_id="call_sp",
-            ),
-        ),
-        _make_conversation_item(
-            "fco_1",
-            "function_call_output",
-            FunctionCallOutputData(
-                call_id="call_sp",
-                output='{"response_ids": ["resp_A", "resp_B"]}',
-            ),
-        ),
-        # Only resp_A was auto-collected (steering interrupted).
-        _make_conversation_item(
-            "msg_auto",
-            "message",
-            MessageData(
-                role="user",
-                content=[
-                    {
-                        "type": "input_text",
-                        "text": (
-                            "[System: auto-collected sub-agent results]\n"
-                            '{"results": [{"response_id": "resp_A"}]}'
-                        ),
-                    }
-                ],
-            ),
-        ),
-    ]
-
-    spawned, collected = _recover_spawn_state(history)
-
-    # Both spawned.
-    assert spawned == {"resp_A", "resp_B"}, f"Expected both sub-agent IDs spawned, got {spawned}."
-    # Only resp_A collected — resp_B is still uncollected.
-    # This triggers a second auto-collect cycle in the agent loop.
-    assert collected == {"resp_A"}, (
-        f"Expected only resp_A collected (partial), got "
-        f"{collected}. If both are collected, the function "
-        f"is incorrectly marking uncollected sub-agents."
-    )
-
-
-def test_recover_spawn_state_empty_history() -> None:
-    """
-    ``_recover_spawn_state`` returns empty sets for history
-    with no spawn-related items.
-    """
-    history = [
-        _make_conversation_item(
-            "msg_1",
-            "message",
-            MessageData(
-                role="user",
-                content=[{"type": "input_text", "text": "Hello"}],
-            ),
-        ),
-    ]
-
-    spawned, collected = _recover_spawn_state(history)
-
-    assert spawned == set(), f"Expected no spawned IDs for non-spawn history, got {spawned}."
-    assert collected == set(), f"Expected no collected IDs for non-spawn history, got {collected}."
 
 
 # ── Executor storage ──────────────────────────────────────

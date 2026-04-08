@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 import pytest
 
-from agent_plane.runtime.executor import (
+from agent_plane.runtime.executors import (
     Executor,
     ExecutorContext,
     ToolCallObserved,
