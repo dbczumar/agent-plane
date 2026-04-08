@@ -337,6 +337,7 @@ class TaskStore(ABC):
         self,
         conversation_id: str | None = None,
         agent_id: str | None = None,
+        root_task_id: str | None = None,
     ) -> list[Task]:
         """
         Return tasks matching the given filters.
@@ -349,6 +350,9 @@ class TaskStore(ABC):
             e.g. ``"conv_abc123"``.
         :param agent_id: Optional agent ID filter,
             e.g. ``"agent_xyz789"``.
+        :param root_task_id: Optional root task ID filter. When
+            set, returns only sub-agent tasks spawned under this
+            root, e.g. ``"task_abc123"``.
         :returns: A list of matching :class:`Task` objects,
             ordered by ``created_at`` descending.
         """

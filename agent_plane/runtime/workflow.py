@@ -74,10 +74,10 @@ from agent_plane.runtime.durability import (
     workflow,
     write_stream,
 )
-from agent_plane.runtime.executor import (
+from agent_plane.runtime.executors import (
     ContextWindowExceeded as ExecutorContextWindowExceeded,
 )
-from agent_plane.runtime.executor import (
+from agent_plane.runtime.executors import (
     Executor,
     ExecutorContext,
     ExecutorError,
@@ -91,7 +91,7 @@ from agent_plane.runtime.executor import (
     dict_to_event,
     event_to_dict,
 )
-from agent_plane.runtime.executor import (
+from agent_plane.runtime.executors import (
     NativeToolOutput as ExecutorNativeToolOutput,
 )
 from agent_plane.runtime.live_stream import close as _live_close
@@ -185,7 +185,7 @@ def _create_executor(spec: AgentSpec) -> Executor:
         return ClaudeAgentsExecutor.from_spec(spec)
 
     if executor_type == "remote":
-        from agent_plane.runtime.executor import RemoteExecutor
+        from agent_plane.runtime.executors import RemoteExecutor
 
         return RemoteExecutor.from_spec(spec)
 
@@ -195,7 +195,7 @@ def _create_executor(spec: AgentSpec) -> Executor:
             code=ErrorCode.INVALID_INPUT,
         )
 
-    from agent_plane.runtime.executor import DefaultExecutor
+    from agent_plane.runtime.executors import DefaultExecutor
 
     return DefaultExecutor.from_spec(spec)
 
@@ -3324,8 +3324,9 @@ def _build_executor_context(
         :returns: The tool's result.
         """
         if call.name in server_names:
+            bare = _strip_mcp_tool_prefix(call.name)
             result_str = tool_mgr.call_tool(
-                call.name,
+                bare,
                 json.dumps(call.arguments),
                 tool_ctx,
             )
@@ -3660,15 +3661,23 @@ async def _run_agent_loop(
             )
             if obs_cursor is not None:
                 last_seen = obs_cursor
-                # Track spawn/collect from observed tool calls so
-                # auto-collect sees sub-agents spawned by executor-
-                # managed turns (e.g. Claude SDK calling
-                # spawn_sub_agents via MCP).
                 _track_spawn_collect(
                     output_items,
                     spawned_ids,
                     collected_ids,
                 )
+
+            # Discover sub-agents spawned during this turn by
+            # querying the task store. MCP tool calls (e.g.
+            # spawn_sub_agents called by the Claude SDK) are
+            # invisible to the stream — ToolCallObserved is never
+            # emitted, so _track_spawn_collect can't detect them.
+            # The task store is the ground truth for spawns.
+            child_tasks = await task_store.list_tasks(
+                root_task_id=task_id,
+            )
+            for ct in child_tasks:
+                spawned_ids.add(ct.id)
 
             if not _has_tool_calls(llm_resp):
                 # Auto-collect outstanding sub-agents before completing.

@@ -671,6 +671,7 @@ class SqlAlchemyTaskStore(TaskStore):
         self,
         conversation_id: str | None = None,
         agent_id: str | None = None,
+        root_task_id: str | None = None,
     ) -> list[Task]:
         """
         Return tasks matching the given filters, enriched with
@@ -680,6 +681,9 @@ class SqlAlchemyTaskStore(TaskStore):
             e.g. ``"conv_abc123"``.
         :param agent_id: Optional agent ID filter,
             e.g. ``"agent_xyz789"``.
+        :param root_task_id: Optional root task ID filter. When
+            set, returns only sub-agent tasks spawned under this
+            root, e.g. ``"task_abc123"``.
         :returns: A list of matching :class:`Task` objects,
             ordered by ``created_at`` descending.
         """
@@ -689,6 +693,8 @@ class SqlAlchemyTaskStore(TaskStore):
                 stmt = stmt.where(SqlTask.conversation_id == conversation_id)
             if agent_id:
                 stmt = stmt.where(SqlTask.agent_id == agent_id)
+            if root_task_id:
+                stmt = stmt.where(SqlTask.root_task_id == root_task_id)
             # Not paginated (internal use only), but ordered for determinism.
             stmt = stmt.order_by(SqlTask.created_at.desc())
             rows = list(session.execute(stmt).scalars().all())
