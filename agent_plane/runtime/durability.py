@@ -133,6 +133,13 @@ get_workflow_status_async = DBOS.get_workflow_status_async
 cancel_workflow_async = DBOS.cancel_workflow_async
 read_stream_async = DBOS.read_stream_async
 
+# Async APIs for parallel tool execution
+# (see designs/PARALLEL_TOOL_CALLS.md)
+dbos_recv_async = DBOS.recv_async
+dbos_sleep_async = DBOS.sleep_async
+asyncio_wait = DBOS.asyncio_wait
+close_stream_async = DBOS.close_stream_async
+
 
 def get_workflow_id() -> str:
     """
@@ -150,8 +157,11 @@ __all__ = [
     "WorkflowHandleAsync",
     "WorkflowStatus",
     "WorkflowStatusString",
+    "asyncio_wait",
     "dbos_recv",
+    "dbos_recv_async",
     "dbos_sleep",
+    "dbos_sleep_async",
     "send_direct",
     "cancel_workflow",
     "cancel_workflow_async",

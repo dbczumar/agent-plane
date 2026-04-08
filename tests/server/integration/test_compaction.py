@@ -77,7 +77,7 @@ def _make_compacting_llm_call(
         ``_executor_turn_with_compaction``.
     """
 
-    def _fake_executor_turn(
+    async def _fake_executor_turn(
         task_id: str,
         executor: Any,
         spec: AgentSpec,
@@ -250,7 +250,7 @@ async def test_next_execution_loads_from_compaction_cursor(
     # so the workflow completes.
     captured_history: list[Any] = []
 
-    def _capture_history_llm_call(
+    async def _capture_history_llm_call(
         task_id: str,
         executor: Any,
         spec: AgentSpec,

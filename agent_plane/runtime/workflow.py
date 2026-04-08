@@ -6,6 +6,7 @@ All durably checkpointed for crash recovery.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -65,7 +66,8 @@ from agent_plane.runtime.compaction import (
 )
 from agent_plane.runtime.content_resolver import resolve_content_references
 from agent_plane.runtime.durability import (
-    close_stream,
+    asyncio_wait,
+    dbos_recv_async,
     get_workflow_id,
     step,
     workflow,
@@ -108,6 +110,36 @@ from agent_plane.tools.client_specified import (
 )
 
 _logger = logging.getLogger(__name__)
+
+
+def _monotonic() -> float:
+    """
+    Return the current monotonic time.
+
+    Thin wrapper around ``time.monotonic()`` to allow test
+    monkeypatching without interfering with the asyncio event
+    loop, which also calls ``time.monotonic()`` internally.
+
+    :returns: Monotonic time in seconds.
+    """
+    return time.monotonic()
+
+
+async def _to_thread(fn: Callable[[], Any]) -> Any:
+    """
+    Run a sync callable in the thread pool.
+
+    Used to call sync DBOS APIs (``get_workflow_status``,
+    ``close_inbox``, etc.) from within the async workflow
+    without blocking the event loop. DBOS raises if its sync
+    APIs are called while an event loop is running.
+
+    :param fn: A zero-argument callable to execute.
+    :returns: The callable's return value.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, fn)
+
 
 # Hard upper bound on LLM turns per execution. Prevents runaway loops.
 # See designs/AGENTLOOP.md "Not Yet" for making this configurable.
@@ -168,24 +200,43 @@ def _write_output(task_id: str, event: dict[str, Any]) -> None:
     Write an event to both the durable stream and the live
     (real-time) stream.
 
+    Safe to call from both sync threads (inside ``run_in_executor``)
+    and async contexts. When called from an async context (no DBOS
+    step context), the durable ``write_stream`` is skipped — SSE
+    events still reach clients via ``_live_publish`` (the real-time
+    in-process channel). Durable SSE replay on crash recovery uses
+    the conversation store items, not the output stream.
+
     :param task_id: The task identifier, e.g.
         ``"task_abc123"``.
     :param event: The event dict to write, e.g.
         ``{"type": "response.output_text.delta",
         "delta": "Hello"}``.
     """
-    write_stream("output", event)
+    try:
+        write_stream("output", event)
+    except RuntimeError:
+        # Called from async context where DBOS sync API is
+        # unavailable (no step context on the event loop thread).
+        # _live_publish still delivers the event in real-time.
+        pass
     _live_publish(task_id, event)
 
 
-def _close_output(task_id: str) -> None:
+async def _close_output(task_id: str) -> None:
     """
     Close both the durable stream and the live stream.
+
+    Must be async because it runs inside the async workflow,
+    and DBOS raises if ``close_stream`` (sync) is called while
+    an event loop is running.
 
     :param task_id: The task identifier, e.g.
         ``"task_abc123"``.
     """
-    close_stream("output")
+    from agent_plane.runtime.durability import close_stream_async
+
+    await close_stream_async("output")
     _live_close(task_id)
 
 
@@ -431,7 +482,7 @@ def _response_to_dict(resp: LLMResponse) -> dict[str, Any]:
 
 
 @step()
-def _call_llm(
+async def _call_llm(
     task_id: str,
     input_items: list[dict[str, Any]],
     instructions: str,
@@ -446,7 +497,9 @@ def _call_llm(
     Call the LLM via the Responses API (non-streaming) with retry.
 
     Retries are handled inside this ``@step`` boundary so they
-    don't cause duplicate checkpoints.
+    don't cause duplicate checkpoints. Blocking LLM I/O runs in
+    the thread pool via ``run_in_executor`` to avoid blocking
+    the async event loop.
 
     :param task_id: The task identifier for SSE event emission,
         e.g. ``"task_abc123"``.
@@ -474,31 +527,36 @@ def _call_llm(
     """
     args = _build_responses_args(model, tools, extra)
 
-    def do_call() -> dict[str, Any]:
-        """Execute the non-streaming LLM call."""
-        resp = cast(
-            LLMResponse,
-            _get_llm_client().responses.create(
-                input=input_items,
-                instructions=instructions,
-                reasoning=args.reasoning,
-                connection_params=connection,
-                timeout=timeout,
-                **args.kwargs,
-            ),
-        )
-        return _response_to_dict(resp)
+    def _blocking_call() -> dict[str, Any]:
+        """Execute the non-streaming LLM call in a thread."""
 
-    effective_retry = retry_config or RetryConfig(max_attempts=1)
-    return execute_with_retry(
-        do_call,
-        effective_retry,
-        on_retry=lambda event: _write_output(task_id, event),
-    )
+        def do_call() -> dict[str, Any]:
+            resp = cast(
+                LLMResponse,
+                _get_llm_client().responses.create(
+                    input=input_items,
+                    instructions=instructions,
+                    reasoning=args.reasoning,
+                    connection_params=connection,
+                    timeout=timeout,
+                    **args.kwargs,
+                ),
+            )
+            return _response_to_dict(resp)
+
+        effective_retry = retry_config or RetryConfig(max_attempts=1)
+        return execute_with_retry(
+            do_call,
+            effective_retry,
+            on_retry=lambda event: _write_output(task_id, event),
+        )
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _blocking_call)
 
 
 @step()
-def _call_llm_streaming(
+async def _call_llm_streaming(
     task_id: str,
     input_items: list[dict[str, Any]],
     instructions: str,
@@ -519,6 +577,8 @@ def _call_llm_streaming(
     This is a ``@step`` so the result is durably checkpointed.
     On crash recovery the cached response is returned without
     re-executing the LLM call. Retries are internal to this step.
+    Blocking LLM I/O runs in the thread pool via
+    ``run_in_executor``.
 
     :param task_id: The task identifier, e.g.
         ``"task_abc123"``.
@@ -546,28 +606,33 @@ def _call_llm_streaming(
     """
     args = _build_responses_args(model, tools, extra)
 
-    def do_call() -> dict[str, Any]:
-        """Execute the streaming LLM call and accumulate."""
-        stream_resp = cast(
-            Iterator[ResponseStreamEvent],
-            _get_llm_client().responses.create(
-                input=input_items,
-                instructions=instructions,
-                reasoning=args.reasoning,
-                stream=True,
-                connection_params=connection,
-                timeout=timeout,
-                **args.kwargs,
-            ),
-        )
-        return _accumulate_stream(task_id, stream_resp)
+    def _blocking_call() -> dict[str, Any]:
+        """Execute the streaming LLM call in a thread."""
 
-    effective_retry = retry_config or RetryConfig(max_attempts=1)
-    return execute_with_retry(
-        do_call,
-        effective_retry,
-        on_retry=lambda event: _write_output(task_id, event),
-    )
+        def do_call() -> dict[str, Any]:
+            stream_resp = cast(
+                Iterator[ResponseStreamEvent],
+                _get_llm_client().responses.create(
+                    input=input_items,
+                    instructions=instructions,
+                    reasoning=args.reasoning,
+                    stream=True,
+                    connection_params=connection,
+                    timeout=timeout,
+                    **args.kwargs,
+                ),
+            )
+            return _accumulate_stream(task_id, stream_resp)
+
+        effective_retry = retry_config or RetryConfig(max_attempts=1)
+        return execute_with_retry(
+            do_call,
+            effective_retry,
+            on_retry=lambda event: _write_output(task_id, event),
+        )
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _blocking_call)
 
 
 # SSE event types emitted for reasoning content
@@ -652,7 +717,7 @@ _EXECUTOR_REASONING_SSE_TYPES: dict[str, str] = {
 
 
 @step()
-def _checkpointed_turn(
+async def _checkpointed_turn(
     task_id: str,
     executor: Executor,
     messages: list[dict[str, Any]],
@@ -669,7 +734,8 @@ def _checkpointed_turn(
     the live SSE stream via ``_write_output`` as they arrive.
     All events are serialized and returned so DBOS can cache
     them — on crash replay, the cached list is returned without
-    re-calling the executor.
+    re-calling the executor. Blocking executor iteration runs
+    in the thread pool via ``run_in_executor``.
 
     :param task_id: Task identifier for SSE routing, e.g.
         ``"task_abc123"``.
@@ -683,17 +749,23 @@ def _checkpointed_turn(
     :param context: Agent-plane capabilities and identifiers.
     :returns: Serialized event list (DBOS-cached on replay).
     """
-    events: list[dict[str, Any]] = []
-    for event in executor.run_turn(
-        messages,
-        tools,
-        system_prompt,
-        llm_config,
-        context,
-    ):
-        _emit_executor_streaming_event(task_id, event)
-        events.append(event_to_dict(event))
-    return events
+
+    def _blocking_turn() -> list[dict[str, Any]]:
+        """Consume executor events in a thread."""
+        events: list[dict[str, Any]] = []
+        for event in executor.run_turn(
+            messages,
+            tools,
+            system_prompt,
+            llm_config,
+            context,
+        ):
+            _emit_executor_streaming_event(task_id, event)
+            events.append(event_to_dict(event))
+        return events
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _blocking_turn)
 
 
 def _event_to_sse_dict(event: ExecutorEvent) -> dict[str, Any] | None:
@@ -828,7 +900,7 @@ class _ContextWindowOverflow:
     actual_tokens: int
 
 
-def _run_executor_turn(
+async def _run_executor_turn(
     task_id: str,
     executor: Executor,
     messages: list[dict[str, Any]],
@@ -857,7 +929,7 @@ def _run_executor_turn(
     :raises PermanentLLMError: On unrecoverable executor errors.
     """
     if executor.max_context_tokens() is not None:
-        raw = _checkpointed_turn(
+        raw = await _checkpointed_turn(
             task_id,
             executor,
             messages,
@@ -868,14 +940,14 @@ def _run_executor_turn(
         )
         events: list[ExecutorEvent] = [dict_to_event(e) for e in raw]
     else:
-        events = _consume_executor_live(
+        events = await _consume_executor_live(
             task_id, executor, messages, tools, system_prompt, llm_config, context
         )
 
     return _events_to_response_dict(events, llm_config.model)
 
 
-def _consume_executor_live(
+async def _consume_executor_live(
     task_id: str,
     executor: Executor,
     messages: list[dict[str, Any]],
@@ -888,7 +960,8 @@ def _consume_executor_live(
     Consume an executor turn with live SSE emission.
 
     Used for executor-managed executors (``max_context_tokens()``
-    returns ``None``) that skip the ``@step`` wrapper.
+    returns ``None``) that skip the ``@step`` wrapper. Blocking
+    executor iteration runs in the thread pool.
 
     :param task_id: Task identifier for SSE routing.
     :param executor: The executor to run.
@@ -899,21 +972,25 @@ def _consume_executor_live(
     :param context: Agent-plane capabilities and identifiers.
     :returns: Collected list of all executor events.
     """
-    events: list[ExecutorEvent] = []
-    for event in executor.run_turn(
-        messages,
-        tools,
-        system_prompt,
-        llm_config,
-        context,
-    ):
-        _logger.info("executor event: %s", type(event).__name__)
-        # Live-only: no DBOS step context on this path, so
-        # _write_output (which calls write_stream) would crash.
-        _emit_executor_live_only(task_id, event)
-        events.append(event)
-    _logger.info("total executor events: %d", len(events))
-    return events
+
+    def _blocking_consume() -> list[ExecutorEvent]:
+        """Consume executor events in a thread."""
+        events: list[ExecutorEvent] = []
+        for event in executor.run_turn(
+            messages,
+            tools,
+            system_prompt,
+            llm_config,
+            context,
+        ):
+            _logger.info("executor event: %s", type(event).__name__)
+            _emit_executor_live_only(task_id, event)
+            events.append(event)
+        _logger.info("total executor events: %d", len(events))
+        return events
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _blocking_consume)
 
 
 def _events_to_response_dict(
@@ -977,7 +1054,7 @@ def _events_to_response_dict(
     }
 
 
-def _executor_turn_with_compaction(
+async def _executor_turn_with_compaction(
     task_id: str,
     executor: Executor,
     spec: AgentSpec,
@@ -1027,7 +1104,7 @@ def _executor_turn_with_compaction(
         compaction_state,
         task_id,
     )
-    result = _run_executor_turn(
+    result = await _run_executor_turn(
         task_id,
         executor,
         messages,
@@ -1048,7 +1125,7 @@ def _executor_turn_with_compaction(
         compaction_state,
         task_id,
     )
-    retry_result = _run_executor_turn(
+    retry_result = await _run_executor_turn(
         task_id,
         executor,
         messages,
@@ -1169,7 +1246,7 @@ def _reactive_compact_from_overflow(
 
 
 @step()
-def _call_tool(
+async def _call_tool(
     task_id: str,
     agent_id: str,
     tool_name: str,
@@ -1183,7 +1260,8 @@ def _call_tool(
 
     Constructs a :class:`ToolContext` from the serializable
     ``task_id`` and ``agent_id`` parameters so the context
-    survives DBOS replay.
+    survives DBOS replay. Blocking tool execution runs in the
+    thread pool via ``run_in_executor``.
 
     Retries are handled inside this ``@step`` boundary so they
     don't cause duplicate checkpoints. On exhausted retries,
@@ -1203,19 +1281,33 @@ def _call_tool(
     :returns: The tool's string result, or an error string
         if all retries are exhausted.
     """
-    mgr = get_tool_manager()
-    ctx = ToolContext(task_id=task_id, agent_id=agent_id)
-    # Inject client-side tool schemas into spawn arguments so
-    # sub-agents know which client tools are available.
-    if tool_name == SpawnTool.name():
-        arguments = _inject_client_tools(arguments, mgr.get_client_tool_schemas())
-    return execute_tool_with_retry(
-        tool_name=tool_name,
-        call_fn=lambda: mgr.call_tool(tool_name, arguments, ctx),
-        timeout=timeout,
-        retry_config=retry_config,
-        on_event=lambda event: _write_output(task_id, event),
-    )
+
+    def _blocking_call() -> str:
+        """Execute the tool call in a thread."""
+        mgr = get_tool_manager()
+        ctx = ToolContext(task_id=task_id, agent_id=agent_id)
+        # Inject client-side tool schemas into spawn arguments so
+        # sub-agents know which client tools are available.
+        effective_args = arguments
+        if tool_name == SpawnTool.name():
+            effective_args = _inject_client_tools(
+                arguments,
+                mgr.get_client_tool_schemas(),
+            )
+        return execute_tool_with_retry(
+            tool_name=tool_name,
+            call_fn=lambda: mgr.call_tool(
+                tool_name,
+                effective_args,
+                ctx,
+            ),
+            timeout=timeout,
+            retry_config=retry_config,
+            on_event=lambda event: _write_output(task_id, event),
+        )
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _blocking_call)
 
 
 def _inject_client_tools(
@@ -1730,7 +1822,7 @@ def _build_function_call_items(
     return fc_new_items
 
 
-def _execute_tools(
+async def _execute_tools(
     task_id: str,
     conversation_id: str,
     tool_calls: list[_ToolCall],
@@ -1741,9 +1833,14 @@ def _execute_tools(
     agent_id: str,
 ) -> str:
     """
-    Execute each tool call with timeout/retry and persist output.
+    Execute tool calls in parallel and persist output in call order.
 
-    Returns the ``last_seen`` ID after all tools complete.
+    Launches all tool calls concurrently via ``asyncio_wait``.
+    Each call runs as a DBOS-checkpointed async step with the
+    blocking work in the thread pool. Results are collected and
+    persisted in the original call order so the LLM sees
+    ``function_call_output`` items matching their ``function_call``
+    items.
 
     :param task_id: The task identifier, e.g.
         ``"task_abc123"``.
@@ -1761,17 +1858,38 @@ def _execute_tools(
         to :class:`ToolContext`, e.g. ``"ag_abc123"``.
     :returns: The ID of the last persisted tool output item.
     """
+    # Launch all tool calls concurrently as async tasks.
+    tasks: list[asyncio.Task[str]] = [
+        asyncio.ensure_future(
+            _call_tool(
+                task_id,
+                agent_id,
+                tc.name,
+                tc.arguments,
+                tools_config.timeout,
+                tools_config.retry,
+            )
+        )
+        for tc in tool_calls
+    ]
+    # DBOS.asyncio_wait checkpoints task completion state for
+    # deterministic recovery on replay. Cast needed because list
+    # is invariant and asyncio_wait expects list[Awaitable[Any]].
+    await asyncio_wait(
+        cast(list[Any], tasks),
+        return_when=asyncio.ALL_COMPLETED,
+    )
+
+    # Map results back by position (tasks and tool_calls share
+    # the same order).
+    results: dict[str, str] = {
+        tool_calls[i].call_id: tasks[i].result() for i in range(len(tool_calls))
+    }
+
+    # Persist in original call order so the LLM sees outputs
+    # matching the function_call item sequence.
     last_seen: str | None = None
     for tc in tool_calls:
-        result = _call_tool(
-            task_id,
-            agent_id,
-            tc.name,
-            tc.arguments,
-            tools_config.timeout,
-            tools_config.retry,
-        )
-
         fco_items = _persist_and_stream(
             task_id,
             conv_store,
@@ -1782,7 +1900,7 @@ def _execute_tools(
                     response_id=task_id,
                     data=FunctionCallOutputData(
                         call_id=tc.call_id,
-                        output=result,
+                        output=results[tc.call_id],
                     ),
                 ),
             ],
@@ -1841,7 +1959,7 @@ def _split_tool_calls(
     return _ToolCallSplit(server=server, client=client, has_client=bool(client))
 
 
-def _handle_tool_calls(
+async def _handle_tool_calls(
     task_id: str,
     conversation_id: str,
     llm_resp: dict[str, Any],
@@ -1903,7 +2021,7 @@ def _handle_tool_calls(
     # Always execute server-side tools — even in mixed batches
     last_seen = fc_items[-1].id
     if split.server:
-        last_seen = _execute_tools(
+        last_seen = await _execute_tools(
             task_id,
             conversation_id,
             split.server,
@@ -2076,7 +2194,7 @@ class _AutoCollectResult:
 _COLLECT_POLL_S = 0.5
 
 
-def _persist_text_before_auto_collect(
+async def _persist_text_before_auto_collect(
     task_id: str,
     conversation_id: str,
     llm_resp: dict[str, Any],
@@ -2118,7 +2236,7 @@ def _persist_text_before_auto_collect(
         output_items,
     )
     history.extend(persisted)
-    return _auto_collect_sub_agents(
+    return await _auto_collect_sub_agents(
         task_id,
         conversation_id,
         uncollected_ids,
@@ -2131,7 +2249,7 @@ def _persist_text_before_auto_collect(
     )
 
 
-def _auto_collect_sub_agents(
+async def _auto_collect_sub_agents(
     task_id: str,
     conversation_id: str,
     response_ids: list[str],
@@ -2164,7 +2282,7 @@ def _auto_collect_sub_agents(
         **original** cursor and the set of actually-collected
         IDs.
     """
-    results, collected = _poll_subagents_with_steering_check(
+    results, collected = await _poll_subagents_with_steering_check(
         response_ids,
         conversation_id,
         last_seen,
@@ -2181,7 +2299,7 @@ def _auto_collect_sub_agents(
     )
 
 
-def _poll_subagents_with_steering_check(
+async def _poll_subagents_with_steering_check(
     response_ids: list[str],
     conversation_id: str,
     last_seen: str,
@@ -2207,7 +2325,7 @@ def _poll_subagents_with_steering_check(
 
     poll_count = 0
     while pending:
-        newly_done = _check_terminal(
+        newly_done = await _check_terminal(
             pending,
             task_store,
             results,
@@ -2243,18 +2361,18 @@ def _poll_subagents_with_steering_check(
             break
 
         poll_count += 1
-        time.sleep(_COLLECT_POLL_S)
+        await asyncio.sleep(_COLLECT_POLL_S)
 
     return results, collected
 
 
-def _check_terminal(
+async def _check_terminal(
     pending: set[str],
     task_store: TaskStore,
     results: list[dict[str, str]],
 ) -> set[str]:
     """
-    Non-blocking check for sub-agents that reached terminal status.
+    Check for sub-agents that reached terminal status.
 
     :param pending: Set of sub-agent IDs still being waited on.
     :param task_store: For fetching current task status.
@@ -2266,7 +2384,11 @@ def _check_terminal(
 
     newly_done: set[str] = set()
     for rid in list(pending):
-        task = task_store.get_sync(rid)
+
+        def _get(task_id: str = rid) -> Any:
+            return task_store.get_sync(task_id)
+
+        task = await _to_thread(_get)
         if task is not None and task.status in TERMINAL_STATUSES:
             results.append(_task_to_result(task))
             newly_done.add(rid)
@@ -2344,7 +2466,7 @@ def _inject_collect_results(
     )
 
 
-def _park_for_client_tools(
+async def _park_for_client_tools(
     task_id: str,
     conversation_id: str,
     root_task_id: str,
@@ -2418,7 +2540,7 @@ def _park_for_client_tools(
     #    calls are completed. Uses DBOS recv which yields the
     #    thread (no polling) — the PATCH handler calls
     #    DBOS.send to wake us.
-    _wait_for_pending_calls(client_call_ids)
+    await _wait_for_pending_calls(client_call_ids)
 
     # 4. Fetch completed results and inject as
     #    function_call_output items into the conversation.
@@ -2450,27 +2572,23 @@ def _park_for_client_tools(
     return fco_items[-1].id
 
 
-def _wait_for_pending_calls(
+async def _wait_for_pending_calls(
     call_ids: list[str],
 ) -> None:
     """
-    Block until all pending tool calls are completed.
+    Wait until all pending tool calls are completed.
 
-    Uses ``DBOS.recv`` per call_id — each ``recv`` yields the
-    workflow thread until the PATCH handler calls
+    Uses ``DBOS.recv_async`` per call_id — each ``recv`` yields
+    the event loop until the PATCH handler calls
     ``DBOS.send(workflow_id, call_id, topic="tool_result")``.
-    This avoids the ``time.sleep`` polling loop that caused
-    DBOS thread pool exhaustion under concurrent load.
 
     :param call_ids: Call IDs to wait for.
     """
-    from agent_plane.runtime.durability import dbos_recv
-
     for _call_id in call_ids:
-        # Each recv blocks until the corresponding send
-        # arrives. DBOS internally uses threading.Event.wait
-        # which releases the GIL — no busy polling.
-        dbos_recv(topic="tool_result", timeout_seconds=600)
+        # Each recv awaits until the corresponding send
+        # arrives. Yields the event loop so other workflows
+        # can make progress.
+        await dbos_recv_async(topic="tool_result", timeout_seconds=600)
 
 
 def _complete_for_client_tools(
@@ -2612,7 +2730,7 @@ def _sync_history(
     return last_seen
 
 
-def _invoke_llm_streaming(
+async def _invoke_llm_streaming(
     task_id: str,
     messages: list[dict[str, Any]],
     sys_instructions: str,
@@ -2638,7 +2756,7 @@ def _invoke_llm_streaming(
     :raises PermanentLLMError: On non-retryable LLM errors.
     :raises RetryableLLMError: When all retry attempts are exhausted.
     """
-    return _call_llm_streaming(
+    return await _call_llm_streaming(
         task_id,
         messages,
         sys_instructions,
@@ -2827,7 +2945,7 @@ def _reactive_compact(
     return result.messages
 
 
-def _call_llm_maybe_compact(
+async def _call_llm_maybe_compact(
     task_id: str,
     spec: AgentSpec,
     llm_config: LLMConfig,
@@ -2881,13 +2999,15 @@ def _call_llm_maybe_compact(
         messages, resolved, sys_tokens, compaction_state, task_id
     )
     try:
-        return _invoke_llm_streaming(task_id, messages, sys_instructions, llm_config, tool_schemas)
+        return await _invoke_llm_streaming(
+            task_id, messages, sys_instructions, llm_config, tool_schemas
+        )
     except ContextWindowExceededError as exc:
         messages = _reactive_compact(
             messages, resolved, sys_tokens, exc, compaction_state, task_id
         )
         try:
-            return _invoke_llm_streaming(
+            return await _invoke_llm_streaming(
                 task_id, messages, sys_instructions, llm_config, tool_schemas
             )
         except (RetryableLLMError, PermanentLLMError) as inner_exc:
@@ -3287,8 +3407,8 @@ def _poll_for_tool_result(
     :param task_store: Task store for querying pending tool calls.
     :returns: The client's tool result, or a timeout error.
     """
-    deadline = time.monotonic() + _TOOL_POLL_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
+    deadline = _monotonic() + _TOOL_POLL_TIMEOUT_SECONDS
+    while _monotonic() < deadline:
         rows = task_store.list_pending_tool_calls(
             call_id=call_id,
             status="completed",
@@ -3317,7 +3437,7 @@ def _poll_for_tool_result(
 # ── The agent loop ────────────────────────────────────────
 
 
-def _run_agent_loop(
+async def _run_agent_loop(
     task_id: str,
     conversation_id: str,
     spec: AgentSpec,
@@ -3363,7 +3483,7 @@ def _run_agent_loop(
     # Sub-agents park when hitting client tools instead of
     # completing — the park mechanism tunnels tool calls to
     # the root response's client.
-    task_row = task_store.get_sync(task_id)
+    task_row = await _to_thread(lambda: task_store.get_sync(task_id))
     root_task_id: str | None = task_row.root_task_id if task_row else None
     # Load history, using the latest compaction item as a cursor
     # to avoid loading the full conversation on long-running agents.
@@ -3385,7 +3505,7 @@ def _run_agent_loop(
     caps = get_caps()
     execution_timeout = min(spec.executor.timeout, caps.execution_timeout)
     max_iterations = spec.executor.max_iterations
-    start_time = time.monotonic()
+    start_time = _monotonic()
     # Track spawned sub-agent response IDs for auto-collect.
     # When the LLM produces a final response without collecting,
     # the loop auto-collects outstanding sub-agents before
@@ -3424,7 +3544,7 @@ def _run_agent_loop(
     try:
         for iteration in range(max_iterations):
             # Check execution timeout at the top of each iteration.
-            elapsed = time.monotonic() - start_time
+            elapsed = _monotonic() - start_time
             if elapsed >= execution_timeout:
                 return _handle_execution_timeout(task_id, output_items, execution_timeout)
 
@@ -3439,7 +3559,7 @@ def _run_agent_loop(
                 last_seen,
                 history,
             )
-            llm_resp = _executor_turn_with_compaction(
+            llm_resp = await _executor_turn_with_compaction(
                 task_id,
                 executor,
                 spec,
@@ -3486,7 +3606,7 @@ def _run_agent_loop(
                     # never committed — ghost tokens that break
                     # steering (the LLM's steering response is
                     # lost and subsequent calls ignore the steer).
-                    collect_result = _persist_text_before_auto_collect(
+                    collect_result = await _persist_text_before_auto_collect(
                         task_id,
                         conversation_id,
                         llm_resp,
@@ -3534,7 +3654,7 @@ def _run_agent_loop(
             # outputs get positions after the steered message, so
             # using the post-tool last_seen would skip it.
             pre_tool_last_seen = last_seen
-            handle_result = _handle_tool_calls(
+            handle_result = await _handle_tool_calls(
                 task_id,
                 conversation_id,
                 llm_resp,
@@ -3550,7 +3670,7 @@ def _run_agent_loop(
                 if root_task_id is not None:
                     # Sub-agent: park and wait for client to deliver
                     # tool results via PATCH on the root response.
-                    last_seen = _park_for_client_tools(
+                    last_seen = await _park_for_client_tools(
                         task_id,
                         conversation_id,
                         root_task_id,
@@ -3639,7 +3759,7 @@ def _find_spec_by_name(
     return None
 
 
-def _resolve_agent_spec_for_task(
+async def _resolve_agent_spec_for_task(
     task_id: str,
     root_spec: AgentSpec,
 ) -> AgentSpec:
@@ -3671,7 +3791,7 @@ def _resolve_agent_spec_for_task(
         sub-agent name recorded on the task is not found in the
         spec tree.
     """
-    task = get_task_store().get_sync(task_id)
+    task = await _to_thread(lambda: get_task_store().get_sync(task_id))
     if task is None:
         raise LookupError(f"task {task_id!r} not found")
 
@@ -3687,7 +3807,7 @@ def _resolve_agent_spec_for_task(
 
 
 @workflow()
-def agent_execution_workflow(
+async def agent_execution_workflow(
     agent_id: str,
     conversation_id: str,
     previous_response_id: str | None = None,
@@ -3739,7 +3859,7 @@ def agent_execution_workflow(
 
         # Resolve spec for sub-agents: if root_task_id is set,
         # find the sub-agent spec by agent_name in the tree.
-        spec = _resolve_agent_spec_for_task(task_id, root_spec)
+        spec = await _resolve_agent_spec_for_task(task_id, root_spec)
         # spec.name is None only for partially-constructed specs that
         # haven't been registered — fall back to agent_id for display.
         agent_name: str = spec.name or agent_id
@@ -3763,7 +3883,7 @@ def agent_execution_workflow(
         set_tool_manager(tool_mgr)
         executor = _create_executor(spec)
 
-        result = _run_agent_loop(
+        result = await _run_agent_loop(
             task_id,
             conversation_id,
             spec,
@@ -3782,7 +3902,7 @@ def agent_execution_workflow(
         )
         raise
     finally:
-        _close_output(task_id)
+        await _close_output(task_id)
         if tool_mgr is not None:
             tool_mgr.shutdown()
         set_tool_manager(None)
