@@ -1186,7 +1186,10 @@ def _write_skills_to_storage(
         skill_dir = storage_dir / ".claude" / "skills" / skill.name
         skill_dir.mkdir(parents=True, exist_ok=True)
         (skill_dir / "SKILL.md").write_text(
-            f"---\nname: {skill.name}\ndescription: {skill.description}\n---\n\n{skill.content}\n"
+            f"---\nname: {skill.name}\n"
+            f"description: {skill.description}\n"
+            f"disable-model-invocation: false\n"
+            f"---\n\n{skill.content}\n"
         )
 
 
