@@ -58,6 +58,34 @@ def build_instructions(
     return "\n\n".join(parts) if parts else "You are a helpful assistant."
 
 
+def _strip_output_annotations(
+    content: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Remove ``annotations`` from ``output_text`` blocks.
+
+    Annotations (e.g. ``file_citation``) are output metadata — they
+    tell the client about files the agent produced. They are not
+    input content for the LLM on subsequent turns. The text
+    description itself survives and provides context.
+
+    :param content: Content block list from a ``MessageData``.
+    :returns: A new list with annotations stripped from output blocks.
+    """
+    result: list[dict[str, Any]] = []
+    for block in content:
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "output_text"
+            and "annotations" in block
+        ):
+            stripped = {k: v for k, v in block.items() if k != "annotations"}
+            result.append(stripped)
+        else:
+            result.append(block)
+    return result
+
+
 def history_to_input_items(
     items: list[ConversationItem],
 ) -> list[dict[str, Any]]:
@@ -79,13 +107,16 @@ def history_to_input_items(
     for item in items:
         if item.type == "message":
             assert isinstance(item.data, MessageData)
-            # Pass content blocks through as-is. After
-            # resolve_content_references(), all file_id refs are
-            # already resolved to inline content.
+            # Pass content blocks through, stripping annotations
+            # from output_text blocks. Annotations are output
+            # metadata (file citations) — not input content for
+            # the LLM. The text description survives and gives
+            # the LLM context about files it previously produced.
+            content = _strip_output_annotations(item.data.content)
             result.append(
                 {
                     "role": item.data.role,
-                    "content": item.data.content,
+                    "content": content,
                 }
             )
 

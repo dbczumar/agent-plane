@@ -1614,6 +1614,7 @@ def _build_assistant_item(
     task_id: str,
     agent_name: str,
     text: str | None,
+    annotations: list[dict[str, Any]] | None = None,
 ) -> NewConversationItem:
     """
     Build the NewConversationItem for the final assistant
@@ -1625,19 +1626,24 @@ def _build_assistant_item(
         ``"research-agent"``.
     :param text: The assistant's text content, or ``None``
         if the LLM produced no text.
+    :param annotations: Optional list of file citation
+        annotations for files the agent produced, e.g.
+        ``[{"type": "file_citation", "file_id": "file_abc123",
+        "filename": "chart.png", "content_type": "image/png"}]``.
     :returns: A NewConversationItem ready for persistence.
     """
+    output_text_block: dict[str, Any] = {
+        "type": "output_text",
+        "text": text,
+    }
+    if annotations:
+        output_text_block["annotations"] = annotations
     return NewConversationItem(
         type="message",
         response_id=task_id,
         data=MessageData(
             role="assistant",
-            content=[
-                {
-                    "type": "output_text",
-                    "text": text,
-                }
-            ],
+            content=[output_text_block],
             agent=agent_name,
         ),
     )

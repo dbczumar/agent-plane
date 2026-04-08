@@ -42,10 +42,14 @@ class OutputText:
 
     :param text: The text content, e.g. ``"Hello! How can I help?"``.
     :param type: Always ``"output_text"``.
+    :param annotations: Optional list of annotations (e.g.
+        ``file_citation``) referencing files the agent produced.
+        ``None`` when no annotations are present.
     """
 
     text: str
     type: str = "output_text"
+    annotations: list[dict[str, Any]] | None = None
 
 
 @dataclass
