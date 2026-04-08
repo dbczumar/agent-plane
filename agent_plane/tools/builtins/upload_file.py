@@ -137,7 +137,9 @@ def _upload(resolved: Path) -> str:
         bytes=len(data),
         content_type=content_type,
     )
-    artifact_store.put(f"files/{file_record.id}", data)
+    # Key must match the server's GET /v1/files/{id}/content
+    # endpoint, which reads via artifact_store.get(stored.id).
+    artifact_store.put(file_record.id, data)
 
     return json.dumps(
         {
