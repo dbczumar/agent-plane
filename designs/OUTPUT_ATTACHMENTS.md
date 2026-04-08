@@ -270,29 +270,38 @@ normal via `response.output_item.done`. Clients that only consume
 3. **`runtime/compaction.py`** — `_clear_binary_content()`: strip
    annotations before passing to summarization LLM.
 
-### Phase 2: Image generation extraction
+### Phase 2: `upload_file` tool → annotations
 
-4. **`runtime/file_extraction.py`** (new) — Extract files from
-   native tool outputs:
-   - `image_generation_call`: decode base64, store, return annotation.
-   - `code_interpreter_call`: detect container citations, download,
-     store, return annotations.
+4. **`tools/builtins/filesystem.py`** — The `upload_file` tool
+   (part of the filesystem builtins) stores a file from the
+   workspace into the file store and returns `file_id`. The
+   workflow detects `file_id` references in tool results and
+   builds `file_citation` annotations on the assistant message.
 
-5. **`runtime/workflow.py`** — `_emit_native_tool_items()`: after
-   emitting raw native tool output, extract files and add
-   annotations to the assistant message.
+5. **`runtime/workflow.py`** — After the agent's final response,
+   scan tool results for `file_id` references from `upload_file`
+   calls. Build `file_citation` annotations automatically.
 
-### Phase 3: Claude SDK executor file extraction
+### Phase 3: Remote executor file support
 
-6. **`runtime/claude_agents_executor.py`** — Detect file-producing
-   tool calls, store files, include annotations. Requires
-   `file_store` and `artifact_store` on `ExecutorContext`.
-
-### Phase 4: Remote executor file support
-
-7. **`runtime/executor.py`** — `RemoteExecutor`: if the remote
+6. **`runtime/executor.py`** — `RemoteExecutor`: if the remote
    service SSE stream includes file annotations, verify files
    exist in the local file store or proxy them.
+
+### Not Yet: Native tool file extraction
+
+Extracting files from `image_generation_call` and
+`code_interpreter_call` is deferred. Agent-plane does not pass
+hosted tool types (image generation, code interpreter) to the
+LLM today — `ToolManager` only handles function tools, MCP tools,
+and builtins. Once hosted tool passthrough is added, file
+extraction from native tool outputs can be implemented:
+
+- `image_generation_call`: decode base64 `result`, store via
+  file infrastructure, add annotation.
+- `code_interpreter_call`: detect `container_file_citation`
+  annotations, download from OpenAI container API, store locally,
+  add annotations.
 
 ---
 
