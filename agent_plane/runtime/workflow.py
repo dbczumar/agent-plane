@@ -7,6 +7,7 @@ All durably checkpointed for crash recovery.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import io
 import json
 import logging
@@ -14,7 +15,7 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 from agent_plane.entities import (
     CompactionData,
@@ -125,20 +126,24 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
-async def _to_thread(fn: Callable[[], Any]) -> Any:
-    """
-    Run a sync callable in the thread pool.
+_T = TypeVar("_T")
 
-    Used to call sync DBOS APIs (``get_workflow_status``,
-    ``close_inbox``, etc.) from within the async workflow
-    without blocking the event loop. DBOS raises if its sync
-    APIs are called while an event loop is running.
+
+async def _to_thread(fn: Callable[[], _T]) -> _T:
+    """
+    Run a sync callable in the thread pool, propagating ``ContextVar`` values.
+
+    Uses ``contextvars.copy_context()`` so that workflow-scoped state
+    (e.g. ``_tool_manager_var``) is visible inside the thread pool
+    thread. Without this, ``run_in_executor`` runs in a bare thread
+    that has no access to the async task's context.
 
     :param fn: A zero-argument callable to execute.
     :returns: The callable's return value.
     """
+    ctx = contextvars.copy_context()
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, fn)
+    return await loop.run_in_executor(None, ctx.run, fn)
 
 
 # Hard upper bound on LLM turns per execution. Prevents runaway loops.
@@ -551,8 +556,7 @@ async def _call_llm(
             on_retry=lambda event: _write_output(task_id, event),
         )
 
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _blocking_call)
+    return await _to_thread(_blocking_call)
 
 
 @step()
@@ -631,8 +635,7 @@ async def _call_llm_streaming(
             on_retry=lambda event: _write_output(task_id, event),
         )
 
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _blocking_call)
+    return await _to_thread(_blocking_call)
 
 
 # SSE event types emitted for reasoning content
@@ -764,8 +767,7 @@ async def _checkpointed_turn(
             events.append(event_to_dict(event))
         return events
 
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _blocking_turn)
+    return await _to_thread(_blocking_turn)
 
 
 def _event_to_sse_dict(event: ExecutorEvent) -> dict[str, Any] | None:
@@ -989,8 +991,7 @@ async def _consume_executor_live(
         _logger.info("total executor events: %d", len(events))
         return events
 
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _blocking_consume)
+    return await _to_thread(_blocking_consume)
 
 
 def _events_to_response_dict(
@@ -1306,8 +1307,7 @@ async def _call_tool(
             on_event=lambda event: _write_output(task_id, event),
         )
 
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _blocking_call)
+    return await _to_thread(_blocking_call)
 
 
 def _inject_client_tools(
@@ -3144,7 +3144,16 @@ def _storage_artifact_key(
     :param agent_name: e.g. ``"research-agent"``.
     :returns: Key string, e.g.
         ``"executor_storage/conv_abc123/research-agent.tar.gz"``.
+    :raises ValueError: If either argument would escape the expected
+        directory tree (path traversal).
     """
+    from pathlib import PurePosixPath
+
+    for label, value in [("conversation_id", conversation_id), ("agent_name", agent_name)]:
+        # PurePosixPath.name strips directory components; if it differs
+        # from the original, the value contains separators or "..".
+        if PurePosixPath(value).name != value:
+            raise ValueError(f"{label} contains path traversal characters: {value!r}")
     return f"{_EXECUTOR_STORAGE_KEY_PREFIX}/{conversation_id}/{agent_name}.tar.gz"
 
 

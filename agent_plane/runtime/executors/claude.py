@@ -175,19 +175,20 @@ class _ClientRegistry:
         :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
         :returns: The per-conversation asyncio event loop.
         """
-        existing = self._loops.get(conv_id)
-        if existing is not None:
-            return existing[0]
-        # First task for this conversation — create a dedicated loop.
-        loop = asyncio.new_event_loop()
-        thread = threading.Thread(
-            target=loop.run_forever,
-            daemon=True,
-            name=f"sdk-loop-{conv_id}",
-        )
-        thread.start()
-        self._loops[conv_id] = (loop, thread)
-        return loop
+        with self._lock:
+            existing = self._loops.get(conv_id)
+            if existing is not None:
+                return existing[0]
+            # First task for this conversation — create a dedicated loop.
+            loop = asyncio.new_event_loop()
+            thread = threading.Thread(
+                target=loop.run_forever,
+                daemon=True,
+                name=f"sdk-loop-{conv_id}",
+            )
+            thread.start()
+            self._loops[conv_id] = (loop, thread)
+            return loop
 
     def register(self, conv_id: str, state: _ClientState) -> None:
         """
@@ -216,9 +217,10 @@ class _ClientRegistry:
 
         :param conv_id: Conversation identifier, e.g. ``"conv_abc123"``.
         """
-        state = self._clients.get(conv_id)
-        if state is not None:
-            state.last_used = time.monotonic()
+        with self._lock:
+            state = self._clients.get(conv_id)
+            if state is not None:
+                state.last_used = time.monotonic()
 
     def __contains__(self, conv_id: str) -> bool:
         """
@@ -507,7 +509,7 @@ async def _async_turn(
     """
     Async implementation of one SDK turn.
 
-    Runs in the registry's shared event loop. Builds the prompt,
+    Runs in the per-conversation event loop. Builds the prompt,
     configures the SDK client (on first task), sends the query, and
     maps the SDK stream events into executor events pushed to the
     queue. Puts ``None`` on ``event_queue`` when done.
@@ -1111,14 +1113,13 @@ def _disconnect_in_loop(
     loop: asyncio.AbstractEventLoop,
 ) -> None:
     """
-    Disconnect an SDK client by submitting to the shared event loop.
+    Disconnect an SDK client by submitting to its event loop.
 
     Used during TTL eviction (called from a workflow thread, not the
-    event loop thread). Does not stop the loop — it's shared across
-    all conversations.
+    event loop thread).
 
     :param client: The ``ClaudeSDKClient`` to disconnect.
-    :param loop: The shared event loop to submit to.
+    :param loop: The per-conversation event loop to submit to.
     """
     try:
         future = asyncio.run_coroutine_threadsafe(
