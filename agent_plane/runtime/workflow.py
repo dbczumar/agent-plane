@@ -2090,10 +2090,15 @@ def _track_spawn_collect(
             parsed = json.loads(output_str)
         except (json.JSONDecodeError, TypeError):
             continue
-        if name == SpawnTool.name():
+        # Match both bare names ("spawn_sub_agents") and MCP-prefixed
+        # names ("mcp__agent_plane__spawn_sub_agents") so tracking
+        # works for both the default executor path (bare) and the
+        # Claude SDK executor path (MCP-prefixed observed tool calls).
+        bare_name = name.rsplit("__", 1)[-1] if "__" in name else name
+        if bare_name == SpawnTool.name():
             for rid in parsed.get("response_ids", []):
                 spawned_ids.add(rid)
-        elif name == CheckSubAgentsTool.name():
+        elif bare_name == CheckSubAgentsTool.name():
             for r in parsed.get("results", []):
                 rid = r.get("response_id", "")
                 status = r.get("status")
@@ -2142,10 +2147,11 @@ def _recover_spawn_state(
                 parsed = json.loads(output_str)
             except (json.JSONDecodeError, TypeError):
                 continue
-            if name == SpawnTool.name():
+            bare_name = name.rsplit("__", 1)[-1] if "__" in name else name
+            if bare_name == SpawnTool.name():
                 for rid in parsed.get("response_ids", []):
                     spawned.add(rid)
-            elif name == CheckSubAgentsTool.name():
+            elif bare_name == CheckSubAgentsTool.name():
                 for r in parsed.get("results", []):
                     rid = r.get("response_id", "")
                     status = r.get("status")
