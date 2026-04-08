@@ -42,9 +42,14 @@ def build_instructions(
     if per_request_instructions:
         parts.append(per_request_instructions)
 
-    # Let the LLM know about available skills (name + description only)
-    # so it can call load_skill to retrieve the full content.
-    if spec.skills:
+    # Only mention skills in the system prompt when load_skill is
+    # available as a tool. Executors that handle skills natively
+    # (e.g. Claude SDK with its built-in Skill tool) don't need
+    # this hint — the SDK informs the model about skills itself.
+    has_load_skill = any(
+        schema.get("function", {}).get("name") == "load_skill" for schema in tool_schemas
+    )
+    if spec.skills and has_load_skill:
         skill_lines = ["Available skills (use the load_skill tool to load one):"]
         for skill in spec.skills:
             skill_lines.append(f"- {skill.name}: {skill.description}")
