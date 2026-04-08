@@ -3301,23 +3301,11 @@ def _build_executor_context(
         :returns: The tool's result.
         """
         if call.name in server_names:
-            args_json = json.dumps(call.arguments)
-            if call.name == "check_sub_agents":
-                # Block until all requested sub-agents finish.
-                # The SDK can't poll in a loop like the default
-                # executor's workflow — it needs a single call
-                # that returns the final result.
-                result_str = _poll_check_sub_agents(
-                    tool_mgr,
-                    args_json,
-                    tool_ctx,
-                )
-            else:
-                result_str = tool_mgr.call_tool(
-                    call.name,
-                    args_json,
-                    tool_ctx,
-                )
+            result_str = tool_mgr.call_tool(
+                call.name,
+                json.dumps(call.arguments),
+                tool_ctx,
+            )
             return ToolResult(content=result_str, status="completed")
         return await_tool_output(call)
 
@@ -3327,47 +3315,6 @@ def _build_executor_context(
         storage_dir=storage_dir,
         call_tool=_call_tool,
     )
-
-
-def _poll_check_sub_agents(
-    tool_mgr: ToolManager,
-    args_json: str,
-    tool_ctx: ToolContext,
-    poll_interval: float = 2.0,
-    timeout: float = 300.0,
-) -> str:
-    """
-    Poll ``check_sub_agents`` until all requested sub-agents finish.
-
-    The default executor's workflow handles collection via its own
-    loop. Executor-managed turns (e.g. Claude SDK) call
-    ``check_sub_agents`` as a tool — it must block until results
-    are ready, otherwise the SDK gives up after a few polls.
-
-    :param tool_mgr: The ToolManager for dispatching the check.
-    :param args_json: JSON-encoded arguments (``response_ids``).
-    :param tool_ctx: Server-side execution context.
-    :param poll_interval: Seconds between polls, e.g. ``2.0``.
-    :param timeout: Max seconds to wait, e.g. ``300.0``.
-    :returns: The final ``check_sub_agents`` result JSON with
-        all sub-agents in a terminal state.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        result_str = tool_mgr.call_tool(
-            "check_sub_agents",
-            args_json,
-            tool_ctx,
-        )
-        try:
-            parsed = json.loads(result_str)
-        except (json.JSONDecodeError, TypeError):
-            return result_str
-        results = parsed.get("results", [])
-        if results and all(r.get("status") in TERMINAL_STATUSES for r in results):
-            return result_str
-        time.sleep(poll_interval)
-    return result_str
 
 
 # ── await_tool_output implementation ───────────────────────
