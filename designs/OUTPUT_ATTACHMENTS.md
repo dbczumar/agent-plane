@@ -31,96 +31,58 @@ references in agent output that clients can download via the existing
 
 ## Design Decisions
 
-### One mechanism: `output_file` content blocks with `file_id`
+### Use `output_text` annotations with `file_id` references
 
-Instead of three different output types (one per category), all
-attachments use the same content block type inside assistant messages:
+No new content block types. File attachments are represented as
+`file_citation` annotations on `output_text` blocks:
 
 ```json
 {
-  "type": "output_file",
-  "file_id": "file_abc123",
-  "filename": "chart.png",
-  "content_type": "image/png"
+  "type": "output_text",
+  "text": "I created solution.py with the implementation.",
+  "annotations": [
+    {
+      "type": "file_citation",
+      "file_id": "file_abc123",
+      "filename": "solution.py",
+      "content_type": "text/x-python"
+    }
+  ]
 }
 ```
 
-The client downloads the content via the existing endpoint:
-`GET /v1/files/{file_id}/content`.
+The text is the human-readable description. The `file_id` is the
+download reference. The client fetches file content via the existing
+`GET /v1/files/{file_id}/content` endpoint. No content is inlined
+in the response — no bloated SSE streams.
 
-**Why one type, not separate `output_image` / `output_file`:**
+**Why annotations, not a new content block type:**
 
-- The download mechanism is identical regardless of content type.
-- The client knows it's an image from `content_type: "image/png"` — no
-  need for a type-level distinction.
-- OpenAI splits these because `image_generation_call` is inline base64
-  while `code_interpreter_call` uses container references. We always
-  use `file_id` references — the split is unnecessary.
-- One content block type means one code path for persistence, SSE,
-  compaction, and prompt construction.
+- **OpenResponses compatible.** The spec defines `output_text` with
+  an `annotations` array. `file_citation` is an existing OpenAI
+  annotation type. No spec extensions needed.
+- **Backward compatible.** Clients that don't understand annotations
+  still see the text description. The file reference is additive.
+- **One mechanism.** Same pattern for images, code files, PDFs,
+  CSVs — the `content_type` field tells the client what it is,
+  the `file_id` tells it where to download.
+- **Aligns with OpenResponses Issue #66** (MIME Types for Content
+  Parts) which proposes `content_type` metadata on content parts.
 
-### Files are stored via the existing file infrastructure
+**Why not inline file content in the response:**
 
-Generated files are stored the same way uploaded files are:
+- SSE streams bloat with base64 images or full code files.
+- The file store already exists — files are uploaded via
+  `POST /v1/files` and downloaded via `GET /v1/files/{id}/content`.
+  Output files use the same infrastructure.
+- Clients that want the content fetch it on demand. Clients that
+  only need the filename and type use the annotation metadata.
 
-- Metadata in `FileStore` (filename, content_type, size)
-- Binary content in `ArtifactStore` (keyed by `file_id`)
-- Downloaded via `GET /v1/files/{file_id}/content`
-
-No new stores, no new endpoints, no new DB tables.
-
-### Native tool outputs become first-class when they contain files
-
-Today, `NativeToolOutput` items (e.g. `image_generation_call`,
-`code_interpreter_call`) are opaque dicts that flow through SSE but
-are NOT persisted to the conversation store. With this change:
-
-1. The workflow inspects native tool outputs for file content.
-2. If an `image_generation_call` contains a base64 `result`, the
-   workflow stores it in the file infrastructure and emits an
-   `output_file` block on the assistant message.
-3. If a `code_interpreter_call` contains `container_file_citation`
-   annotations, the workflow downloads the file from OpenAI's
-   container API, stores it locally, and emits `output_file` blocks.
-
-The native tool output item ALSO flows through SSE for clients that
-want the raw provider-specific data. The `output_file` block is the
-canonical, provider-agnostic representation.
-
-### Agent-produced files use the same path
-
-When a Claude SDK executor (or any internal executor) produces files,
-the executor is responsible for storing them via the file
-infrastructure and including `output_file` blocks in the response.
-
-For the Claude SDK executor specifically:
-
-- The SDK's `ToolResultBlock` for file-producing tools (Write, Edit)
-  contains the file path in `storage_dir`.
-- The executor reads the file content, calls `file_store.create()` +
-  `artifact_store.put()`, and includes the `file_id` in a
-  `ToolCallObserved` event's result.
-- At turn end, the workflow builds the assistant message with
-  `output_file` blocks referencing the stored files.
-
-For the `DefaultExecutor`, file attachments come from provider-native
-tools (image generation, code interpreter) — handled by the native
-tool output extraction described above.
-
-For the `RemoteExecutor`, the remote service can include `output_file`
-blocks directly in its SSE stream. The workflow stores the referenced
-files if they arrive as inline base64, or passes through `file_id`
-references if the remote service pre-stored them.
-
----
-
-## Content Block Schema
-
-### `output_file` (new)
+### Annotation schema: `file_citation`
 
 ```json
 {
-  "type": "output_file",
+  "type": "file_citation",
   "file_id": "file_abc123",
   "filename": "chart.png",
   "content_type": "image/png"
@@ -129,54 +91,139 @@ references if the remote service pre-stored them.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `type` | string | yes | Always `"output_file"` |
-| `file_id` | string | yes | Reference to a file in the file store. Client downloads via `GET /v1/files/{file_id}/content`. |
-| `filename` | string | yes | Original or generated filename, e.g. `"chart.png"`. |
-| `content_type` | string | yes | MIME type, e.g. `"image/png"`, `"text/csv"`, `"application/pdf"`. |
+| `type` | string | yes | `"file_citation"` |
+| `file_id` | string | yes | File store reference. Download via `GET /v1/files/{file_id}/content`. |
+| `filename` | string | yes | Original or generated filename. |
+| `content_type` | string | yes | MIME type, e.g. `"image/png"`, `"text/x-python"`. |
 
-This block appears inside assistant message `content` arrays alongside
-`output_text` blocks:
+OpenAI's `file_citation` has `file_id`, `filename`, and `index`.
+We add `content_type` (per Issue #66's direction) and omit `index`
+(agent-plane doesn't insert citations at character offsets — the
+annotation applies to the whole text block).
 
-```json
-{
-  "type": "message",
-  "role": "assistant",
-  "content": [
-    {"type": "output_text", "text": "Here's the chart you requested:"},
-    {
-      "type": "output_file",
-      "file_id": "file_abc123",
-      "filename": "chart.png",
-      "content_type": "image/png"
-    }
-  ]
-}
+### Files are stored via the existing file infrastructure
+
+Generated and agent-produced files go through the same pipeline as
+client-uploaded files:
+
+- Metadata in `FileStore` (filename, content_type, size)
+- Binary content in `ArtifactStore` (keyed by `file_id`)
+- Downloaded via `GET /v1/files/{file_id}/content`
+
+No new stores, no new endpoints, no new DB tables.
+
+---
+
+## How Each Category Works
+
+### 1. LLM-generated images (`image_generation_call`)
+
+Today: `image_generation_call` flows through as a `NativeToolOutput`
+with base64 in the `result` field. Not persisted, not downloadable.
+
+After:
+
+1. Workflow inspects native tool output for `image_generation_call`.
+2. Decodes base64 `result` → stores via `file_store.create()` +
+   `artifact_store.put()` → gets `file_id`.
+3. Builds `file_citation` annotation on the assistant message's
+   `output_text` block.
+4. The raw `image_generation_call` item ALSO flows through SSE for
+   clients that want the provider-specific data.
+
+### 2. LLM-generated files (`code_interpreter_call`)
+
+Today: `code_interpreter_call` flows through with
+`container_file_citation` annotations. Not stored locally.
+
+After:
+
+1. Workflow detects `container_file_citation` annotations.
+2. Downloads file from OpenAI's container API via
+   `GET /containers/{container_id}/files/{file_id}/content`.
+3. Stores locally → gets agent-plane `file_id`.
+4. Builds `file_citation` annotation with the local `file_id`.
+
+### 3. Agent-produced files (Claude SDK executor)
+
+Today: Files exist in `storage_dir` but aren't referenced in output.
+
+After:
+
+1. Executor detects file-producing tool calls (Write, Edit) in
+   `ToolCallObserved` events.
+2. Reads file from `storage_dir`, stores via file infrastructure.
+3. Includes `file_citation` annotation on the tool result or
+   assistant message.
+
+Requires `file_store` and `artifact_store` access in the executor.
+These can be added to `ExecutorContext`.
+
+---
+
+## Conversation Storage
+
+Annotations live inside `output_text` blocks within
+`MessageData.content`. No new item type needed:
+
+```python
+MessageData(
+    role="assistant",
+    content=[
+        {
+            "type": "output_text",
+            "text": "Here's the chart you requested:",
+            "annotations": [
+                {
+                    "type": "file_citation",
+                    "file_id": "file_abc123",
+                    "filename": "chart.png",
+                    "content_type": "image/png",
+                }
+            ],
+        },
+    ],
+    agent="my-agent",
+)
 ```
 
-### `output_text` annotations (new, optional)
+`MessageData.content` is `list[dict[str, Any]]` — annotations are
+just a nested list within the dict. No schema change needed.
 
-For inline references within text (e.g. "see [chart.png]"), the
-existing `output_text` block gains an optional `annotations` array
-matching OpenAI's pattern:
+---
 
-```json
-{
-  "type": "output_text",
-  "text": "Here's the analysis [1]...",
-  "annotations": [
-    {
-      "type": "file_citation",
-      "file_id": "file_abc123",
-      "filename": "report.pdf",
-      "index": 0
-    }
-  ]
-}
-```
+## Prompt Construction
 
-Annotations are informational — the canonical attachment is the
-`output_file` block. Annotations provide inline context for where in
-the text a file is referenced.
+On subsequent turns, `history_to_input_items()` encounters
+`output_text` blocks with `file_citation` annotations. The text
+description is already human-readable ("Here's the chart you
+requested:"). The annotation metadata is stripped or preserved
+depending on provider support:
+
+- **For providers that support annotations** (OpenAI): pass through.
+- **For providers that don't**: strip annotations, keep text only.
+  The LLM still sees "Here's the chart you requested:" and knows
+  it produced a file.
+
+No binary content enters the context window. The file exists in
+the file store for the client to download — the LLM doesn't need
+to re-see it.
+
+---
+
+## Compaction
+
+`file_citation` annotations are metadata on text blocks, not binary
+content. They survive compaction naturally:
+
+- **Layer 1:** No change — there's no binary content to clear.
+  The annotation is just `{type, file_id, filename, content_type}`.
+- **Layer 2:** The text ("Here's the chart you requested:") is
+  included in summarization input. The summary captures that the
+  agent produced a file. Annotations are stripped before
+  summarization (they're metadata, not content for the LLM).
+- **Layer 3:** If the message is truncated, the annotation goes
+  with it. The file still exists in the file store.
 
 ---
 
@@ -184,7 +231,7 @@ the text a file is referenced.
 
 ### New: `response.output_file.done`
 
-Emitted when an output file is ready for download:
+Emitted when an output file is stored and ready for download:
 
 ```json
 {
@@ -192,146 +239,60 @@ Emitted when an output file is ready for download:
   "file_id": "file_abc123",
   "filename": "chart.png",
   "content_type": "image/png",
-  "output_index": 2,
   "sequence_number": 5
 }
 ```
 
-Clients that want to show a thumbnail or download link can react to
-this event immediately. The file is already stored and downloadable
-by the time this event is emitted.
+Clients that want to show a thumbnail or download link can react
+immediately. The file is already stored and downloadable by the time
+this event is emitted.
 
 ### Existing: `response.output_item.done`
 
-The completed assistant message item (with `output_file` blocks in
-its content array) is emitted as normal via `response.output_item.done`.
-The `output_file.done` event is a convenience for eager rendering —
-clients that only consume `output_item.done` still get the full picture.
-
----
-
-## Conversation Storage
-
-`output_file` blocks are stored as part of the assistant message's
-`content` array in `MessageData`. No new item type needed — files are
-content blocks within messages, not standalone items.
-
-```python
-MessageData(
-    role="assistant",
-    content=[
-        {"type": "output_text", "text": "Here's the chart:"},
-        {
-            "type": "output_file",
-            "file_id": "file_abc123",
-            "filename": "chart.png",
-            "content_type": "image/png",
-        },
-    ],
-    agent="my-agent",
-)
-```
-
-`MessageData.content` is already `list[dict[str, Any]]` — no schema
-change needed. The heterogeneous content block pattern is the same as
-input (`input_text`, `input_image`, `input_file`).
-
----
-
-## Prompt Construction
-
-`history_to_input_items()` must handle `output_file` blocks when
-replaying history. On subsequent turns, the LLM should know what files
-it previously produced. Two options:
-
-**Option A: Convert to text reference.** Replace `output_file` blocks
-with a text description: `"[Attached file: chart.png (image/png)]"`.
-The LLM knows it produced a file without seeing the binary content.
-Simple, works with all providers.
-
-**Option B: Convert to `input_file` block.** Re-inject the file as an
-`input_file` block so the LLM can see the content on subsequent turns.
-Expensive (re-encodes the file every turn) and not always useful (the
-LLM already produced the file).
-
-**Decision: Option A.** Convert to text reference. If the LLM needs to
-re-examine a file it produced, the user can re-attach it as input. This
-avoids bloating the context with file content the LLM already knows
-about.
-
----
-
-## Compaction
-
-`output_file` blocks are treated like `input_image` / `input_file`
-blocks during compaction:
-
-- **Layer 1:** Clear binary content (replace `output_file` blocks
-  outside the recent window with
-  `"[output file cleared — file_id: file_abc123]"`). The `file_id`
-  is preserved so the client can still download the file via the API.
-- **Layer 2:** The text reference from Layer 1 is included in the
-  summarization input. The summary captures "the agent produced
-  chart.png" without the binary content.
+The completed assistant message (with annotations) is emitted as
+normal via `response.output_item.done`. Clients that only consume
+`output_item.done` still get the full picture via annotations.
 
 ---
 
 ## Implementation Plan
 
-### Phase 1: `output_file` content blocks (core)
+### Phase 1: Annotation support in assistant messages
 
-**Changed files:**
+1. **`runtime/workflow.py`** — `_build_assistant_item()`: propagate
+   annotations from `output_text` blocks to the persisted message.
+   Today annotations are silently dropped.
 
-1. **`runtime/workflow.py`** — `_build_assistant_item()`: include
-   `output_file` blocks in the assistant message content array when
-   file attachments are present.
+2. **`runtime/prompt.py`** — `history_to_input_items()`: strip
+   `annotations` from `output_text` blocks when building input
+   (annotations are output metadata, not input content).
 
-2. **`runtime/prompt.py`** — `history_to_input_items()`: convert
-   `output_file` blocks to text references when replaying history.
-
-3. **`runtime/compaction.py`** — `_clear_binary_content()`: handle
-   `output_file` blocks the same as `input_image` / `input_file`.
-
-4. **`server/routes/responses.py`** — No changes to the response
-   builder. `output_file` blocks are already inside `MessageData.content`
-   which is serialized as-is.
+3. **`runtime/compaction.py`** — `_clear_binary_content()`: strip
+   annotations before passing to summarization LLM.
 
 ### Phase 2: Image generation extraction
 
-**New file:**
+4. **`runtime/file_extraction.py`** (new) — Extract files from
+   native tool outputs:
+   - `image_generation_call`: decode base64, store, return annotation.
+   - `code_interpreter_call`: detect container citations, download,
+     store, return annotations.
 
-5. **`runtime/file_extraction.py`** — Extract files from native tool
-   outputs:
-   - `image_generation_call`: decode base64 `result`, store via
-     file infrastructure, return `output_file` block.
-   - `code_interpreter_call`: detect `container_file_citation`
-     annotations, download from OpenAI container API, store locally,
-     return `output_file` blocks.
-
-**Changed files:**
-
-6. **`runtime/workflow.py`** — `_emit_native_tool_items()`: after
-   emitting the raw native tool output, also extract files and
-   append `output_file` blocks to the assistant message.
+5. **`runtime/workflow.py`** — `_emit_native_tool_items()`: after
+   emitting raw native tool output, extract files and add
+   annotations to the assistant message.
 
 ### Phase 3: Claude SDK executor file extraction
 
-**Changed files:**
-
-7. **`runtime/claude_agents_executor.py`** — When the SDK writes
-   files via Edit/Write tools, detect file creation in
-   `ToolCallObserved` events, store via file infrastructure, and
-   include `output_file` references. Requires access to
-   `file_store` and `artifact_store` — passed via `ExecutorContext`.
+6. **`runtime/claude_agents_executor.py`** — Detect file-producing
+   tool calls, store files, include annotations. Requires
+   `file_store` and `artifact_store` on `ExecutorContext`.
 
 ### Phase 4: Remote executor file support
 
-8. **`runtime/executor.py`** — `RemoteExecutor`: if the remote
-   service SSE stream includes `output_file` events with inline
-   base64, store them locally and rewrite to `file_id` references.
-   If the remote service already provides `file_id` references,
-   pass them through (assumes the remote service's file store is
-   accessible to the client, or a proxy endpoint is added).
+7. **`runtime/executor.py`** — `RemoteExecutor`: if the remote
+   service SSE stream includes file annotations, verify files
+   exist in the local file store or proxy them.
 
 ---
 
@@ -345,10 +306,10 @@ blocks during compaction:
 | `POST /v1/files` | No | Client uploads still work |
 | `MessageData` | No | `content: list[dict[str, Any]]` already flexible |
 | `ConversationStore` | No | Stores `MessageData` as-is |
-| Conversation items API | No | Returns `MessageData` content as-is |
-| `history_to_input_items()` | Yes | Convert `output_file` to text reference |
-| `_clear_binary_content()` | Yes | Handle `output_file` blocks in compaction |
-| `_build_assistant_item()` | Yes | Include `output_file` blocks in content |
+| Items API | No | Returns `MessageData` content with annotations |
+| `history_to_input_items()` | Yes | Strip annotations from output blocks |
+| `_clear_binary_content()` | Yes | Strip annotations before summarization |
+| `_build_assistant_item()` | Yes | Propagate annotations to persisted message |
 | `_emit_native_tool_items()` | Yes | Extract files from native tool outputs |
 | SSE events | Yes | Add `response.output_file.done` |
 | `ExecutorContext` | Yes | Add file_store + artifact_store for Phase 3 |
@@ -357,60 +318,64 @@ blocks during compaction:
 
 ## Examples
 
-### Image generation → output_file
+### Image generation → file_citation annotation
 
-User asks: "Generate a chart of Q3 revenue."
+User: "Generate a chart of Q3 revenue."
 
 LLM response includes `image_generation_call` with base64 result.
 
 Workflow:
 1. Decodes base64 → stores as `file_abc123` (image/png)
-2. Emits SSE: `response.output_file.done` with `file_id`
+2. Emits SSE: `response.output_file.done`
 3. Builds assistant message:
    ```json
    {
-     "content": [
-       {"type": "output_text", "text": "Here's the Q3 revenue chart:"},
-       {"type": "output_file", "file_id": "file_abc123",
-        "filename": "q3_revenue.png", "content_type": "image/png"}
-     ]
+     "type": "message",
+     "role": "assistant",
+     "content": [{
+       "type": "output_text",
+       "text": "Here's the Q3 revenue chart:",
+       "annotations": [{
+         "type": "file_citation",
+         "file_id": "file_abc123",
+         "filename": "q3_revenue.png",
+         "content_type": "image/png"
+       }]
+     }]
    }
    ```
 4. Client downloads: `GET /v1/files/file_abc123/content`
 
-### Claude SDK executor → output_file
+### Claude SDK executor → file_citation annotation
 
-Claude Code writes `solution.py` via the Edit tool.
+Claude Code writes `solution.py` via Edit tool.
 
 Executor:
-1. Detects file write in `ToolCallObserved` for Edit tool
-2. Reads file from `storage_dir/solution.py`
-3. Stores as `file_xyz789` (text/x-python)
-4. Includes reference in turn output
+1. Detects file write in `ToolCallObserved`
+2. Reads from `storage_dir/solution.py`, stores as `file_xyz789`
+3. Includes annotation in turn output
 
-Workflow builds assistant message:
+Assistant message:
 ```json
 {
-  "content": [
-    {"type": "output_text", "text": "I created solution.py with the implementation."},
-    {"type": "output_file", "file_id": "file_xyz789",
-     "filename": "solution.py", "content_type": "text/x-python"}
-  ]
+  "type": "output_text",
+  "text": "I created solution.py with the implementation.",
+  "annotations": [{
+    "type": "file_citation",
+    "file_id": "file_xyz789",
+    "filename": "solution.py",
+    "content_type": "text/x-python"
+  }]
 }
 ```
 
 ### Subsequent turn — history replay
 
-On the next turn, `history_to_input_items()` converts:
+On the next turn, `history_to_input_items()` strips annotations:
+
 ```json
-{"type": "output_file", "file_id": "file_abc123",
- "filename": "q3_revenue.png", "content_type": "image/png"}
-```
-to:
-```json
-{"type": "output_text",
- "text": "[Attached file: q3_revenue.png (image/png, file_id=file_abc123)]"}
+{"type": "output_text", "text": "I created solution.py with the implementation."}
 ```
 
-The LLM knows it produced the file without re-seeing the binary
-content.
+The LLM sees the text description. The file exists in the file
+store. No binary content in the context window.
