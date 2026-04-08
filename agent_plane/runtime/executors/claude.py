@@ -49,7 +49,7 @@ from agent_plane.runtime.executors.base import (
     TurnComplete,
 )
 from agent_plane.spec import AgentSpec
-from agent_plane.spec.types import LLMConfig
+from agent_plane.spec.types import LLMConfig, SkillSpec
 
 _logger = logging.getLogger(__name__)
 
@@ -406,9 +406,11 @@ class ClaudeAgentsExecutor(Executor):
         *,
         allowed_tools: list[str],
         model: str | None = None,
+        skills: list[SkillSpec] | None = None,
     ) -> None:
         self._allowed_tools = allowed_tools
         self._model = model
+        self._skills = skills or []
 
     @classmethod
     def from_spec(cls, spec: AgentSpec) -> Self:
@@ -417,13 +419,28 @@ class ClaudeAgentsExecutor(Executor):
 
         Extracts ``claude:``-prefixed tools from the spec's tool
         config and strips the prefix to get allowed tool names.
+        Captures skills so they can be written to ``.claude/skills/``
+        in ``on_task_start`` for the SDK's native Skill tool.
 
         :param spec: Agent spec with ``executor.type == "claude_sdk"``.
         :returns: Configured ClaudeAgentsExecutor.
         """
         allowed = _extract_claude_tools(spec)
         model = spec.llm.model if spec.llm else None
-        return cls(allowed_tools=allowed, model=model)
+        return cls(allowed_tools=allowed, model=model, skills=spec.skills)
+
+    def on_task_start(self, context: ExecutorContext) -> None:
+        """
+        Write skills to ``.claude/skills/`` in the storage dir.
+
+        The Claude Agent SDK discovers skills from this directory
+        when ``setting_sources=["project"]`` and ``"Skill"`` is in
+        ``allowed_tools``. Written idempotently each task so skill
+        content stays current with the agent spec.
+
+        :param context: Agent-plane capabilities and identifiers.
+        """
+        _write_skills_to_storage(self._skills, context.storage_dir)
 
     def max_context_tokens(self) -> int | None:
         """
@@ -728,6 +745,8 @@ def _build_sdk_options(
         mcp_servers["agent_plane"] = mcp_server
 
     allowed_tools = list(executor._allowed_tools)
+    if executor._skills:
+        allowed_tools.append("Skill")
     for schema in tools:
         tool_name = schema.get("name", "")
         allowed_tools.append(f"mcp__agent_plane__{tool_name}")
@@ -736,6 +755,12 @@ def _build_sdk_options(
     env = {"CLAUDECODE": ""}
 
     model = executor._model or llm_config.model
+
+    # Enable project setting sources so the SDK discovers skills
+    # from .claude/skills/ (written by on_task_start).
+    setting_sources: list[str] | None = None
+    if executor._skills:
+        setting_sources = ["project"]
 
     options = sdk.ClaudeAgentOptions(
         tools=list(executor._allowed_tools),
@@ -749,6 +774,7 @@ def _build_sdk_options(
         # session state via storage_dir and the artifact store.
         extra_args={"no-session-persistence": None},
         cwd=str(context.storage_dir),
+        setting_sources=setting_sources,
     )
 
     cli_path = shutil.which("claude")
@@ -1135,6 +1161,28 @@ def _disconnect_in_loop(
         _logger.warning(
             "Failed to disconnect Claude SDK client",
             exc_info=True,
+        )
+
+
+def _write_skills_to_storage(
+    skills: list[SkillSpec],
+    storage_dir: Path,
+) -> None:
+    """
+    Write skill files to ``.claude/skills/`` inside the storage dir.
+
+    The Claude Agent SDK discovers skills from this path when
+    ``setting_sources=["project"]`` and ``"Skill"`` is in
+    ``allowed_tools``. No-op if the skill list is empty.
+
+    :param skills: Parsed skills from the agent spec.
+    :param storage_dir: The executor's working directory (SDK ``cwd``).
+    """
+    for skill in skills:
+        skill_dir = storage_dir / ".claude" / "skills" / skill.name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {skill.name}\ndescription: {skill.description}\n---\n\n{skill.content}\n"
         )
 
 
