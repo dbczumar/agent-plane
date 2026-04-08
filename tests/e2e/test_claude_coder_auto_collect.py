@@ -81,9 +81,7 @@ def test_single_message_subagent_auto_collect(
 
     # Generous timeout: parent spawn + sub-agent execution + auto-collect.
     body = poll_until_terminal(http_client, response_id, timeout=240)
-    assert body["status"] == "completed", (
-        f"Task failed: {body.get('error')}"
-    )
+    assert body["status"] == "completed", f"Task failed: {body.get('error')}"
 
     text = _extract_all_text(body)
 
