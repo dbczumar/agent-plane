@@ -3202,15 +3202,16 @@ def _build_executor_context(
         """
         Route a tool call to server-side or client-side execution.
 
-        Server-side tools (registered in ToolManager) are called
-        directly. Everything else is tunneled to the client via
-        the parking/polling mechanism.
+        Server-side tools (registered in ToolManager and NOT
+        client-side stubs) are called directly. Client-side tools
+        and unknown tools are tunneled to the client via the
+        parking/polling mechanism.
 
         :param call: The tool call to execute.
         :returns: The tool's result.
         """
-        if call.name in server_names:
-            bare = _strip_mcp_tool_prefix(call.name)
+        bare = _strip_mcp_tool_prefix(call.name)
+        if bare in server_names and not tool_mgr.is_client_side_tool(bare):
             result_str = tool_mgr.call_tool(
                 bare,
                 json.dumps(call.arguments),
@@ -3485,6 +3486,11 @@ async def _run_agent_loop(
         conversation_id,
         agent_name,
     )
+    # workspace/ subdir is the shared working directory for all tools.
+    # Created here so it exists before any tool invocation.
+    workspace = storage_dir / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    workspace_path = str(workspace)
     executor_context = _build_executor_context(
         task_id,
         conversation_id,
@@ -3632,6 +3638,7 @@ async def _run_agent_loop(
                 output_items,
                 conv_store,
                 tool_mgr,
+                workspace_path=workspace_path,
             )
             if isinstance(handle_result, _ClientToolCallsPending):
                 if root_task_id is not None:

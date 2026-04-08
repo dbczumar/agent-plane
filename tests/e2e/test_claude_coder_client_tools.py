@@ -27,7 +27,9 @@ _CLIENT_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "get_current_time",
-            "description": "Get the current date and time. Call this when you need to know what time it is.",
+            "description": (
+                "Get the current date and time. Call this when you need to know what time it is."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -103,8 +105,12 @@ def test_claude_sdk_parks_client_tool_call(
     patch_resp = http_client.patch(
         f"/v1/responses/{response_id}",
         json={
-            "call_id": call_id,
-            "output": f"The current time is {current_time}.",
+            "tool_results": [
+                {
+                    "call_id": call_id,
+                    "output": f"The current time is {current_time}.",
+                },
+            ],
         },
     )
     assert patch_resp.status_code == 200, (
