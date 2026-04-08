@@ -149,14 +149,7 @@ class LocalPythonTool(Tool):
         # srt and Docker both wrap the command in their own process
         # chain, so the fd 3 pipe doesn't survive to the inner
         # Python process. Use the stdout protocol instead.
-        # srt is skipped when the tool has inline deps (PEP 508
-        # specifiers break srt's bash -c wrapping), so check
-        # whether srt will actually be prepended.
-        srt_active = (
-            self._srt_available
-            and self._sandbox_config.enabled
-            and not (self._info.has_inline_deps and self._uv_available)
-        )
+        srt_active = self._srt_available and self._sandbox_config.enabled
         use_stdout = self._sandbox_config.docker_image is not None or srt_active
         if use_stdout:
             return self._invoke_stdout(request)
@@ -237,52 +230,63 @@ class LocalPythonTool(Tool):
             return self._build_docker_command()
 
         base = [sys.executable, _RUNNER_PATH]
-        base = self._prepend_uv(base)
+        # When both uv and srt are active, uv must run OUTSIDE
+        # srt (it needs network access to pypi and write access
+        # to its cache). srt wraps only the inner python command.
+        if self._info.has_inline_deps and self._uv_available:
+            return self._build_uv_command(base)
         base = self._prepend_srt(base)
         return base
 
-    def _prepend_uv(self, cmd: list[str]) -> list[str]:
+    def _build_uv_command(self, base: list[str]) -> list[str]:
         """
-        Prepend ``uv run --with`` if the tool has PEP 723 deps.
+        Build a ``uv run --with`` command for tools with PEP 723 deps.
+
+        When srt is also active, uv runs OUTSIDE srt (it needs
+        network for pypi and write access to its cache). srt wraps
+        only the inner ``python _runner.py`` via uv's ``--``
+        separator. Without srt, uv wraps the plain python command.
 
         Uses ``python`` (not ``sys.executable``) so uv's ephemeral
-        venv Python is used — ``sys.executable`` would bypass the
-        venv and miss the installed deps.
+        venv Python is used and can see installed deps.
 
-        :param cmd: The base command to wrap.
-        :returns: The wrapped command, or ``cmd`` unchanged.
+        :param base: The base command ``[sys.executable, _runner]``
+            (unused — replaced with ``python`` for uv).
+        :returns: The uv command list.
         """
-        if not (self._info.has_inline_deps and self._uv_available):
-            return cmd
         uv_args: list[str] = ["uv", "run"]
         for dep in self._info.inline_deps or []:
             uv_args.extend(["--with", dep])
-        # Use "python" (not sys.executable) so uv's venv Python
-        # is used and can see the installed deps.
-        uv_args.extend(["--", "python", _RUNNER_PATH])
+        if self._srt_available and self._sandbox_config.enabled:
+            # uv runs outside srt; srt wraps the inner python.
+            # srt -c receives the python command as a quoted string.
+            import shlex
+
+            inner = shlex.join(["python", _RUNNER_PATH])
+            uv_args.extend(["--", "srt", "-c", inner])
+        else:
+            uv_args.extend(["--", "python", _RUNNER_PATH])
         return uv_args
 
     def _prepend_srt(self, cmd: list[str]) -> list[str]:
         """
         Prepend ``srt`` if sandbox is enabled and available.
 
-        Skipped when the tool has inline deps — srt wraps the
-        command in ``bash -c '...'`` which misinterprets shell
-        metacharacters in PEP 508 version specifiers (e.g.
-        ``>=``, ``!=``). uv's ephemeral venv provides sufficient
-        isolation for the dependency install.
+        Uses ``srt -c '<command>'`` instead of ``srt arg1 arg2``
+        because srt's default mode joins args into ``bash -c``
+        without proper quoting, which misinterprets PEP 508
+        specifiers like ``>=6.0`` as shell redirects.
 
         :param cmd: The base command to wrap.
         :returns: The wrapped command, or ``cmd`` unchanged.
         """
         if not (self._srt_available and self._sandbox_config.enabled):
             return cmd
-        # srt's bash -c wrapping misinterprets PEP 508 specifiers
-        # like ">=6.0" as shell redirects. Skip srt when uv is
-        # handling deps.
-        if self._info.has_inline_deps and self._uv_available:
-            return cmd
-        return ["srt"] + cmd
+        # Use srt -c with a properly quoted command string so
+        # shell metacharacters in args (e.g. ">=6.0") are preserved.
+        import shlex
+
+        return ["srt", "-c", shlex.join(cmd)]
 
     def _build_docker_command(self) -> list[str]:
         """

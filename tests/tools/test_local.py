@@ -431,8 +431,12 @@ def test_build_command_with_srt(tmp_path: Path) -> None:
         uv_available=False,
     )
     cmd = tool._build_command()
+    # srt uses -c with a quoted command string to avoid shell
+    # metacharacter issues.
     assert cmd[0] == "srt"
-    assert cmd[-2:] == [sys.executable, _RUNNER_PATH]
+    assert cmd[1] == "-c"
+    assert sys.executable in cmd[2]
+    assert _RUNNER_PATH in cmd[2]
 
 
 def test_build_command_srt_disabled(tmp_path: Path) -> None:
@@ -457,11 +461,11 @@ def test_build_command_srt_disabled(tmp_path: Path) -> None:
     assert cmd == [sys.executable, _RUNNER_PATH]
 
 
-def test_build_command_srt_skipped_with_inline_deps(tmp_path: Path) -> None:
+def test_build_command_uv_outside_srt_inside(tmp_path: Path) -> None:
     """
-    When both srt and uv are active but the tool has inline deps,
-    srt is skipped — PEP 508 specifiers like ``>=`` break srt's
-    bash -c wrapping. uv alone provides the command.
+    When both srt and uv are active with inline deps, uv runs
+    outside srt (needs network for pypi) and srt wraps the inner
+    python command: ``uv run --with ... -- srt -c 'python ...'``.
     """
     from agent_plane.spec.types import SandboxConfig
     from agent_plane.tools.local import LocalPythonTool
@@ -482,9 +486,10 @@ def test_build_command_srt_skipped_with_inline_deps(tmp_path: Path) -> None:
         uv_available=True,
     )
     cmd = tool._build_command()
-    # srt is NOT prepended — uv handles the command directly
+    # uv runs first (outside srt), srt wraps the inner python
     assert cmd[0] == "uv"
-    assert "srt" not in cmd
+    assert "srt" in cmd
+    assert "-c" in cmd
 
 
 def test_build_command_docker(tmp_path: Path) -> None:
