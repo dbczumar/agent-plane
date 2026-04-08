@@ -3637,6 +3637,15 @@ async def _run_agent_loop(
             )
             if obs_cursor is not None:
                 last_seen = obs_cursor
+                # Track spawn/collect from observed tool calls so
+                # auto-collect sees sub-agents spawned by executor-
+                # managed turns (e.g. Claude SDK calling
+                # spawn_sub_agents via MCP).
+                _track_spawn_collect(
+                    output_items,
+                    spawned_ids,
+                    collected_ids,
+                )
 
             if not _has_tool_calls(llm_resp):
                 # Auto-collect outstanding sub-agents before completing.
