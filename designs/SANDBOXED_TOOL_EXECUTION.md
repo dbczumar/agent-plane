@@ -7,13 +7,16 @@ Local Python tools (`tools/python/*.py`) currently execute **in-process** via
 entire server. No agent framework sandboxes tool functions by default — this
 would make agent-plane the first.
 
-We want subprocess-based execution with three tiers:
-1. **Plain subprocess** (default) — crash isolation, no external dependencies
-2. **srt-wrapped subprocess** (when `srt` is on PATH) — OS-level filesystem/network sandbox
-3. **Docker container** (opt-in via config) — full container isolation
+We want subprocess-based execution with four tiers that auto-detect
+based on what's available:
 
-Tools can declare inline dependencies via PEP 723 (`# /// script` metadata),
-executed via `uv run --with`.
+1. **Plain subprocess** (default) — crash isolation, no external deps
+2. **uv** (auto if tool has PEP 723 inline deps and `uv` on PATH) — auto-installs tool dependencies
+3. **srt** (auto if `srt` on PATH) — OS-level filesystem/network sandboxing via Anthropic Sandbox Runtime
+4. **Docker** (opt-in via `sandbox.docker_image` config) — full container isolation
+
+Tiers compose: srt wraps uv which wraps python. Priority:
+Docker > srt+uv > srt > uv > plain.
 
 ### Industry comparison
 
