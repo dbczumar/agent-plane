@@ -15,6 +15,8 @@ Exercises:
 
 from __future__ import annotations
 
+import json
+
 import httpx
 
 from tests.e2e.conftest import poll_until_terminal
@@ -90,7 +92,18 @@ def test_archer_calls_word_count_tool(
         f"Expected 1 function_call_output for word_count, got {len(fco_items)}"
     )
     tool_output = fco_items[0].get("output", "")
-    assert "7" in tool_output, f"Expected word count of 7 in tool output, got: {tool_output!r}"
+    # The tool output must be valid JSON with word_count — NOT an
+    # error string. If uv failed to install the ftfy dependency,
+    # the output would be "Error: ModuleNotFoundError: No module
+    # named 'ftfy'" instead of valid JSON.
+    assert not tool_output.startswith("Error"), (
+        f"Tool returned an error (uv may have failed to install "
+        f"the ftfy dependency): {tool_output!r}"
+    )
+    tool_data = json.loads(tool_output)
+    assert tool_data["word_count"] == 7, (
+        f"Expected word_count=7, got {tool_data}. Tool may have failed or returned wrong result."
+    )
 
     # Step 5: LLM judge — ask a fresh LLM whether the agent's
     # response correctly reports the word count.
