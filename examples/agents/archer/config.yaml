@@ -12,6 +12,8 @@ llm:
 tools:
   builtins:
     - web_search_openai
+    - code_sandbox
+    - upload_file
   agents:
     - fact_checker
     - summarizer
