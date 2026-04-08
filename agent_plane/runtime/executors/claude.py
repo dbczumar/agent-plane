@@ -337,24 +337,28 @@ def _build_history_prompt(
     The SDK sees the prior conversation as context in the first
     prompt.
 
-    Skips ``function_call`` and ``function_call_output`` items —
-    these represent tool calls the executor ran internally on a
-    prior turn. Including them as empty ``"user: "`` lines would
-    confuse the model.
+    Serializes ``function_call`` items as
+    ``assistant: [Called tool 'name' with: {args}]`` and
+    ``function_call_output`` items as ``tool: result`` so
+    Claude knows what tools it ran in the previous session.
 
     :param messages: Responses API input items (full history).
     :returns: A multi-line text prompt summarizing the conversation.
     """
     lines = ["Conversation so far:"]
     for msg in messages:
-        # Skip executor-observed tool call items — they don't
-        # have role/content and would produce empty "user: " lines.
         msg_type = msg.get("type")
-        if msg_type in ("function_call", "function_call_output"):
+        if msg_type == "function_call":
+            # Serialize tool calls so Claude knows what it did.
+            name = msg.get("name", "unknown")
+            arguments = msg.get("arguments", "{}")
+            lines.append(f"assistant: [Called tool {name!r} with: {arguments}]")
             continue
-        # After filtering function_call/function_call_output, all
-        # remaining items are user/assistant messages with role+content.
-        role = str(msg["role"])
+        if msg_type == "function_call_output":
+            output = msg.get("output", "")
+            lines.append(f"tool: {output}")
+            continue
+        role = str(msg.get("role", "user"))
         content = msg.get("content", "")
         if not isinstance(content, str):
             content = json.dumps(content, ensure_ascii=False)
