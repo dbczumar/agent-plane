@@ -597,6 +597,7 @@ def test_execution_timeout_preserves_prior_output(
         output_items: list[dict[str, Any]],
         conv_store: Any,
         tool_mgr: Any,
+        workspace_path: str | None = None,
     ) -> str | None:
         """
         Fake tool call handler that injects a prior output item.

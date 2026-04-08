@@ -118,21 +118,51 @@ class ToolManager:
         """
         Register built-in tools declared in ``tools.builtins``.
 
-        Each entry is looked up in the built-in registry and
-        instantiated with its spec-level config (API keys, etc.).
-        Unrecognized names are logged as warnings and skipped.
+        Most tools are looked up in the built-in registry and
+        instantiated with spec-level config. ``code_sandbox`` and
+        ``upload_file`` are handled specially — they need sandbox
+        capability flags from ToolManager.
         """
         for entry in self._spec.tools.builtins:
-            tool = get_builtin_tool(entry.name, config=entry.config)
+            tool = self._create_builtin(entry.name, entry.config)
             if tool is None:
                 _logger.warning(
                     "Unknown built-in tool %r — skipping. "
                     "Available: web_search_openai, web_search_google, "
-                    "web_search_perplexity",
+                    "web_search_perplexity, code_sandbox, upload_file",
                     entry.name,
                 )
                 continue
             self._tools[tool.name()] = tool
+
+    def _create_builtin(
+        self,
+        name: str,
+        config: dict[str, str] | None,
+    ) -> Tool | None:
+        """
+        Instantiate a built-in tool by name.
+
+        :param name: The builtin name from the spec.
+        :param config: Optional spec-level config dict.
+        :returns: A :class:`Tool` instance, or ``None``.
+        """
+        if name == "code_sandbox":
+            from agent_plane.tools.builtins.code_sandbox import (
+                CodeSandboxTool,
+            )
+
+            return CodeSandboxTool(
+                srt_available=self._srt_available,
+                sandbox_enabled=self._spec.tools.sandbox.enabled,
+            )
+        if name == "upload_file":
+            from agent_plane.tools.builtins.upload_file import (
+                UploadFileTool,
+            )
+
+            return UploadFileTool()
+        return get_builtin_tool(name, config=config)
 
     def _register_sub_agent_tools(self) -> None:
         """

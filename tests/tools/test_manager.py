@@ -693,7 +693,7 @@ SCHEMA: dict[str, Any] = {{
         "parameters": {{"type": "object", "properties": {{}}}},
     }},
 }}
-def run(arguments: dict[str, Any]) -> str:
+async def run(arguments: dict[str, Any]) -> str:
     """Execute."""
     return "local_tool_result"
 '''

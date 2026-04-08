@@ -53,6 +53,9 @@ __all__ = [
     "list_skill_resources",
 ]
 
+# Lazy imports for code_sandbox and upload_file to avoid
+# circular imports — they are registered in the factory below.
+
 # Factory type: each constructor accepts a config dict and returns
 # a Tool. Callable is used instead of type[Tool] because the base
 # Tool.__init__ does not declare a config parameter — only the

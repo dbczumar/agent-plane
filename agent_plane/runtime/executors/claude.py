@@ -378,7 +378,7 @@ def _has_session_transcript(storage_dir: Path) -> bool:
     :param storage_dir: The scoped persistent directory.
     :returns: True if session transcript files exist.
     """
-    claude_dir = storage_dir / ".claude"
+    claude_dir = storage_dir / "workspace" / ".claude"
     return claude_dir.is_dir() and any(claude_dir.iterdir())
 
 
@@ -792,7 +792,9 @@ def _build_sdk_options(
         # Disable SDK session persistence — agent-plane manages
         # session state via storage_dir and the artifact store.
         extra_args={"no-session-persistence": None},
-        cwd=str(context.storage_dir),
+        # Use workspace/ subdir as cwd so SDK tools (Read, Edit,
+        # Bash) and .claude/ state share the same directory tree.
+        cwd=str(context.storage_dir / "workspace"),
         setting_sources=setting_sources,
     )
 
@@ -1195,10 +1197,13 @@ def _write_skills_to_storage(
     ``allowed_tools``. No-op if the skill list is empty.
 
     :param skills: Parsed skills from the agent spec.
-    :param storage_dir: The executor's working directory (SDK ``cwd``).
+    :param storage_dir: The executor's storage directory. Skills are
+        written to ``workspace/.claude/skills/`` so the SDK finds them.
     """
+    workspace = storage_dir / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
     for skill in skills:
-        skill_dir = storage_dir / ".claude" / "skills" / skill.name
+        skill_dir = workspace / ".claude" / "skills" / skill.name
         skill_dir.mkdir(parents=True, exist_ok=True)
         (skill_dir / "SKILL.md").write_text(
             f"---\nname: {skill.name}\n"
