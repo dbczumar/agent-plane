@@ -1553,6 +1553,7 @@ def _handle_item_done(
                 acc.pending_tool_calls.append(item)
     elif item_type == "function_call_output":
         _mount_tool_result(scroll, item)
+        _maybe_download_file(scroll, item)
         # Track server-side completions so we can filter them
         # out of pending_tool_calls after the stream ends.
         call_id = item.get("call_id", "")
@@ -1838,6 +1839,75 @@ def _mount_tool_result(
         scroll.mount(widget)
         _wlog("MOUNT", "Collapsible", f"tool_result: {first_line}")
     scroll.scroll_end()
+
+
+def _maybe_download_file(
+    scroll: VerticalScroll,
+    item: dict[str, object],
+) -> None:
+    """
+    If a tool result contains a ``file_id``, download the file
+    and open it with the system viewer.
+
+    Parses the tool output as JSON. If it has a ``file_id`` key,
+    downloads via ``GET /v1/files/{id}/content``, saves to
+    ``./downloads/``, and opens with ``open`` (macOS) or
+    ``xdg-open`` (Linux).
+
+    :param scroll: The scrollable container for status messages.
+    :param item: The function_call_output item dict.
+    """
+    raw = item.get("output")
+    if not isinstance(raw, str):
+        return
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return
+    file_id = parsed.get("file_id")
+    filename = parsed.get("filename", "download")
+    if not file_id:
+        return
+
+    # Download the file
+    try:
+        resp = httpx.get(
+            f"{BASE_URL}/v1/files/{file_id}/content",
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        scroll.mount(
+            SystemInfo(
+                Text.from_markup(
+                    f"[dim red]download failed: {escape(str(exc))}[/dim red]",
+                )
+            )
+        )
+        return
+
+    # Save to ./downloads/
+    downloads = pathlib.Path("downloads")
+    downloads.mkdir(exist_ok=True)
+    dest = downloads / filename
+    dest.write_bytes(resp.content)
+    scroll.mount(
+        SystemInfo(
+            Text.from_markup(
+                f"[dim green]saved: {escape(str(dest))}[/dim green]",
+            )
+        )
+    )
+    scroll.scroll_end()
+
+    # Open with system viewer
+    import platform
+    import subprocess as _sp
+
+    if platform.system() == "Darwin":
+        _sp.Popen(["open", str(dest)])
+    else:
+        _sp.Popen(["xdg-open", str(dest)])
 
 
 def _mount_native_tool(
