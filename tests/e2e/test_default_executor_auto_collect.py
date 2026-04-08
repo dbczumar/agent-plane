@@ -73,14 +73,10 @@ def test_archer_spawns_and_auto_collects(
     response_id = resp.json()["id"]
 
     body = poll_until_terminal(http_client, response_id, timeout=240)
-    assert body["status"] == "completed", (
-        f"Task failed: {body.get('error')}"
-    )
+    assert body["status"] == "completed", f"Task failed: {body.get('error')}"
 
     text = _extract_all_text(body)
-    assert len(text) > 50, (
-        f"Expected substantial output, got: {text!r}"
-    )
+    assert len(text) > 50, f"Expected substantial output, got: {text!r}"
 
     # Use LLM judge to verify the response contains collected
     # sub-agent results about photosynthesis.

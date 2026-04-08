@@ -145,7 +145,30 @@ class CompactionData(BaseModel):
     token_count: int
 
 
-ItemData = MessageData | FunctionCallData | FunctionCallOutputData | ReasoningData | CompactionData
+class NativeToolData(BaseModel):
+    """
+    A provider-native tool output item (e.g. ``web_search_call``).
+
+    These are executed server-side by the LLM provider and returned
+    as opaque dicts. Agent-plane persists and replays them so the
+    LLM sees its own tool results on subsequent iterations.
+
+    :param item: The raw dict from the Responses API output, e.g.
+        ``{"type": "web_search_call", "id": "ws_abc",
+        "status": "completed", "action": {...}}``.
+    """
+
+    item: dict[str, Any]
+
+
+ItemData = (
+    MessageData
+    | FunctionCallData
+    | FunctionCallOutputData
+    | ReasoningData
+    | CompactionData
+    | NativeToolData
+)
 
 ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
     "message": MessageData,
@@ -153,6 +176,7 @@ ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
     "function_call_output": FunctionCallOutputData,
     "reasoning": ReasoningData,
     "compaction": CompactionData,
+    "native_tool": NativeToolData,
 }
 
 

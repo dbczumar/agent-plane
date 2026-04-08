@@ -9,6 +9,7 @@ from agent_plane.entities import (
     FunctionCallData,
     FunctionCallOutputData,
     MessageData,
+    NativeToolData,
 )
 from agent_plane.spec import AgentSpec
 
@@ -140,6 +141,13 @@ def history_to_input_items(
                     "output": item.data.output,
                 }
             )
+
+        elif item.type == "native_tool":
+            assert isinstance(item.data, NativeToolData)
+            # Pass the raw provider dict through as-is. The
+            # Responses API accepts its own output items
+            # (e.g. web_search_call) as input items.
+            result.append(item.data.item)
 
         elif item.type == "reasoning":
             # reasoning items are not included in the LLM prompt

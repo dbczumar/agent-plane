@@ -23,6 +23,7 @@ from agent_plane.entities import (
     FunctionCallData,
     FunctionCallOutputData,
     MessageData,
+    NativeToolData,
     NewConversationItem,
 )
 from agent_plane.entities.task import TERMINAL_STATUSES
@@ -1445,27 +1446,46 @@ def fetch_all_items(
     return all_items
 
 
-def _emit_native_tool_items(
+def _emit_and_persist_native_tool_items(
     task_id: str,
+    conversation_id: str,
+    agent_name: str,
     llm_resp: dict[str, Any],
+    history: list[ConversationItem],
     output_items: list[dict[str, Any]],
-) -> None:
+    conv_store: ConversationStore,
+) -> str | None:
     """
-    Append provider-native tool output items to *output_items*
-    and stream them to SSE consumers.
+    Persist provider-native tool items, append to output, and
+    stream them to SSE consumers.
 
     Native tool items (e.g. ``web_search_call``) are executed
-    server-side by the LLM provider. They are included in the
-    API response output but NOT persisted to the conversation
-    store (they are ephemeral provider-specific items).
+    server-side by the LLM provider. They must be persisted so
+    the LLM sees its own tool results on subsequent agent loop
+    iterations — without this, the LLM re-requests the same
+    searches in a loop.
 
     :param task_id: The task identifier, e.g. ``"task_abc123"``.
+    :param conversation_id: The conversation ID, e.g.
+        ``"conv_abc123"``.
+    :param agent_name: The agent's registered name, e.g.
+        ``"archer"``.
     :param llm_resp: The LLM response dict from
         :func:`_response_to_dict`.
+    :param history: Mutable conversation history. Extended
+        in place.
     :param output_items: Mutable list of API-format output dicts
         (modified in-place).
+    :param conv_store: The ConversationStore for persistence.
+    :returns: The ID of the last persisted item, or ``None`` if
+        no native tool items were present.
     """
-    for item_dict in llm_resp.get("native_tool_items", []):
+    native_items = llm_resp.get("native_tool_items", [])
+    if not native_items:
+        return None
+
+    new_items: list[NewConversationItem] = []
+    for item_dict in native_items:
         output_items.append(item_dict)
         _write_output(
             task_id,
@@ -1475,6 +1495,18 @@ def _emit_native_tool_items(
                 "output_index": len(output_items) - 1,
             },
         )
+        new_items.append(
+            NewConversationItem(
+                type="native_tool",
+                response_id=task_id,
+                data=NativeToolData(item=item_dict),
+            )
+        )
+
+    persisted = conv_store.append(conversation_id, new_items)
+    for item in persisted:
+        history.append(item)
+    return persisted[-1].id if persisted else None
 
 
 def _build_observed_tool_items(
@@ -3533,9 +3565,20 @@ async def _run_agent_loop(
                 content_cache,
             )
 
-            # Emit provider-native tool items (e.g. web_search_call) to
-            # output before handling function calls or final response.
-            _emit_native_tool_items(task_id, llm_resp, output_items)
+            # Persist and emit provider-native tool items (e.g.
+            # web_search_call) so the LLM sees its own tool
+            # results on subsequent iterations.
+            native_cursor = _emit_and_persist_native_tool_items(
+                task_id,
+                conversation_id,
+                agent_name,
+                llm_resp,
+                history,
+                output_items,
+                conv_store,
+            )
+            if native_cursor is not None:
+                last_seen = native_cursor
 
             # Persist executor-observed tool calls (e.g. Claude SDK
             # running tools internally). SSE was already emitted

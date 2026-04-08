@@ -175,6 +175,7 @@ _ITEM_TYPE_PREFIX: dict[str, str] = {
     "function_call_output": "fco_",
     "reasoning": "rs_",
     "compaction": "cmp_",
+    "native_tool": "nt_",
 }
 
 
@@ -361,6 +362,10 @@ def extract_search_text(item: NewConversationItem) -> str:
     if item.type == "compaction":
         assert isinstance(item.data, CompactionData)
         return item.data.summary
+    if item.type == "native_tool":
+        # Native tool items are opaque provider dicts — no
+        # meaningful text to index for search.
+        return ""
     raise ValueError(f"unknown item type: {item.type!r}")
 
 
