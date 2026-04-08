@@ -558,9 +558,10 @@ def _discover_local_tools(
     Discover local tool files under ``tools/python/`` and
     ``tools/typescript/``.
 
-    Tool names are derived from the file stem by replacing
-    underscores with dots (e.g. ``arxiv_search.py`` becomes
-    ``"arxiv.search"``).
+    Tool names are derived from the file stem directly (e.g.
+    ``arxiv_search.py`` becomes ``"arxiv_search"``). Underscores
+    are preserved — the tool name regex requires
+    ``[a-zA-Z0-9_-]``.
 
     :param tools_dir: Path to the ``tools/`` directory, e.g.
         ``root / "tools"``.
@@ -576,9 +577,7 @@ def _discover_local_tools(
         if not lang_dir.is_dir():
             continue
         for tool_file in sorted(lang_dir.glob(f"*{ext}")):
-            # Derive tool name: arxiv_search.py -> arxiv.search
-            stem = tool_file.stem
-            tool_name = stem.replace("_", ".")
+            tool_name = tool_file.stem
             rel_path = str(tool_file.relative_to(tools_dir.parent))
             tools.append(LocalToolInfo(name=tool_name, path=rel_path, language=language))
     return tools

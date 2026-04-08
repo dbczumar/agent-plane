@@ -12,7 +12,9 @@ export:
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import inspect
 import json
 import logging
 from pathlib import Path
@@ -73,7 +75,11 @@ class LocalPythonTool(Tool):
 
     def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
-        Execute the tool by calling the module's ``run`` function.
+        Execute the tool by calling the module's async ``run`` function.
+
+        Runs the coroutine in a fresh event loop via ``asyncio.run()``.
+        This is safe because ``invoke`` is called from a thread pool
+        (via ``run_in_executor`` in the async workflow).
 
         :param arguments: JSON-encoded arguments string from the LLM.
         :param ctx: Server-side execution context (unused by
@@ -81,7 +87,7 @@ class LocalPythonTool(Tool):
         :returns: The tool's string result.
         """
         parsed: dict[str, Any] = json.loads(arguments) if arguments else {}
-        result: str = self._run_fn(parsed)
+        result: str = asyncio.run(self._run_fn(parsed))
         return result
 
 
@@ -155,17 +161,74 @@ def _load_module(tool_name: str, path: Path) -> ModuleType | None:
     return module
 
 
+def _validate_schema(tool_name: str, schema: Any) -> bool:
+    """
+    Validate the structure of a local tool's ``SCHEMA`` export.
+
+    Must be a dict with a ``"function"`` key containing at least
+    ``"name"`` (str) and ``"parameters"`` (dict).
+
+    :param tool_name: The tool name for error messages.
+    :param schema: The ``SCHEMA`` value from the module.
+    :returns: ``True`` if the schema is well-formed.
+    """
+    if not isinstance(schema, dict):
+        _logger.warning(
+            "Local tool %r: SCHEMA must be a dict, got %s — skipping",
+            tool_name,
+            type(schema).__name__,
+        )
+        return False
+    func = schema.get("function")
+    if not isinstance(func, dict):
+        _logger.warning(
+            "Local tool %r: SCHEMA missing 'function' dict — skipping",
+            tool_name,
+        )
+        return False
+    if not isinstance(func.get("name"), str):
+        _logger.warning(
+            "Local tool %r: SCHEMA.function.name must be a string — skipping",
+            tool_name,
+        )
+        return False
+    if not isinstance(func.get("parameters"), dict):
+        _logger.warning(
+            "Local tool %r: SCHEMA.function.parameters must be a dict — skipping",
+            tool_name,
+        )
+        return False
+    return True
+
+
 def _validate_module(tool_name: str, module: ModuleType) -> bool:
     """
     Validate that a loaded module has the required exports.
 
+    Checks for ``SCHEMA`` (dict with ``"function"`` key containing
+    ``"name"`` and ``"parameters"``) and ``run`` (must be
+    ``async def``).
+
     :param tool_name: The tool name for error messages.
     :param module: The loaded Python module.
-    :returns: ``True`` if the module has ``SCHEMA`` and ``run``.
+    :returns: ``True`` if the module passes all checks.
     """
     if not hasattr(module, "SCHEMA"):
         _logger.warning(
             "Local tool %r: module missing SCHEMA — skipping",
+            tool_name,
+        )
+        return False
+    if not _validate_schema(tool_name, module.SCHEMA):
+        return False
+    schema_name = module.SCHEMA["function"]["name"]
+    if schema_name != tool_name:
+        _logger.warning(
+            "Local tool %r: SCHEMA.function.name is %r but filename "
+            "derives %r — the LLM calls the schema name, so these "
+            "must match. Skipping",
+            tool_name,
+            schema_name,
             tool_name,
         )
         return False
@@ -178,6 +241,12 @@ def _validate_module(tool_name: str, module: ModuleType) -> bool:
     if not callable(module.run):
         _logger.warning(
             "Local tool %r: run is not callable — skipping",
+            tool_name,
+        )
+        return False
+    if not inspect.iscoroutinefunction(module.run):
+        _logger.warning(
+            "Local tool %r: run() must be async def — skipping",
             tool_name,
         )
         return False

@@ -423,7 +423,7 @@ def test_parse_local_python_tools(agent_dir: Path) -> None:
     spec = parse(agent_dir)
     assert len(spec.local_tools) == 2
     names = {t.name for t in spec.local_tools}
-    assert names == {"arxiv.search", "web.scrape"}
+    assert names == {"arxiv_search", "web_scrape"}
     assert all(t.language == "python" for t in spec.local_tools)
 
 
@@ -433,7 +433,7 @@ def test_parse_local_typescript_tools(agent_dir: Path) -> None:
     (ts_dir / "code_run.ts").write_text("export function run() {}")
     spec = parse(agent_dir)
     assert len(spec.local_tools) == 1
-    assert spec.local_tools[0].name == "code.run"
+    assert spec.local_tools[0].name == "code_run"
     assert spec.local_tools[0].language == "typescript"
 
 
