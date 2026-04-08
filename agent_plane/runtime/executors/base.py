@@ -151,7 +151,7 @@ class ExecutorError:
 @dataclass
 class ToolResult:
     """
-    Result of a tool call executed via ``await_tool_output``.
+    Result of a tool call executed via ``call_tool``.
 
     :param content: The tool's output string.
     :param status: ``"success"`` or ``"error"``.
@@ -281,14 +281,16 @@ class ExecutorContext:
         e.g. ``"conv_abc123"``.
     :param storage_dir: Scoped persistent directory for this
         conversation. The workflow manages artifact store I/O.
-    :param await_tool_output: Submit a tool call for client-side
-        execution. Blocks until the client returns a result.
+    :param call_tool: Execute a tool by name. The workflow routes
+        to server-side execution (ToolManager) if the tool is
+        registered, otherwise tunnels to the client for execution.
+        Blocks until the result is available.
     """
 
     task_id: str
     conversation_id: str
     storage_dir: Path
-    await_tool_output: Callable[[ToolCallRequested], ToolResult]
+    call_tool: Callable[[ToolCallRequested], ToolResult]
 
 
 # ── Executor ABC ───────────────────────────────────────────

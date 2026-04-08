@@ -8,7 +8,7 @@ stream into agent-plane executor events.
 Server-side tools (Bash, Read, Edit, etc.) are configured via
 ``allowed_tools`` — the SDK executes them with its built-in
 implementations. Client-side tools are bridged through an in-process
-MCP server backed by ``context.await_tool_output``, which parks the
+MCP server backed by ``context.call_tool``, which parks the
 call and blocks until the client delivers a result.
 
 Requirements::
@@ -78,15 +78,15 @@ def _ensure_sdk() -> Any:
 @dataclass
 class _CallbackHolder:
     """
-    Mutable holder for the current task's ``await_tool_output`` callback.
+    Mutable holder for the current task's ``call_tool`` callback.
 
     Shared between the long-lived MCP server handlers and per-task setup.
     Updated to the current task's callback before each ``client.query()``
     call; cleared to ``None`` after the query completes. MCP handlers read
     it at call time (not at creation time), so they always route to the
-    current task's parking infrastructure.
+    current task's tool dispatch.
 
-    :param callback: The current task's ``await_tool_output`` function,
+    :param callback: The current task's ``call_tool`` function,
         or ``None`` between tasks (no active query running).
     """
 
@@ -106,7 +106,7 @@ class _ClientState:
     :param model: Model name the client was created with, or ``None``
         if using the SDK default.
     :param callback_holder: Updated each task so MCP tool handlers
-        route to the current task's ``await_tool_output``.
+        route to the current task's ``call_tool``.
     :param last_used: ``time.monotonic()`` timestamp of the last
         ``on_task_end`` call. Used for TTL-based eviction.
     """
@@ -389,7 +389,7 @@ class ClaudeAgentsExecutor(Executor):
     The SDK runs Claude Code's full agent loop internally. Server-side
     tools execute via the SDK's built-in handlers. Client-side tools
     are routed through an in-process MCP server backed by
-    ``context.await_tool_output``.
+    ``context.call_tool``.
 
     Maintains a persistent ``ClaudeSDKClient`` per conversation across
     ``run_turn()`` calls — the SDK subprocess keeps context in memory
@@ -477,7 +477,7 @@ class ClaudeAgentsExecutor(Executor):
 
         Server-side tools: SDK executes via built-in handlers.
         Client-side tools: routed through an in-process MCP server
-        backed by ``context.await_tool_output``.
+        backed by ``context.call_tool``.
 
         :param messages: Used to build prompt for fresh/recovery
             sessions. Ignored for continuing sessions (SDK has context
@@ -581,7 +581,7 @@ async def _async_turn(
     # Safe: runs in a single event loop thread. The MCP handler reads
     # holder.callback only during client.query(), so the sequence
     # set → query → clear is strictly sequential.
-    holder.callback = context.await_tool_output
+    holder.callback = context.call_tool
     try:
         await client.query(prompt, session_id=conv_id)
         await _consume_sdk_stream(sdk, client, event_queue)
@@ -639,19 +639,26 @@ def _build_client_tool_mcp_server(
     :param sdk: The ``claude_agent_sdk`` module.
     :param tools: Client-side tool schemas (OpenAI format).
     :param callback_holder: Mutable holder for the current task's
-        ``await_tool_output`` callback.
+        ``call_tool`` callback.
     :returns: An MCP server object, or ``None`` if no client tools.
     """
     if not tools:
         return None
 
+    # Tools excluded from the MCP server — the SDK handles these
+    # natively via its own mechanisms (e.g. Skill tool).
+    _EXCLUDED_TOOLS = {"load_skill", "read_skill_file"}
+
     mcp_tools = []
     for schema in tools:
-        tool_name = schema.get("name", "")
-        tool_desc = schema.get("description", "")
-        # OpenAI tool schemas always include "parameters"; the empty
-        # object fallback matches the SDK's expectation for no-arg tools.
-        tool_params = schema.get(
+        # Tool schemas are in OpenAI wrapper format:
+        # {"type": "function", "function": {"name": ..., ...}}
+        func = schema.get("function", {})
+        tool_name = func.get("name", "")
+        if not tool_name or tool_name in _EXCLUDED_TOOLS:
+            continue
+        tool_desc = func.get("description", "")
+        tool_params = func.get(
             "parameters",
             {
                 "type": "object",
@@ -684,13 +691,17 @@ def _make_client_tool_handler(
 
     :param tool_name: The tool name, e.g. ``"Read"``.
     :param callback_holder: Mutable holder for the current task's
-        ``await_tool_output`` callback.
+        ``call_tool`` callback.
     :returns: An async callable for the SDK's ``@tool`` decorator.
     """
 
     async def handler(args: dict[str, Any]) -> dict[str, Any]:
         """
-        MCP handler that parks a client-side tool call.
+        MCP handler that dispatches a tool call.
+
+        Routes to server-side execution (ToolManager) or client
+        tunneling transparently — the workflow's ``call_tool``
+        callback handles the routing.
 
         :param args: Tool arguments from the SDK.
         :returns: MCP-format result dict.
@@ -707,7 +718,9 @@ def _make_client_tool_handler(
             arguments=args,
         )
         loop = asyncio.get_running_loop()
-        # await_tool_output is sync (blocking) — run in thread
+        # call_tool is sync (may block on server-side execution
+        # or client polling) — run in thread to avoid blocking
+        # the event loop.
         result: ToolResult = await loop.run_in_executor(None, cb, call)
         response: dict[str, Any] = {
             "content": [{"type": "text", "text": result.content}],
@@ -748,8 +761,10 @@ def _build_sdk_options(
     if executor._skills:
         allowed_tools.append("Skill")
     for schema in tools:
-        tool_name = schema.get("name", "")
-        allowed_tools.append(f"mcp__agent_plane__{tool_name}")
+        func = schema.get("function", {})
+        tool_name = func.get("name", "")
+        if tool_name:
+            allowed_tools.append(f"mcp__agent_plane__{tool_name}")
 
     # Unset CLAUDECODE to prevent "nested session" error from the SDK.
     env = {"CLAUDECODE": ""}

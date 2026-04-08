@@ -94,7 +94,7 @@ def executor_context() -> ExecutorContext:
         task_id="task_test_123",
         conversation_id="conv_test_456",
         storage_dir=Path("/tmp/test-storage"),
-        await_tool_output=lambda _req: ToolResult(content="stub output", status="success"),
+        call_tool=lambda _req: ToolResult(content="stub output", status="success"),
     )
 
 

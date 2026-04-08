@@ -233,6 +233,15 @@ class ToolManager:
             self._loop_thread = None
         self._started = False
 
+    def get_tool_names(self) -> list[str]:
+        """
+        Return the names of all registered tools.
+
+        :returns: Tool names, e.g. ``["spawn_sub_agents",
+            "load_skill", "web_search_openai"]``.
+        """
+        return list(self._tools.keys())
+
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         """
         Return OpenAI-format tool schemas for all registered

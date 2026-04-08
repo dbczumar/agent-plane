@@ -1,8 +1,8 @@
-"""Integration tests for executor storage lifecycle and await_tool_output.
+"""Integration tests for executor storage lifecycle and call_tool.
 
 Tests use a custom executor injected via monkeypatch to exercise the
 real workflow paths (restore → use → persist → cleanup) and the
-await_tool_output callback (register → publish → poll → return) end-to-end
+call_tool callback (register → publish → poll → return) end-to-end
 through the HTTP server.
 """
 
@@ -136,10 +136,10 @@ class _StorageTestExecutor(Executor):
 @dataclass
 class _AwaitToolProbe:
     """
-    Shared state for the await_tool_output integration test.
+    Shared state for the call_tool integration test.
 
     :param tool_result_received: The tool result content
-        returned by the await_tool_output callback. None until
+        returned by the call_tool callback. None until
         the callback returns.
     :param callback_returned: Signals that the executor's
         run_turn completed after receiving the tool result.
@@ -153,7 +153,7 @@ class _AwaitToolProbe:
 
 class _AwaitToolExecutor(Executor):
     """
-    Executor that calls ``context.await_tool_output()`` during
+    Executor that calls ``context.call_tool()`` during
     ``run_turn()`` to exercise the client-side tool bridging path.
 
     :param probe: Shared probe for communicating results.
@@ -181,21 +181,21 @@ class _AwaitToolExecutor(Executor):
         context: ExecutorContext,
     ) -> Iterator[TurnComplete]:
         """
-        Call ``await_tool_output`` for a client-side tool, then
+        Call ``call_tool`` for a client-side tool, then
         yield the result as text.
 
         :param messages: Ignored.
         :param tools: Ignored.
         :param system_prompt: Ignored.
         :param llm_config: Ignored.
-        :param context: Provides the ``await_tool_output`` callback.
+        :param context: Provides the ``call_tool`` callback.
         """
         call = ToolCallRequested(
             call_id=f"call_integ_{int(time.monotonic() * 1000)}",
             name="Read",
             arguments={"file_path": "/tmp/test.txt"},
         )
-        result = context.await_tool_output(call)
+        result = context.call_tool(call)
         self._probe.tool_result_received = result.content
         self._probe.callback_returned.set()
         yield TurnComplete(text=f"Tool returned: {result.content}")
@@ -389,14 +389,14 @@ async def test_executor_storage_persists_across_tasks(
 
 
 @pytest.mark.asyncio
-async def test_await_tool_output_park_patch_resume(
+async def test_call_tool_park_patch_resume(
     client: httpx.AsyncClient,
     mock_llm: ControllableMockClient,
     task_store: SqlAlchemyTaskStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    An executor that calls ``context.await_tool_output()`` parks
+    An executor that calls ``context.call_tool()`` parks
     the tool call, the client discovers it via GET, PATCHes the
     result, and the executor receives it to complete the task.
 

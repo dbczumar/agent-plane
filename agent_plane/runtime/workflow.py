@@ -3255,15 +3255,17 @@ def _build_executor_context(
     storage_dir: Path,
     root_task_id: str | None,
     task_store: TaskStore,
+    tool_mgr: ToolManager,
+    agent_id: str,
 ) -> ExecutorContext:
     """
     Build an :class:`ExecutorContext` for an agent execution.
 
     The ``await_tool_output`` callback bridges client-side tool
     calls from internal executors (Claude SDK) to the client.
-    It registers a pending tool call, publishes to the SSE
-    stream, and polls the task store until the client PATCHes
-    the result.
+    The ``call_server_tool`` callback lets executors call
+    agent-plane server-side tools (e.g. ``spawn_sub_agents``)
+    directly without client tunneling.
 
     :param task_id: Current task identifier, e.g. ``"task_abc123"``.
     :param conversation_id: Current conversation identifier,
@@ -3275,18 +3277,43 @@ def _build_executor_context(
         ``None`` for root-level tasks. Determines which SSE
         stream receives the ``function_call`` event.
     :param task_store: Task store for pending tool call operations.
+    :param tool_mgr: The ToolManager for server-side tool dispatch.
+    :param agent_id: The agent ID for the ToolContext.
     :returns: A configured ExecutorContext.
     """
-    callback = _build_await_tool_output(
+    await_tool_output = _build_await_tool_output(
         task_id,
         root_task_id,
         task_store,
     )
+    tool_ctx = ToolContext(task_id=task_id, agent_id=agent_id)
+    server_names = frozenset(tool_mgr.get_tool_names())
+
+    def _call_tool(call: ToolCallRequested) -> ToolResult:
+        """
+        Route a tool call to server-side or client-side execution.
+
+        Server-side tools (registered in ToolManager) are called
+        directly. Everything else is tunneled to the client via
+        the parking/polling mechanism.
+
+        :param call: The tool call to execute.
+        :returns: The tool's result.
+        """
+        if call.name in server_names:
+            result_str = tool_mgr.call_tool(
+                call.name,
+                json.dumps(call.arguments),
+                tool_ctx,
+            )
+            return ToolResult(content=result_str, status="completed")
+        return await_tool_output(call)
+
     return ExecutorContext(
         task_id=task_id,
         conversation_id=conversation_id,
         storage_dir=storage_dir,
-        await_tool_output=callback,
+        call_tool=_call_tool,
     )
 
 
@@ -3320,7 +3347,7 @@ def _build_await_tool_output(
         ``None`` for root-level tasks (publishes to own stream).
     :param task_store: Task store for pending tool call operations.
     :returns: A blocking callback suitable for
-        ``ExecutorContext.await_tool_output``.
+        ``ExecutorContext.call_tool``.
     """
     # Sub-agents tunnel to the root task's stream; root tasks
     # publish to their own.
@@ -3553,6 +3580,8 @@ async def _run_agent_loop(
         storage_dir,
         root_task_id,
         task_store,
+        tool_mgr,
+        agent_id,
     )
     executor.on_task_start(executor_context)
 
