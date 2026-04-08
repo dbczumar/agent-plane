@@ -146,9 +146,14 @@ class LocalPythonTool(Tool):
             }
         ).encode()
 
-        use_docker = self._sandbox_config.docker_image is not None
-        if use_docker:
-            return self._invoke_docker(request)
+        # srt and Docker both wrap the command in their own process
+        # chain, so the fd 3 pipe doesn't survive to the inner
+        # Python process. Use the stdout protocol instead.
+        use_stdout = self._sandbox_config.docker_image is not None or (
+            self._srt_available and self._sandbox_config.enabled
+        )
+        if use_stdout:
+            return self._invoke_stdout(request)
         return self._invoke_subprocess(request)
 
     def _invoke_subprocess(self, request: bytes) -> str:
@@ -184,22 +189,26 @@ class LocalPythonTool(Tool):
                 os.close(write_fd)
             os.close(read_fd)
 
-    def _invoke_docker(self, request: bytes) -> str:
+    def _invoke_stdout(self, request: bytes) -> str:
         """
-        Run the tool in a Docker container via stdout protocol.
+        Run the tool via stdout protocol (for srt and Docker).
 
-        Docker doesn't support ``pass_fds``, so the runner writes
-        the response to stdout with a ``__AP_RESPONSE__:`` prefix.
+        When the command is wrapped by srt or Docker, the fd 3 pipe
+        doesn't survive to the inner Python process. The runner
+        writes the response to stdout with a ``__AP_RESPONSE__:``
+        prefix instead.
 
         :param request: JSON-encoded request bytes.
         :returns: Tool result or error string.
         """
         try:
+            env = {**os.environ, "_AP_RESPONSE_MODE": "stdout"}
             self._proc = subprocess.Popen(
                 self._build_command(),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=env,
             )
             stdout, stderr = self._proc.communicate(input=request)
             return _read_stdout_response(

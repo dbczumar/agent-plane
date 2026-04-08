@@ -175,7 +175,15 @@ def test_cancel_kills_subprocess(tmp_path: Path, tool_ctx: ToolContext) -> None:
         path="tools/python/sleeper.py",
         language="python",
     )
-    tools = load_local_python_tools([info], tmp_path)
+    # Explicitly disable srt so we test the fd 3 subprocess path.
+    # srt wrapping uses a different process tree that is tested
+    # separately via integration tests.
+    tools = load_local_python_tools(
+        [info],
+        tmp_path,
+        srt_available=False,
+        uv_available=False,
+    )
     tool = tools[0]
 
     import threading
