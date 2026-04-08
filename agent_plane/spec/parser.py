@@ -21,6 +21,7 @@ from agent_plane.spec.types import (
     MCPServerConfig,
     ModalityConfig,
     RetryConfig,
+    SandboxConfig,
     SkillSpec,
     ToolsConfig,
 )
@@ -182,12 +183,44 @@ def _parse_tools_config(
     timeout = int(raw["timeout"]) if "timeout" in raw else 60
     retry = _parse_retry(raw.get("retry"))
     builtins = _parse_builtin_tools(raw.get("builtins", []))
+    sandbox = _parse_sandbox_config(raw.get("sandbox"))
     return ToolsConfig(
         agents=raw.get("agents", []),
         builtins=builtins,
         timeout=timeout,
         retry=retry,
+        sandbox=sandbox,
     )
+
+
+def _parse_sandbox_config(
+    raw: dict[str, Any] | bool | None,
+) -> SandboxConfig:
+    """
+    Parse the ``tools.sandbox`` block from config.yaml.
+
+    Accepts a boolean shorthand or a detailed dict::
+
+        sandbox: true
+        sandbox: false
+        sandbox:
+          enabled: true
+          docker_image: python:3.12-slim
+
+    :param raw: The raw ``sandbox`` value from the ``tools``
+        block. ``None`` means not specified (use defaults).
+    :returns: A :class:`SandboxConfig`.
+    """
+    if raw is None:
+        return SandboxConfig()
+    if isinstance(raw, bool):
+        return SandboxConfig(enabled=raw)
+    if isinstance(raw, dict):
+        return SandboxConfig(
+            enabled=raw.get("enabled", True),
+            docker_image=raw.get("docker_image"),
+        )
+    return SandboxConfig()
 
 
 def _parse_builtin_tools(

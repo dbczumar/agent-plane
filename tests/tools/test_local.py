@@ -349,6 +349,193 @@ def test_load_skips_schema_name_mismatch(tmp_path: Path) -> None:
     assert tools == []
 
 
+# ── Command construction tiers ──────────────────────────
+
+
+def test_build_command_plain(tmp_path: Path) -> None:
+    """
+    Default tier: plain ``python _runner.py``.
+    """
+    from agent_plane.spec.types import SandboxConfig
+    from agent_plane.tools.local import _RUNNER_PATH, LocalPythonTool
+
+    info = LocalToolInfo(name="t", path="t.py", language="python")
+    tool = LocalPythonTool(
+        info=info,
+        schema={"type": "function", "function": {"name": "t", "parameters": {}}},
+        module_path=tmp_path / "t.py",
+        sandbox_config=SandboxConfig(),
+        srt_available=False,
+        uv_available=False,
+    )
+    cmd = tool._build_command()
+    assert cmd == [sys.executable, _RUNNER_PATH]
+
+
+def test_build_command_with_uv(tmp_path: Path) -> None:
+    """
+    When tool has PEP 723 deps and uv is available, command
+    is wrapped with ``uv run --with``.
+    """
+    from agent_plane.spec.types import SandboxConfig
+    from agent_plane.tools.local import _RUNNER_PATH, LocalPythonTool
+
+    info = LocalToolInfo(
+        name="t",
+        path="t.py",
+        language="python",
+        has_inline_deps=True,
+        inline_deps=["requests>=2.28", "pandas"],
+    )
+    tool = LocalPythonTool(
+        info=info,
+        schema={"type": "function", "function": {"name": "t", "parameters": {}}},
+        module_path=tmp_path / "t.py",
+        sandbox_config=SandboxConfig(),
+        srt_available=False,
+        uv_available=True,
+    )
+    cmd = tool._build_command()
+    assert cmd[:2] == ["uv", "run"]
+    assert "--with" in cmd
+    assert "requests>=2.28" in cmd
+    assert "pandas" in cmd
+    assert cmd[-2:] == [sys.executable, _RUNNER_PATH]
+
+
+def test_build_command_with_srt(tmp_path: Path) -> None:
+    """
+    When srt is available and sandbox enabled, command is
+    wrapped with ``srt``.
+    """
+    from agent_plane.spec.types import SandboxConfig
+    from agent_plane.tools.local import _RUNNER_PATH, LocalPythonTool
+
+    info = LocalToolInfo(name="t", path="t.py", language="python")
+    tool = LocalPythonTool(
+        info=info,
+        schema={"type": "function", "function": {"name": "t", "parameters": {}}},
+        module_path=tmp_path / "t.py",
+        sandbox_config=SandboxConfig(enabled=True),
+        srt_available=True,
+        uv_available=False,
+    )
+    cmd = tool._build_command()
+    assert cmd[0] == "srt"
+    assert cmd[-2:] == [sys.executable, _RUNNER_PATH]
+
+
+def test_build_command_srt_disabled(tmp_path: Path) -> None:
+    """
+    When sandbox.enabled is False, srt is NOT prepended even
+    when available on PATH.
+    """
+    from agent_plane.spec.types import SandboxConfig
+    from agent_plane.tools.local import _RUNNER_PATH, LocalPythonTool
+
+    info = LocalToolInfo(name="t", path="t.py", language="python")
+    tool = LocalPythonTool(
+        info=info,
+        schema={"type": "function", "function": {"name": "t", "parameters": {}}},
+        module_path=tmp_path / "t.py",
+        sandbox_config=SandboxConfig(enabled=False),
+        srt_available=True,
+        uv_available=False,
+    )
+    cmd = tool._build_command()
+    # Plain command, no srt prefix
+    assert cmd == [sys.executable, _RUNNER_PATH]
+
+
+def test_build_command_srt_plus_uv(tmp_path: Path) -> None:
+    """
+    When both srt and uv are active, srt wraps the uv command.
+    """
+    from agent_plane.spec.types import SandboxConfig
+    from agent_plane.tools.local import LocalPythonTool
+
+    info = LocalToolInfo(
+        name="t",
+        path="t.py",
+        language="python",
+        has_inline_deps=True,
+        inline_deps=["httpx"],
+    )
+    tool = LocalPythonTool(
+        info=info,
+        schema={"type": "function", "function": {"name": "t", "parameters": {}}},
+        module_path=tmp_path / "t.py",
+        sandbox_config=SandboxConfig(enabled=True),
+        srt_available=True,
+        uv_available=True,
+    )
+    cmd = tool._build_command()
+    # srt wraps everything: srt uv run --with httpx -- python _runner.py
+    assert cmd[0] == "srt"
+    assert cmd[1] == "uv"
+
+
+def test_build_command_docker(tmp_path: Path) -> None:
+    """
+    When docker_image is configured, command uses ``docker run``.
+    """
+    from agent_plane.spec.types import SandboxConfig
+    from agent_plane.tools.local import LocalPythonTool
+
+    info = LocalToolInfo(name="t", path="t.py", language="python")
+    tool = LocalPythonTool(
+        info=info,
+        schema={"type": "function", "function": {"name": "t", "parameters": {}}},
+        module_path=tmp_path / "t.py",
+        sandbox_config=SandboxConfig(docker_image="python:3.12-slim"),
+        srt_available=True,
+        uv_available=True,
+    )
+    cmd = tool._build_command()
+    assert cmd[0] == "docker"
+    assert "run" in cmd
+    assert "--network" in cmd
+    assert "none" in cmd
+    assert "python:3.12-slim" in cmd
+
+
+def test_pep723_scanning_at_load_time(tmp_path: Path) -> None:
+    """
+    Tool files with PEP 723 inline metadata have has_inline_deps
+    set at load time.
+    """
+    py_dir = tmp_path / "tools" / "python"
+    py_dir.mkdir(parents=True)
+    (py_dir / "with_deps.py").write_text("""\
+# /// script
+# dependencies = ["requests"]
+# ///
+
+from typing import Any
+
+SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "with_deps",
+        "description": "Test.",
+        "parameters": {"type": "object"},
+    },
+}
+
+async def run(args: dict[str, Any]) -> str:
+    return "ok"
+""")
+    info = LocalToolInfo(
+        name="with_deps",
+        path="tools/python/with_deps.py",
+        language="python",
+    )
+    tools = load_local_python_tools([info], tmp_path)
+    assert len(tools) == 1
+    assert info.has_inline_deps is True
+    assert info.inline_deps == ["requests"]
+
+
 # ── Runner subprocess (direct invocation) ──────────────
 
 

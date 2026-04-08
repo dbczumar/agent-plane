@@ -212,6 +212,24 @@ class BuiltinToolConfig:
 
 
 @dataclass
+class SandboxConfig:
+    """
+    Sandbox configuration for local tool execution.
+
+    :param enabled: Whether to use ``srt`` sandboxing when available
+        on PATH. ``True`` by default; set to ``False`` to disable
+        even when ``srt`` is installed.
+    :param docker_image: When set, tools run inside this Docker
+        container instead of a local subprocess. Mutually exclusive
+        with ``srt`` sandboxing (Docker provides its own isolation),
+        e.g. ``"python:3.12-slim"``.
+    """
+
+    enabled: bool = True
+    docker_image: str | None = None
+
+
+@dataclass
 class ToolsConfig:
     """
     Declared tool references from config.yaml.
@@ -239,6 +257,7 @@ class ToolsConfig:
             backoff_max=10.0,
         )
     )
+    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
 
 
 @dataclass
@@ -317,8 +336,8 @@ class LocalToolInfo:
     """
     A discovered local tool file (Python or TypeScript).
 
-    :param name: Derived tool name with dots replacing underscores,
-        e.g. ``"arxiv.search"`` (from ``arxiv_search.py``).
+    :param name: Derived tool name from filename stem,
+        e.g. ``"arxiv_search"`` (from ``arxiv_search.py``).
     :param path: Relative path within the agent image, e.g.
         ``"tools/python/arxiv_search.py"``.
     :param language: Source language. Either ``"python"`` or
@@ -327,15 +346,24 @@ class LocalToolInfo:
         ``tools.timeout``.
     :param retry: Per-tool retry policy. ``None`` inherits
         ``tools.retry``.
+    :param has_inline_deps: ``True`` if the tool file contains
+        PEP 723 inline script metadata with dependencies.
+    :param inline_deps: PEP 508 dependency specifiers extracted
+        from the ``# /// script`` block. ``None`` when no
+        inline metadata is present.
     """
 
-    name: str  # derived tool name, e.g. "arxiv.search"
-    path: str  # relative path within the agent image, e.g. "tools/python/arxiv_search.py"
-    language: str  # "python" | "typescript"
+    name: str
+    path: str
+    language: str
     # Per-tool timeout/retry overrides. None = inherit from
     # tools.timeout / tools.retry.
     timeout: int | None = None
     retry: RetryConfig | None = None
+    # PEP 723 inline dependency metadata. Populated at load time
+    # by scanning the tool source file.
+    has_inline_deps: bool = False
+    inline_deps: list[str] | None = None
 
 
 @dataclass

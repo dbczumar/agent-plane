@@ -8,6 +8,7 @@ cached across workflow executions to avoid repeated round-trips.
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +91,8 @@ class ToolManager:
         self._tools: dict[str, Tool] = {}
         self._mcp_connections: list[McpServerConnection] = []
         self._loop_thread: EventLoopThread | None = None
+        self._srt_available = shutil.which("srt") is not None
+        self._uv_available = shutil.which("uv") is not None
         self._register_skill_tools()
         self._register_builtin_tools()
         self._register_sub_agent_tools()
@@ -161,7 +164,13 @@ class ToolManager:
         """
         if workdir is None or not self._spec.local_tools:
             return
-        for tool in load_local_python_tools(self._spec.local_tools, workdir):
+        for tool in load_local_python_tools(
+            self._spec.local_tools,
+            workdir,
+            sandbox_config=self._spec.tools.sandbox,
+            srt_available=self._srt_available,
+            uv_available=self._uv_available,
+        ):
             if not is_valid_tool_name(tool.name()):
                 _logger.warning(
                     "Local tool %r has invalid name — skipping",
