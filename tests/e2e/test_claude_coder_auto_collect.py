@@ -68,10 +68,8 @@ def test_single_message_subagent_auto_collect(
         json={
             "model": claude_coder_agent,
             "input": (
-                "Use spawn_sub_agents to spawn the 'reviewer' sub-agent. "
-                "Ask it to review /etc/hosts and identify any issues. "
-                "Wait for it to finish and include its full review in "
-                "your response."
+                "Use spawn_sub_agents to spawn the 'reviewer' sub-agent "
+                "and ask it to review /etc/hosts."
             ),
             "background": True,
         },
@@ -94,23 +92,25 @@ def test_single_message_subagent_auto_collect(
     judge = make_judge(
         name="auto_collect_completeness",
         instructions=(
-            "You are evaluating whether an AI assistant's response "
-            "contains the actual results from a sub-agent it spawned, "
-            "as opposed to just saying 'I spawned it' or 'check back "
-            "later.'\n\n"
+            "You are evaluating whether an AI assistant received "
+            "and presented results from a sub-agent it spawned.\n\n"
             "The assistant was asked to spawn a 'reviewer' sub-agent "
-            "to review the /etc/hosts file. The response should "
-            "contain the reviewer's actual feedback about the file "
-            "(e.g. comments about the hosts file contents, format, "
-            "or any observations).\n\n"
+            "to review the /etc/hosts file.\n\n"
             "The assistant's response is:\n"
             "{{ outputs }}\n\n"
-            "Return True if the response includes substantive review "
-            "content that clearly came from the sub-agent completing "
-            "its work (not just 'the reviewer is working on it' or "
-            "'I'll check back'). Return False if the response "
-            "indicates the sub-agent hasn't finished yet or contains "
-            "no actual review output."
+            "A PASSING response must:\n"
+            "1. Show that spawn_sub_agents was called\n"
+            "2. Show that check_sub_agents returned a COMPLETED "
+            "status (not 'in_progress')\n"
+            "3. Include specific observations about the /etc/hosts "
+            "file that came from the reviewer\n\n"
+            "A FAILING response:\n"
+            "- Says 'the reviewer is still working' or 'in progress'\n"
+            "- Only shows the assistant's own analysis (not the "
+            "sub-agent's)\n"
+            "- Says 'check back later'\n\n"
+            "Return True ONLY if the sub-agent completed and its "
+            "results are included. Return False otherwise."
         ),
         feedback_value_type=bool,
     )
