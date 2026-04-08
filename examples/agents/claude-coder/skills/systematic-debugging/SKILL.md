@@ -1,5 +1,5 @@
 ---
-name: debug
+name: systematic-debugging
 description: Systematically diagnose and fix bugs using logs, stack traces, and targeted investigation.
 ---
 
