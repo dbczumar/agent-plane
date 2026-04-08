@@ -28,12 +28,12 @@ for uploading to the file store.
 tools:
   builtins:
     - name: filesystem
-      root: /home/user/project   # allowed directory
       writable: true              # default: false (read-only)
 ```
 
-`root` is required. Resolved to an absolute path at parse time. All
-tool operations are confined to this directory.
+All filesystem tool operations are confined to the **workspace** — the
+per-conversation persistent directory (`storage_dir`). No configurable
+`root` — the workspace is always the root.
 
 `writable` controls whether `write_file` and `edit_file` are
 registered. Read-only by default — agents must opt in to writes.
@@ -61,25 +61,25 @@ downloads via `GET /v1/files/{file_id}/content`.
 
 ## Path Validation
 
-All paths are resolved and validated before any I/O:
+All paths are resolved and validated against the workspace before any I/O:
 
 ```python
-def _safe_resolve(path: str, root: Path) -> Path:
-    resolved = (root / path).resolve()
-    if not resolved.is_relative_to(root):
-        raise ValueError(f"Path escapes allowed directory: {path}")
-    # Reject symlinks that point outside root
+def _safe_resolve(path: str, workspace: Path) -> Path:
+    resolved = (workspace / path).resolve()
+    if not resolved.is_relative_to(workspace):
+        raise ValueError(f"Path escapes workspace: {path}")
+    # Reject symlinks that point outside workspace
     if resolved.is_symlink():
         target = resolved.resolve(strict=True)
-        if not target.is_relative_to(root):
-            raise ValueError(f"Symlink escapes allowed directory: {path}")
+        if not target.is_relative_to(workspace):
+            raise ValueError(f"Symlink escapes workspace: {path}")
     return resolved
 ```
 
 This covers:
 - `../` traversal (resolve + is_relative_to)
 - Symlink escape (resolve target + is_relative_to)
-- Absolute paths outside root (is_relative_to catches `/etc/passwd`)
+- Absolute paths outside workspace (is_relative_to catches `/etc/passwd`)
 
 ---
 
@@ -87,26 +87,22 @@ This covers:
 
 ### New file
 
-**`tools/builtins/filesystem.py`** — `FilesystemTool` class:
+**`tools/builtins/filesystem.py`** — filesystem tool classes:
 
-- Constructor takes `root: str` and `writable: bool` from config
-- Resolves `root` to absolute `Path` at init
-- `name()` returns `"filesystem"` (but registers multiple tool
-  schemas — one per operation)
-- `invoke(operation, args, context)` dispatches to the right handler
-- `publish_file` needs `file_store` and `artifact_store` — accessed
-  via `ToolContext` (requires adding these to `ToolContext`)
+- Each tool takes `writable: bool` from config
+- Reads `workspace` from `ToolContext.workspace` at invoke time
+- `publish_file` accesses `file_store` and `artifact_store` via
+  runtime globals (`get_file_store()`, `get_artifact_store()`)
 
 ### Changed files
 
 **`tools/builtins/__init__.py`** — Register `FilesystemTool` in
 `_BUILTIN_REGISTRY`.
 
-**`tools/base.py`** — Add `file_store` and `artifact_store` to
-`ToolContext` so `publish_file` can store files.
+**`tools/base.py`** — Add `workspace: Path` to `ToolContext`.
 
-**`tools/manager.py`** — Pass `file_store` and `artifact_store`
-when constructing `ToolContext`.
+**`tools/manager.py`** — Pass `workspace` when constructing
+`ToolContext`.
 
 ---
 
@@ -133,17 +129,18 @@ based on `writable`.
 def create_filesystem_tools(
     config: dict[str, str],
 ) -> list[Tool]:
-    root = Path(config["root"]).resolve()
     writable = config.get("writable", "false").lower() == "true"
-    tools = [
-        ReadFileTool(root),
-        ListDirectoryTool(root),
-        SearchFilesTool(root),
-        PublishFileTool(root),  # needs file_store access
+    # workspace (root) is resolved at invoke time from ToolContext,
+    # not at factory creation time — it varies per conversation.
+    tools: list[Tool] = [
+        ReadFileTool(),
+        ListDirectoryTool(),
+        SearchFilesTool(),
+        PublishFileTool(),
     ]
     if writable:
-        tools.append(WriteFileTool(root))
-        tools.append(EditFileTool(root))
+        tools.append(WriteFileTool())
+        tools.append(EditFileTool())
     return tools
 ```
 
@@ -183,3 +180,16 @@ Client downloads: GET /v1/files/file_abc123/content → chart.png
 
 Works with DefaultExecutor (no Claude SDK needed), works with any
 model, uses the existing file store infrastructure.
+
+---
+
+## Integration with Sandboxed Tool Execution
+
+See `designs/SANDBOXED_TOOL_EXECUTION.md` for the full design.
+
+- Filesystem tools and local Python tools share the same **workspace**
+  (the per-conversation `storage_dir`).
+- Filesystem tools run in-process with path validation (trusted code).
+- Local Python tools run in sandboxed subprocesses with `cwd = workspace`.
+- When `srt` is available, the subprocess is confined to the workspace
+  via OS-level filesystem restrictions.
