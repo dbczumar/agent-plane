@@ -2053,6 +2053,25 @@ async def _handle_tool_calls(
     return last_seen
 
 
+def _strip_mcp_tool_prefix(name: str) -> str:
+    """
+    Strip the Claude SDK MCP tool prefix from a tool name.
+
+    The Claude SDK names MCP tools as ``mcp__{server}__{tool}``
+    (e.g. ``mcp__agent_plane__spawn_sub_agents``). This function
+    returns the bare tool name (``spawn_sub_agents``) so it can
+    be matched against agent-plane's internal tool names.
+
+    Returns the name unchanged if it has no MCP prefix.
+
+    :param name: Tool name, possibly MCP-prefixed.
+    :returns: The bare tool name, e.g. ``"spawn_sub_agents"``.
+    """
+    if "__" in name:
+        return name.rsplit("__", 1)[-1]
+    return name
+
+
 def _track_spawn_collect(
     output_items: list[dict[str, Any]],
     spawned_ids: set[str],
@@ -2090,11 +2109,7 @@ def _track_spawn_collect(
             parsed = json.loads(output_str)
         except (json.JSONDecodeError, TypeError):
             continue
-        # Match both bare names ("spawn_sub_agents") and MCP-prefixed
-        # names ("mcp__agent_plane__spawn_sub_agents") so tracking
-        # works for both the default executor path (bare) and the
-        # Claude SDK executor path (MCP-prefixed observed tool calls).
-        bare_name = name.rsplit("__", 1)[-1] if "__" in name else name
+        bare_name = _strip_mcp_tool_prefix(name)
         if bare_name == SpawnTool.name():
             for rid in parsed.get("response_ids", []):
                 spawned_ids.add(rid)
@@ -2147,7 +2162,7 @@ def _recover_spawn_state(
                 parsed = json.loads(output_str)
             except (json.JSONDecodeError, TypeError):
                 continue
-            bare_name = name.rsplit("__", 1)[-1] if "__" in name else name
+            bare_name = _strip_mcp_tool_prefix(name)
             if bare_name == SpawnTool.name():
                 for rid in parsed.get("response_ids", []):
                     spawned.add(rid)
