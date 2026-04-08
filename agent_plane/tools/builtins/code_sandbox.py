@@ -12,10 +12,51 @@ returned as a string.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from agent_plane.tools.base import Tool, ToolContext
+
+# Cached srt settings file path — reused across invocations for
+# the same workspace to avoid creating a temp file per call.
+_srt_settings_cache: dict[str, str] = {}
+
+
+def _write_srt_settings(workspace: Path) -> str:
+    """
+    Write an srt settings file that allows writes only to the workspace.
+
+    Cached per workspace path so repeated invocations reuse the
+    same file.
+
+    :param workspace: The workspace directory to allow writes to.
+    :returns: Path to the settings JSON file.
+    """
+    import tempfile
+
+    ws_str = str(workspace)
+    if ws_str in _srt_settings_cache:
+        return _srt_settings_cache[ws_str]
+
+    settings = {
+        "network": {
+            "allowedDomains": [],
+            "deniedDomains": [],
+        },
+        "filesystem": {
+            "allowWrite": [ws_str],
+            "denyRead": [],
+            "denyWrite": [],
+        },
+    }
+    fd, path = tempfile.mkstemp(suffix=".json", prefix="srt-ap-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(settings, f)
+    _srt_settings_cache[ws_str] = path
+    return path
+
 
 _SCHEMA: dict[str, Any] = {
     "type": "function",
@@ -102,7 +143,7 @@ class CodeSandboxTool(Tool):
         if ctx.workspace is None:
             return "Error: no workspace available"
 
-        cmd = self._build_command(command)
+        cmd = self._build_command(command, ctx.workspace)
         try:
             self._proc = subprocess.Popen(
                 cmd,
@@ -132,13 +173,25 @@ class CodeSandboxTool(Tool):
             except ProcessLookupError:
                 pass
 
-    def _build_command(self, command: str) -> list[str]:
+    def _build_command(
+        self,
+        command: str,
+        workspace: Path,
+    ) -> list[str]:
         """
         Build the subprocess command, optionally wrapping with srt.
 
+        When srt is active, writes a temporary settings file that
+        allows writes to the workspace directory and ``/tmp``
+        (needed for bash heredocs).
+
         :param command: The shell command string.
+        :param workspace: The workspace directory path.
         :returns: The command list for ``Popen``.
         """
         if self._srt_available and self._sandbox_enabled:
-            return ["srt", "-c", command]
+            settings_path = _write_srt_settings(workspace)
+            # TMPDIR=workspace so bash heredocs stay in the sandbox.
+            wrapped = f"TMPDIR={workspace} {command}"
+            return ["srt", "--settings", settings_path, "-c", wrapped]
         return ["bash", "-c", command]
