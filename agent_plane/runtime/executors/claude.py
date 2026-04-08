@@ -762,8 +762,12 @@ def _build_sdk_options(
     if executor._skills:
         setting_sources = ["project"]
 
+    base_tools = list(executor._allowed_tools)
+    if executor._skills:
+        base_tools.append("Skill")
+
     options = sdk.ClaudeAgentOptions(
-        tools=list(executor._allowed_tools),
+        tools=base_tools,
         system_prompt=system_prompt or None,
         mcp_servers=mcp_servers,
         allowed_tools=allowed_tools,

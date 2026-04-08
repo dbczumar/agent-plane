@@ -178,7 +178,7 @@ def _create_executor(spec: AgentSpec) -> Executor:
     """
     executor_type = spec.executor.type
     if executor_type == "claude_sdk":
-        from agent_plane.runtime.claude_agents_executor import (
+        from agent_plane.runtime.executors.claude import (
             ClaudeAgentsExecutor,
         )
 
