@@ -236,84 +236,73 @@ tools:
 
 ---
 
-## Workspace: the per-conversation working directory
+## Storage layout
 
-The workspace is `storage_dir` — the per-conversation persistent
-directory already managed by agent-plane:
-
-```
-~/.agent-plane/executor_storage/{conversation_id}/{agent_name}/
-```
-
-This directory:
-- Persists across tasks within a conversation
-- Survives server restarts (snapshotted to artifact store, restored on demand)
-- Is scoped to (conversation, agent) — no cross-conversation interference
-- Is already the Claude SDK executor's `cwd`
-
-All tool types share the workspace:
-
-| Tool type | Execution | Workspace access |
-|-----------|-----------|-----------------|
-| Filesystem builtins (read_file, write_file) | In-process, path-validated | Root = workspace |
-| Local Python tools (user-authored) | Sandboxed subprocess | cwd = workspace |
-| Claude SDK tools (Bash, Read, Edit) | SDK subprocess | cwd = workspace |
-
-No configurable `root` needed. Files enter the workspace through:
-- **File upload API** — user uploads, agent reads
-- **Tool execution** — write_file creates files, local tools produce output
-- **Docker volume mounts** — for Docker mode, external dirs mounted in
-
-### How filesystem tools and local tools interact
+Each (conversation, agent) pair gets a persistent directory:
 
 ```
-Agent receives: "Analyze the CSV and make a chart"
-
-1. read_file(path="sales.csv")           <- filesystem builtin (in-process)
-     Reads {workspace}/sales.csv
-
-2. analyze_data({"file": "sales.csv"})   <- local Python tool (subprocess)
-     Subprocess cwd = {workspace}
-     Tool does: pd.read_csv("sales.csv")  <- reads the SAME file
-     Writes output/chart.png
-     Returns: "Chart saved to output/chart.png"
-
-3. publish_file(path="output/chart.png") <- filesystem builtin (in-process)
-     Reads {workspace}/output/chart.png
-     Uploads to file store -> file_id
+storage_dir/                          ← per (conversation, agent)
+  managed/                            ← agent-plane internal state
+    .claude/                          ← Claude SDK session transcripts
+    .claude/skills/                   ← skill files for SDK discovery
+  workspace/                          ← user-visible files
+    sales.csv
+    output/chart.png
 ```
+
+- **`managed/`** — internal state, invisible to filesystem tools and
+  local tool subprocesses. The Claude SDK's `cwd` is set here so
+  `.claude/` lands naturally. Agent-plane metadata lives here too.
+
+- **`workspace/`** — user-visible filesystem. Filesystem tools resolve
+  paths against this directory. Local tool subprocesses can access it
+  via srt's allow-list. Not a cwd — a mounted path.
+
+The whole `storage_dir/` is snapshotted to the artifact store for
+durability across server restarts.
+
+### How each tool type uses the layout
+
+| Tool type | Execution | cwd | Filesystem access |
+|-----------|-----------|-----|-------------------|
+| Filesystem builtins | In-process, path-validated | N/A | Resolves paths against `workspace/` via `ToolContext.workspace` |
+| Local Python tools | Sandboxed subprocess | `managed/` | `workspace/` mounted read-write by srt; `managed/` is cwd but srt denies writes outside `workspace/` |
+| Claude SDK tools | SDK subprocess | `managed/` | SDK operates in `managed/`; separate from user files |
+
+### Why cwd = managed/
+
+The subprocess cwd is `managed/`, not `workspace/`. This prevents
+local tools from accidentally reading/writing internal state via
+relative paths. The tool accesses `workspace/` only through explicit
+paths passed in its arguments (e.g. the agent passes
+`{"file": "/workspace/sales.csv"}`), or through the srt mount.
+
+With srt active, the sandbox mounts `workspace/` at a known path
+inside the sandbox and restricts writes to it. Without srt, the
+subprocess can technically reach anywhere — but cwd being `managed/`
+still provides defense-in-depth against accidental relative-path
+access to wrong directories.
 
 ### srt sandbox confinement
 
-When srt wraps a local tool subprocess, the workspace is the allowed
-write path:
-
 ```bash
-srt --allow-write {workspace} -- python _runner.py
+srt --allow-write {storage_dir}/workspace -- python _runner.py
 ```
 
-On macOS: Seatbelt profile allows writes to workspace only.
-On Linux: bubblewrap bind-mounts workspace as read-write within a
-read-only root.
-
-### Filesystem tools config simplification
-
-The `root` field from FILESYSTEM_TOOLS.md is removed. Config becomes:
-
-```yaml
-tools:
-  builtins:
-    - name: filesystem
-      writable: true    # that's it — root is always the workspace
-```
+On macOS: Seatbelt profile allows writes to `workspace/` only.
+On Linux: bubblewrap bind-mounts `workspace/` as read-write within
+a read-only root. `managed/` is not writable from the sandboxed
+process.
 
 ### ToolContext gains workspace
 
-`ToolContext` gets a `workspace: Path` field. Both filesystem tools
-and the sandbox command builder read the workspace from context.
+`ToolContext` gets a `workspace: Path` field pointing to
+`storage_dir/workspace/`. The `code_sandbox` builtin uses it as
+`cwd`. The `upload_file` builtin resolves paths against it.
+`LocalPythonTool` receives it at init for srt allowed paths.
 
-`LocalPythonTool` receives `workspace: Path` at init for subprocess
-cwd and srt allowed paths.
+See `designs/FILESYSTEM_TOOLS.md` for the `code_sandbox` and
+`upload_file` builtin design.
 
 ---
 
