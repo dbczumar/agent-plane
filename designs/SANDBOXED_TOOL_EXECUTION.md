@@ -244,65 +244,47 @@ tools:
 Each (conversation, agent) pair gets a persistent directory:
 
 ```
-storage_dir/                          ← per (conversation, agent)
-  managed/                            ← agent-plane internal state
-    .claude/                          ← Claude SDK session transcripts
+storage_dir/
+  workspace/                          ← single workspace for everything
+    .claude/                          ← SDK session transcripts (hidden by convention)
     .claude/skills/                   ← skill files for SDK discovery
-  workspace/                          ← user-visible files
-    sales.csv
-    output/chart.png
+    sales.csv                         ← user/agent files
+    output/chart.png                  ← tool outputs
 ```
 
-- **`managed/`** — internal state, invisible to filesystem tools and
-  local tool subprocesses. The Claude SDK's `cwd` is set here so
-  `.claude/` lands naturally. Agent-plane metadata lives here too.
+One directory, one cwd. No `managed/` split — `.claude/` lives
+alongside user files, same as `.git/` in a normal repo. Claude
+Code's built-in tools (Read, Edit, Bash) operate relative to cwd,
+so they need to see both SDK state and user files in the same tree.
 
-- **`workspace/`** — user-visible filesystem. Filesystem tools resolve
-  paths against this directory. Local tool subprocesses can access it
-  via srt's allow-list. Not a cwd — a mounted path.
-
-The whole `storage_dir/` is snapshotted to the artifact store for
-durability across server restarts.
+The whole `storage_dir/workspace/` is snapshotted to the artifact
+store for durability across server restarts.
 
 ### How each tool type uses the layout
 
 | Tool type | Execution | cwd | Filesystem access |
 |-----------|-----------|-----|-------------------|
-| Filesystem builtins | In-process, path-validated | N/A | Resolves paths against `workspace/` via `ToolContext.workspace` |
-| Local Python tools | Sandboxed subprocess | `managed/` | `workspace/` mounted read-write by srt; `managed/` is cwd but srt denies writes outside `workspace/` |
-| Claude SDK tools | SDK subprocess | `managed/` | SDK operates in `managed/`; separate from user files |
-
-### Why cwd = managed/
-
-The subprocess cwd is `managed/`, not `workspace/`. This prevents
-local tools from accidentally reading/writing internal state via
-relative paths. The tool accesses `workspace/` only through explicit
-paths passed in its arguments (e.g. the agent passes
-`{"file": "/workspace/sales.csv"}`), or through the srt mount.
-
-With srt active, the sandbox mounts `workspace/` at a known path
-inside the sandbox and restricts writes to it. Without srt, the
-subprocess can technically reach anywhere — but cwd being `managed/`
-still provides defense-in-depth against accidental relative-path
-access to wrong directories.
+| code_sandbox | Sandboxed subprocess | `workspace/` | Full access; srt confines writes here |
+| upload_file | In-process, path-validated | N/A | Resolves paths against `workspace/` via `ToolContext.workspace` |
+| Local Python tools | Sandboxed subprocess | N/A | No filesystem access; data via arguments |
+| Claude SDK tools | SDK subprocess | `workspace/` | SDK operates in `workspace/`; `.claude/` lands here naturally |
 
 ### srt sandbox confinement
 
 ```bash
-srt --allow-write {storage_dir}/workspace -- python _runner.py
+srt --allow-write {storage_dir}/workspace -- bash -c '<command>'
 ```
 
 On macOS: Seatbelt profile allows writes to `workspace/` only.
 On Linux: bubblewrap bind-mounts `workspace/` as read-write within
-a read-only root. `managed/` is not writable from the sandboxed
-process.
+a read-only root.
 
 ### ToolContext gains workspace
 
 `ToolContext` gets a `workspace: Path` field pointing to
 `storage_dir/workspace/`. The `code_sandbox` builtin uses it as
-`cwd`. The `upload_file` builtin resolves paths against it.
-`LocalPythonTool` receives it at init for srt allowed paths.
+subprocess `cwd`. The `upload_file` builtin resolves paths against
+it.
 
 See `designs/FILESYSTEM_TOOLS.md` for the `code_sandbox` and
 `upload_file` builtin design.
