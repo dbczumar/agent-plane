@@ -21,5 +21,7 @@ tools:
     - claude:Write
     - claude:Glob
     - claude:Grep
+  agents:
+    - reviewer
 
 instructions: INSTRUCTIONS.md
