@@ -62,16 +62,21 @@ def resolve_tool_retry(
 def call_tool_with_timeout(
     call_fn: Callable[[], str],
     timeout: int,
+    cancel_fn: Callable[[], None] | None = None,
 ) -> str:
     """
     Execute a tool call with a wall-clock timeout.
 
     Uses a thread pool to enforce the timeout. If the tool
-    exceeds the deadline, raises ``TimeoutError``.
+    exceeds the deadline, calls ``cancel_fn`` (if provided)
+    to kill the underlying process, then raises ``TimeoutError``.
 
     :param call_fn: Zero-argument callable that executes the
         tool and returns a string result.
     :param timeout: Timeout in seconds, e.g. ``60``.
+    :param cancel_fn: Optional callable to invoke on timeout,
+        e.g. ``tool.cancel`` which sends SIGKILL to a
+        subprocess. ``None`` means no cancellation action.
     :returns: The tool's string result.
     :raises TimeoutError: If the tool does not complete within
         the timeout.
@@ -81,6 +86,8 @@ def call_tool_with_timeout(
         try:
             return future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
+            if cancel_fn is not None:
+                cancel_fn()
             raise TimeoutError(f"Tool execution timed out after {timeout}s") from None
 
 
@@ -90,6 +97,7 @@ def execute_tool_with_retry(
     timeout: int,
     retry_config: RetryConfig,
     on_event: Callable[[dict[str, Any]], None],
+    cancel_fn: Callable[[], None] | None = None,
 ) -> str:
     """
     Execute a tool call with timeout and retry.
@@ -106,6 +114,9 @@ def execute_tool_with_retry(
     :param retry_config: Retry policy for this tool.
     :param on_event: Callback to emit SSE events (retry and
         error). Called with the event dict.
+    :param cancel_fn: Optional callable to invoke on timeout,
+        e.g. ``tool.cancel`` which sends SIGKILL to a
+        subprocess. ``None`` means no cancellation action.
     :returns: The tool's string result, or an error string if
         all retries are exhausted.
     """
@@ -113,7 +124,7 @@ def execute_tool_with_retry(
 
     for attempt in range(retry_config.max_attempts):
         try:
-            return call_tool_with_timeout(call_fn, timeout)
+            return call_tool_with_timeout(call_fn, timeout, cancel_fn)
         except TimeoutError as exc:
             last_error = str(exc)
             if attempt + 1 < retry_config.max_attempts:

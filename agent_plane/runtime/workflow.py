@@ -1287,6 +1287,7 @@ async def _call_tool(
         """Execute the tool call in a thread."""
         mgr = get_tool_manager()
         ctx = ToolContext(task_id=task_id, agent_id=agent_id)
+        tool = mgr.get_tool(tool_name)
         # Inject client-side tool schemas into spawn arguments so
         # sub-agents know which client tools are available.
         effective_args = arguments
@@ -1305,6 +1306,7 @@ async def _call_tool(
             timeout=timeout,
             retry_config=retry_config,
             on_event=lambda event: _write_output(task_id, event),
+            cancel_fn=tool.cancel if tool is not None else None,
         )
 
     return await _to_thread(_blocking_call)

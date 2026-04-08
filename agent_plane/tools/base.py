@@ -88,3 +88,12 @@ class Tool(abc.ABC):
             and agent identity.
         :returns: The tool's string result.
         """
+
+    def cancel(self) -> None:
+        """
+        Cancel an in-progress invocation.
+
+        Called by ``call_tool_with_timeout`` when the deadline
+        expires. Subprocess-based tools override this to kill
+        the child process. Default is a no-op.
+        """

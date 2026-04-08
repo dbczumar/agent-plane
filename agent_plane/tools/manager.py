@@ -253,6 +253,16 @@ class ToolManager:
         """
         return [tool.get_schema() for tool in self._tools.values()]
 
+    def get_tool(self, name: str) -> Tool | None:
+        """
+        Look up a registered tool by name.
+
+        :param name: The tool function name, e.g. ``"load_skill"``.
+        :returns: The :class:`Tool` instance, or ``None`` if not
+            registered.
+        """
+        return self._tools.get(name)
+
     def call_tool(
         self,
         name: str,
