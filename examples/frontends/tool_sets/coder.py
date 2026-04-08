@@ -12,6 +12,7 @@ from __future__ import annotations
 import glob as glob_mod
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -277,6 +278,20 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": (
+                "Get the current date and time. Returns an "
+                "ISO-formatted timestamp."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
 ]
 
 
@@ -320,6 +335,7 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> str:
         "Grep": _execute_grep,
         "Bash": _execute_bash,
         "LSP": _execute_lsp,
+        "get_current_time": _execute_get_current_time,
     }
     executor = executors.get(name)
     if executor is None:
@@ -500,3 +516,13 @@ def _execute_lsp(args: dict[str, Any]) -> str:
         f"LSP not implemented in this client. "
         f"Action: {args.get('action')}, file: {args.get('file_path')}"
     )
+
+
+def _execute_get_current_time(args: dict[str, Any]) -> str:
+    """
+    Return the current date and time as an ISO-formatted string.
+
+    :param args: Unused — no arguments required.
+    :returns: ISO timestamp, e.g. ``"2026-04-08T14:30:00"``.
+    """
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
