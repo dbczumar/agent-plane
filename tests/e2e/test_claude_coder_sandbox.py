@@ -85,10 +85,7 @@ def test_read_blocked_outside_workspace(
             "/v1/responses",
             json={
                 "model": claude_coder_agent,
-                "input": (
-                    f"Use the Read tool to read {secret_path}. "
-                    "Do NOT use Bash or cat."
-                ),
+                "input": (f"Use the Read tool to read {secret_path}. Do NOT use Bash or cat."),
                 "background": True,
             },
         )
@@ -96,20 +93,17 @@ def test_read_blocked_outside_workspace(
         response_id = resp.json()["id"]
 
         body = poll_until_terminal(
-            http_client, response_id, timeout=90,
+            http_client,
+            response_id,
+            timeout=90,
         )
-        assert body["status"] == "completed", (
-            f"Task failed: {body.get('error')}"
-        )
+        assert body["status"] == "completed", f"Task failed: {body.get('error')}"
 
         # The PreToolUse hook must have blocked the Read tool.
         # Check that at least one tool result contains the
         # "access denied" / "outside" message from the hook.
         all_results = _collect_tool_results(body)
-        has_deny = any(
-            "denied" in r.lower() or "outside" in r.lower()
-            for r in all_results
-        )
+        has_deny = any("denied" in r.lower() or "outside" in r.lower() for r in all_results)
         assert has_deny, (
             "PreToolUse hook did not block the Read tool! "
             f"Tool results: {[r[:100] for r in all_results]}"
@@ -202,3 +196,81 @@ def test_write_succeeds_inside_workspace(
     assert "SANDBOX_OK" in text, (
         f"Agent couldn't write/read inside workspace. Output: {text[:300]}"
     )
+
+
+def test_glob_blocked_outside_workspace(
+    http_client: httpx.Client,
+    claude_coder_agent: str,
+) -> None:
+    """
+    The Glob tool cannot search outside the workspace.
+
+    PreToolUse hooks block Glob calls with paths that resolve
+    outside the workspace directory.
+
+    **What breaks if wrong:** The agent discovers files across
+    the entire host filesystem.
+    """
+    resp = http_client.post(
+        "/v1/responses",
+        json={
+            "model": claude_coder_agent,
+            "input": (
+                "Use the Glob tool to search for *.txt files in /tmp. Do NOT use Bash or ls."
+            ),
+            "background": True,
+        },
+    )
+    resp.raise_for_status()
+    response_id = resp.json()["id"]
+
+    body = poll_until_terminal(http_client, response_id, timeout=90)
+    assert body["status"] == "completed", f"Task failed: {body.get('error')}"
+
+    all_results = _collect_tool_results(body)
+    has_deny = any("denied" in r.lower() or "outside" in r.lower() for r in all_results)
+    assert has_deny, (
+        "PreToolUse hook did not block the Glob tool! "
+        f"Tool results: {[r[:100] for r in all_results]}"
+    )
+
+
+def test_edit_blocked_outside_workspace(
+    http_client: httpx.Client,
+    claude_coder_agent: str,
+) -> None:
+    """
+    The Edit tool cannot modify files outside the workspace.
+
+    PreToolUse hooks block Edit calls targeting paths outside
+    the workspace directory.
+
+    **What breaks if wrong:** The agent modifies arbitrary files
+    on the host filesystem.
+    """
+    resp = http_client.post(
+        "/v1/responses",
+        json={
+            "model": claude_coder_agent,
+            "input": (
+                "Use the Edit tool to add the line '# hacked' to /etc/hosts. Do NOT use Bash."
+            ),
+            "background": True,
+        },
+    )
+    resp.raise_for_status()
+    response_id = resp.json()["id"]
+
+    body = poll_until_terminal(http_client, response_id, timeout=90)
+    assert body["status"] == "completed", f"Task failed: {body.get('error')}"
+
+    all_results = _collect_tool_results(body)
+    all_text = _extract_all_text(body)
+    full_output = " ".join(all_results) + " " + all_text
+
+    # Must not contain evidence of successful edit.
+    assert (
+        "hacked" not in full_output.lower()
+        or "denied" in full_output.lower()
+        or "outside" in full_output.lower()
+    ), f"Edit tool modified a file outside the workspace! Output: {full_output[:300]}"
