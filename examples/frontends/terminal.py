@@ -2007,8 +2007,10 @@ def _format_native_tool_label(
     return f"{display_name}"
 
 
-# Auth headers for remote server connections. Set by
-# auth.authenticate() and used by _run_sse_stream().
+# Auth headers for remote server connections. Populated during
+# main() and read by _run_sse_stream / _send_steering / etc.
+# Ideally this would be on ChatApp, but it's also needed by
+# module-level functions that don't have access to the app instance.
 _REMOTE_AUTH_HEADERS: dict[str, str] = {}
 
 
@@ -2018,6 +2020,17 @@ _REMOTE_AUTH_HEADERS: dict[str, str] = {}
 def main() -> None:
     """
     Start server, deploy agent from directory or tarball, launch TUI.
+
+    Two modes:
+
+    **Local mode** (default): starts a local agent-plane server,
+    deploys the agent from the given directory, launches the TUI.
+    First positional arg is the agent directory path.
+
+    **Remote mode** (``--server <url>``): connects to an existing
+    remote server (e.g. a Databricks App). No local server started.
+    First positional arg is the agent name (not a path). For
+    Databricks Apps, opens a browser for OAuth authentication.
 
     Accepts ``--auto-send "message"`` to auto-submit a message on
     startup (for automated testing without user interaction).

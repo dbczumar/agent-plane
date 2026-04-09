@@ -20,26 +20,30 @@ try:
 
     # ── Configuration ──────────────────────────────────────────
 
-    LAKEBASE_ENDPOINT = os.environ.get("AP_LAKEBASE_ENDPOINT", "")
-    VOLUME_PATH = os.environ.get("AP_ARTIFACT_VOLUME_PATH", "")
+    # Required env vars — injected by Databricks Apps runtime from
+    # the resources declared in databricks.yml / app.yaml.
+    LAKEBASE_ENDPOINT = os.environ["AP_LAKEBASE_ENDPOINT"]
+    VOLUME_PATH = os.environ["AP_ARTIFACT_VOLUME_PATH"]
+    PGHOST = os.environ["PGHOST"]
+    PGDATABASE = os.environ["PGDATABASE"]
+    PGUSER = os.environ["PGUSER"]
+
+    # Optional with documented defaults.
     PORT = int(os.environ.get("DATABRICKS_APP_PORT", "8000"))
-
-    PGHOST = os.environ.get("PGHOST", "")
     PGPORT = os.environ.get("PGPORT", "5432")
-    PGDATABASE = os.environ.get("PGDATABASE", "")
-    PGUSER = os.environ.get("PGUSER", "")
     PGSSLMODE = os.environ.get("PGSSLMODE", "require")
-    POOL_RECYCLE_SECONDS = int(
-        os.environ.get("AP_POOL_RECYCLE_SECONDS", "300")
+    # Recycle DB connections before Lakebase 60-min token expiry.
+    # 300s (5 min) is conservative — see designs/DATABRICKS_APPS_DEPLOYMENT.md.
+    POOL_RECYCLE_SECONDS = int(os.environ.get("AP_POOL_RECYCLE_SECONDS", "300"))
+
+    logger.info(
+        "Config: PGHOST=%s PGDATABASE=%s PGUSER=%s VOLUME=%s PORT=%d",
+        PGHOST,
+        PGDATABASE,
+        PGUSER,
+        VOLUME_PATH,
+        PORT,
     )
-
-    logger.info("Config: PGHOST=%s PGDATABASE=%s PGUSER=%s VOLUME=%s PORT=%d",
-                PGHOST, PGDATABASE, PGUSER, VOLUME_PATH, PORT)
-
-    if not PGHOST:
-        logger.error("PGHOST not set — is the postgres resource configured?")
-    if not VOLUME_PATH:
-        logger.error("AP_ARTIFACT_VOLUME_PATH not set — is the volume resource configured?")
 
     # ── Lakebase token injection ──────────────────────────────
 
@@ -114,5 +118,6 @@ except Exception:
     logger.error("FATAL: agent-plane failed to start:\n%s", traceback.format_exc())
     # Keep the process alive briefly so logs can be captured
     import time
+
     time.sleep(30)
     sys.exit(1)

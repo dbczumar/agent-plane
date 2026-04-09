@@ -25,7 +25,6 @@ _dbos_initialized = False
 _init_lock = threading.Lock()
 
 
-
 def ensure_dbos(
     uri: str,
     *,

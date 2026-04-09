@@ -203,9 +203,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             objects in relevance order.
         """
         with self._session() as session:
+            # Dialect-specific search: SQLite has FTS5 virtual tables
+            # (MATCH + rank), PostgreSQL doesn't. ILIKE on the JSON
+            # data column is a functional fallback. Proper tsvector
+            # indexing is a future optimization (tracked in GAPS.md).
             is_sqlite = self._engine.dialect.name == "sqlite"
             if is_sqlite:
-                # SQLite FTS5: MATCH syntax with rank ordering.
                 if conversation_id is not None:
                     stmt = text(
                         "SELECT item_id FROM conversation_items_fts "
