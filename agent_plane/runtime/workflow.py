@@ -1748,7 +1748,7 @@ def _build_assistant_item(
     )
 
 
-def _handle_final_response(
+async def _handle_final_response(
     task_id: str,
     conversation_id: str,
     llm_resp: dict[str, Any],
@@ -1758,6 +1758,7 @@ def _handle_final_response(
     output_items: list[dict[str, Any]],
     task_store: TaskStore,
     conv_store: ConversationStore,
+    iteration_item_ids: frozenset[str] | None = None,
 ) -> _AgentLoopResult | _SteeringRetry:
     """
     Handle the no-tool-calls path using persist-first-then-check.
@@ -1820,12 +1821,13 @@ def _handle_final_response(
     # the LLM was streaming — those messages have positions
     # between last_seen and the assistant message we just
     # persisted.
-    steered = _check_steering_inbox(
+    steered = await _check_steering_inbox(
         task_id,
         conversation_id,
         last_seen,
         persisted,
         task_store,
+        extra_own_ids=iteration_item_ids,
     )
     if steered:
         # Late messages arrived during the LLM call. Add the
@@ -1843,10 +1845,12 @@ def _handle_final_response(
     # item's cursor. A steering message could arrive between
     # steps 2 and 3, so we must check the return value: if
     # close_inbox returns items, a late message snuck in.
-    final_late = task_store.close_inbox(
-        task_id,
-        conversation_id,
-        persisted[-1].id,
+    final_late = await _to_thread(
+        lambda: task_store.close_inbox(
+            task_id,
+            conversation_id,
+            persisted[-1].id,
+        ),
     )
     if final_late:
         # A steering message arrived between steps 2 and 3.
@@ -1863,12 +1867,13 @@ def _handle_final_response(
     )
 
 
-def _check_steering_inbox(
+async def _check_steering_inbox(
     task_id: str,
     conversation_id: str,
     last_seen: str | None,
     persisted: list[ConversationItem],
     task_store: TaskStore,
+    extra_own_ids: frozenset[str] | None = None,
 ) -> list[ConversationItem]:
     """
     Check for steered messages that arrived during the LLM call.
@@ -1890,12 +1895,16 @@ def _check_steering_inbox(
     :returns: List of steered conversation items (may be
         empty if no steering messages arrived).
     """
-    late = task_store.close_inbox(
-        task_id,
-        conversation_id,
-        last_seen,
+    late = await _to_thread(
+        lambda: task_store.close_inbox(
+            task_id,
+            conversation_id,
+            last_seen,
+        ),
     )
     own_ids = {ci.id for ci in persisted}
+    if extra_own_ids:
+        own_ids |= extra_own_ids
     return [ci for ci in late if ci.id not in own_ids]
 
 
@@ -2623,7 +2632,7 @@ async def _wait_for_pending_calls(
         await dbos_recv_async(topic="tool_result", timeout_seconds=600)
 
 
-def _complete_for_client_tools(
+async def _complete_for_client_tools(
     task_id: str,
     conversation_id: str,
     fc_last_seen: str,
@@ -2662,7 +2671,9 @@ def _complete_for_client_tools(
     :param task_store: The TaskStore for inbox close operations.
     :returns: A completed :class:`_AgentLoopResult`.
     """
-    task_store.close_inbox(task_id, conversation_id, fc_last_seen)
+    await _to_thread(
+        lambda: task_store.close_inbox(task_id, conversation_id, fc_last_seen),
+    )
     return _AgentLoopResult(
         status="completed",
         output=output_items,
@@ -3643,6 +3654,14 @@ async def _run_agent_loop(
                 last_seen,
                 history,
             )
+            # Save the pre-LLM cursor and history length. Used by
+            # _handle_final_response to check for steered messages
+            # that arrived during the LLM call — their positions
+            # may be interleaved with native tool items persisted
+            # during the call.
+            pre_llm_last_seen = last_seen
+            history_len_before_llm = len(history)
+
             llm_resp = await _executor_turn_with_compaction(
                 task_id,
                 executor,
@@ -3689,6 +3708,12 @@ async def _run_agent_loop(
             if obs_cursor is not None:
                 last_seen = obs_cursor
 
+            # Collect IDs of items persisted during this iteration
+            # (native tools + observed tools). These must be
+            # excluded from the steering inbox check — they're our
+            # own items, not steered user messages.
+            iteration_item_ids = frozenset(ci.id for ci in history[history_len_before_llm:])
+
             # Discover sub-agents by querying the task store — the
             # single source of truth regardless of executor type.
             # Terminal children go into both sets so auto-collect
@@ -3733,16 +3758,17 @@ async def _run_agent_loop(
                     # Re-run the LLM so it can see collected
                     # results and any steered messages.
                     continue
-                result = _handle_final_response(
+                result = await _handle_final_response(
                     task_id,
                     conversation_id,
                     llm_resp,
                     agent_name,
-                    last_seen,
+                    pre_llm_last_seen,
                     history,
                     output_items,
                     task_store,
                     conv_store,
+                    iteration_item_ids=iteration_item_ids,
                 )
                 if isinstance(result, _SteeringRetry):
                     # Late steered messages arrived during streaming.
@@ -3792,7 +3818,7 @@ async def _run_agent_loop(
                     continue
                 # Top-level task: return function_call items to the
                 # caller and complete without server-side execution.
-                return _complete_for_client_tools(
+                return await _complete_for_client_tools(
                     task_id,
                     conversation_id,
                     handle_result.last_seen,
