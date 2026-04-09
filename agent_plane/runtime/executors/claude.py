@@ -1237,30 +1237,16 @@ def _build_filesystem_hooks(
         context: Any,
     ) -> dict[str, Any]:
         """
-        Block tools that access paths outside the workspace.
+        Block file tools that target paths outside the workspace.
 
-        For file tools (Read, Edit, Write, Glob, Grep): checks
-        the path argument directly.
-
-        For Bash: scans the command string for absolute paths
-        that don't start with the workspace. Not foolproof
-        (shell is complex) but catches ``ls /tmp``,
-        ``cat /etc/passwd``, etc.
-
-        :param input_data: ``PreToolUseHookInput`` dict.
+        :param input_data: ``PreToolUseHookInput`` dict with
+            ``tool_name`` and ``tool_input``.
         :param tool_use_id: The tool use ID (unused).
         :param context: The ``HookContext`` (unused).
-        :returns: Empty dict to allow, or block decision.
+        :returns: Empty dict to allow, or ``{"decision": "block"}``
+            to deny.
         """
-        tool_name = input_data.get("tool_name", "")
         tool_input = input_data.get("tool_input", {})
-
-        if tool_name == "Bash":
-            return _check_bash_command(
-                tool_input.get("command", ""),
-                resolved_workspace,
-            )
-
         path = (
             tool_input.get("file_path") or tool_input.get("path") or tool_input.get("pattern", "")
         )
@@ -1273,51 +1259,6 @@ def _build_filesystem_hooks(
             "decision": "block",
             "reason": (f"Access denied: {path} is outside the workspace ({resolved_workspace})."),
         }
-
-    def _check_bash_command(
-        command: str,
-        workspace: str,
-    ) -> dict[str, Any]:
-        """
-        Scan a Bash command for absolute paths outside the workspace.
-
-        Splits the command on whitespace and checks each token
-        that looks like an absolute path (starts with ``/``).
-        Tokens starting with the workspace path are allowed.
-
-        Not foolproof — shell variables, backticks, and complex
-        quoting can evade this. But it catches the common cases:
-        ``ls /tmp``, ``cat /etc/passwd``, ``cp /home/... .``.
-
-        :param command: The Bash command string.
-        :param workspace: Resolved workspace path.
-        :returns: Empty dict to allow, or block decision.
-        """
-        import shlex
-
-        try:
-            tokens = shlex.split(command)
-        except ValueError:
-            tokens = command.split()
-
-        for token in tokens:
-            if not token.startswith("/"):
-                continue
-            resolved = str(Path(token).resolve())
-            if resolved.startswith(workspace):
-                continue
-            # Allow standard system paths needed for commands.
-            if any(resolved.startswith(p) for p in ("/usr", "/bin", "/sbin", "/opt", "/dev")):
-                continue
-            return {
-                "decision": "block",
-                "reason": (
-                    f"Access denied: Bash command references "
-                    f"{token} which is outside the workspace "
-                    f"({workspace})."
-                ),
-            }
-        return {}
 
     return {
         "PreToolUse": [
