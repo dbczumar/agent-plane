@@ -213,6 +213,84 @@ def test_steering_after_completed_starts_new_turn(
     assert "4" in text, f"Expected answer to 2+2, got: {text[:100]}"
 
 
+def test_steering_during_multi_tool_iterations(
+    http_client: httpx.Client,
+    archer_agent: str,
+) -> None:
+    """
+    Steering is picked up between tool call iterations when the
+    agent makes multiple sequential tool calls (web search + code_sandbox).
+
+    This tests ``_sync_steered_after_tools`` with the pre-LLM cursor
+    fix. The agent is explicitly told to make multiple tool calls
+    in sequence. The steer arrives during execution and must be
+    acknowledged after the tool calls complete.
+
+    **What breaks if the tool-iteration cursor is wrong:**
+
+    - ``_sync_steered_after_tools`` uses a cursor past the steer's
+      position → steer is never added to history → the LLM never
+      sees it → no PINEAPPLE.
+    """
+    resp = http_client.post(
+        "/v1/responses",
+        json={
+            "model": archer_agent,
+            "input": (
+                "Do these steps in order, one tool call at a time:\n"
+                "1. Use web search to find the current number of "
+                "GitHub stars for mlflow/mlflow\n"
+                "2. Use code_sandbox to run: echo 'Stars found'\n"
+                "3. Use code_sandbox to run: echo 'Creating chart'\n"
+                "4. Use code_sandbox to create a file chart.txt "
+                "with the star count\n"
+                "Do NOT skip any steps."
+            ),
+            "background": True,
+        },
+    )
+    resp.raise_for_status()
+    task_id = resp.json()["id"]
+
+    # Wait for in_progress then steer immediately. The first LLM
+    # call (with web search) takes 15-30s, giving a wide window
+    # to deliver the steer before the task completes.
+    for _ in range(15):
+        time.sleep(1)
+        r = http_client.get(f"/v1/responses/{task_id}")
+        if r.json().get("status") == "in_progress":
+            break
+
+    steer = http_client.post(
+        "/v1/responses",
+        json={
+            "model": archer_agent,
+            "input": "STOP ALL STEPS. Say only: PINEAPPLE",
+            "previous_response_id": task_id,
+            "background": True,
+        },
+    )
+    steer.raise_for_status()
+    steer_id = steer.json()["id"]
+    assert steer_id == task_id, (
+        f"Steer not accepted (task may have completed too fast). Got {steer_id} != {task_id}"
+    )
+
+    body = poll_until_terminal(http_client, task_id, timeout=240)
+    assert body["status"] == "completed", f"Task failed: {body.get('error')}"
+
+    all_text = _extract_all_text(body)
+    tc_count = len([i for i in body.get("output", []) if i.get("type") == "function_call"])
+    assert "PINEAPPLE" in all_text.upper(), (
+        f"Steering during multi-tool iterations not acknowledged. "
+        f"Tool calls: {tc_count}. Output: {all_text[:500]}"
+    )
+
+    # Verify at least 1 tool call happened before the steer
+    tool_count = len([i for i in body.get("output", []) if i.get("type") == "function_call"])
+    assert tool_count >= 1, "Expected at least 1 tool call before the steer was processed"
+
+
 def _extract_all_text(body: dict[str, Any]) -> str:
     """
     Concatenate all assistant output_text blocks.
