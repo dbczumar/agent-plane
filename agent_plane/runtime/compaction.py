@@ -235,6 +235,41 @@ def _clear_binary_content(
     return messages
 
 
+def _strip_output_annotations(
+    messages: list[dict[str, Any]],
+    protect_from: int,
+) -> list[dict[str, Any]]:
+    """
+    Remove ``annotations`` from ``output_text`` blocks outside
+    the recent window.
+
+    Annotations (e.g. ``file_citation``) are output metadata for
+    the client, not content the summarization LLM should see.
+    Stripping them before Layer 2 keeps the summarization input
+    clean and reduces token waste.
+
+    :param messages: The messages list to process (modified in place).
+    :param protect_from: Index of the first message in the recent
+        window. Messages at indices < *protect_from* are eligible
+        for stripping.
+    :returns: The same list (modified in place) for convenience.
+    """
+    for i, msg in enumerate(messages):
+        if i >= protect_from:
+            break
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "output_text"
+                and "annotations" in block
+            ):
+                del block["annotations"]
+    return messages
+
+
 def _truncate_oldest(
     messages: list[dict[str, Any]],
     budget: int,
@@ -523,6 +558,7 @@ def compact(
     # --- Layer 1 ---
     _clear_tool_results(working, msg_boundary)
     _clear_binary_content(working, msg_boundary)
+    _strip_output_annotations(working, msg_boundary)
 
     if count_tokens(working, model) <= budget:
         return CompactionResult(messages=working, summary_metadata=None)

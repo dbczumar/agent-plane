@@ -1419,3 +1419,124 @@ def test_truncate_oldest_preserves_tool_call_pairs(
         f"Expected the surviving message to be the user message, "
         f"got type={result[0].get('type')!r} role={result[0].get('role')!r}."
     )
+
+
+def test_compaction_strips_annotations_before_summarization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Layer 1 strips ``annotations`` from ``output_text`` blocks
+    before they reach Layer 2 summarization.
+
+    Captures the messages passed to ``summarize_history`` and
+    verifies annotations are absent.
+    """
+    call_counts = [0]
+
+    def mock_count_tokens(
+        msgs: list[dict[str, Any]],
+        model: str,
+    ) -> int:
+        """
+        First call above budget to trigger Layer 2, then below.
+
+        :param msgs: Messages (unused).
+        :param model: Model string (unused).
+        :returns: Token count.
+        """
+        call_counts[0] += 1
+        if call_counts[0] == 1:
+            return 10001
+        return 50
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.compaction.count_tokens",
+        mock_count_tokens,
+    )
+
+    captured_inputs: list[list[dict[str, Any]]] = []
+
+    def _capturing_summarize(
+        msgs: list[dict[str, Any]],
+        llm_client: Any,
+        model: str,
+        connection: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Capture summarization input for assertion.
+
+        :param msgs: Messages to summarize.
+        :param llm_client: LLM client (unused).
+        :param model: Model string (unused).
+        :param connection: Connection params (unused).
+        :returns: Fake summary.
+        """
+        captured_inputs.append(list(msgs))
+        return {"text": "Summary", "token_count": 10}
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.compaction.summarize_history",
+        _capturing_summarize,
+    )
+
+    # Assistant message with file_citation annotation OUTSIDE recent window.
+    annotated_msg = {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "output_text",
+                "text": "Here is the chart:",
+                "annotations": [
+                    {
+                        "type": "file_citation",
+                        "file_id": "file_abc123",
+                        "filename": "chart.png",
+                        "content_type": "image/png",
+                    }
+                ],
+            }
+        ],
+    }
+    history = [
+        _user_msg("msg_u1"),
+        _assistant_msg("msg_a1"),
+        _user_msg("msg_u2"),
+        _assistant_msg("msg_a2"),
+    ]
+    messages = [
+        _user_msg_dict(),
+        annotated_msg,
+        _user_msg_dict(),
+        _assistant_msg_dict(),
+    ]
+
+    compact(
+        messages,
+        history,
+        config=CompactionConfig(trigger_threshold=0.8, recent_window=1),
+        context_window=12500,
+        system_token_budget=0,
+        model="openai/gpt-4o",
+        task_id="task_ann_strip",
+        llm_client=_RaisesIfCalled(),
+    )
+
+    # summarize_history must have been called.
+    assert len(captured_inputs) == 1, (
+        f"Expected 1 summarize_history call, got {len(captured_inputs)}."
+    )
+
+    # The annotated output_text block in the summarization input
+    # must NOT have annotations — they should be stripped by Layer 1.
+    summarized = captured_inputs[0]
+    for msg in summarized:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "output_text":
+                assert "annotations" not in block, (
+                    f"output_text block still has annotations in "
+                    f"summarization input: {block}. Layer 1 should "
+                    f"have stripped them."
+                )

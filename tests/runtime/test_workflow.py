@@ -22,8 +22,11 @@ from agent_plane.llms.errors import ContextWindowExceededError, PermanentLLMErro
 from agent_plane.runtime.caps import RuntimeCaps
 from agent_plane.runtime.compaction import CompactionResult, SummaryMetadata, _CompactionState
 from agent_plane.runtime.executors import DefaultExecutor, ToolCallRequested, ToolResult
+from agent_plane.runtime.prompt import _strip_output_annotations
 from agent_plane.runtime.workflow import (
+    _build_assistant_item,
     _build_await_tool_output,
+    _collect_file_annotations,
     _get_or_restore_executor_storage,
     _load_initial_history,
     _maybe_persist_compaction_item,
@@ -1987,3 +1990,156 @@ def _invoke_callback_with_completion(
         f"Expected {result_text!r}, got {result_holder[0].content!r}."
     )
     assert result_holder[0].status == "success"
+
+
+# ── _collect_file_annotations ────────────────────────────────────────────────
+
+
+def test_collect_file_annotations_extracts_upload_file_results() -> None:
+    """
+    ``_collect_file_annotations`` parses ``upload_file`` tool results
+    and builds ``file_citation`` annotation dicts.
+    """
+    output_items: list[dict[str, Any]] = [
+        {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "upload_file",
+            "arguments": '{"path": "chart.png"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": (
+                '{"file_id": "file_abc", "filename": "chart.png", "content_type": "image/png"}'
+            ),
+        },
+    ]
+
+    result = _collect_file_annotations(output_items)
+
+    # Exactly one annotation from one upload_file call.
+    assert len(result) == 1, f"Expected 1 annotation, got {len(result)}."
+    ann = result[0]
+    assert ann["type"] == "file_citation"
+    assert ann["file_id"] == "file_abc"
+    assert ann["filename"] == "chart.png"
+    assert ann["content_type"] == "image/png"
+
+
+def test_collect_file_annotations_ignores_non_upload_tools() -> None:
+    """
+    ``_collect_file_annotations`` returns empty list when no
+    ``upload_file`` calls are present.
+    """
+    output_items: list[dict[str, Any]] = [
+        {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "code_sandbox",
+            "arguments": '{"command": "ls"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "file1.txt\nfile2.txt",
+        },
+    ]
+
+    result = _collect_file_annotations(output_items)
+
+    assert result == [], f"Expected empty list for non-upload tools, got {result}."
+
+
+# ── _build_assistant_item ────────────────────────────────────────────────────
+
+
+def test_build_assistant_item_with_annotations() -> None:
+    """
+    When annotations are provided, they are attached to the
+    ``output_text`` block in the persisted message.
+    """
+    annotations = [
+        {
+            "type": "file_citation",
+            "file_id": "file_abc",
+            "filename": "chart.png",
+            "content_type": "image/png",
+        }
+    ]
+    item = _build_assistant_item(
+        "task_1",
+        "my-agent",
+        "Here is the chart:",
+        annotations=annotations,
+    )
+
+    content = item.data.content
+    assert len(content) == 1
+    block = content[0]
+    assert block["type"] == "output_text"
+    assert block["text"] == "Here is the chart:"
+    assert block["annotations"] == annotations, f"Annotations not attached: {block}"
+
+
+# ── _strip_output_annotations ────────────────────────────────────────────────
+
+
+def test_strip_output_annotations_removes_from_output_text() -> None:
+    """
+    ``_strip_output_annotations`` removes annotations from
+    ``output_text`` blocks while preserving the text content.
+    """
+    content = [
+        {
+            "type": "output_text",
+            "text": "Here is the chart:",
+            "annotations": [
+                {"type": "file_citation", "file_id": "file_abc"},
+            ],
+        },
+    ]
+
+    result = _strip_output_annotations(content)
+
+    assert len(result) == 1
+    assert result[0]["text"] == "Here is the chart:"
+    assert "annotations" not in result[0], "annotations should be stripped from output_text blocks"
+
+
+def test_strip_output_annotations_preserves_other_blocks() -> None:
+    """
+    Non-output_text blocks and output_text blocks without
+    annotations are passed through unchanged.
+    """
+    content = [
+        {"type": "input_text", "text": "User message"},
+        {"type": "output_text", "text": "No annotations here"},
+        {
+            "type": "output_text",
+            "text": "Has annotations",
+            "annotations": [{"type": "file_citation"}],
+        },
+    ]
+
+    result = _strip_output_annotations(content)
+
+    # input_text: unchanged
+    assert result[0] == {"type": "input_text", "text": "User message"}
+    # output_text without annotations: unchanged
+    assert result[1] == {"type": "output_text", "text": "No annotations here"}
+    # output_text with annotations: stripped
+    assert result[2] == {"type": "output_text", "text": "Has annotations"}
+
+
+def test_build_assistant_item_without_annotations() -> None:
+    """
+    When no annotations are provided, the ``output_text`` block
+    does NOT have an ``annotations`` key.
+    """
+    item = _build_assistant_item("task_1", "my-agent", "Hello.")
+
+    block = item.data.content[0]
+    assert "annotations" not in block, (
+        f"output_text should not have annotations key when none provided: {block}"
+    )

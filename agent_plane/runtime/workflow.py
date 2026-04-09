@@ -1709,6 +1709,34 @@ def _collect_file_annotations(
     return annotations
 
 
+def _emit_file_annotations(
+    task_id: str,
+    annotations: list[dict[str, Any]],
+) -> None:
+    """
+    Emit ``response.output_file.done`` SSE events for each
+    file annotation.
+
+    Called after ``_collect_file_annotations`` and before
+    ``_build_assistant_item`` so clients can start downloading
+    files before the full message is persisted.
+
+    :param task_id: The task identifier for SSE routing.
+    :param annotations: File citation annotation dicts from
+        ``_collect_file_annotations``.
+    """
+    for ann in annotations:
+        _write_output(
+            task_id,
+            {
+                "type": "response.output_file.done",
+                "file_id": ann.get("file_id", ""),
+                "filename": ann.get("filename", ""),
+                "content_type": ann.get("content_type", ""),
+            },
+        )
+
+
 def _build_assistant_item(
     task_id: str,
     agent_name: str,
@@ -1800,6 +1828,7 @@ async def _handle_final_response(
     # whether late steering messages arrived.
     text = _get_text_content(llm_resp)
     file_annotations = _collect_file_annotations(output_items)
+    _emit_file_annotations(task_id, file_annotations)
     item = _build_assistant_item(
         task_id,
         agent_name,
@@ -2263,6 +2292,7 @@ async def _persist_text_before_auto_collect(
     """
     text = _get_text_content(llm_resp)
     file_annotations = _collect_file_annotations(output_items)
+    _emit_file_annotations(task_id, file_annotations)
     item = _build_assistant_item(
         task_id,
         agent_name,
