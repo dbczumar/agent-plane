@@ -42,7 +42,12 @@ def _write_srt_settings(workspace: Path) -> str:
 
     settings = {
         "network": {
-            "allowedDomains": [],
+            # Allow package registries so agents can pip/npm install.
+            "allowedDomains": [
+                "pypi.org",
+                "files.pythonhosted.org",
+                "registry.npmjs.org",
+            ],
             "deniedDomains": [],
         },
         "filesystem": {
@@ -145,12 +150,26 @@ class CodeSandboxTool(Tool):
 
         cmd = self._build_command(command, ctx.workspace)
         try:
+            # Set package install targets to workspace so pip/npm
+            # install locally (not to system site-packages).
+            # Packages persist across turns within a conversation.
+            ws = str(ctx.workspace)
+            env = {
+                **os.environ,
+                "PIP_TARGET": f"{ws}/.pip",
+                "PIP_CACHE_DIR": f"{ws}/.cache/pip",
+                "PYTHONPATH": f"{ws}/.pip",
+                "NODE_PATH": f"{ws}/node_modules",
+                "npm_config_prefix": ws,
+                "npm_config_cache": f"{ws}/.cache/npm",
+            }
             self._proc = subprocess.Popen(
                 cmd,
                 cwd=str(ctx.workspace),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
+                env=env,
             )
             stdout, _ = self._proc.communicate()
             output = stdout.decode(errors="replace")
