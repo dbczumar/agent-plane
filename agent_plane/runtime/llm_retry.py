@@ -14,7 +14,13 @@ from typing import Any, TypeVar
 
 import httpx
 
-from agent_plane.llms.errors import LLMErrorDetail, PermanentLLMError, RetryableLLMError
+from agent_plane.llms.client import _detect_context_overflow
+from agent_plane.llms.errors import (
+    ContextWindowExceededError,
+    LLMErrorDetail,
+    PermanentLLMError,
+    RetryableLLMError,
+)
 from agent_plane.spec.types import RetryConfig
 
 _logger = logging.getLogger(__name__)
@@ -61,9 +67,15 @@ def _classify_http_error(
     """
     Classify an HTTP status error as retryable or permanent.
 
+    HTTP 400 is checked for context-window overflow before the
+    generic retryable/permanent split. This allows the executor's
+    retry logic to surface ``ContextWindowExceededError`` so the
+    workflow can compact and retry.
+
     :param exc: The HTTP status error from httpx.
     :param retryable_status_codes: Status codes that trigger retry.
-    :returns: A :class:`RetryableLLMError` or
+    :returns: A :class:`RetryableLLMError`,
+        :class:`ContextWindowExceededError`, or
         :class:`PermanentLLMError`.
     """
     status = exc.response.status_code
@@ -71,6 +83,21 @@ def _classify_http_error(
     detail = LLMErrorDetail(status_code=status, response_body=body)
     code = str(status)
     message = f"LLM returned HTTP {status}: {body}"
+
+    # HTTP 400 may be a context-window overflow — check before
+    # the generic split so the workflow can compact-retry.
+    if status == 400:
+        overflow = _detect_context_overflow(body)
+        if overflow is not None:
+            return ContextWindowExceededError(
+                f"Context window exceeded: "
+                f"{overflow.actual_tokens} tokens "
+                f"> {overflow.max_context_tokens} max",
+                code="context_length_exceeded",
+                detail=detail,
+                max_context_tokens=overflow.max_context_tokens,
+                actual_tokens=overflow.actual_tokens,
+            )
 
     if status in retryable_status_codes:
         return RetryableLLMError(message, code=code, detail=detail)
