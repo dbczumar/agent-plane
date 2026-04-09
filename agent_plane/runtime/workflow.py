@@ -3982,10 +3982,12 @@ async def agent_execution_workflow(
             ).to_dict(task_id)
 
         client_tool_specs: list[ClientSideToolSpec] = parse_client_side_tool_specs(tools or [])
+        caps = get_caps()
         tool_mgr = ToolManager(
             spec,
             client_tool_specs=client_tool_specs,
             workdir=loaded.workdir,
+            sandbox_enabled=caps.sandbox_enabled,
         )
         set_tool_manager(tool_mgr)
         executor = _create_executor(spec)

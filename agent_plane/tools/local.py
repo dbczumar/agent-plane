@@ -86,6 +86,7 @@ class LocalPythonTool(Tool):
         sandbox_config: SandboxConfig,
         srt_available: bool,
         uv_available: bool,
+        sandbox_enabled: bool = True,
     ) -> None:
         """
         Initialize from a validated tool file.
@@ -94,15 +95,18 @@ class LocalPythonTool(Tool):
         :param schema: The validated SCHEMA dict.
         :param module_path: Absolute path to the tool file, e.g.
             ``Path("/tmp/cache/ag_abc/tools/python/my_tool.py")``.
-        :param sandbox_config: Sandbox settings from the agent spec.
+        :param sandbox_config: Agent-level sandbox settings
+            (docker_image).
         :param srt_available: Whether ``srt`` is on PATH.
         :param uv_available: Whether ``uv`` is on PATH.
+        :param sandbox_enabled: Runtime policy for srt sandboxing.
         """
         self._info = info
         self._schema = schema
         self._name: str = info.name
         self._module_path = module_path
         self._sandbox_config = sandbox_config
+        self._sandbox_enabled = sandbox_enabled
         self._srt_available = srt_available
         self._uv_available = uv_available
         self._proc: subprocess.Popen[bytes] | None = None
@@ -149,7 +153,7 @@ class LocalPythonTool(Tool):
         # srt and Docker both wrap the command in their own process
         # chain, so the fd 3 pipe doesn't survive to the inner
         # Python process. Use the stdout protocol instead.
-        srt_active = self._srt_available and self._sandbox_config.enabled
+        srt_active = self._srt_available and self._sandbox_enabled
         use_stdout = self._sandbox_config.docker_image is not None or srt_active
         if use_stdout:
             return self._invoke_stdout(request)
@@ -257,7 +261,7 @@ class LocalPythonTool(Tool):
         uv_args: list[str] = ["uv", "run"]
         for dep in self._info.inline_deps or []:
             uv_args.extend(["--with", dep])
-        if self._srt_available and self._sandbox_config.enabled:
+        if self._srt_available and self._sandbox_enabled:
             # uv runs outside srt; srt wraps the inner python.
             # srt -c receives the python command as a quoted string.
             import shlex
@@ -280,7 +284,7 @@ class LocalPythonTool(Tool):
         :param cmd: The base command to wrap.
         :returns: The wrapped command, or ``cmd`` unchanged.
         """
-        if not (self._srt_available and self._sandbox_config.enabled):
+        if not (self._srt_available and self._sandbox_enabled):
             return cmd
         # Use srt -c with a properly quoted command string so
         # shell metacharacters in args (e.g. ">=6.0") are preserved.
@@ -409,6 +413,7 @@ def load_local_python_tools(
     sandbox_config: SandboxConfig | None = None,
     srt_available: bool | None = None,
     uv_available: bool | None = None,
+    sandbox_enabled: bool = True,
 ) -> list[LocalPythonTool]:
     """
     Load and validate local Python tools from the agent image.
@@ -463,6 +468,7 @@ def load_local_python_tools(
                 sandbox_config=effective_sandbox,
                 srt_available=effective_srt,
                 uv_available=effective_uv,
+                sandbox_enabled=sandbox_enabled,
             )
         )
     return tools

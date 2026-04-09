@@ -68,6 +68,7 @@ class ToolManager:
         spec: AgentSpec,
         client_tool_specs: list[ClientSideToolSpec] | None = None,
         workdir: Path | None = None,
+        sandbox_enabled: bool = True,
     ) -> None:
         """
         Initialize the tool manager and register built-in,
@@ -85,8 +86,13 @@ class ToolManager:
         :param workdir: The extracted agent image directory on disk.
             Required for local tool loading. ``None`` skips local
             tool registration, e.g. ``Path("/tmp/cache/ag_abc123")``.
+        :param sandbox_enabled: Runtime policy for ``srt`` sandboxing.
+            ``True`` enables sandboxing when ``srt`` is on PATH.
+            This is a deployment decision from ``RuntimeCaps``, not
+            an agent config setting.
         """
         self._spec = spec
+        self._sandbox_enabled = sandbox_enabled
         self._started = False
         self._tools: dict[str, Tool] = {}
         self._mcp_connections: list[McpServerConnection] = []
@@ -154,7 +160,7 @@ class ToolManager:
 
             return CodeSandboxTool(
                 srt_available=self._srt_available,
-                sandbox_enabled=self._spec.tools.sandbox.enabled,
+                sandbox_enabled=self._sandbox_enabled,
             )
         if name == "upload_file":
             from agent_plane.tools.builtins.upload_file import (
@@ -200,6 +206,7 @@ class ToolManager:
             sandbox_config=self._spec.tools.sandbox,
             srt_available=self._srt_available,
             uv_available=self._uv_available,
+            sandbox_enabled=self._sandbox_enabled,
         ):
             if not is_valid_tool_name(tool.name()):
                 _logger.warning(

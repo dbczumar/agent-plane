@@ -208,18 +208,18 @@ class BuiltinToolConfig:
 @dataclass
 class SandboxConfig:
     """
-    Sandbox configuration for local tool execution.
+    Agent-level sandbox configuration for local tool execution.
 
-    :param enabled: Whether to use ``srt`` sandboxing when available
-        on PATH. ``True`` by default; set to ``False`` to disable
-        even when ``srt`` is installed.
+    Only contains settings the agent author controls (what
+    execution environment their tools need). Whether sandboxing
+    is enabled/enforced is a runtime decision — see
+    ``RuntimeCaps.sandbox_enabled``.
+
     :param docker_image: When set, tools run inside this Docker
-        container instead of a local subprocess. Mutually exclusive
-        with ``srt`` sandboxing (Docker provides its own isolation),
-        e.g. ``"python:3.12-slim"``.
+        container instead of a local subprocess. Docker provides
+        its own isolation, e.g. ``"python:3.12-slim"``.
     """
 
-    enabled: bool = True
     docker_image: str | None = None
 
 

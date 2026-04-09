@@ -194,33 +194,27 @@ def _parse_tools_config(
 
 
 def _parse_sandbox_config(
-    raw: dict[str, Any] | bool | None,
+    raw: dict[str, Any] | None,
 ) -> SandboxConfig:
     """
     Parse the ``tools.sandbox`` block from config.yaml.
 
-    Accepts a boolean shorthand or a detailed dict::
+    Only agent-level settings (``docker_image``) are parsed here.
+    Whether sandboxing is enabled is a runtime decision, not an
+    agent config decision::
 
-        sandbox: true
-        sandbox: false
         sandbox:
-          enabled: true
           docker_image: python:3.12-slim
 
     :param raw: The raw ``sandbox`` value from the ``tools``
         block. ``None`` means not specified (use defaults).
     :returns: A :class:`SandboxConfig`.
     """
-    if raw is None:
+    if raw is None or not isinstance(raw, dict):
         return SandboxConfig()
-    if isinstance(raw, bool):
-        return SandboxConfig(enabled=raw)
-    if isinstance(raw, dict):
-        return SandboxConfig(
-            enabled=raw.get("enabled", True),
-            docker_image=raw.get("docker_image"),
-        )
-    return SandboxConfig()
+    return SandboxConfig(
+        docker_image=raw.get("docker_image"),
+    )
 
 
 def _parse_builtin_tools(
