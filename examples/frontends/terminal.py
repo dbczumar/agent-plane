@@ -2017,9 +2017,10 @@ def main() -> None:
     startup (for automated testing without user interaction).
     Accepts ``--client-tools <name>`` to load a client-side tool set.
     """
-    global AGENT_NAME
+    global AGENT_NAME, BASE_URL
     auto_send: str | None = None
     tool_set: ModuleType | None = None
+    remote_server: str | None = None
     args = sys.argv[1:]
 
     # Parse --auto-send flag.
@@ -2042,20 +2043,27 @@ def main() -> None:
             print("Error: --client-tools requires a tool set name")
             sys.exit(1)
 
+    # Parse --server flag for connecting to a remote server.
+    if "--server" in args:
+        idx = args.index("--server")
+        if idx + 1 < len(args):
+            remote_server = args[idx + 1].rstrip("/")
+            args = args[:idx] + args[idx + 2 :]
+        else:
+            print("Error: --server requires a URL argument")
+            sys.exit(1)
+
     if not args:
         _print_usage()
         sys.exit(1)
 
-    agent_path = args[0]
-    bundle = _load_agent_bundle(agent_path)
-    AGENT_NAME = _extract_agent_name(bundle)
+    if remote_server is not None:
+        # Remote mode: connect to existing server, no local server.
+        # First arg is the agent name (not a path).
+        AGENT_NAME = args[0]
+        BASE_URL = remote_server
 
-    server_proc = _start_server(agent_path)
-    try:
-        wait_for_server(server_proc)
-        # The --agent flag pre-registered the agent at startup.
-        # Look up the agent ID by name instead of uploading.
-        with httpx.Client() as client:
+        with httpx.Client(timeout=30) as client:
             agents_resp = client.get(f"{BASE_URL}/api/agents")
             agents_resp.raise_for_status()
             agent_id = None
@@ -2064,18 +2072,45 @@ def main() -> None:
                     agent_id = agent["id"]
                     break
             if agent_id is None:
-                raise RuntimeError(f"Agent '{AGENT_NAME}' not found after server startup")
-    except Exception:
-        server_proc.kill()
-        raise
+                raise RuntimeError(f"Agent '{AGENT_NAME}' not found on server {remote_server}")
 
-    app = ChatApp(
-        server_proc=server_proc,
-        agent_id=agent_id,
-        auto_send=auto_send,
-        tool_set=tool_set,
-    )
-    app.run()
+        app = ChatApp(
+            server_proc=None,
+            agent_id=agent_id,
+            auto_send=auto_send,
+            tool_set=tool_set,
+        )
+        app.run()
+    else:
+        # Local mode: start server, deploy agent.
+        agent_path = args[0]
+        bundle = _load_agent_bundle(agent_path)
+        AGENT_NAME = _extract_agent_name(bundle)
+
+        server_proc = _start_server(agent_path)
+        try:
+            wait_for_server(server_proc)
+            with httpx.Client() as client:
+                agents_resp = client.get(f"{BASE_URL}/api/agents")
+                agents_resp.raise_for_status()
+                agent_id = None
+                for agent in agents_resp.json()["data"]:
+                    if agent["name"] == AGENT_NAME:
+                        agent_id = agent["id"]
+                        break
+                if agent_id is None:
+                    raise RuntimeError(f"Agent '{AGENT_NAME}' not found after server startup")
+        except Exception:
+            server_proc.kill()
+            raise
+
+        app = ChatApp(
+            server_proc=server_proc,
+            agent_id=agent_id,
+            auto_send=auto_send,
+            tool_set=tool_set,
+        )
+        app.run()
 
 
 def _load_tool_set(name: str) -> ModuleType:
