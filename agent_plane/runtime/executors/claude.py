@@ -795,26 +795,40 @@ def _build_sdk_options(
         # Bash) and .claude/ state share the same directory tree.
         cwd=str(context.storage_dir / "workspace"),
         setting_sources=setting_sources,
-        # Enable OS-level sandbox — restricts Bash/file access to
-        # cwd. autoAllowBashIfSandboxed=True means sandboxed Bash
-        # runs without permission prompts (the sandbox boundary
-        # replaces the per-command prompt).
+        # OS-level sandbox: restricts Bash writes to cwd.
+        # autoAllowBashIfSandboxed=True auto-approves sandboxed
+        # Bash without permission prompts.
         sandbox=sdk.SandboxSettings(
             enabled=True,
             autoAllowBashIfSandboxed=True,
             allowUnsandboxedCommands=False,
         ),
-        # PreToolUse hooks enforce read isolation for built-in
-        # tools (Read, Glob, Grep) — these run in-process and
-        # are NOT restricted by the sandbox. The sandbox handles
-        # Bash write isolation. Bash reads outside workspace
-        # are restricted by sandbox.filesystem.denyRead.
+        # PreToolUse hooks block built-in tools (Read, Glob,
+        # Grep, Edit, Write) from accessing paths outside the
+        # workspace. These tools run in-process and are NOT
+        # restricted by the OS sandbox — hooks are the only
+        # mechanism that works for them.
         hooks=_build_filesystem_hooks(
             str(context.storage_dir / "workspace"),
         ),
-        # Restrict Bash reads to the workspace via sandbox
-        # denyRead. Paths must be resolved (macOS /tmp is a
-        # symlink to /private/tmp — Seatbelt uses real paths).
+        # sandbox.filesystem.denyRead: intended to restrict Bash
+        # subprocess reads via Seatbelt (macOS) / bubblewrap
+        # (Linux). Paths are resolved because macOS /tmp is a
+        # symlink to /private/tmp.
+        #
+        # KNOWN BUG: denyRead does not currently block Bash reads
+        # on macOS or Linux. Tracked upstream:
+        #   - https://github.com/anthropics/claude-code/issues/32226
+        #     (primary: "denyRead seems ineffective")
+        #   - https://github.com/anthropics/claude-code/issues/43043
+        #     (allowRead overrides denyRead)
+        #   - https://github.com/anthropics/claude-code/issues/44379
+        #     (denyRead not enforced on bundled rg subprocess)
+        #   - https://github.com/anthropic-experimental/sandbox-runtime/issues/193
+        #     (denyRead inside allowRead directory)
+        #
+        # When these are fixed, Bash reads will be restricted too.
+        # Until then, built-in tools are covered by hooks above.
         settings=json.dumps(
             {
                 "sandbox": {
@@ -1226,8 +1240,14 @@ def _build_filesystem_hooks(
 
     Hooks fire before the permission system and cannot be bypassed
     by ``bypassPermissions``. They cover built-in tools (Read,
-    Glob, Grep, Edit, Write) which run in-process — the sandbox
-    only isolates Bash subprocesses.
+    Glob, Grep, Edit, Write) which run in-process and are NOT
+    restricted by the OS sandbox.
+
+    This is the primary read isolation mechanism because
+    ``sandbox.filesystem.denyRead`` does not currently block
+    reads on macOS or Linux (see upstream bugs linked in
+    ``_build_sdk_options``). Hooks are the only working
+    approach for built-in tools.
 
     :param workspace_path: Absolute path to the workspace dir,
         e.g. ``"/home/user/.agent-plane/.../workspace"``.

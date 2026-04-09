@@ -203,6 +203,20 @@ agent-name/
   (`tools.timeout`, `tools.retry`) and per-tool (MCP server config,
   `tools.local` block). Exponential backoff with jitter.
 
+- **Security sandboxing** — when `srt` (Anthropic's Sandbox Runtime) is on
+  PATH, `code_sandbox` and local Python tools run inside an OS-level sandbox
+  with filesystem and network restrictions. Writes are restricted to the
+  per-conversation workspace. Reads are denied outside the workspace and
+  system directories. Network access is limited to package registries
+  (pypi.org, npmjs.org). **Known limitation on macOS:** srt uses sandbox-exec
+  seatbelt rules, which operate at the syscall level — `denyRead: ["/"]`
+  blocks all `file-read*` operations including PATH resolution for shell
+  commands. To preserve bash functionality, the macOS sandbox dynamically
+  derives system directories from `$PATH` and re-allows them. On Linux, srt
+  uses bubblewrap with a read-only root bind mount, so `denyRead: ["/"]`
+  works without an allowlist — system binaries remain readable from the
+  initial mount.
+
 ### Planned
 
 - **Compatibility libraries** — adapters for running agents defined in
@@ -250,11 +264,6 @@ agent-name/
   monitoring, reporting, data collection, and maintenance without manual
   invocation.
 
-- **Security sandboxing** — subprocess execution provides fault isolation
-  today but not security sandboxing. Planned: filesystem sandboxing (read-only
-  workdir mount), resource limits (cgroups/ulimit), network isolation, import
-  isolation. Required for untrusted third-party agent images.
-
 - **TypeScript tools** — local tool execution for `.ts` files via Node.js
   subprocess. The parser already discovers TypeScript files; the loader and
   runner are the missing pieces.
@@ -266,6 +275,59 @@ agent-name/
 - **Built-in feedback** — collect user feedback (thumbs up/down, corrections,
   ratings) on agent responses and tie it back to specific executions.
   First-class support for evaluation loops and quality tracking.
+
+
+## Sandbox & Tool Isolation
+
+Agent-plane isolates tool execution so agents can't access files or
+resources outside their workspace.
+
+### Default executor (LLM)
+
+Local Python tools run in subprocesses. When `srt` is on PATH and
+`RuntimeCaps.sandbox_enabled` is True (default), tools are wrapped
+with OS-level sandboxing. Docker containers are supported via
+`tools.sandbox.docker_image` in the agent spec.
+
+### Claude SDK executor
+
+Three isolation layers protect the host filesystem:
+
+| Layer | What it covers | Mechanism |
+|-------|---------------|-----------|
+| **PreToolUse hooks** | Built-in tools (Read, Glob, Grep, Edit, Write) | Blocks file paths outside workspace. Cannot be bypassed. |
+| **OS sandbox (writes)** | Bash write operations | Seatbelt (macOS) / bubblewrap (Linux) restricts writes to workspace. |
+| **OS sandbox (reads)** | Bash read operations | `sandbox.filesystem.denyRead` configured but **not currently effective** — see known issues below. |
+
+**Known issues with Bash read isolation:**
+
+The `sandbox.filesystem.denyRead` setting does not block Bash reads
+on macOS or Linux. This is a Claude Code platform bug, not an
+agent-plane issue:
+
+- [anthropics/claude-code#32226](https://github.com/anthropics/claude-code/issues/32226) — "denyRead seems ineffective" (primary tracker)
+- [anthropics/claude-code#43043](https://github.com/anthropics/claude-code/issues/43043) — allowRead overrides denyRead
+- [anthropics/claude-code#44379](https://github.com/anthropics/claude-code/issues/44379) — denyRead not enforced on bundled rg
+- [anthropic-experimental/sandbox-runtime#193](https://github.com/anthropic-experimental/sandbox-runtime/issues/193) — denyRead inside allowRead directory
+
+Agent-plane configures `denyRead` so that when these bugs are fixed
+upstream, Bash reads will be restricted automatically. Until then,
+built-in file tools are the primary read isolation mechanism (via
+PreToolUse hooks).
+
+### Configuration
+
+Sandboxing is a **runtime** policy — agents cannot disable it:
+
+```python
+# RuntimeCaps (operator-controlled)
+RuntimeCaps(sandbox_enabled=True)  # default: srt enabled when on PATH
+
+# Agent spec (agent-controlled)
+tools:
+  sandbox:
+    docker_image: python:3.12-slim  # optional: run tools in Docker
+```
 
 
 ## LLM Providers
