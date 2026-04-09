@@ -155,7 +155,8 @@ def test_steering_with_web_search(
     steer.raise_for_status()
     assert steer.json()["id"] == task_id, "Steer not accepted"
 
-    body = poll_until_terminal(http_client, task_id, timeout=120)
+    # Web search + steer + re-run can take a while.
+    body = poll_until_terminal(http_client, task_id, timeout=240)
     assert body["status"] == "completed"
 
     all_text = _extract_all_text(body)

@@ -3786,7 +3786,10 @@ async def _run_agent_loop(
             # messages that arrived during tool execution. Tool
             # outputs get positions after the steered message, so
             # using the post-tool last_seen would skip it.
-            pre_tool_last_seen = last_seen
+            # Use the pre-LLM cursor so steered messages delivered
+            # during the LLM call (before native tools were persisted)
+            # are picked up by _sync_steered_after_tools.
+            pre_tool_last_seen = pre_llm_last_seen
             handle_result = await _handle_tool_calls(
                 task_id,
                 conversation_id,
