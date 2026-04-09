@@ -62,13 +62,40 @@ __all__ = [
 # web search subclasses do.
 _BuiltinFactory = Callable[[dict[str, str]], Tool]
 
+
 # Registry of built-in tools that agents can enable via
 # ``tools.builtins`` in config.yaml. Keyed by the name string
 # users write in the spec.
+def _create_code_sandbox(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for CodeSandboxTool.
+
+    :param config: Tool config (unused).
+    :returns: A CodeSandboxTool instance.
+    """
+    from agent_plane.tools.builtins.code_sandbox import CodeSandboxTool
+
+    return CodeSandboxTool()
+
+
+def _create_upload_file(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for UploadFileTool.
+
+    :param config: Tool config (unused).
+    :returns: An UploadFileTool instance.
+    """
+    from agent_plane.tools.builtins.upload_file import UploadFileTool
+
+    return UploadFileTool()
+
+
 _BUILTIN_REGISTRY: dict[str, _BuiltinFactory] = {
     "web_search_openai": WebSearchOpenAITool,
     "web_search_google": WebSearchGoogleTool,
     "web_search_perplexity": WebSearchPerplexityTool,
+    "code_sandbox": _create_code_sandbox,
+    "upload_file": _create_upload_file,
 }
 
 
