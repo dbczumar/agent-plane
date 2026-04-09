@@ -508,6 +508,10 @@ class ChatApp(App[None]):
         self._previous_response_id: str | None = None
         self._current_response_id: str | None = None
         self._streaming = False
+        # Set True when response.completed/failed arrives from the
+        # server. Reset at the start of each new stream. This is
+        # the authoritative signal that the response is done.
+        self._response_terminal = True
         # The live Static widget being updated during streaming.
         self._live_widget: Static | None = None
         # Files attached to the next message (drag-and-drop or paste).
@@ -564,11 +568,16 @@ class ChatApp(App[None]):
 
         scroll = self.query_one("#chat-scroll", VerticalScroll)
 
-        # Check if a stream worker is actively running. Use the
-        # Textual workers list as the authoritative source — the
-        # _streaming flag can be stale due to async timing.
-        has_active_stream = any(not w.is_finished for w in self.workers if w.group == "stream")
-        if has_active_stream and self._current_response_id is not None:
+        # Route to steering only if the server response is still
+        # in progress. _response_terminal is set by _handle_sse
+        # when response.completed/failed arrives — this is the
+        # authoritative signal from the server, not an async flag
+        # subject to worker lifecycle timing.
+        if (
+            not self._response_terminal
+            and self._current_response_id is not None
+            and self._streaming
+        ):
             self._send_steering(text)
             scroll.mount(
                 UserMessage(
@@ -617,6 +626,7 @@ class ChatApp(App[None]):
             of content block dicts when files are attached.
         """
         self._streaming = True
+        self._response_terminal = False
         self._current_response_id = None
         scroll = self.query_one("#chat-scroll", VerticalScroll)
 
@@ -724,7 +734,6 @@ class ChatApp(App[None]):
                 if tc.get("call_id") not in acc._completed_call_ids
             ]
 
-            # If no client-side tool calls pending, we're done.
             if not acc.pending_tool_calls or self._tool_set is None:
                 # Clean up the status widget if finalization ran.
                 if acc.finalized and self._live_widget is not None:
@@ -893,8 +902,7 @@ class ChatApp(App[None]):
         in-progress response via the cancel API. Otherwise,
         toggle between input mode and browse mode.
         """
-        has_active_stream = any(not w.is_finished for w in self.workers if w.group == "stream")
-        if has_active_stream and self._current_response_id is not None:
+        if not self._response_terminal and self._current_response_id is not None:
             self._cancel_response()
             return
 
@@ -1462,12 +1470,13 @@ def _handle_sse(
 
     elif event_type in ("response.completed", "response.failed"):
         _extract_response_id(data, app)
-        # Mark streaming done as soon as the terminal event arrives
-        # — before the SSE stream fully closes. Without this, there
-        # is a window between the last visible text and the stream
-        # ending where user input routes to steering instead of a
-        # new turn.
-        app._streaming = False
+        # Mark the response as terminal. This is the authoritative
+        # signal from the server. on_input_submitted checks this
+        # to decide between steering (response still running) and
+        # new turn (response done). Unlike _streaming (which depends
+        # on async worker lifecycle), this is set synchronously in
+        # the SSE handler with no race.
+        app._response_terminal = True
 
     return live
 
