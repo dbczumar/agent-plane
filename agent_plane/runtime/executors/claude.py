@@ -804,12 +804,25 @@ def _build_sdk_options(
             autoAllowBashIfSandboxed=True,
             allowUnsandboxedCommands=False,
         ),
-        # Restrict filesystem access to the workspace directory.
-        # Permission deny rules are enforced even with
-        # bypassPermissions. Deny root-level Read/Edit, then
-        # allow the workspace via explicit allow rules.
-        settings=_build_sandbox_permission_settings(
+        # PreToolUse hooks enforce read isolation for built-in
+        # tools (Read, Glob, Grep) — these run in-process and
+        # are NOT restricted by the sandbox. The sandbox handles
+        # Bash write isolation. Bash reads outside workspace
+        # are restricted by sandbox.filesystem.denyRead.
+        hooks=_build_filesystem_hooks(
             str(context.storage_dir / "workspace"),
+        ),
+        settings=json.dumps(
+            {
+                "sandbox": {
+                    "filesystem": {
+                        "denyRead": ["/"],
+                        "allowRead": [
+                            str(context.storage_dir / "workspace"),
+                        ],
+                    },
+                },
+            }
         ),
     )
 
@@ -1200,40 +1213,61 @@ def _disconnect_in_loop(
         )
 
 
-def _build_sandbox_permission_settings(workspace_path: str) -> str:
+def _build_filesystem_hooks(
+    workspace_path: str,
+) -> dict[str, list[Any]]:
     """
-    Build a ``--settings`` JSON string that restricts filesystem
-    access to the workspace directory.
+    Build PreToolUse hooks that restrict file access to the workspace.
 
-    Uses permission deny/allow rules because deny rules are
-    enforced even with ``bypassPermissions`` mode. Read/Edit
-    deny rules block the built-in file tools. The sandbox
-    (SandboxSettings) handles write isolation for Bash. Bash
-    reads outside the workspace are not fully blocked — the
-    sandbox ``denyRead`` setting doesn't apply to Bash on macOS.
+    Hooks fire before the permission system and cannot be bypassed
+    by ``bypassPermissions``. They cover built-in tools (Read,
+    Glob, Grep, Edit, Write) which run in-process — the sandbox
+    only isolates Bash subprocesses.
 
     :param workspace_path: Absolute path to the workspace dir,
         e.g. ``"/home/user/.agent-plane/.../workspace"``.
-    :returns: JSON string for the SDK's ``settings`` option.
+    :returns: Hooks dict for ``ClaudeAgentOptions.hooks``.
     """
-    return json.dumps(
-        {
-            "permissions": {
-                "deny": [
-                    "Read(//**)",
-                    "Edit(//**)",
-                ],
-                "allow": [
-                    f"Read(//{workspace_path}/**)",
-                    f"Edit(//{workspace_path}/**)",
-                    "Bash",
-                    "Glob",
-                    "Grep",
-                    "Write",
-                ],
-            },
+    sdk = _ensure_sdk()
+    resolved_workspace = str(Path(workspace_path).resolve())
+
+    async def _restrict_file_access(
+        input_data: Any,
+        tool_use_id: str | None,
+        context: Any,
+    ) -> dict[str, Any]:
+        """
+        Block file tools that target paths outside the workspace.
+
+        :param input_data: ``PreToolUseHookInput`` dict with
+            ``tool_name`` and ``tool_input``.
+        :param tool_use_id: The tool use ID (unused).
+        :param context: The ``HookContext`` (unused).
+        :returns: Empty dict to allow, or ``{"decision": "block"}``
+            to deny.
+        """
+        tool_input = input_data.get("tool_input", {})
+        path = (
+            tool_input.get("file_path") or tool_input.get("path") or tool_input.get("pattern", "")
+        )
+        if not isinstance(path, str) or not path:
+            return {}
+        resolved = str(Path(path).resolve())
+        if resolved.startswith(resolved_workspace):
+            return {}
+        return {
+            "decision": "block",
+            "reason": (f"Access denied: {path} is outside the workspace ({resolved_workspace})."),
         }
-    )
+
+    return {
+        "PreToolUse": [
+            sdk.HookMatcher(
+                matcher="",
+                hooks=[_restrict_file_access],
+            ),
+        ],
+    }
 
 
 def _write_skills_to_storage(
