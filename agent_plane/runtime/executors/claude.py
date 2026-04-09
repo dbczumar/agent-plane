@@ -796,6 +796,14 @@ def _build_sdk_options(
         # Bash) and .claude/ state share the same directory tree.
         cwd=str(context.storage_dir / "workspace"),
         setting_sources=setting_sources,
+        # Enable OS-level sandbox — restricts Bash/file access to
+        # cwd. autoAllowBashIfSandboxed=True means sandboxed Bash
+        # runs without permission prompts (the sandbox boundary
+        # replaces the per-command prompt).
+        sandbox=sdk.SandboxSettings(
+            enabled=True,
+            autoAllowBashIfSandboxed=True,
+        ),
     )
 
     cli_path = shutil.which("claude")
