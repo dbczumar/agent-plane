@@ -27,6 +27,32 @@ _DEFAULT_DB_URI = "sqlite:///agent_plane.db"
 _DEFAULT_ARTIFACT_LOCATION = "./artifacts"
 
 
+def _create_artifact_store(location: str) -> Any:
+    """
+    Create an artifact store based on the location URI scheme.
+
+    ``dbfs:/Volumes/...`` URIs use
+    :class:`DatabricksVolumesArtifactStore` (requires
+    ``databricks-sdk``). All other locations use
+    :class:`LocalArtifactStore`.
+
+    :param location: Artifact storage location, e.g.
+        ``"./artifacts"`` for local or
+        ``"dbfs:/Volumes/cat/schema/vol"`` for UC Volumes.
+    :returns: An :class:`ArtifactStore` instance.
+    """
+    if location.startswith("dbfs:/Volumes/"):
+        from agent_plane.stores.artifact_store.databricks_volumes import (
+            DatabricksVolumesArtifactStore,
+        )
+
+        return DatabricksVolumesArtifactStore(location)
+
+    from agent_plane.stores.artifact_store.local import LocalArtifactStore
+
+    return LocalArtifactStore(location)
+
+
 def _preregister_agent(
     agent_dir: Path,
     agent_store: Any,
@@ -149,7 +175,6 @@ def server(
 
     from agent_plane.server.app import create_app
     from agent_plane.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-    from agent_plane.stores.artifact_store.local import LocalArtifactStore
     from agent_plane.stores.conversation_store.sqlalchemy_store import (
         SqlAlchemyConversationStore,
     )
@@ -172,7 +197,7 @@ def server(
     file_store = SqlAlchemyFileStore(db_uri)
     task_store = SqlAlchemyTaskStore(db_uri)
     conversation_store = SqlAlchemyConversationStore(db_uri)
-    artifact_store = LocalArtifactStore(art_loc)
+    artifact_store = _create_artifact_store(art_loc)
 
     # Initialize the runtime with store references so workflow code
     # can access them via getter functions (get_agent_cache(), etc.).
