@@ -188,72 +188,119 @@ env:
 
 Entry point that:
 
-1. Reads Lakebase connection env vars (`PGHOST`, `PGPORT`, etc.)
-2. Registers a SQLAlchemy `do_connect` event listener for token
-   injection
+1. Registers a class-level SQLAlchemy `do_connect` event listener
+   for Lakebase token injection — **before** importing agent-plane
+2. Reads Lakebase connection env vars (`PGHOST`, `PGPORT`, etc.)
 3. Builds the database URI and artifact location
-4. Starts the agent-plane server via subprocess or direct import
+4. Starts the agent-plane server in-process via `create_app()` +
+   `uvicorn.run()`
+
+**Critical design: class-level event hook.**
+
+The `do_connect` hook is registered on the `Engine` class (not a
+specific engine instance). This means it fires for every engine
+created in the process — including agent-plane's internal engine
+and DBOS's engine. The hook checks the hostname to avoid injecting
+tokens into non-Lakebase connections (e.g. SQLite for DBOS).
+
+This requires **no changes to agent-plane's engine creation code**.
+The hook is registered at module import time, before any engine
+exists. Verified: SQLAlchemy class-level event listeners fire for
+all subsequently-created engine instances.
+
+The entry point must start agent-plane **in-process** (not via
+`subprocess.run(["ap", "server", ...])`) because Python event
+listeners don't cross process boundaries.
 
 ```python
+"""Databricks Apps entry point for agent-plane with Lakebase."""
+
 import os
-import subprocess
+
 from databricks.sdk import WorkspaceClient
+from sqlalchemy import Engine, event
+
+# ── Lakebase token injection ──────────────────────────────
+#
+# Register BEFORE importing agent-plane so the hook is active
+# when agent-plane creates its SQLAlchemy engine.
 
 LAKEBASE_ENDPOINT = os.environ["AP_LAKEBASE_ENDPOINT"]
-VOLUME_PATH = os.environ["AP_ARTIFACT_VOLUME_PATH"]
-PORT = os.environ.get("DATABRICKS_APP_PORT", "8000")
+_wc = WorkspaceClient()
 
-# Build connection string
+
+def _get_lakebase_token() -> str:
+    return _wc.postgres.generate_database_credential(
+        endpoint=LAKEBASE_ENDPOINT,
+    ).token
+
+
+@event.listens_for(Engine, "do_connect")
+def _inject_lakebase_token(dialect, conn_rec, cargs, cparams):
+    # Only inject for Lakebase connections — skip SQLite (DBOS)
+    # and any other non-PostgreSQL engines.
+    host = cparams.get("host", "")
+    if host and "localhost" not in host and "127.0.0.1" not in host:
+        cparams["password"] = _get_lakebase_token()
+
+
+# ── Build configuration ──────────────────────────────────
+
+VOLUME_PATH = os.environ["AP_ARTIFACT_VOLUME_PATH"]
+PORT = int(os.environ.get("DATABRICKS_APP_PORT", "8000"))
+
 pg_host = os.environ["PGHOST"]
 pg_port = os.environ["PGPORT"]
 pg_db = os.environ["PGDATABASE"]
 pg_user = os.environ["PGUSER"]
 db_uri = f"postgresql+psycopg://{pg_user}@{pg_host}:{pg_port}/{pg_db}"
-
-# Artifact location as dbfs: URI
 artifact_uri = f"dbfs:{VOLUME_PATH}"
 
-# Inject Lakebase OAuth tokens into SQLAlchemy connections
-from sqlalchemy import event, create_engine
+# ── Start agent-plane in-process ─────────────────────────
 
-def _get_token():
-    wc = WorkspaceClient()
-    return wc.postgres.generate_database_credential(
-        endpoint=LAKEBASE_ENDPOINT
-    ).token
+from agent_plane.server import create_app
+from agent_plane.stores.artifact_store.databricks_volumes import (
+    DatabricksVolumesArtifactStore,
+)
+from agent_plane.stores.artifact_store.local import LocalArtifactStore
+from agent_plane.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
+from agent_plane.stores.agent_store.sqlalchemy_store import (
+    SqlAlchemyAgentStore,
+)
+from agent_plane.stores.file_store.sqlalchemy_store import (
+    SqlAlchemyFileStore,
+)
+from agent_plane.stores.task_store.sqlalchemy_store import (
+    SqlAlchemyTaskStore,
+)
+import uvicorn
 
-engine = create_engine(
-    db_uri,
-    pool_recycle=3000,  # Recycle before 60-min token expiry
+artifact_store = DatabricksVolumesArtifactStore(artifact_uri)
+agent_store = SqlAlchemyAgentStore(db_uri)
+conversation_store = SqlAlchemyConversationStore(db_uri)
+file_store = SqlAlchemyFileStore(db_uri)
+task_store = SqlAlchemyTaskStore(db_uri)
+
+app = create_app(
+    agent_store=agent_store,
+    file_store=file_store,
+    task_store=task_store,
+    conversation_store=conversation_store,
+    artifact_store=artifact_store,
 )
 
-@event.listens_for(engine, "do_connect")
-def inject_token(dialect, conn_rec, cargs, cparams):
-    cparams["password"] = _get_token()
-
-# Start agent-plane
-subprocess.run([
-    "ap", "server",
-    "--host", "0.0.0.0",
-    "--port", PORT,
-    "--database-uri", db_uri,
-    "--artifact-location", artifact_uri,
-])
+uvicorn.run(app, host="0.0.0.0", port=PORT)
 ```
 
-**Note:** The `do_connect` hook injects a fresh token on every new
-connection. The pool recycles connections every 3000 seconds (50
-minutes) so tokens never expire mid-session.
-
-**Open question:** The `do_connect` hook operates on `engine`, but
-agent-plane creates its own engine internally. The example may need
-to set `AP_DB_URI` as an env var and patch the engine creation in
-agent-plane to accept the pre-configured engine, OR agent-plane's
-engine creation needs to support a `do_connect` hook registration
-callback. The MLflow example handles this by registering the hook
-before importing MLflow (which creates the engine at import time).
-Agent-plane's engine creation happens in `db/utils.py` — we may
-need a similar hook point.
+**Token lifecycle:** The `do_connect` hook injects a fresh token on
+every new database connection. SQLAlchemy's connection pool creates
+new connections as needed. Connections should be recycled before the
+60-minute token expiry — set `pool_recycle=3000` (50 minutes) on
+the engine. This is configured in `db/utils.py`'s engine creation
+(needs a one-line change to set `pool_recycle` when the URI is
+PostgreSQL).
 
 #### `requirements.txt`
 
@@ -283,26 +330,21 @@ psycopg[binary]>=3.1
 
 ## Open Questions
 
-1. **Engine hook for token injection.** Agent-plane creates its own
-   SQLAlchemy engine in `db/utils.py`. The Lakebase token injection
-   hook needs to be registered on THAT engine, not a separate one.
-   Options:
-   - (a) Accept a `connect_hook` callback in `db/utils.py`'s engine
-     creation and register it via `event.listens_for`
-   - (b) Export the engine after creation so `app.py` can register
-     on it
-   - (c) Set env vars and have `db/utils.py` detect Databricks
-     context and auto-register the hook
-
-   Option (a) is cleanest — explicit, no magic detection.
+1. **Engine `pool_recycle` for Lakebase.** Agent-plane's
+   `db/utils.py` creates engines without `pool_recycle`. For
+   Lakebase (60-minute token expiry), connections must recycle
+   before expiry. Needs a one-line change: pass
+   `pool_recycle=3000` when the URI is PostgreSQL. Alternatively,
+   `app.py` could monkey-patch the engine after creation, but
+   that's fragile.
 
 2. **Executor storage on UC Volumes.** The `_EXECUTOR_STORAGE_BASE`
    is currently `~/.agent-plane/executor_storage/` (local disk). On
-   Databricks Apps, local disk is ephemeral. Should executor storage
-   also move to UC Volumes? Or is the artifact store snapshot
-   (which already uses UC Volumes) sufficient for crash recovery?
-   The artifact store snapshot restores on server restart, so
+   Databricks Apps, local disk is ephemeral. The artifact store
+   snapshot (which uses UC Volumes) restores on server restart, so
    ephemeral local storage + artifact backup should be sufficient.
+   No change needed unless we want to eliminate the local disk
+   dependency entirely.
 
 3. **DBOS system database.** DBOS creates its own `agent_plane.db`
    SQLite database for workflow state. On Databricks Apps, this
