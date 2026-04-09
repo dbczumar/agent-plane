@@ -6,15 +6,17 @@ backoff delays, and provides a retry loop that emits SSE events.
 
 from __future__ import annotations
 
+import json
 import logging
 import random
+import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 import httpx
 
-from agent_plane.llms.client import _detect_context_overflow
 from agent_plane.llms.errors import (
     ContextWindowExceededError,
     LLMErrorDetail,
@@ -26,6 +28,92 @@ from agent_plane.spec.types import RetryConfig
 _logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+@dataclass
+class _OverflowTokens:
+    """
+    Token counts parsed from a provider context-overflow error body.
+
+    :param max_context_tokens: The model's context window size as
+        reported by the provider, e.g. ``128000``.
+    :param actual_tokens: The token count the provider measured for
+        the rejected request, e.g. ``142000``.
+    """
+
+    max_context_tokens: int
+    actual_tokens: int
+
+
+def _detect_context_overflow(body: str) -> _OverflowTokens | None:
+    """
+    Parse provider-specific context-overflow error messages and
+    extract token counts.
+
+    Matches conservatively — only well-known error shapes produce a
+    result. Unknown 400 errors return ``None`` so they propagate as
+    ``PermanentLLMError`` rather than entering a compact-retry loop.
+
+    Supported providers:
+
+    - **OpenAI**: ``error.code == "context_length_exceeded"``
+    - **Anthropic**: ``"{input} + {max_tokens} > {limit}"`` or
+      ``"prompt is too long: {actual} tokens > {limit} maximum"``
+    - **Gemini**: ``"input token count ({actual}) exceeds the
+      maximum number of tokens allowed ({limit})"``
+
+    :param body: The raw HTTP response body string from the provider.
+    :returns: Parsed token counts, or ``None`` if the body does not
+        match any known overflow pattern.
+    """
+    # OpenAI: {"error": {"code": "context_length_exceeded", ...}}
+    try:
+        parsed = json.loads(body)
+        error_obj = parsed.get("error", {})
+        if error_obj.get("code") == "context_length_exceeded":
+            msg = error_obj.get("message", "")
+            max_m = re.search(r"maximum context length is (\d+) tokens", msg)
+            act_m = re.search(r"you requested (\d+) tokens", msg)
+            if max_m and act_m:
+                return _OverflowTokens(
+                    max_context_tokens=int(max_m.group(1)),
+                    actual_tokens=int(act_m.group(1)),
+                )
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    # Anthropic: "{input} + {max_tokens} > {limit}"
+    anthropic_sum = re.search(r"(\d+)\s*\+\s*\d+\s*>\s*(\d+)", body)
+    if anthropic_sum:
+        return _OverflowTokens(
+            max_context_tokens=int(anthropic_sum.group(2)),
+            actual_tokens=int(anthropic_sum.group(1)),
+        )
+
+    # Anthropic: "prompt is too long: {actual} tokens > {limit} maximum"
+    anthropic_long = re.search(
+        r"prompt is too long:\s*(\d+)\s*tokens\s*>\s*(\d+)\s*maximum",
+        body,
+    )
+    if anthropic_long:
+        return _OverflowTokens(
+            max_context_tokens=int(anthropic_long.group(2)),
+            actual_tokens=int(anthropic_long.group(1)),
+        )
+
+    # Gemini: "input token count ({actual}) exceeds ... ({limit})"
+    gemini_match = re.search(
+        r"input token count \((\d+)\) exceeds the maximum number"
+        r" of tokens allowed \((\d+)\)",
+        body,
+    )
+    if gemini_match:
+        return _OverflowTokens(
+            max_context_tokens=int(gemini_match.group(2)),
+            actual_tokens=int(gemini_match.group(1)),
+        )
+
+    return None
 
 
 def classify_llm_error(
