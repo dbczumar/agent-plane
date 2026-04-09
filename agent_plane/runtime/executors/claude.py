@@ -804,13 +804,13 @@ def _build_sdk_options(
             autoAllowBashIfSandboxed=True,
             allowUnsandboxedCommands=False,
         ),
-        # NOTE: The SDK sandbox restricts WRITES to cwd but allows
-        # READS from the entire filesystem by default. Read
-        # restrictions (denyRead) can only be set via user-level or
-        # managed settings (~/.claude/settings.json), not
-        # project-level or programmatic settings. Operators who need
-        # read isolation should configure denyRead in their
-        # deployment's ~/.claude/settings.json.
+        # Restrict filesystem access to the workspace directory.
+        # Permission deny rules are enforced even with
+        # bypassPermissions. Deny root-level Read/Edit, then
+        # allow the workspace via explicit allow rules.
+        settings=_build_sandbox_permission_settings(
+            str(context.storage_dir / "workspace"),
+        ),
     )
 
     cli_path = shutil.which("claude")
@@ -1198,6 +1198,42 @@ def _disconnect_in_loop(
             "Failed to disconnect Claude SDK client",
             exc_info=True,
         )
+
+
+def _build_sandbox_permission_settings(workspace_path: str) -> str:
+    """
+    Build a ``--settings`` JSON string that restricts filesystem
+    access to the workspace directory.
+
+    Uses permission deny/allow rules because deny rules are
+    enforced even with ``bypassPermissions`` mode. Read/Edit
+    deny rules block the built-in file tools. The sandbox
+    (SandboxSettings) handles write isolation for Bash. Bash
+    reads outside the workspace are not fully blocked — the
+    sandbox ``denyRead`` setting doesn't apply to Bash on macOS.
+
+    :param workspace_path: Absolute path to the workspace dir,
+        e.g. ``"/home/user/.agent-plane/.../workspace"``.
+    :returns: JSON string for the SDK's ``settings`` option.
+    """
+    return json.dumps(
+        {
+            "permissions": {
+                "deny": [
+                    "Read(//**)",
+                    "Edit(//**)",
+                ],
+                "allow": [
+                    f"Read(//{workspace_path}/**)",
+                    f"Edit(//{workspace_path}/**)",
+                    "Bash",
+                    "Glob",
+                    "Grep",
+                    "Write",
+                ],
+            },
+        }
+    )
 
 
 def _write_skills_to_storage(
