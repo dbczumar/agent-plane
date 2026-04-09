@@ -1,0 +1,10 @@
+command: ["python", "app.py"]
+env:
+  # Lakebase endpoint name — used to generate OAuth tokens.
+  # Injected from the postgres resource declared in databricks.yml.
+  - name: AP_LAKEBASE_ENDPOINT
+    valueFrom: postgres
+  # UC Volume path for artifact storage.
+  # Injected from the artifact_volume resource declared in databricks.yml.
+  - name: AP_ARTIFACT_VOLUME_PATH
+    valueFrom: artifact_volume

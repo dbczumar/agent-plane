@@ -1,0 +1,9 @@
+# Agent-plane and its dependencies
+agent-plane
+
+# Databricks SDK for UC Volumes artifact store and Lakebase
+# OAuth token generation
+databricks-sdk>=0.40.0
+
+# PostgreSQL driver for Lakebase
+psycopg[binary]>=3.1
