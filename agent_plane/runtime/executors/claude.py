@@ -812,13 +812,18 @@ def _build_sdk_options(
         hooks=_build_filesystem_hooks(
             str(context.storage_dir / "workspace"),
         ),
+        # Restrict Bash reads to the workspace via sandbox
+        # denyRead. Paths must be resolved (macOS /tmp is a
+        # symlink to /private/tmp — Seatbelt uses real paths).
         settings=json.dumps(
             {
                 "sandbox": {
                     "filesystem": {
-                        "denyRead": ["/"],
+                        "denyRead": [
+                            str(Path("/").resolve()),
+                        ],
                         "allowRead": [
-                            str(context.storage_dir / "workspace"),
+                            str((context.storage_dir / "workspace").resolve()),
                         ],
                     },
                 },
