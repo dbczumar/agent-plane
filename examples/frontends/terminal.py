@@ -2044,19 +2044,43 @@ def _authenticate_remote(server_url: str) -> dict[str, str]:
     except Exception:
         pass
 
-    # Databricks App OAuth: use the Databricks SDK to get a token.
-    # The SDK reads DATABRICKS_HOST and DATABRICKS_TOKEN from env.
+    # Databricks App OAuth: browser-based U2M flow using the
+    # Databricks CLI's OAuth client (supports localhost redirect).
     print("Authenticating to Databricks App...")
+    print("A browser window will open — please authorize access.\n")
     try:
         from databricks.sdk import WorkspaceClient
+        from databricks.sdk.oauth import OAuthClient, OidcEndpoints
 
         wc = WorkspaceClient()
-        # Generate a token that the app's OAuth proxy will accept.
-        # The app proxy checks tokens issued by the workspace's OIDC.
-        token = wc.config.token
-        headers = {"Authorization": f"Bearer {token}"}
+        host = wc.config.host.rstrip("/")
 
-        # Test if it works
+        # Discover OIDC endpoints
+        oidc_resp = httpx.get(
+            f"{host}/oidc/.well-known/openid-configuration",
+            timeout=10,
+        )
+        oidc_resp.raise_for_status()
+        oidc = oidc_resp.json()
+
+        # Use the Databricks CLI's registered OAuth client which
+        # supports localhost redirect + PKCE for U2M flows.
+        oauth = OAuthClient(
+            oidc_endpoints=OidcEndpoints(
+                authorization_endpoint=oidc["authorization_endpoint"],
+                token_endpoint=oidc["token_endpoint"],
+            ),
+            client_id="databricks-cli",
+            redirect_url="http://localhost:8020",
+            scopes=["all-apis"],
+        )
+
+        consent = oauth.initiate_consent()
+        creds = consent.launch_external_browser()
+        token = creds.token()
+        headers = {"Authorization": f"Bearer {token.access_token}"}
+
+        # Verify
         resp = httpx.get(
             f"{server_url}/health",
             headers=headers,
@@ -2064,23 +2088,19 @@ def _authenticate_remote(server_url: str) -> dict[str, str]:
             follow_redirects=False,
         )
         if resp.status_code == 200:
-            print("Authenticated with workspace token")
+            print("Authenticated successfully!\n")
             _REMOTE_AUTH_HEADERS = headers
             return headers
         else:
-            print(f"Workspace token rejected ({resp.status_code})")
+            print(f"Token rejected by app ({resp.status_code})")
     except ImportError:
-        print("databricks-sdk not installed — can't authenticate to Databricks App")
+        print("databricks-sdk not installed — can't authenticate")
     except Exception as exc:
         print(f"Authentication failed: {exc}")
 
-    # Fallback: prompt user for a token
     print(
-        f"\nCould not auto-authenticate to {server_url}"
-        "\nOpen the app URL in your browser, then copy the session"
-        " cookie value from your browser's developer tools."
-        "\n\nOr set DATABRICKS_HOST and DATABRICKS_TOKEN env vars"
-        " for automatic authentication.\n"
+        f"\nCould not authenticate to {server_url}"
+        "\nEnsure DATABRICKS_HOST is set to your workspace URL.\n"
     )
     sys.exit(1)
 
