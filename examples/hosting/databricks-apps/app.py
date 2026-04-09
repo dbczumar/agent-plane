@@ -92,6 +92,9 @@ def _inject_lakebase_credentials(
 # Import AFTER the do_connect hook is registered so agent-plane's
 # engine creation picks it up.
 
+import tempfile  # noqa: E402
+from pathlib import Path  # noqa: E402
+
 import uvicorn  # noqa: E402
 
 from agent_plane.runtime import init as init_runtime  # noqa: E402
@@ -116,6 +119,9 @@ from agent_plane.stores.task_store.sqlalchemy_store import (  # noqa: E402
 
 DB_URI = f"postgresql+psycopg://{PGUSER}@{PGHOST}:{PGPORT}/{PGDATABASE}"
 ARTIFACT_URI = f"dbfs:{VOLUME_PATH}"
+# Local cache directory for extracted agent bundles. Ephemeral —
+# the artifact store (UC Volumes) is the durable backing store.
+CACHE_DIR = Path(tempfile.mkdtemp(prefix="ap_cache_"))
 
 # Create stores
 agent_store = SqlAlchemyAgentStore(DB_URI)
@@ -126,7 +132,7 @@ artifact_store = DatabricksVolumesArtifactStore(ARTIFACT_URI)
 
 # Initialize runtime
 init_runtime(
-    agent_cache=AgentCache(artifact_store=artifact_store),
+    agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=CACHE_DIR),
     caps=RuntimeCaps(),
     agent_store=agent_store,
     file_store=file_store,
