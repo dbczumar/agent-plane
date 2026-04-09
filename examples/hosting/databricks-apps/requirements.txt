@@ -1,5 +1,7 @@
-# Agent-plane and its dependencies
-agent-plane
+# Agent-plane — installed from the private GitHub repo.
+# For public repos, use: agent-plane (once published to PyPI).
+# For private repos, use a deploy token or upload a wheel.
+git+https://github.com/dbczumar/agent-plane.git@main
 
 # Databricks SDK for UC Volumes artifact store and Lakebase
 # OAuth token generation
