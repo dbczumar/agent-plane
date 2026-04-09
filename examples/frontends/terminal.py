@@ -836,6 +836,7 @@ class ChatApp(App[None]):
             resp = httpx.post(
                 f"{BASE_URL}/v1/responses",
                 json=body,
+                headers=_REMOTE_AUTH_HEADERS,
                 # Server may be busy executing a long tool call
                 # (e.g. npm install) — use a generous timeout.
                 timeout=120.0,
@@ -944,7 +945,7 @@ class ChatApp(App[None]):
             self._live_widget = None
         scroll = self.query_one("#chat-scroll", VerticalScroll)
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=10.0, headers=_REMOTE_AUTH_HEADERS) as client:
                 resp = await client.post(
                     f"{BASE_URL}/v1/responses/{response_id}/cancel",
                 )
@@ -1310,7 +1311,7 @@ async def _run_sse_stream(
     debug_file = open("/tmp/tui-sse.log", "w")  # noqa: SIM115
     # Long read timeout: tool execution can pause SSE for minutes
     timeout = httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, headers=_REMOTE_AUTH_HEADERS) as client:
         async with client.stream(
             "POST",
             f"{BASE_URL}/v1/responses",
@@ -1630,7 +1631,7 @@ async def _execute_and_patch_tool_call(
     if root_id is None:
         _logger.error("No response ID for PATCH — tunneled tool call lost")
         return
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=60.0, headers=_REMOTE_AUTH_HEADERS) as client:
         patch_resp = await client.patch(
             f"{BASE_URL}/v1/responses/{root_id}",
             json={
@@ -2006,6 +2007,84 @@ def _format_native_tool_label(
     return f"{display_name}"
 
 
+# ── Remote server authentication ──────────────────────
+
+
+# Auth headers for remote server connections. Set by
+# _authenticate_remote() and used by _run_sse_stream().
+_REMOTE_AUTH_HEADERS: dict[str, str] = {}
+
+
+def _authenticate_remote(server_url: str) -> dict[str, str]:
+    """
+    Authenticate to a remote agent-plane server.
+
+    For Databricks Apps (detected by ``databricksapps.com`` in the
+    URL), performs a browser-based OAuth flow using the Databricks
+    SDK. The user's browser opens for consent, and the resulting
+    token is used for API calls.
+
+    For plain HTTP servers, returns empty headers (no auth needed).
+
+    :param server_url: The remote server URL, e.g.
+        ``"https://my-app.databricksapps.com"``.
+    :returns: HTTP headers dict with auth credentials.
+    """
+    global _REMOTE_AUTH_HEADERS
+
+    # Check if this is a Databricks App
+    if "databricksapps.com" not in server_url:
+        return {}
+
+    # Try a plain request first — if it works, no auth needed
+    try:
+        resp = httpx.get(f"{server_url}/health", timeout=10, follow_redirects=False)
+        if resp.status_code == 200:
+            return {}
+    except Exception:
+        pass
+
+    # Databricks App OAuth: use the Databricks SDK to get a token.
+    # The SDK reads DATABRICKS_HOST and DATABRICKS_TOKEN from env.
+    print("Authenticating to Databricks App...")
+    try:
+        from databricks.sdk import WorkspaceClient
+
+        wc = WorkspaceClient()
+        # Generate a token that the app's OAuth proxy will accept.
+        # The app proxy checks tokens issued by the workspace's OIDC.
+        token = wc.config.token
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Test if it works
+        resp = httpx.get(
+            f"{server_url}/health",
+            headers=headers,
+            timeout=10,
+            follow_redirects=False,
+        )
+        if resp.status_code == 200:
+            print("Authenticated with workspace token")
+            _REMOTE_AUTH_HEADERS = headers
+            return headers
+        else:
+            print(f"Workspace token rejected ({resp.status_code})")
+    except ImportError:
+        print("databricks-sdk not installed — can't authenticate to Databricks App")
+    except Exception as exc:
+        print(f"Authentication failed: {exc}")
+
+    # Fallback: prompt user for a token
+    print(
+        f"\nCould not auto-authenticate to {server_url}"
+        "\nOpen the app URL in your browser, then copy the session"
+        " cookie value from your browser's developer tools."
+        "\n\nOr set DATABRICKS_HOST and DATABRICKS_TOKEN env vars"
+        " for automatic authentication.\n"
+    )
+    sys.exit(1)
+
+
 # ── Entry point ───────────────────────────────────────
 
 
@@ -2044,6 +2123,8 @@ def main() -> None:
             sys.exit(1)
 
     # Parse --server flag for connecting to a remote server.
+    # Use with Databricks Apps: the TUI opens a browser for OAuth
+    # login, then uses the session token for all API calls.
     if "--server" in args:
         idx = args.index("--server")
         if idx + 1 < len(args):
@@ -2063,7 +2144,13 @@ def main() -> None:
         AGENT_NAME = args[0]
         BASE_URL = remote_server
 
-        with httpx.Client(timeout=30) as client:
+        # Authenticate to the remote server. For Databricks Apps,
+        # this does a browser-based OAuth flow and returns headers
+        # with the session token. For plain HTTP servers, returns
+        # empty headers.
+        auth_headers = _authenticate_remote(remote_server)
+
+        with httpx.Client(timeout=30, headers=auth_headers) as client:
             agents_resp = client.get(f"{BASE_URL}/api/agents")
             agents_resp.raise_for_status()
             agent_id = None
