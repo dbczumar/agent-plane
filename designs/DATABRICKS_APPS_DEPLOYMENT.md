@@ -248,6 +248,12 @@ def _inject_lakebase_token(dialect, conn_rec, cargs, cparams):
 
 VOLUME_PATH = os.environ["AP_ARTIFACT_VOLUME_PATH"]
 PORT = int(os.environ.get("DATABRICKS_APP_PORT", "8000"))
+# Recycle DB connections before Lakebase token expiry (60 min).
+# Default 300s (5 min) is conservative — the only cost is a new
+# TCP handshake + token generation per recycled connection.
+POOL_RECYCLE_SECONDS = int(
+    os.environ.get("AP_POOL_RECYCLE_SECONDS", "300")
+)
 
 pg_host = os.environ["PGHOST"]
 pg_port = os.environ["PGPORT"]
@@ -296,11 +302,10 @@ uvicorn.run(app, host="0.0.0.0", port=PORT)
 
 **Token lifecycle:** The `do_connect` hook injects a fresh token on
 every new database connection. SQLAlchemy's connection pool creates
-new connections as needed. Connections should be recycled before the
-60-minute token expiry — set `pool_recycle=3000` (50 minutes) on
-the engine. This is configured in `db/utils.py`'s engine creation
-(needs a one-line change to set `pool_recycle` when the URI is
-PostgreSQL).
+new connections as needed. Connections must be recycled before the
+60-minute token expiry. The `app.py` template passes
+`pool_recycle` to `db/utils.py`'s engine creation — configurable
+via `AP_POOL_RECYCLE_SECONDS` (default 300s / 5 minutes).
 
 #### `requirements.txt`
 
@@ -330,15 +335,7 @@ psycopg[binary]>=3.1
 
 ## Open Questions
 
-1. **Engine `pool_recycle` for Lakebase.** Agent-plane's
-   `db/utils.py` creates engines without `pool_recycle`. For
-   Lakebase (60-minute token expiry), connections must recycle
-   before expiry. Needs a one-line change: pass
-   `pool_recycle=3000` when the URI is PostgreSQL. Alternatively,
-   `app.py` could monkey-patch the engine after creation, but
-   that's fragile.
-
-2. **Executor storage on UC Volumes.** The `_EXECUTOR_STORAGE_BASE`
+1. **Executor storage on UC Volumes.** The `_EXECUTOR_STORAGE_BASE`
    is currently `~/.agent-plane/executor_storage/` (local disk). On
    Databricks Apps, local disk is ephemeral. The artifact store
    snapshot (which uses UC Volumes) restores on server restart, so
@@ -346,7 +343,7 @@ psycopg[binary]>=3.1
    No change needed unless we want to eliminate the local disk
    dependency entirely.
 
-3. **DBOS system database.** DBOS creates its own `agent_plane.db`
+2. **DBOS system database.** DBOS creates its own `agent_plane.db`
    SQLite database for workflow state. On Databricks Apps, this
    needs to be either: (a) pointed at a Lakebase-compatible
    PostgreSQL URI, or (b) kept on ephemeral local disk (workflow
