@@ -154,9 +154,7 @@ def test_npm_install_and_use_package(
         f"The agent should complete after npm install and node run."
     )
 
-    assert _has_tool_call(body, "code_sandbox"), (
-        "Expected at least one code_sandbox tool call."
-    )
+    assert _has_tool_call(body, "code_sandbox"), "Expected at least one code_sandbox tool call."
 
     text = _extract_all_text(body)
     all_output = " ".join(

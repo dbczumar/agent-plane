@@ -1,4 +1,4 @@
-"""End-to-end test for code_sandbox package installation.
+"""End-to-end test for code_sandbox package installation and isolation.
 
 Requires ``--llm-api-key`` and a real server. Run with::
 
@@ -9,9 +9,13 @@ Exercises:
 - code_sandbox tool executing pip and npm install commands
 - Installed packages usable in subsequent code_sandbox calls
 - Package directories isolated to the conversation's workspace
+- Sandbox blocks reads of files outside the workspace
 """
 
 from __future__ import annotations
+
+import os
+import tempfile
 
 import httpx
 
@@ -212,3 +216,71 @@ def test_packages_isolated_across_conversations(
         f"Expected ModuleNotFoundError in conversation 2 (isolation), "
         f"got: {[i.get('output', '')[:100] for i in fco_items]}"
     )
+
+
+def test_sandbox_blocks_reads_outside_workspace(
+    http_client: httpx.Client,
+    archer_agent: str,
+) -> None:
+    """
+    The sandbox must block reading files outside the workspace.
+
+    Creates a sentinel file in /tmp with unique content, then asks
+    the agent to ``cat`` it. The sandbox's srt filesystem policy
+    should deny the read — the sentinel content must NOT appear in
+    the tool output.
+
+    **What breaks if wrong**:
+    - denyRead is empty: srt allows all reads, sentinel leaks
+    - allowRead too broad: reads outside workspace succeed
+    """
+    # Create a sentinel file outside any workspace.
+    sentinel = f"SANDBOX_LEAK_{os.getpid()}"
+    fd, sentinel_path = tempfile.mkstemp(
+        prefix="ap_sandbox_read_test_",
+        dir="/tmp",
+    )
+    try:
+        os.write(fd, sentinel.encode())
+        os.close(fd)
+
+        resp = http_client.post(
+            "/v1/responses",
+            json={
+                "model": archer_agent,
+                "input": (
+                    f"Use the code_sandbox tool to run this exact command: cat {sentinel_path}"
+                ),
+                "background": True,
+            },
+        )
+        resp.raise_for_status()
+        response_id = resp.json()["id"]
+        final = poll_until_terminal(
+            http_client,
+            response_id,
+            timeout=120,
+        )
+        assert final["status"] == "completed", f"Task failed: {final.get('error')}"
+
+        # Collect all tool outputs — the sentinel content must
+        # NOT appear. If it does, the sandbox failed to block the
+        # read.
+        fco_items = _get_output_items(final, "function_call_output")
+        all_tool_output = " ".join(i.get("output", "") for i in fco_items)
+
+        # The sentinel value must not appear in any tool output.
+        # If it does, the sandbox allowed reading /tmp — the bug
+        # we're testing for.
+        assert sentinel not in all_tool_output, (
+            f"SECURITY: sandbox allowed reading {sentinel_path} "
+            f"outside workspace. Tool output contained the "
+            f"sentinel '{sentinel}'. The srt denyRead policy is "
+            f"not blocking reads outside the workspace."
+        )
+    finally:
+        # Clean up sentinel file.
+        try:
+            os.unlink(sentinel_path)
+        except OSError:
+            pass

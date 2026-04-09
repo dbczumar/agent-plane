@@ -15,6 +15,7 @@ tools:
     - web_search_openai
     - code_sandbox
     - upload_file
+    - search_conversations
   agents:
     - fact_checker
     - summarizer

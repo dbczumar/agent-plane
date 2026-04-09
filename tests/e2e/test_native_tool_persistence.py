@@ -45,11 +45,7 @@ def _count_web_search_calls(body: dict[str, Any]) -> int:
     :param body: The terminal response body.
     :returns: Number of web_search_call items.
     """
-    return sum(
-        1
-        for item in body.get("output", [])
-        if item.get("type") == "web_search_call"
-    )
+    return sum(1 for item in body.get("output", []) if item.get("type") == "web_search_call")
 
 
 def test_web_search_results_not_repeated(
@@ -92,9 +88,7 @@ def test_web_search_results_not_repeated(
     response_id = resp.json()["id"]
 
     body = poll_until_terminal(http_client, response_id, timeout=120)
-    assert body["status"] == "completed", (
-        f"Task failed: {body.get('error')}"
-    )
+    assert body["status"] == "completed", f"Task failed: {body.get('error')}"
 
     text = _extract_all_text(body)
     assert len(text) > 30, f"Expected output, got: {text!r}"
@@ -135,7 +129,5 @@ def test_web_search_results_not_repeated(
 
     feedback = judge(outputs=text)
     assert feedback.value is True, (
-        f"LLM judge: star counts not found.\n"
-        f"Rationale: {feedback.rationale}\n"
-        f"Output: {text[:500]}"
+        f"LLM judge: star counts not found.\nRationale: {feedback.rationale}\nOutput: {text[:500]}"
     )

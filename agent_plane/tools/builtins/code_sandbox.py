@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -21,24 +22,98 @@ from agent_plane.tools.base import Tool, ToolContext
 
 # Cached srt settings file path — reused across invocations for
 # the same workspace to avoid creating a temp file per call.
-_srt_settings_cache: dict[str, str] = {}
+srt_settings_cache: dict[str, str] = {}
 
 
-def _write_srt_settings(workspace: Path) -> str:
+def system_read_allowlist() -> list[str]:
     """
-    Write an srt settings file that allows writes only to the workspace.
+    Derive the set of system directories that must remain readable
+    for shell commands to work inside the sandbox.
 
-    Cached per workspace path so repeated invocations reuse the
-    same file.
+    On macOS, ``denyRead: ["/"]`` blocks ALL ``file-read*``
+    syscalls (including PATH resolution for ``/usr/bin/cat``).
+    We need to explicitly re-allow system directories.
 
-    :param workspace: The workspace directory to allow writes to.
+    The list is built dynamically rather than hardcoded:
+
+    1. Walk ``$PATH`` (via :func:`os.get_exec_path`), resolve
+       each entry, discard anything under the user home tree,
+       and collect the top-level root directory (e.g.
+       ``/opt/homebrew/bin`` → ``/opt``).
+    2. Add ``/dev`` (device nodes), ``/private/etc`` (macOS
+       ``/etc`` symlink target), and ``/private/var/run``
+       (runtime sockets).
+
+    On Linux this is unused — srt's bubblewrap starts with
+    ``--ro-bind / /`` so system paths are already readable.
+
+    **Known limitation (macOS only):** This is best-effort.
+    macOS sandbox-exec has no equivalent of bubblewrap's
+    ``--ro-bind / /`` (read-only root mount), so there is no
+    way to allow all system paths without also enumerating
+    them. The allowlist covers everything reachable via
+    ``$PATH`` plus essential OS plumbing, but a tool that
+    reads from an unlisted system directory (e.g. a
+    non-standard ``/srv`` or ``/opt/custom``) will be denied.
+    Sensitive directories (user home, ``/tmp``,
+    ``/private/tmp``, ``/private/var/folders``) are
+    intentionally excluded.
+
+    :returns: Sorted list of top-level system directories,
+        e.g. ``["/Applications", "/System", "/bin", ...]``.
+    """
+    home_root = Path.home().parent
+    roots: set[str] = set()
+    for p in os.get_exec_path():
+        resolved = Path(p).resolve()
+        # Skip anything under the user home tree — that's the
+        # data we're trying to protect.
+        if resolved.is_relative_to(home_root):
+            continue
+        if resolved.exists() and len(resolved.parts) >= 2:
+            roots.add("/" + resolved.parts[1])
+    # /dev for device nodes (e.g. /dev/null, /dev/urandom).
+    # /private/etc is the real path behind the macOS /etc symlink.
+    # /private/var/run is needed for runtime sockets/daemons.
+    # NOT /private (contains /private/tmp) or /private/var
+    # (contains /private/var/folders, the per-user temp cache).
+    roots.update(["/dev", "/private/etc", "/private/var/run"])
+    return sorted(roots)
+
+
+def write_srt_settings(workspace: Path) -> str:
+    """
+    Write an srt settings file for sandbox read/write isolation.
+
+    Uses ``denyRead: ["/"]`` on all platforms to block reads from
+    the entire filesystem. On macOS, system directories needed
+    for shell command execution are re-allowed via
+    :func:`system_read_allowlist`. On Linux, srt's bubblewrap
+    handles this automatically (``--ro-bind / /``).
+
+    Cached per workspace path so repeated invocations reuse
+    the same file.
+
+    :param workspace: The workspace directory. Resolved to its
+        canonical path to handle macOS ``/var`` → ``/private/var``
+        symlinks.
     :returns: Path to the settings JSON file.
     """
     import tempfile
 
-    ws_str = str(workspace)
-    if ws_str in _srt_settings_cache:
-        return _srt_settings_cache[ws_str]
+    # Resolve symlinks so the allowRead/allowWrite paths
+    # match what srt sees on the real filesystem. On macOS,
+    # /var is a symlink to /private/var — without resolving,
+    # the workspace path won't match the deny rules.
+    resolved = str(workspace.resolve())
+    if resolved in srt_settings_cache:
+        return srt_settings_cache[resolved]
+
+    allow_read = [resolved]
+    if platform.system() == "Darwin":
+        # macOS sandbox-exec needs explicit read allowances for
+        # system paths; Linux bwrap doesn't (ro-bind root).
+        allow_read += system_read_allowlist()
 
     settings = {
         "network": {
@@ -51,15 +126,16 @@ def _write_srt_settings(workspace: Path) -> str:
             "deniedDomains": [],
         },
         "filesystem": {
-            "allowWrite": [ws_str],
-            "denyRead": [],
+            "allowWrite": [resolved],
+            "denyRead": ["/"],
+            "allowRead": allow_read,
             "denyWrite": [],
         },
     }
     fd, path = tempfile.mkstemp(suffix=".json", prefix="srt-ap-")
     with os.fdopen(fd, "w") as f:
         json.dump(settings, f)
-    _srt_settings_cache[ws_str] = path
+    srt_settings_cache[resolved] = path
     return path
 
 
@@ -201,16 +277,18 @@ class CodeSandboxTool(Tool):
         Build the subprocess command, optionally wrapping with srt.
 
         When srt is active, writes a temporary settings file that
-        allows writes to the workspace directory and ``/tmp``
-        (needed for bash heredocs).
+        denies reads outside the workspace and system directories.
 
         :param command: The shell command string.
         :param workspace: The workspace directory path.
         :returns: The command list for ``Popen``.
         """
         if self._srt_available and self._sandbox_enabled:
-            settings_path = _write_srt_settings(workspace)
+            settings_path = write_srt_settings(workspace)
+            # Resolve so TMPDIR matches the allowWrite path in
+            # srt settings (macOS /var → /private/var symlink).
+            resolved = workspace.resolve()
             # TMPDIR=workspace so bash heredocs stay in the sandbox.
-            wrapped = f"TMPDIR={workspace} {command}"
+            wrapped = f"TMPDIR={resolved} {command}"
             return ["srt", "--settings", settings_path, "-c", wrapped]
         return ["bash", "-c", command]
