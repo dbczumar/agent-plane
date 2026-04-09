@@ -82,17 +82,6 @@ try:
     logger.info("DB_URI: %s", DB_URI[:80])
     logger.info("ARTIFACT_URI: %s", ARTIFACT_URI)
 
-    # Pre-create the DBOS schema if it doesn't exist. DBOS's
-    # migration uses CREATE SCHEMA (without IF NOT EXISTS) which
-    # fails on a shared database where the schema already exists.
-    from sqlalchemy import create_engine, text
-
-    _engine = create_engine(DB_URI, pool_recycle=300)
-    with _engine.connect() as conn:
-        conn.execute(text('CREATE SCHEMA IF NOT EXISTS dbos'))
-        conn.commit()
-    _engine.dispose()
-
     agent_store = SqlAlchemyAgentStore(DB_URI)
     file_store = SqlAlchemyFileStore(DB_URI)
     task_store = SqlAlchemyTaskStore(DB_URI)

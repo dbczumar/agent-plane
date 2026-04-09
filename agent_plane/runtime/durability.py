@@ -25,6 +25,7 @@ _dbos_initialized = False
 _init_lock = threading.Lock()
 
 
+
 def ensure_dbos(
     uri: str,
     *,
@@ -58,18 +59,6 @@ def ensure_dbos(
         )
         if application_version is not None:
             config["application_version"] = application_version
-        # Pre-create the dbos schema if on PostgreSQL. DBOS's
-        # migration uses CREATE SCHEMA without IF NOT EXISTS,
-        # which fails on shared databases where the schema
-        # already exists from a previous deployment.
-        if "postgresql" in uri:
-            from sqlalchemy import create_engine, text
-
-            _engine = create_engine(uri)
-            with _engine.connect() as conn:
-                conn.execute(text("CREATE SCHEMA IF NOT EXISTS dbos"))
-                conn.commit()
-            _engine.dispose()
         DBOS(config=config)
         DBOS.launch()
         _dbos_initialized = True
