@@ -98,9 +98,10 @@ def test_pip_install_and_use_package(
         "The agent may not have used the sandbox tool."
     )
 
-    # Verify the agent attempted the install. The output should
-    # mention cowsay — either the ASCII art (success) or an install
-    # error (network restrictions). Both prove the sandbox ran.
+    # The cowsay ASCII art must appear in the output — proves the
+    # package was installed AND executed successfully. If pip fails
+    # (SSL, network, etc.), the test fails — that's a broken
+    # environment, not something to handle gracefully.
     text = _extract_all_text(body)
     all_output = " ".join(
         str(it.get("output", ""))
@@ -108,9 +109,10 @@ def test_pip_install_and_use_package(
         if it.get("type") == "function_call_output"
     )
     combined = (text + " " + all_output).lower()
-    assert "cowsay" in combined, (
-        f"Expected 'cowsay' in output (install success or error). "
-        f"Got: {combined[:500]}"
+    assert "hello from agent-plane" in combined, (
+        f"Expected cowsay ASCII art with 'hello from agent-plane' "
+        f"in output — proves pip install succeeded and the package "
+        f"ran. Got: {combined[:500]}"
     )
 
 
@@ -163,6 +165,8 @@ def test_npm_install_and_use_package(
         if it.get("type") == "function_call_output"
     )
     combined = (text + " " + all_output).lower()
-    assert "cowsay" in combined or "npm" in combined, (
-        f"Expected 'cowsay' or 'npm' in output. Got: {combined[:500]}"
+    assert "npm works" in combined, (
+        f"Expected cowsay output with 'npm works' — proves npm "
+        f"install succeeded and node ran the package. "
+        f"Got: {combined[:500]}"
     )
