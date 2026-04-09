@@ -817,7 +817,9 @@ class ChatApp(App[None]):
             resp = httpx.post(
                 f"{BASE_URL}/v1/responses",
                 json=body,
-                timeout=10.0,
+                # Server may be busy executing a long tool call
+                # (e.g. npm install) — use a generous timeout.
+                timeout=120.0,
             )
             resp.raise_for_status()
         except httpx.HTTPStatusError:
