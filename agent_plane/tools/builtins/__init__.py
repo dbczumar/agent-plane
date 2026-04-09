@@ -90,12 +90,27 @@ def _create_upload_file(config: dict[str, str]) -> Tool:
     return UploadFileTool()
 
 
+def _create_search_conversations(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for SearchConversationsTool.
+
+    :param config: Tool config (unused).
+    :returns: A SearchConversationsTool instance.
+    """
+    from agent_plane.tools.builtins.search_conversations import (
+        SearchConversationsTool,
+    )
+
+    return SearchConversationsTool()
+
+
 _BUILTIN_REGISTRY: dict[str, _BuiltinFactory] = {
     "web_search_openai": WebSearchOpenAITool,
     "web_search_google": WebSearchGoogleTool,
     "web_search_perplexity": WebSearchPerplexityTool,
     "code_sandbox": _create_code_sandbox,
     "upload_file": _create_upload_file,
+    "search_conversations": _create_search_conversations,
 }
 
 

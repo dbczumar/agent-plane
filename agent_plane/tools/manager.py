@@ -99,26 +99,11 @@ class ToolManager:
         self._loop_thread: EventLoopThread | None = None
         self._srt_available = shutil.which("srt") is not None
         self._uv_available = shutil.which("uv") is not None
-        self._register_search_tool()
         self._register_skill_tools()
         self._register_builtin_tools()
         self._register_sub_agent_tools()
         self._register_local_tools(workdir)
         self._register_client_tools(client_tool_specs or [])
-
-    def _register_search_tool(self) -> None:
-        """
-        Register the conversation search tool.
-
-        Always available — every agent benefits from being able
-        to recall information from past conversations.
-        """
-        from agent_plane.tools.builtins.search_conversations import (
-            SearchConversationsTool,
-        )
-
-        tool = SearchConversationsTool()
-        self._tools[tool.name()] = tool
 
     def _register_skill_tools(self) -> None:
         """
