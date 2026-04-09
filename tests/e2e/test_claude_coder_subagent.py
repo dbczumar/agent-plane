@@ -130,7 +130,8 @@ def test_claude_coder_spawns_reviewer(
     assert spawned, (
         "Expected spawn_sub_agents tool call in output. "
         "Claude may have reviewed directly instead of delegating. "
-        f"Tool calls found: {[i.get('name') for i in body.get('output', []) if i.get('type') == 'function_call']}"
+        f"Tool calls found: "
+        f"{[i.get('name') for i in body.get('output', []) if i.get('type') == 'function_call']}"
     )
 
     # Use LLM judge to verify the review quality.
