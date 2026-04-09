@@ -2007,102 +2007,9 @@ def _format_native_tool_label(
     return f"{display_name}"
 
 
-# ── Remote server authentication ──────────────────────
-
-
 # Auth headers for remote server connections. Set by
-# _authenticate_remote() and used by _run_sse_stream().
+# auth.authenticate() and used by _run_sse_stream().
 _REMOTE_AUTH_HEADERS: dict[str, str] = {}
-
-
-def _authenticate_remote(server_url: str) -> dict[str, str]:
-    """
-    Authenticate to a remote agent-plane server.
-
-    For Databricks Apps (detected by ``databricksapps.com`` in the
-    URL), performs a browser-based OAuth flow using the Databricks
-    SDK. The user's browser opens for consent, and the resulting
-    token is used for API calls.
-
-    For plain HTTP servers, returns empty headers (no auth needed).
-
-    :param server_url: The remote server URL, e.g.
-        ``"https://my-app.databricksapps.com"``.
-    :returns: HTTP headers dict with auth credentials.
-    """
-    global _REMOTE_AUTH_HEADERS
-
-    # Check if this is a Databricks App
-    if "databricksapps.com" not in server_url:
-        return {}
-
-    # Try a plain request first — if it works, no auth needed
-    try:
-        resp = httpx.get(f"{server_url}/health", timeout=10, follow_redirects=False)
-        if resp.status_code == 200:
-            return {}
-    except Exception:
-        pass
-
-    # Databricks App OAuth: browser-based U2M flow using the
-    # Databricks CLI's OAuth client (supports localhost redirect).
-    print("Authenticating to Databricks App...")
-    print("A browser window will open — please authorize access.\n")
-    try:
-        from databricks.sdk import WorkspaceClient
-        from databricks.sdk.oauth import OAuthClient, OidcEndpoints
-
-        wc = WorkspaceClient()
-        host = wc.config.host.rstrip("/")
-
-        # Discover OIDC endpoints
-        oidc_resp = httpx.get(
-            f"{host}/oidc/.well-known/openid-configuration",
-            timeout=10,
-        )
-        oidc_resp.raise_for_status()
-        oidc = oidc_resp.json()
-
-        # Use the Databricks CLI's registered OAuth client which
-        # supports localhost redirect + PKCE for U2M flows.
-        oauth = OAuthClient(
-            oidc_endpoints=OidcEndpoints(
-                authorization_endpoint=oidc["authorization_endpoint"],
-                token_endpoint=oidc["token_endpoint"],
-            ),
-            client_id="databricks-cli",
-            redirect_url="http://localhost:8020",
-            scopes=["all-apis"],
-        )
-
-        consent = oauth.initiate_consent()
-        creds = consent.launch_external_browser()
-        token = creds.token()
-        headers = {"Authorization": f"Bearer {token.access_token}"}
-
-        # Verify
-        resp = httpx.get(
-            f"{server_url}/health",
-            headers=headers,
-            timeout=10,
-            follow_redirects=False,
-        )
-        if resp.status_code == 200:
-            print("Authenticated successfully!\n")
-            _REMOTE_AUTH_HEADERS = headers
-            return headers
-        else:
-            print(f"Token rejected by app ({resp.status_code})")
-    except ImportError:
-        print("databricks-sdk not installed — can't authenticate")
-    except Exception as exc:
-        print(f"Authentication failed: {exc}")
-
-    print(
-        f"\nCould not authenticate to {server_url}"
-        "\nEnsure DATABRICKS_HOST is set to your workspace URL.\n"
-    )
-    sys.exit(1)
 
 
 # ── Entry point ───────────────────────────────────────
@@ -2168,7 +2075,10 @@ def main() -> None:
         # this does a browser-based OAuth flow and returns headers
         # with the session token. For plain HTTP servers, returns
         # empty headers.
-        auth_headers = _authenticate_remote(remote_server)
+        from auth import authenticate
+
+        auth_headers = authenticate(remote_server)
+        _REMOTE_AUTH_HEADERS.update(auth_headers)
 
         with httpx.Client(timeout=30, headers=auth_headers) as client:
             agents_resp = client.get(f"{BASE_URL}/api/agents")
