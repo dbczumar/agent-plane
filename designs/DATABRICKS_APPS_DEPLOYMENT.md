@@ -343,9 +343,9 @@ psycopg[binary]>=3.1
    No change needed unless we want to eliminate the local disk
    dependency entirely.
 
-2. **DBOS system database.** DBOS creates its own `agent_plane.db`
-   SQLite database for workflow state. On Databricks Apps, this
-   needs to be either: (a) pointed at a Lakebase-compatible
-   PostgreSQL URI, or (b) kept on ephemeral local disk (workflow
-   state is reconstructed on restart). DBOS supports PostgreSQL
-   natively — this just needs the right configuration.
+2. ~~**DBOS system database.**~~ *Resolved:* DBOS uses the same
+   database URI as agent-plane's stores — it creates its own
+   `dbos_`-prefixed tables in the shared database. No separate
+   database needed. When the Lakebase URI is passed to agent-plane,
+   DBOS automatically uses it too (via `ensure_dbos(storage_location)`
+   in `SqlAlchemyTaskStore.__init__`).
