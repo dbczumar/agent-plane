@@ -1455,8 +1455,14 @@ def _handle_sse(
     elif event_type == "response.output_item.done":
         live = _handle_item_done(app, scroll, live, data, acc)
 
-    elif event_type == "response.completed":
+    elif event_type in ("response.completed", "response.failed"):
         _extract_response_id(data, app)
+        # Mark streaming done as soon as the terminal event arrives
+        # — before the SSE stream fully closes. Without this, there
+        # is a window between the last visible text and the stream
+        # ending where user input routes to steering instead of a
+        # new turn.
+        app._streaming = False
 
     return live
 
