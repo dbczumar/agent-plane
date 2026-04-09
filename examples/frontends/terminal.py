@@ -622,6 +622,12 @@ class ChatApp(App[None]):
 
         try:
             await self._stream_loop(scroll, current_input)
+            # Mark streaming done immediately after the loop exits
+            # successfully — before the finally block's cleanup.
+            # Without this, there's a window between the last
+            # visible text update and the finally block where
+            # user input routes to steering instead of a new turn.
+            self._streaming = False
         except httpx.HTTPStatusError as exc:
             # Streaming responses must be read before accessing .text.
             try:
