@@ -280,10 +280,12 @@ def _parse_responses_output(
     """
     Convert Responses API output items to ``llms.types`` output objects.
 
-    Skips ``reasoning`` items. ``message`` and ``function_call``
-    items are parsed into typed objects. Provider-native tool items
-    (e.g. ``web_search_call``) are wrapped in :class:`NativeToolOutput`
-    and passed through as raw dicts.
+    ``message`` and ``function_call`` items are parsed into typed
+    objects. Provider-native tool items (e.g. ``web_search_call``)
+    and ``reasoning`` items are wrapped in :class:`NativeToolOutput`
+    and passed through as raw dicts. Reasoning items must be
+    preserved because OpenAI requires them when replaying
+    ``web_search_call`` items as input.
 
     :param output_items: List of output item dicts from the Responses
         API response, e.g. the ``response.output`` list.
@@ -309,7 +311,7 @@ def _parse_responses_output(
                     arguments=item["arguments"],
                 )
             )
-        elif item_type in NATIVE_TOOL_OUTPUT_TYPES:
+        elif item_type in NATIVE_TOOL_OUTPUT_TYPES or item_type == "reasoning":
             output.append(NativeToolOutput(data=item))
     return output
 
@@ -368,7 +370,9 @@ def _parse_responses_event(
             return ResponseReasoningStartedEvent()
     if event_type == "response.output_item.done":
         item = data.get("item", {})
-        if item.get("type") in NATIVE_TOOL_OUTPUT_TYPES:
+        # Include reasoning items alongside native tool items — OpenAI
+        # requires them when replaying web_search_call as input.
+        if item.get("type") in NATIVE_TOOL_OUTPUT_TYPES or item.get("type") == "reasoning":
             return NativeToolOutputAddedEvent(item=item)
     if event_type == "response.completed":
         return ResponseCompletedEvent(response=_parse_responses_response(data["response"]))

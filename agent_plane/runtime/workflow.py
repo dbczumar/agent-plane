@@ -1484,6 +1484,21 @@ def _emit_and_persist_native_tool_items(
     if not native_items:
         return None
 
+    # Deduplicate by item ID — OpenAI can return the same
+    # web_search_call multiple times (e.g. when the model
+    # issues the same query twice). The Responses API rejects
+    # duplicate IDs in input items with a 400 error.
+    seen_ids: set[str] = set()
+    unique_items: list[dict[str, Any]] = []
+    for item in native_items:
+        item_id = item.get("id")
+        if item_id and item_id in seen_ids:
+            continue
+        if item_id:
+            seen_ids.add(item_id)
+        unique_items.append(item)
+    native_items = unique_items
+
     new_items: list[NewConversationItem] = []
     for item_dict in native_items:
         output_items.append(item_dict)
@@ -2050,13 +2065,29 @@ async def _handle_tool_calls(
         the client-side path.
     """
     tool_calls = _get_tool_calls(llm_resp)
+
+    # Persist an assistant message before function_call items so
+    # the Responses API sees a valid turn structure. Without this,
+    # native tool items (web_search_call) followed by function_calls
+    # are rejected with 400 — the API requires an assistant message
+    # between native tool results and function calls.
+    assistant_text = llm_resp.get("text") or ""
+    assistant_msg = NewConversationItem(
+        type="message",
+        response_id=task_id,
+        data=MessageData(
+            role="assistant",
+            content=[{"type": "output_text", "text": assistant_text}],
+            agent=agent_name,
+        ),
+    )
     fc_new_items = _build_function_call_items(task_id, agent_name, tool_calls)
 
     fc_items = _persist_and_stream(
         task_id,
         conv_store,
         conversation_id,
-        fc_new_items,
+        [assistant_msg] + fc_new_items,
         output_items,
     )
     history.extend(fc_items)
