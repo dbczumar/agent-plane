@@ -170,6 +170,87 @@ Works with DefaultExecutor, any model, existing file store.
 
 ---
 
+## Package Installation (pip / npm)
+
+Agents can install packages inside the sandbox. The workspace env
+vars redirect installs to local directories so packages stay inside
+the workspace and persist across turns.
+
+### How it works
+
+```
+code_sandbox(command="pip install pandas")
+      |
+      v
+srt --settings {settings.json} -c "TMPDIR={workspace} pip install pandas"
+      |
+      +-- srt network: pypi.org in allowedDomains -> allowed
+      +-- srt filesystem: workspace in allowWrite -> allowed
+      |
+      v
+pip installs to workspace (not system site-packages):
+  PIP_TARGET={workspace}/.pip           <- packages go here
+  PIP_CACHE_DIR={workspace}/.cache/pip  <- download cache
+  PYTHONPATH={workspace}/.pip           <- python finds them
+```
+
+Next turn, `import pandas` just works — `.pip/` is still there and
+`PYTHONPATH` is set on every invocation.
+
+### Environment variables set by code_sandbox
+
+| Variable | Value | Purpose |
+|----------|-------|---------|
+| `PIP_TARGET` | `{workspace}/.pip` | pip installs packages here |
+| `PIP_CACHE_DIR` | `{workspace}/.cache/pip` | pip download cache |
+| `PYTHONPATH` | `{workspace}/.pip` | Python import path |
+| `NODE_PATH` | `{workspace}/node_modules` | Node.js require path |
+| `npm_config_prefix` | `{workspace}` | npm installs here |
+| `npm_config_cache` | `{workspace}/.cache/npm` | npm download cache |
+| `TMPDIR` | `{workspace}` | Temp files (bash heredocs, etc.) |
+
+### Workspace layout after installs
+
+```
+workspace/
+  .pip/                     <- pip packages (pandas, numpy, etc.)
+  .cache/
+    pip/                    <- pip download cache
+    npm/                    <- npm download cache
+  node_modules/             <- npm packages
+  .claude/                  <- SDK state
+  analysis.py               <- agent's script
+  output/chart.png          <- generated output
+```
+
+### srt network allowlist
+
+The srt settings allow only package registries:
+
+```json
+{
+  "network": {
+    "allowedDomains": [
+      "pypi.org",
+      "files.pythonhosted.org",
+      "registry.npmjs.org"
+    ]
+  }
+}
+```
+
+All other network access is blocked. The agent can install packages
+but cannot exfiltrate data to arbitrary hosts.
+
+### Persistence
+
+Installed packages persist because the workspace is snapshotted to
+the artifact store after each task. On the next turn (or after a
+server restart), the workspace is restored with `.pip/` and
+`node_modules/` intact — no re-install needed.
+
+---
+
 ## Integration with Sandboxed Tool Execution
 
 See `designs/SANDBOXED_TOOL_EXECUTION.md` for the full sandbox design.
