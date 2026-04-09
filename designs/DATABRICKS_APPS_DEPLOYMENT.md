@@ -333,15 +333,15 @@ psycopg[binary]>=3.1
 
 ---
 
-## Open Questions
+## Resolved Questions
 
-1. **Executor storage on UC Volumes.** The `_EXECUTOR_STORAGE_BASE`
-   is currently `~/.agent-plane/executor_storage/` (local disk). On
-   Databricks Apps, local disk is ephemeral. The artifact store
-   snapshot (which uses UC Volumes) restores on server restart, so
-   ephemeral local storage + artifact backup should be sufficient.
-   No change needed unless we want to eliminate the local disk
-   dependency entirely.
+1. ~~**Executor storage on UC Volumes.**~~ *Resolved:* The workflow
+   already restores from the artifact store before each task
+   (`_get_or_restore_executor_storage`) and snapshots back after
+   (`_persist_executor_storage`). On Databricks Apps, the artifact
+   store is UC Volumes. Local disk is ephemeral but that's fine —
+   after a restart, the first task for each conversation restores
+   from UC Volumes automatically. No changes needed.
 
 2. ~~**DBOS system database.**~~ *Resolved:* DBOS uses the same
    database URI as agent-plane's stores — it creates its own
@@ -349,3 +349,8 @@ psycopg[binary]>=3.1
    database needed. When the Lakebase URI is passed to agent-plane,
    DBOS automatically uses it too (via `ensure_dbos(storage_location)`
    in `SqlAlchemyTaskStore.__init__`).
+
+3. ~~**Engine hook for Lakebase tokens.**~~ *Resolved:* Class-level
+   `event.listens_for(Engine, "do_connect")` registered before
+   importing agent-plane. Fires for all engines. Requires in-process
+   startup. Verified in Python.
