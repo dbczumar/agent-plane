@@ -1556,6 +1556,8 @@ def _handle_item_done(
     if item_type == "message":
         if live is not None:
             _finalize_message(scroll, live, item, acc)
+        # Download files referenced by file_citation annotations.
+        _download_annotated_files(scroll, item)
         # Reset live to None — a fresh widget will be created
         # lazily by _ensure_live if a follow-up message starts
         # (e.g. from steering). This avoids a visible flash of
@@ -1581,7 +1583,6 @@ def _handle_item_done(
                 acc.pending_tool_calls.append(item)
     elif item_type == "function_call_output":
         _mount_tool_result(scroll, item)
-        _maybe_download_file(scroll, item)
         # Track server-side completions so we can filter them
         # out of pending_tool_calls after the stream ends.
         call_id = item.get("call_id", "")
@@ -1869,35 +1870,55 @@ def _mount_tool_result(
     scroll.scroll_end()
 
 
-def _maybe_download_file(
+def _download_annotated_files(
     scroll: VerticalScroll,
     item: dict[str, object],
 ) -> None:
     """
-    If a tool result contains a ``file_id``, download the file
-    and open it with the system viewer.
+    Download files referenced by ``file_citation`` annotations on
+    a message's ``output_text`` blocks.
 
-    Parses the tool output as JSON. If it has a ``file_id`` key,
-    downloads via ``GET /v1/files/{id}/content``, saves to
-    ``./downloads/``, and opens with ``open`` (macOS) or
-    ``xdg-open`` (Linux).
+    For each annotation with a ``file_id``, downloads via
+    ``GET /v1/files/{id}/content``, saves to ``./downloads/``,
+    and opens with the system viewer.
 
     :param scroll: The scrollable container for status messages.
-    :param item: The function_call_output item dict.
+    :param item: A ``message`` output item dict.
     """
-    raw = item.get("output")
-    if not isinstance(raw, str):
+    content = item.get("content")
+    if not isinstance(content, list):
         return
-    try:
-        parsed = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return
-    file_id = parsed.get("file_id")
-    filename = parsed.get("filename", "download")
-    if not file_id:
-        return
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        annotations = block.get("annotations")
+        if not isinstance(annotations, list):
+            continue
+        for ann in annotations:
+            if not isinstance(ann, dict):
+                continue
+            if ann.get("type") != "file_citation":
+                continue
+            file_id = ann.get("file_id")
+            filename = ann.get("filename", "download")
+            if not file_id:
+                continue
+            _download_single_file(scroll, file_id, filename)
 
-    # Download the file
+
+def _download_single_file(
+    scroll: VerticalScroll,
+    file_id: str,
+    filename: str,
+) -> None:
+    """
+    Download a single file by ID, save it, and open with the
+    system viewer.
+
+    :param scroll: The scrollable container for status messages.
+    :param file_id: The file store ID, e.g. ``"file_abc123"``.
+    :param filename: The display filename, e.g. ``"chart.png"``.
+    """
     try:
         resp = httpx.get(
             f"{BASE_URL}/v1/files/{file_id}/content",
@@ -1914,7 +1935,6 @@ def _maybe_download_file(
         )
         return
 
-    # Save to ./downloads/
     downloads = pathlib.Path("downloads")
     downloads.mkdir(exist_ok=True)
     dest = downloads / filename
@@ -1928,7 +1948,6 @@ def _maybe_download_file(
     )
     scroll.scroll_end()
 
-    # Open with system viewer
     import platform
     import subprocess as _sp
 

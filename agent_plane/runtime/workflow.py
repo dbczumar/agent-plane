@@ -1661,6 +1661,54 @@ def _persist_and_stream(
     return persisted
 
 
+def _collect_file_annotations(
+    output_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Extract ``file_citation`` annotations from ``upload_file`` tool results.
+
+    Scans the output items for ``function_call`` / ``function_call_output``
+    pairs where the tool is ``upload_file``. Parses the output JSON to
+    build ``file_citation`` annotation dicts.
+
+    :param output_items: The accumulated API-format output item list.
+    :returns: A list of ``file_citation`` annotation dicts, empty if
+        no file uploads were found.
+    """
+    # Build call_id → tool_name lookup.
+    call_names: dict[str, str] = {}
+    for item in output_items:
+        if item.get("type") == "function_call":
+            call_names[item.get("call_id", "")] = item.get("name", "")
+
+    annotations: list[dict[str, Any]] = []
+    for item in output_items:
+        if item.get("type") != "function_call_output":
+            continue
+        call_id = item.get("call_id", "")
+        if call_names.get(call_id) != "upload_file":
+            continue
+        raw = item.get("output", "")
+        if not isinstance(raw, str):
+            continue
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        file_id = parsed.get("file_id")
+        if not file_id:
+            continue
+        annotations.append(
+            {
+                "type": "file_citation",
+                "file_id": file_id,
+                "filename": parsed.get("filename", ""),
+                "content_type": parsed.get("content_type", ""),
+            }
+        )
+    return annotations
+
+
 def _build_assistant_item(
     task_id: str,
     agent_name: str,
@@ -1750,7 +1798,13 @@ def _handle_final_response(
     # message must exist in the conversation regardless of
     # whether late steering messages arrived.
     text = _get_text_content(llm_resp)
-    item = _build_assistant_item(task_id, agent_name, text)
+    file_annotations = _collect_file_annotations(output_items)
+    item = _build_assistant_item(
+        task_id,
+        agent_name,
+        text,
+        annotations=file_annotations or None,
+    )
     persisted = _persist_and_stream(
         task_id,
         conv_store,
@@ -2199,7 +2253,13 @@ async def _persist_text_before_auto_collect(
     :returns: An :class:`_AutoCollectResult` from auto-collect.
     """
     text = _get_text_content(llm_resp)
-    item = _build_assistant_item(task_id, agent_name, text)
+    file_annotations = _collect_file_annotations(output_items)
+    item = _build_assistant_item(
+        task_id,
+        agent_name,
+        text,
+        annotations=file_annotations or None,
+    )
     persisted = _persist_and_stream(
         task_id,
         conv_store,
