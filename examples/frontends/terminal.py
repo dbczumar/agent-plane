@@ -564,7 +564,11 @@ class ChatApp(App[None]):
 
         scroll = self.query_one("#chat-scroll", VerticalScroll)
 
-        if self._streaming and self._current_response_id is not None:
+        # Check if a stream worker is actively running. Use the
+        # Textual workers list as the authoritative source — the
+        # _streaming flag can be stale due to async timing.
+        has_active_stream = any(not w.is_finished for w in self.workers if w.group == "stream")
+        if has_active_stream and self._current_response_id is not None:
             self._send_steering(text)
             scroll.mount(
                 UserMessage(
@@ -889,7 +893,8 @@ class ChatApp(App[None]):
         in-progress response via the cancel API. Otherwise,
         toggle between input mode and browse mode.
         """
-        if self._streaming and self._current_response_id is not None:
+        has_active_stream = any(not w.is_finished for w in self.workers if w.group == "stream")
+        if has_active_stream and self._current_response_id is not None:
             self._cancel_response()
             return
 
