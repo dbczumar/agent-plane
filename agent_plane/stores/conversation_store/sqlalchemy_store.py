@@ -203,20 +203,42 @@ class SqlAlchemyConversationStore(ConversationStore):
             objects in relevance order.
         """
         with self._session() as session:
-            stmt = text(
-                "SELECT item_id FROM conversation_items_fts "
-                "WHERE search_text MATCH :query "
-                "ORDER BY rank "
-                "LIMIT :limit"
-            )
+            is_sqlite = self._engine.dialect.name == "sqlite"
+            if is_sqlite:
+                # SQLite FTS5: MATCH syntax with rank ordering.
+                if conversation_id is not None:
+                    stmt = text(
+                        "SELECT item_id FROM conversation_items_fts "
+                        "WHERE conversation_id = :cid "
+                        "AND search_text MATCH :query "
+                        "ORDER BY rank LIMIT :limit"
+                    )
+                else:
+                    stmt = text(
+                        "SELECT item_id FROM conversation_items_fts "
+                        "WHERE search_text MATCH :query "
+                        "ORDER BY rank LIMIT :limit"
+                    )
+            else:
+                # PostgreSQL: ILIKE fallback (no FTS5 virtual table).
+                # Full tsvector/tsquery indexing can be added later.
+                like_pattern = f"%{query}%"
+                if conversation_id is not None:
+                    stmt = text(
+                        "SELECT ci.id FROM conversation_items ci "
+                        "WHERE ci.conversation_id = :cid "
+                        "AND ci.data::text ILIKE :query "
+                        "ORDER BY ci.created_at DESC LIMIT :limit"
+                    )
+                else:
+                    stmt = text(
+                        "SELECT ci.id FROM conversation_items ci "
+                        "WHERE ci.data::text ILIKE :query "
+                        "ORDER BY ci.created_at DESC LIMIT :limit"
+                    )
+                query = like_pattern
             params: dict[str, str | int] = {"query": query, "limit": limit}
             if conversation_id is not None:
-                stmt = text(
-                    "SELECT item_id FROM conversation_items_fts "
-                    "WHERE conversation_id = :cid AND search_text MATCH :query "
-                    "ORDER BY rank "
-                    "LIMIT :limit"
-                )
                 params["cid"] = conversation_id
             item_ids = [row[0] for row in session.execute(stmt, params).fetchall()]
             if not item_ids:
