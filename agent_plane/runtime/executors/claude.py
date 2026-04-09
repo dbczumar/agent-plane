@@ -771,11 +771,10 @@ def _build_sdk_options(
 
     model = executor._model or llm_config.model
 
-    # Enable project setting sources so the SDK discovers skills
-    # from .claude/skills/ (written by on_task_start).
-    setting_sources: list[str] | None = None
-    if executor._skills:
-        setting_sources = ["project"]
+    # Always enable project setting sources so the SDK discovers:
+    # - skills from .claude/skills/ (written by on_task_start)
+    # - sandbox filesystem restrictions from .claude/settings.json
+    setting_sources: list[str] = ["project"]
 
     base_tools = list(executor._allowed_tools)
     if executor._skills:
@@ -803,7 +802,15 @@ def _build_sdk_options(
         sandbox=sdk.SandboxSettings(
             enabled=True,
             autoAllowBashIfSandboxed=True,
+            allowUnsandboxedCommands=False,
         ),
+        # NOTE: The SDK sandbox restricts WRITES to cwd but allows
+        # READS from the entire filesystem by default. Read
+        # restrictions (denyRead) can only be set via user-level or
+        # managed settings (~/.claude/settings.json), not
+        # project-level or programmatic settings. Operators who need
+        # read isolation should configure denyRead in their
+        # deployment's ~/.claude/settings.json.
     )
 
     cli_path = shutil.which("claude")
