@@ -1671,16 +1671,21 @@ def _collect_file_annotations(
     call_names: dict[str, str] = {}
     for item in output_items:
         if item.get("type") == "function_call":
-            call_names[item.get("call_id", "")] = item.get("name", "")
+            cid = item.get("call_id")
+            nm = item.get("name")
+            if cid is not None and nm is not None:
+                call_names[cid] = nm
 
     annotations: list[dict[str, Any]] = []
     for item in output_items:
         if item.get("type") != "function_call_output":
             continue
-        call_id = item.get("call_id", "")
+        call_id = item.get("call_id")
+        if call_id is None:
+            continue
         if call_names.get(call_id) != "upload_file":
             continue
-        raw = item.get("output", "")
+        raw = item.get("output")
         if not isinstance(raw, str):
             continue
         try:
@@ -1694,8 +1699,10 @@ def _collect_file_annotations(
             {
                 "type": "file_citation",
                 "file_id": file_id,
-                "filename": parsed.get("filename", ""),
-                "content_type": parsed.get("content_type", ""),
+                # Optional metadata — None when not provided
+                # by the upload_file tool result.
+                "filename": parsed.get("filename"),
+                "content_type": parsed.get("content_type"),
             }
         )
     return annotations
@@ -1718,15 +1725,17 @@ def _emit_file_annotations(
         ``_collect_file_annotations``.
     """
     for ann in annotations:
-        _write_output(
-            task_id,
-            {
-                "type": "response.output_file.done",
-                "file_id": ann.get("file_id", ""),
-                "filename": ann.get("filename", ""),
-                "content_type": ann.get("content_type", ""),
-            },
-        )
+        event: dict[str, Any] = {
+            "type": "response.output_file.done",
+            "file_id": ann["file_id"],
+        }
+        # Optional metadata — only include if present in the
+        # annotation (set by _collect_file_annotations).
+        if ann.get("filename") is not None:
+            event["filename"] = ann["filename"]
+        if ann.get("content_type") is not None:
+            event["content_type"] = ann["content_type"]
+        _write_output(task_id, event)
 
 
 def _build_assistant_item(
@@ -2577,13 +2586,13 @@ async def _park_for_client_tools(
     # 1. Register pending tool calls so the PATCH endpoint
     #    can route results back to this sub-agent.
     for call_id in client_call_ids:
-        fc = fc_by_call_id.get(call_id, {})
+        fc = fc_by_call_id[call_id]
         task_store.create_pending_tool_call(
             call_id=call_id,
             root_task_id=root_task_id,
             task_id=task_id,
-            tool_name=str(fc.get("name", "")),
-            arguments=str(fc.get("arguments", "{}")),
+            tool_name=fc["name"],
+            arguments=fc["arguments"],
         )
 
     # 2. Publish function_call items to the root task's SSE
@@ -2612,14 +2621,16 @@ async def _park_for_client_tools(
 
     fco_new_items: list[NewConversationItem] = []
     for call_id in client_call_ids:
-        result = results_by_call_id.get(call_id, "")
+        result = results_by_call_id.get(call_id)
+        if result is None:
+            raise ValueError(f"Pending tool call {call_id} completed but has no result in store")
         fco_new_items.append(
             NewConversationItem(
                 type="function_call_output",
                 response_id=task_id,
                 data=FunctionCallOutputData(
                     call_id=call_id,
-                    output=result or "",
+                    output=result,
                 ),
             ),
         )

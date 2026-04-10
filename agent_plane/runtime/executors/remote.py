@@ -191,8 +191,7 @@ def _extract_new_messages(
     # Walk backwards to find the last assistant message boundary.
     new: list[dict[str, Any]] = []
     for msg in reversed(messages):
-        role = msg.get("role", "")
-        if role == "assistant":
+        if msg.get("role") == "assistant":
             break
         new.append(msg)
     new.reverse()
@@ -232,15 +231,17 @@ async def _consume_remote_sse_stream(
         if not line.startswith("data: "):
             continue
         payload = json.loads(line[6:])
-        evt_type = payload.get("type", "")
+        evt_type = payload.get("type")
 
         if evt_type == "text_chunk":
             yield TextChunk(text=payload["text"])
 
         elif evt_type == "reasoning_chunk":
+            # delta and event_type are required by the remote
+            # executor SSE protocol — fail loud if missing.
             yield ReasoningChunk(
-                delta=payload.get("delta", ""),
-                event_type=payload.get("event_type", "reasoning_text"),
+                delta=payload["delta"],
+                event_type=payload["event_type"],
             )
 
         elif evt_type == "tool_call_requested":
