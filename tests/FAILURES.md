@@ -58,27 +58,32 @@ Use the runtime `sandbox_enabled` parameter instead.
 
 **Fix:** Await the callback in an async context or use `asyncio.run()`.
 
-## Root Cause 8: Durability tests hit real OpenAI API (3 failures)
+## Root Causes 8/9: DBOS async workflow + mock LLM interaction (6 remaining failures)
 
 - `test_durability.py::test_workflow_recovers_after_server_restart`
 - `test_durability.py::test_incomplete_step_reexecutes_after_crash`
 - `test_durability.py::test_steered_messages_survive_crash`
 
-Mock LLM client injection broken by async refactor. Workflow reaches real
-OpenAI API → 401 → DBOS can't pickle `HTTPStatusError`.
+The mock LLM client is correctly patched in both `workflow._get_llm_client`
+and `executors.default._get_llm_client`. The mock's `create()` is async
+and returns proper async generators. But when DBOS runs the async workflow
+via `_execute_workflow_async`, the mock's async generator encounters
+`object list_iterator can't be used in 'await' expression` — suggesting
+DBOS's internal async scheduling doesn't fully support async generators
+returned from mocked coroutines.
 
-**Fix:** Fix mock LLM injection for the async workflow path.
+The durability tests additionally hit DBOS lifecycle errors (`No DBOS was
+created yet`) when destroying and recreating DBOS between crash simulations.
 
-## Root Cause 9: Task store tests hit real API (3 failures)
-
-- `test_task_store.py::test_start_and_get_completed`
-- `test_task_store.py::test_wait_returns_completed_task`
+- `test_durability.py::test_workflow_recovers_after_server_restart`
+- `test_durability.py::test_incomplete_step_reexecutes_after_crash`
+- `test_durability.py::test_steered_messages_survive_crash`
 - `test_task_store.py::test_stream_closed_on_workflow_exception`
 - `test_task_store.py::test_persist_first_prevents_ghost_tokens`
 
-Same as Root Cause 8 — mock LLM not intercepted.
-
-**Fix:** Same as Root Cause 8.
+**Fix:** Needs investigation of DBOS async workflow thread pool interaction
+with mock async generators. May require the mock to return a different
+async iterable type, or DBOS configuration changes.
 
 ## Root Cause 10: MCP schema normalization changed (2 failures)
 
