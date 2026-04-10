@@ -6,7 +6,7 @@ import asyncio
 import io
 import tarfile
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -593,7 +593,14 @@ def _make_streaming_client_with_steering(
     """
     call_count = 0
 
-    def _fake_responses_create(**kwargs: Any) -> list[MagicMock]:
+    async def _fake_responses_create(**kwargs: Any) -> Any:
+        """
+        Async mock create that injects a steering message on
+        the first call and returns an async generator of events.
+
+        :param kwargs: Responses API kwargs (captured but unused).
+        :returns: An async generator yielding one completed event.
+        """
         nonlocal call_count
         call_count += 1
 
@@ -626,10 +633,15 @@ def _make_streaming_client_with_steering(
         else:
             text = "Follow-up addressing steering"
 
-        return iter([_make_completed_event(text)])
+        async def _aiter() -> Any:
+            yield _make_completed_event(text)
+
+        if kwargs.get("stream"):
+            return _aiter()
+        return _make_completed_event(text).response
 
     mock_client = MagicMock()
-    mock_client.responses.create.side_effect = _fake_responses_create
+    mock_client.responses.create = AsyncMock(side_effect=_fake_responses_create)
     return mock_client
 
 

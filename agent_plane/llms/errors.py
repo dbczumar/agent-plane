@@ -48,7 +48,7 @@ class RetryableLLMError(AgentPlaneError):
         self,
         message: str,
         *,
-        code: str,
+        code: str = "unknown",
         detail: LLMErrorDetail | None = None,
     ) -> None:
         super().__init__(message, code=code)
@@ -73,7 +73,7 @@ class PermanentLLMError(AgentPlaneError):
         self,
         message: str,
         *,
-        code: str,
+        code: str = "unknown",
         detail: LLMErrorDetail | None = None,
     ) -> None:
         super().__init__(message, code=code)
