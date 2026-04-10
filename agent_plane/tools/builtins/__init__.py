@@ -104,12 +104,38 @@ def _create_search_conversations(config: dict[str, str]) -> Tool:
     return SearchConversationsTool()
 
 
+def _create_list_files(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for ListFilesTool.
+
+    :param config: Tool config (unused).
+    :returns: A ListFilesTool instance.
+    """
+    from agent_plane.tools.builtins.list_files import ListFilesTool
+
+    return ListFilesTool()
+
+
+def _create_download_file(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for DownloadFileTool.
+
+    :param config: Tool config (unused).
+    :returns: A DownloadFileTool instance.
+    """
+    from agent_plane.tools.builtins.download_file import DownloadFileTool
+
+    return DownloadFileTool()
+
+
 _BUILTIN_REGISTRY: dict[str, _BuiltinFactory] = {
     "web_search_openai": WebSearchOpenAITool,
     "web_search_google": WebSearchGoogleTool,
     "web_search_perplexity": WebSearchPerplexityTool,
     "code_sandbox": _create_code_sandbox,
     "upload_file": _create_upload_file,
+    "list_files": _create_list_files,
+    "download_file": _create_download_file,
     "search_conversations": _create_search_conversations,
 }
 
