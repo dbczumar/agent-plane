@@ -310,36 +310,55 @@ Validator rejects `tools.builtins` and `instructions` when
 
 ## Dependencies
 
-### Level 1: Pre-installed (v1)
+Dependencies are resolved at **worker startup** using `uv run`, not
+at deploy time. This is the same pattern used for local Python tools
+with PEP 723 inline metadata.
 
-Packages must be on the server. Document it.
+### How it works
 
-### Level 2: `requirements.txt` in bundle
+When the worker subprocess starts, agent-plane wraps the launch
+command with `uv run`:
 
-Agent-plane runs `pip install -r requirements.txt --target {agent_deps_dir}`
-at deploy time. The worker subprocess's `sys.path` includes
-`{agent_deps_dir}`. Isolated per-agent — no version conflicts.
+```bash
+# With requirements.txt:
+uv run --requirements {agent_dir}/requirements.txt \
+  -- python -m agent_plane.runtime.sdk_worker {agent_dir} --port {port}
 
-### Level 3: PEP 723 inline metadata
-
-The entrypoint declares deps inline:
-
-```python
-# /// script
-# dependencies = ["my-vector-db>=2.0", "langchain>=0.3"]
-# ///
+# With PEP 723 inline metadata:
+uv run --with my-vector-db --with langchain \
+  -- python -m agent_plane.runtime.sdk_worker {agent_dir} --port {port}
 ```
 
-Agent-plane parses PEP 723 metadata (same as local Python tools)
-and installs via `uv run --with`. Uses `uv` if available,
-falls back to pip.
+`uv` creates an ephemeral virtual environment, installs deps, and
+runs the worker inside it. The venv is cached by `uv` keyed on the
+exact dependency set — second startup is near-instant.
 
-### Why subprocess isolation enables Levels 2 and 3
+### Where deps go
 
-Per-agent deps installed into separate directories. Each worker
-subprocess has its own `sys.path` pointing at its agent's deps.
-No version conflicts between agents, no module leaking through
-`sys.modules` in the server process.
+Into `uv`'s global cache (`~/.cache/uv/` by default). NOT into
+the workspace or storage_dir. The cache is shared across all
+conversations for the same agent (same deps = same cached venv).
+
+No explicit per-agent directory to manage, no cleanup needed — `uv`
+handles cache lifecycle.
+
+### Supported formats
+
+| Format | Detection | Launch command |
+|--------|-----------|----------------|
+| `requirements.txt` in bundle | File exists | `uv run --requirements requirements.txt -- ...` |
+| PEP 723 inline metadata in entrypoint | `# /// script` block | `uv run --with dep1 --with dep2 -- ...` |
+| No deps declared | Neither present | `python -m agent_plane.runtime.sdk_worker ...` (no uv) |
+
+### Why this works
+
+- **No deploy-time step**: Deps resolve on first worker startup
+- **Cached**: `uv` caches aggressively — subsequent starts are fast
+- **Isolated**: Each worker runs in its own `uv`-managed venv —
+  no version conflicts between agents
+- **Consistent**: Same `uv run` pattern used for local Python tools
+- **Fallback**: If `uv` is not available, the worker starts without
+  dep resolution (pre-installed packages only)
 
 ---
 
@@ -348,11 +367,14 @@ No version conflicts between agents, no module leaking through
 ### Startup
 
 1. Agent-plane finds a free port
-2. Spawns: `python -m agent_plane.runtime.sdk_worker {agent_dir} --port {port}`
-3. Worker imports `agent.py`, calls `create_options()`
-4. Extracts `options.agents` → reports sub-agent defs to agent-plane
-5. Starts HTTP server on `localhost:{port}`
-6. Agent-plane creates `RemoteExecutor(endpoint=...)`
+2. Detects deps: `requirements.txt` in bundle or PEP 723 in entrypoint
+3. Spawns worker:
+   - With deps: `uv run --requirements ... -- python -m agent_plane.runtime.sdk_worker {agent_dir} --port {port}`
+   - Without deps: `python -m agent_plane.runtime.sdk_worker {agent_dir} --port {port}`
+4. Worker imports `agent.py`, calls `create_options()`
+5. Extracts `options.agents` → reports sub-agent defs to agent-plane
+6. Starts HTTP server on `localhost:{port}`
+7. Agent-plane creates `RemoteExecutor(endpoint=...)`
 
 ### Per-turn
 
