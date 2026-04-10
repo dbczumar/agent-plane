@@ -215,7 +215,9 @@ def _make_function_tool(
 
     func_spec = schema["function"]
     name = func_spec["name"]
-    desc = func_spec.get("description", "")
+    # description is optional in the OpenAI tool schema spec.
+    # Empty string is the correct default — the SDK accepts it.
+    desc = func_spec.get("description") or ""
     params_schema = func_spec.get(
         "parameters",
         {"type": "object", "properties": {}},
@@ -465,10 +467,8 @@ class AgentsSdkExecutor(Executor):
         Run one SDK turn as an async generator.
 
         Builds an ``Agent`` with function tools, calls
-        ``Runner.run_streamed()``, and yields executor events
-        from the SDK's streaming response. No queue bridge
-        needed — the SDK is async-native and runs in the
-        caller's event loop.
+        ``Runner.run_streamed()``, and yields executor events.
+        No queue bridge needed — the SDK is async-native.
 
         :param messages: Conversation history as Responses API
             input items.
@@ -477,53 +477,97 @@ class AgentsSdkExecutor(Executor):
         :param system_prompt: Assembled system instructions.
         :param llm_config: LLM configuration (model, extra,
             connection, timeout, retry).
-        :param context: Agent-plane capabilities and identifiers.
+        :param context: Agent-plane capabilities and
+            identifiers.
         """
-        sdk = _ensure_sdk()
-
-        function_tools = [_make_function_tool(schema, context) for schema in tools]
-        hosted_tools: list[Any] = []
-        if _has_web_search(self._builtins):
-            hosted_tools.append(sdk.WebSearchTool())
-
-        model_settings = _build_model_settings(llm_config)
-        client = _build_openai_client(
-            self._connection,
-            self._request_timeout,
-            self._max_retries,
+        agent = _build_agent(
+            self,
+            tools,
+            system_prompt,
+            llm_config,
+            context,
         )
-        model = _build_model(llm_config.model, client)
-
-        agent = sdk.Agent(
-            name="agent",
-            instructions=system_prompt,
-            model=model,
-            model_settings=model_settings,
-            tools=[*function_tools, *hosted_tools],
-        )
-
         input_items = _messages_to_input(messages)
-        try:
-            result = sdk.Runner.run_streamed(
-                agent,
-                input=input_items,
-                max_turns=_SDK_MAX_TURNS,
+        async for event in _stream_sdk_turn(
+            agent,
+            input_items,
+        ):
+            yield event
+
+
+def _build_agent(
+    executor: AgentsSdkExecutor,
+    tools: list[dict[str, Any]],
+    system_prompt: str,
+    llm_config: LLMConfig,
+    context: ExecutorContext,
+) -> Any:
+    """
+    Construct an Agents SDK ``Agent`` from executor config.
+
+    :param executor: The executor instance.
+    :param tools: Tool schemas in OpenAI format.
+    :param system_prompt: System instructions.
+    :param llm_config: LLM configuration.
+    :param context: Agent-plane executor context.
+    :returns: A configured ``Agent`` instance.
+    """
+    sdk = _ensure_sdk()
+
+    function_tools = [_make_function_tool(schema, context) for schema in tools]
+    hosted_tools: list[Any] = []
+    if _has_web_search(executor._builtins):
+        hosted_tools.append(sdk.WebSearchTool())
+
+    model_settings = _build_model_settings(llm_config)
+    client = _build_openai_client(
+        executor._connection,
+        executor._request_timeout,
+        executor._max_retries,
+    )
+    model = _build_model(llm_config.model, client)
+
+    return sdk.Agent(
+        name="agent",
+        instructions=system_prompt,
+        model=model,
+        model_settings=model_settings,
+        tools=[*function_tools, *hosted_tools],
+    )
+
+
+async def _stream_sdk_turn(
+    agent: Any,
+    input_items: list[dict[str, Any]],
+) -> AsyncIterator[ExecutorEvent]:
+    """
+    Run ``Runner.run_streamed()`` and yield executor events.
+
+    Handles ``MaxTurnsExceeded`` and generic exceptions,
+    converting them to executor event types.
+
+    :param agent: The configured Agents SDK ``Agent``.
+    :param input_items: Responses API input items.
+    """
+    sdk = _ensure_sdk()
+    try:
+        result = sdk.Runner.run_streamed(
+            agent,
+            input=input_items,
+            max_turns=_SDK_MAX_TURNS,
+        )
+        async for event in result.stream_events():
+            mapped = _map_event(event)
+            if mapped is not None:
+                yield mapped
+        yield TurnComplete(text=result.final_output)
+    except Exception as exc:
+        cls_name = type(exc).__name__
+        if cls_name == "MaxTurnsExceeded":
+            yield TurnComplete(text=None)
+        else:
+            _logger.error("Agents SDK error: %s", exc)
+            yield ExecutorError(
+                message=f"Agents SDK error: {exc}",
+                code=cls_name,
             )
-            async for event in result.stream_events():
-                mapped = _map_event(event)
-                if mapped is not None:
-                    yield mapped
-            yield TurnComplete(text=result.final_output)
-        except Exception as exc:
-            cls_name = type(exc).__name__
-            if cls_name == "MaxTurnsExceeded":
-                yield TurnComplete(text=None)
-            else:
-                _logger.error(
-                    "Agents SDK error: %s",
-                    exc,
-                )
-                yield ExecutorError(
-                    message=f"Agents SDK error: {exc}",
-                    code=cls_name,
-                )
