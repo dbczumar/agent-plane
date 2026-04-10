@@ -390,8 +390,15 @@ def task_store(
         file_store=file_store,
         artifact_store=artifact_store,
     )
-    # Patch the LLM client so DefaultExecutor uses our mock.
-    # _get_llm_client lives in executors/default.py.
+    # Patch the LLM client in BOTH locations so the mock is used
+    # everywhere:
+    # - workflow._get_llm_client: checkpointed path (_call_llm,
+    #   _call_llm_streaming)
+    # - executors.default._get_llm_client: executor-managed path
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._get_llm_client",
+        lambda: mock_llm,
+    )
     monkeypatch.setattr(
         "agent_plane.runtime.executors.default._get_llm_client",
         lambda: mock_llm,

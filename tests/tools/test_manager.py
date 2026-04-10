@@ -538,7 +538,7 @@ def test_mcp_duplicate_tool_name_last_wins() -> None:
         "tool:colon",
         "tool.dot",
         "",
-        "a" * 65,  # exceeds 64-char limit
+        "a" * 257,  # exceeds 256-char limit
         "tool/slash",
         "ns::tool",
     ],
@@ -640,7 +640,7 @@ def test_mcp_tool_mixed_valid_and_invalid() -> None:
         "tool with spaces",
         "tool:colon",
         "",
-        "a" * 65,
+        "a" * 257,
     ],
     ids=[
         "spaces",

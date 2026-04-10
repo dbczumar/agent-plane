@@ -193,7 +193,7 @@ def test_execute_tool_with_retry_retries_on_timeout(
     # Patch call_tool_with_timeout so we control failures without real threads.
     monkeypatch.setattr(
         "agent_plane.runtime.tool_retry.call_tool_with_timeout",
-        lambda call_fn, timeout: flaky_tool(),
+        lambda call_fn, timeout, cancel_fn=None: flaky_tool(),
     )
 
     result = execute_tool_with_retry(
@@ -228,7 +228,7 @@ def test_execute_tool_with_retry_returns_error_string_on_exhaustion(
     # Patch call_tool_with_timeout so every call raises TimeoutError.
     monkeypatch.setattr(
         "agent_plane.runtime.tool_retry.call_tool_with_timeout",
-        lambda call_fn, timeout: (_ for _ in ()).throw(
+        lambda call_fn, timeout, cancel_fn=None: (_ for _ in ()).throw(
             TimeoutError("Tool execution timed out after 5s")
         ),
     )
@@ -279,12 +279,17 @@ def test_tool_retry_event_has_correct_fields(
 
     call_count = 0
 
-    def timeout_then_succeed(call_fn: Callable[[], str], timeout: int) -> str:
+    def timeout_then_succeed(
+        call_fn: Callable[[], str],
+        timeout: int,
+        cancel_fn: Callable[[], None] | None = None,
+    ) -> str:
         """
         Raises TimeoutError on first call, returns success on second.
 
         :param call_fn: The tool callable (ignored in this stub).
         :param timeout: The timeout value (ignored in this stub).
+        :param cancel_fn: The cancel callback (ignored in this stub).
         :returns: ``"ok"`` on second call.
         :raises TimeoutError: On first call.
         """
@@ -378,7 +383,7 @@ def test_tool_error_event_has_correct_fields(
     # Every call raises TimeoutError to exhaust all attempts.
     monkeypatch.setattr(
         "agent_plane.runtime.tool_retry.call_tool_with_timeout",
-        lambda call_fn, timeout: (_ for _ in ()).throw(
+        lambda call_fn, timeout, cancel_fn=None: (_ for _ in ()).throw(
             TimeoutError("Tool execution timed out after 5s")
         ),
     )
@@ -441,12 +446,17 @@ def test_tool_retry_non_timeout_exception_no_retry(
     :param captured_events: List accumulating events for inspection.
     """
 
-    def raise_value_error(call_fn: Callable[[], str], timeout: int) -> str:
+    def raise_value_error(
+        call_fn: Callable[[], str],
+        timeout: int,
+        cancel_fn: Callable[[], None] | None = None,
+    ) -> str:
         """
         Always raises ValueError to simulate a non-timeout failure.
 
         :param call_fn: The tool callable (ignored in this stub).
         :param timeout: The timeout value (ignored in this stub).
+        :param cancel_fn: The cancel callback (ignored in this stub).
         :raises ValueError: Always.
         """
         raise ValueError("bad input")

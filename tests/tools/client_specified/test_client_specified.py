@@ -239,7 +239,7 @@ def test_invoke_raises_runtime_error(
         "tool with spaces",
         "tool:colon",
         "tool.dot",
-        "a" * 65,
+        "a" * 257,
         "ns::method",
     ],
     ids=[

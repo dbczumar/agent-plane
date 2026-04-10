@@ -1,7 +1,7 @@
 """Unit tests for the code_sandbox built-in tool.
 
-Tests the srt settings generation and sandbox read/write isolation
-without needing a real LLM or server.
+Tests the srt config generation, filesystem isolation, and
+unrestricted network access without needing a real LLM or server.
 """
 
 from __future__ import annotations
@@ -17,28 +17,18 @@ import pytest
 from agent_plane.tools.base import ToolContext
 from agent_plane.tools.builtins.code_sandbox import (
     CodeSandboxTool,
-    srt_settings_cache,
+    build_srt_config,
+    deny_read_paths,
     system_read_allowlist,
-    write_srt_settings,
 )
 
-
-@pytest.fixture(autouse=True)
-def _clear_srt_cache() -> None:
-    """
-    Clear the module-level srt settings cache before each test
-    so cached files from previous tests don't interfere.
-    """
-    srt_settings_cache.clear()
+# ── Config generation tests (no srt needed) ────────────────
 
 
-def test_srt_settings_deny_read_is_root(
-    tmp_path: Path,
-) -> None:
+def test_srt_config_deny_read_is_non_empty(tmp_path: Path) -> None:
     """
-    ``denyRead`` must be ``["/"]`` — deny everything, then
-    selectively allow back. An empty ``denyRead`` (the original
-    bug) allows agents to read any file on the host.
+    ``denyRead`` must not be empty — that was the original bug
+    that allowed agents to read any file on the host.
 
     **What breaks if wrong**: Agent can ``cat /tmp/secrets``,
     ``ls ~/Documents``, etc.
@@ -46,18 +36,47 @@ def test_srt_settings_deny_read_is_root(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    settings_path = write_srt_settings(workspace)
-    with open(settings_path) as f:
-        settings = json.load(f)
+    config = json.loads(build_srt_config(workspace))
 
-    assert settings["filesystem"]["denyRead"] == ["/"], (
-        f"denyRead must be ['/'], got: {settings['filesystem']['denyRead']}"
+    assert len(config["filesystem"]["denyRead"]) > 0, (
+        "denyRead must not be empty — that was the original bug"
     )
 
 
-def test_srt_settings_workspace_in_allow_read(
-    tmp_path: Path,
-) -> None:
+def test_srt_config_deny_read_covers_tmp(tmp_path: Path) -> None:
+    """
+    ``/tmp`` must be denied on all platforms. This was the
+    user's original bug report.
+
+    **What breaks if wrong**: Agent reads /tmp files containing
+    secrets, API keys, or other user data.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    config = json.loads(build_srt_config(workspace))
+    deny = config["filesystem"]["denyRead"]
+
+    # /tmp must be blocked, either directly or via denying "/".
+    tmp_blocked = "/" in deny or "/tmp" in deny or "/private/tmp" in deny
+    assert tmp_blocked, f"denyRead must block /tmp (directly or via '/'), got: {deny}"
+
+
+def test_deny_read_paths_covers_user_home() -> None:
+    """
+    ``deny_read_paths`` must cover either ``/`` (Linux) or
+    the user home root (macOS).
+
+    **What breaks if wrong**: No read restrictions at all.
+    """
+    paths = deny_read_paths()
+    assert len(paths) > 0
+    covers_root = "/" in paths
+    covers_users = "/Users" in paths or "/home" in paths
+    assert covers_root or covers_users, f"Must deny either '/' or user-data roots, got: {paths}"
+
+
+def test_srt_config_workspace_in_allow_read(tmp_path: Path) -> None:
     """
     The workspace must appear in ``allowRead`` so the agent
     can read its own files within the denied region.
@@ -68,21 +87,19 @@ def test_srt_settings_workspace_in_allow_read(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    settings_path = write_srt_settings(workspace)
-    with open(settings_path) as f:
-        settings = json.load(f)
-
+    config = json.loads(build_srt_config(workspace))
     resolved_ws = str(workspace.resolve())
-    assert resolved_ws in settings["filesystem"]["allowRead"], (
+
+    assert resolved_ws in config["filesystem"]["allowRead"], (
         f"allowRead must include resolved workspace '{resolved_ws}'"
     )
 
 
-def test_srt_settings_restrict_writes_to_workspace(
+def test_srt_config_restrict_writes_to_workspace(
     tmp_path: Path,
 ) -> None:
     """
-    The srt settings must only allow writes to the workspace.
+    The srt config must only allow writes to the workspace.
 
     **What breaks if wrong**: An agent could write files anywhere
     on the host filesystem.
@@ -90,20 +107,33 @@ def test_srt_settings_restrict_writes_to_workspace(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    settings_path = write_srt_settings(workspace)
-    with open(settings_path) as f:
-        settings = json.load(f)
-
+    config = json.loads(build_srt_config(workspace))
     resolved_ws = str(workspace.resolve())
-    assert settings["filesystem"]["allowWrite"] == [resolved_ws], (
+
+    assert config["filesystem"]["allowWrite"] == [resolved_ws], (
         f"allowWrite must be exactly [resolved_workspace], "
-        f"got: {settings['filesystem']['allowWrite']}"
+        f"got: {config['filesystem']['allowWrite']}"
     )
 
 
-def test_srt_settings_resolve_symlinks(
-    tmp_path: Path,
-) -> None:
+def test_srt_config_no_network_key(tmp_path: Path) -> None:
+    """
+    The config must NOT include a ``network`` key. Network
+    restriction is disabled by the wrapper script via
+    ``updateConfig``.
+
+    **What breaks if wrong**: The wrapper might re-apply network
+    restrictions from the config.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    config = json.loads(build_srt_config(workspace))
+
+    assert "network" not in config, f"Config must not include 'network' key, got: {config.keys()}"
+
+
+def test_srt_config_resolve_symlinks(tmp_path: Path) -> None:
     """
     Workspace paths must be resolved to canonical form. On macOS,
     ``/var`` → ``/private/var`` — without resolving, the srt
@@ -115,13 +145,11 @@ def test_srt_settings_resolve_symlinks(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    settings_path = write_srt_settings(workspace)
-    with open(settings_path) as f:
-        settings = json.load(f)
-
+    config = json.loads(build_srt_config(workspace))
     resolved = str(workspace.resolve())
-    assert settings["filesystem"]["allowWrite"] == [resolved]
-    assert resolved in settings["filesystem"]["allowRead"]
+
+    assert config["filesystem"]["allowWrite"] == [resolved]
+    assert resolved in config["filesystem"]["allowRead"]
 
 
 def test_system_read_allowlist_excludes_user_home() -> None:
@@ -135,7 +163,6 @@ def test_system_read_allowlist_excludes_user_home() -> None:
     allow = system_read_allowlist()
     home_root = str(Path.home().parent)
 
-    # The home root (e.g. /Users) must not be in the allowlist.
     assert home_root not in allow, f"allowlist must not include user home root '{home_root}'"
 
 
@@ -149,10 +176,13 @@ def test_system_read_allowlist_includes_bin_dirs() -> None:
     fail with "command not found."
     """
     allow = system_read_allowlist()
-    # /usr covers /usr/bin, /usr/local/bin, etc.
+
     assert "/usr" in allow or "/bin" in allow, (
         f"allowlist must include /usr or /bin for PATH resolution, got: {allow}"
     )
+
+
+# ── srt integration tests (require srt on PATH) ───────────
 
 
 @pytest.mark.skipif(
@@ -190,8 +220,6 @@ def test_sandbox_blocks_read_outside_workspace(
             agent_id="test_agent",
             workspace=workspace,
         )
-        # Use absolute path to bypass PATH resolution — tests
-        # the filesystem read restriction directly.
         result = tool.invoke(
             json.dumps({"command": f"/bin/cat {sentinel_path}"}),
             ctx,
@@ -260,7 +288,7 @@ def test_sandbox_shell_commands_resolve_via_path(
 ) -> None:
     """
     Shell commands like ``ls`` must resolve via PATH inside the
-    sandbox. The system allowRead dirs must cover PATH entries.
+    sandbox. System allowRead dirs must cover PATH entries.
 
     **What breaks if wrong**: Every unqualified command fails
     with "command not found."
@@ -277,7 +305,6 @@ def test_sandbox_shell_commands_resolve_via_path(
         agent_id="test_agent",
         workspace=workspace,
     )
-    # ls is an external binary that requires PATH resolution.
     result = tool.invoke(
         json.dumps({"command": "ls -d ."}),
         ctx,
@@ -287,4 +314,53 @@ def test_sandbox_shell_commands_resolve_via_path(
         f"'ls' should resolve via PATH but failed. "
         f"Output: {result[:200]}. System allowRead paths "
         f"may be missing."
+    )
+
+
+@pytest.mark.skipif(
+    shutil.which("srt") is None,
+    reason="srt not on PATH",
+)
+def test_sandbox_allows_network_access(
+    tmp_path: Path,
+) -> None:
+    """
+    Network access must be unrestricted inside the sandbox.
+    The wrapper script removes ``allowedDomains`` from the srt
+    config so no network proxy is activated.
+
+    **What breaks if wrong**: ``curl`` fails with connection
+    errors because srt's network proxy is blocking traffic.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    tool = CodeSandboxTool(
+        srt_available=True,
+        sandbox_enabled=True,
+    )
+    ctx = ToolContext(
+        task_id="test_task",
+        agent_id="test_agent",
+        workspace=workspace,
+    )
+    result = tool.invoke(
+        json.dumps(
+            {
+                "command": (
+                    "curl -sk https://example.com "
+                    "-o /dev/null -w '%{http_code}' "
+                    "--connect-timeout 5"
+                ),
+            }
+        ),
+        ctx,
+    )
+
+    # HTTP 200 proves the request reached example.com and
+    # got a response — network is not restricted.
+    assert "200" in result, (
+        f"Expected HTTP 200 from example.com proving network "
+        f"access works. Got: {result[:200]}. The srt wrapper "
+        f"may not be removing network restrictions."
     )

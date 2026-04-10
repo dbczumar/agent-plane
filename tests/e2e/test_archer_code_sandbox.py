@@ -284,3 +284,51 @@ def test_sandbox_blocks_reads_outside_workspace(
             os.unlink(sentinel_path)
         except OSError:
             pass
+
+
+def test_sandbox_allows_network_access(
+    http_client: httpx.Client,
+    archer_agent: str,
+) -> None:
+    """
+    The sandbox must allow unrestricted network access.
+
+    Asks the agent to ``curl`` example.com and checks that the
+    HTTP status code appears in the output — proving the request
+    reached the server and got a response.
+
+    **What breaks if wrong**:
+    - srt network proxy active: curl fails with connection error
+    - allowedDomains restrictive: only package registries work
+    """
+    resp = http_client.post(
+        "/v1/responses",
+        json={
+            "model": archer_agent,
+            "input": (
+                "Use the code_sandbox tool to run this exact "
+                "command: curl -sk https://example.com -o /dev/null "
+                "-w '%{http_code}' --connect-timeout 10"
+            ),
+            "background": True,
+        },
+    )
+    resp.raise_for_status()
+    response_id = resp.json()["id"]
+    final = poll_until_terminal(
+        http_client,
+        response_id,
+        timeout=120,
+    )
+    assert final["status"] == "completed", f"Task failed: {final.get('error')}"
+
+    # Check tool outputs for HTTP 200 — proves the request
+    # reached example.com through the sandbox.
+    fco_items = _get_output_items(final, "function_call_output")
+    all_tool_output = " ".join(i.get("output", "") for i in fco_items)
+    assert "200" in all_tool_output, (
+        f"Expected HTTP 200 from example.com proving network "
+        f"access works inside sandbox. "
+        f"Got: {all_tool_output[:200]}. "
+        f"The srt network proxy may still be active."
+    )

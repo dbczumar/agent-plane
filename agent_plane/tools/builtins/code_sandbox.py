@@ -2,11 +2,17 @@
 
 Executes arbitrary shell commands in a persistent, per-conversation
 workspace directory. Optionally sandboxed via ``srt`` for OS-level
-filesystem and network restrictions.
+filesystem restrictions with unrestricted network access.
 
 The agent uses this like a terminal — ``cat``, ``python``, ``ls``,
-``echo >``, ``pip install``, etc. all work. Output is captured and
-returned as a string.
+``echo >``, ``pip install``, ``curl``, etc. all work. Output is
+captured and returned as a string.
+
+Sandboxing uses a Node.js wrapper (``_srt_wrap.mjs``) that calls
+srt's ``SandboxManager`` library API. The wrapper disables network
+restriction by calling ``updateConfig()`` without ``allowedDomains``
+— a workaround for srt's CLI requiring a network allowlist with no
+"allow all" option. See ``_srt_wrap.mjs`` for details.
 """
 
 from __future__ import annotations
@@ -20,9 +26,9 @@ from typing import Any
 
 from agent_plane.tools.base import Tool, ToolContext
 
-# Cached srt settings file path — reused across invocations for
-# the same workspace to avoid creating a temp file per call.
-srt_settings_cache: dict[str, str] = {}
+# Absolute path to the Node.js wrapper script that invokes srt's
+# library API with filesystem-only sandboxing (no network restriction).
+_SRT_WRAP_PATH = str(Path(__file__).parent / "_srt_wrap.mjs")
 
 
 def system_read_allowlist() -> list[str]:
@@ -81,62 +87,72 @@ def system_read_allowlist() -> list[str]:
     return sorted(roots)
 
 
-def write_srt_settings(workspace: Path) -> str:
+def deny_read_paths() -> list[str]:
     """
-    Write an srt settings file for sandbox read/write isolation.
+    Return the directories to deny reads from.
 
-    Uses ``denyRead: ["/"]`` on all platforms to block reads from
-    the entire filesystem. On macOS, system directories needed
-    for shell command execution are re-allowed via
-    :func:`system_read_allowlist`. On Linux, srt's bubblewrap
-    handles this automatically (``--ro-bind / /``).
+    On **Linux**, srt uses bubblewrap which starts with
+    ``--ro-bind / /`` (mount entire root read-only) and then
+    overlays ``tmpfs`` on denied dirs, bind-mounting ``allowRead``
+    paths back through. So ``denyRead: ["/"]`` works correctly —
+    system binaries remain readable from the initial ro-bind,
+    and network is unaffected.
 
-    Cached per workspace path so repeated invocations reuse
-    the same file.
+    On **macOS**, srt uses sandbox-exec seatbelt rules.
+    ``denyRead: ["/"]`` blocks all ``file-read*`` syscalls
+    under ``/``, which breaks both shell PATH resolution AND
+    network (the TLS/DNS stack needs to read system files that
+    may not be in our ``allowRead`` list). So we deny only the
+    user-data and temp roots, derived from the system:
+
+    - **Home root**: ``Path.home().parent`` (``/Users``).
+    - **Temp dir**: ``/tmp`` plus its resolved form
+      (``/private/tmp`` on macOS).
+
+    :returns: List of paths to deny reads from.
+    """
+    if platform.system() != "Darwin":
+        return ["/"]
+
+    home_root = str(Path.home().parent)
+    tmp = Path("/tmp")
+    deny = {home_root, str(tmp), str(tmp.resolve())}
+    return sorted(deny)
+
+
+def build_srt_config(workspace: Path) -> str:
+    """
+    Build the JSON config string for the srt wrapper script.
+
+    Filesystem isolation denies reads from user-data and temp
+    directories. On macOS, system directories needed for shell
+    command execution are left readable (targeted deny). On
+    Linux, ``denyRead: ["/"]`` is used (bwrap handles it).
+
+    Network is left unrestricted — the wrapper script handles
+    this by calling ``SandboxManager.updateConfig()`` to remove
+    ``allowedDomains``, which disables srt's network proxy.
 
     :param workspace: The workspace directory. Resolved to its
         canonical path to handle macOS ``/var`` → ``/private/var``
         symlinks.
-    :returns: Path to the settings JSON file.
+    :returns: JSON string for the ``_srt_wrap.mjs`` config arg.
     """
-    import tempfile
-
-    # Resolve symlinks so the allowRead/allowWrite paths
-    # match what srt sees on the real filesystem. On macOS,
-    # /var is a symlink to /private/var — without resolving,
-    # the workspace path won't match the deny rules.
     resolved = str(workspace.resolve())
-    if resolved in srt_settings_cache:
-        return srt_settings_cache[resolved]
 
     allow_read = [resolved]
     if platform.system() == "Darwin":
-        # macOS sandbox-exec needs explicit read allowances for
-        # system paths; Linux bwrap doesn't (ro-bind root).
         allow_read += system_read_allowlist()
 
-    settings = {
-        "network": {
-            # Allow package registries so agents can pip/npm install.
-            "allowedDomains": [
-                "pypi.org",
-                "files.pythonhosted.org",
-                "registry.npmjs.org",
-            ],
-            "deniedDomains": [],
-        },
+    config = {
         "filesystem": {
             "allowWrite": [resolved],
-            "denyRead": ["/"],
+            "denyRead": deny_read_paths(),
             "allowRead": allow_read,
             "denyWrite": [],
         },
     }
-    fd, path = tempfile.mkstemp(suffix=".json", prefix="srt-ap-")
-    with os.fdopen(fd, "w") as f:
-        json.dump(settings, f)
-    srt_settings_cache[resolved] = path
-    return path
+    return json.dumps(config)
 
 
 _SCHEMA: dict[str, Any] = {
@@ -169,7 +185,8 @@ class CodeSandboxTool(Tool):
     Execute shell commands in the per-conversation workspace.
 
     When ``srt`` is available and sandbox is enabled, the command
-    is wrapped with ``srt -c`` for OS-level sandboxing. Otherwise,
+    is wrapped via ``_srt_wrap.mjs`` for OS-level filesystem
+    sandboxing with unrestricted network access. Otherwise,
     plain ``bash -c`` is used.
 
     :param srt_available: Whether ``srt`` is on PATH.
@@ -276,19 +293,18 @@ class CodeSandboxTool(Tool):
         """
         Build the subprocess command, optionally wrapping with srt.
 
-        When srt is active, writes a temporary settings file that
-        denies reads outside the workspace and system directories.
+        When srt is active, invokes ``_srt_wrap.mjs`` which uses
+        srt's library API to sandbox the command with filesystem
+        isolation and unrestricted network access.
 
         :param command: The shell command string.
         :param workspace: The workspace directory path.
         :returns: The command list for ``Popen``.
         """
         if self._srt_available and self._sandbox_enabled:
-            settings_path = write_srt_settings(workspace)
-            # Resolve so TMPDIR matches the allowWrite path in
-            # srt settings (macOS /var → /private/var symlink).
+            config_json = build_srt_config(workspace)
             resolved = workspace.resolve()
             # TMPDIR=workspace so bash heredocs stay in the sandbox.
             wrapped = f"TMPDIR={resolved} {command}"
-            return ["srt", "--settings", settings_path, "-c", wrapped]
+            return ["node", _SRT_WRAP_PATH, config_json, wrapped]
         return ["bash", "-c", command]

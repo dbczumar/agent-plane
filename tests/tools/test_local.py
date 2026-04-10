@@ -426,7 +426,8 @@ def test_build_command_with_srt(tmp_path: Path) -> None:
         info=info,
         schema={"type": "function", "function": {"name": "t", "parameters": {}}},
         module_path=tmp_path / "t.py",
-        sandbox_config=SandboxConfig(enabled=True),
+        sandbox_config=SandboxConfig(),
+        sandbox_enabled=True,
         srt_available=True,
         uv_available=False,
     )
@@ -441,7 +442,7 @@ def test_build_command_with_srt(tmp_path: Path) -> None:
 
 def test_build_command_srt_disabled(tmp_path: Path) -> None:
     """
-    When sandbox.enabled is False, srt is NOT prepended even
+    When sandbox_enabled is False, srt is NOT prepended even
     when available on PATH.
     """
     from agent_plane.spec.types import SandboxConfig
@@ -452,7 +453,8 @@ def test_build_command_srt_disabled(tmp_path: Path) -> None:
         info=info,
         schema={"type": "function", "function": {"name": "t", "parameters": {}}},
         module_path=tmp_path / "t.py",
-        sandbox_config=SandboxConfig(enabled=False),
+        sandbox_config=SandboxConfig(),
+        sandbox_enabled=False,
         srt_available=True,
         uv_available=False,
     )
@@ -481,7 +483,8 @@ def test_build_command_uv_outside_srt_inside(tmp_path: Path) -> None:
         info=info,
         schema={"type": "function", "function": {"name": "t", "parameters": {}}},
         module_path=tmp_path / "t.py",
-        sandbox_config=SandboxConfig(enabled=True),
+        sandbox_config=SandboxConfig(),
+        sandbox_enabled=True,
         srt_available=True,
         uv_available=True,
     )

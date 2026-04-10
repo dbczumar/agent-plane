@@ -632,6 +632,7 @@ async def test_steering_between_persist_and_close_inbox(
         last_seen: str | None,
         persisted: list[ConversationItem],
         ts: SqlAlchemyTaskStore,
+        **kwargs: object,
     ) -> list[ConversationItem]:
         """
         Run the real _check_steering_inbox, then inject a

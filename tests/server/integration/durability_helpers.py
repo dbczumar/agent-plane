@@ -170,11 +170,13 @@ def build_server(
         agent_cache=agent_cache,
     )
 
-    # Patch the LLM client at the module level so the real
-    # workflow uses our mock (same as the conftest fixture)
+    # Patch the LLM client in both workflow and executor modules
+    # so the mock is used everywhere.
+    import agent_plane.runtime.executors.default as exec_mod
     import agent_plane.runtime.workflow as wf_mod
 
     wf_mod._get_llm_client = lambda: mock_llm  # type: ignore[assignment]
+    exec_mod._get_llm_client = lambda: mock_llm  # type: ignore[assignment]
 
     app = create_app(
         agent_store=agent_store,

@@ -333,10 +333,11 @@ async def test_mcp_list_directory_returns_real_files(
 
     items = await _get_items(client, conv_id)
 
-    # 4 items: user message, function_call, function_call_output, assistant.
+    # 5 items: user, empty assistant (before tool calls), function_call,
+    # function_call_output, final assistant.
     # If fewer, the tool call didn't execute; if more, extra LLM rounds fired.
-    assert len(items) == 4, (
-        f"Expected 4 items [user, fc, fco, assistant], got {len(items)}: "
+    assert len(items) == 5, (
+        f"Expected 5 items [user, asst(empty), fc, fco, assistant], got {len(items)}: "
         f"{[i['type'] for i in items]}"
     )
 
@@ -344,25 +345,30 @@ async def test_mcp_list_directory_returns_real_files(
     assert items[0]["type"] == "message"
     assert items[0]["role"] == "user"
 
+    # Empty assistant message persisted before tool calls
+    assert items[1]["type"] == "message"
+    assert items[1]["role"] == "assistant"
+    assert items[1]["content"][0]["text"] == ""
+
     # function_call for list_directory — proves the mock LLM's tool
     # call was routed through the workflow and persisted
-    assert items[1]["type"] == "function_call"
-    assert items[1]["name"] == "list_directory"
-    assert items[1]["call_id"] == "call_mcp_list_1"
+    assert items[2]["type"] == "function_call"
+    assert items[2]["name"] == "list_directory"
+    assert items[2]["call_id"] == "call_mcp_list_1"
 
     # function_call_output with REAL filesystem data — proves the MCP
     # server was actually called and returned live directory contents.
     # If "hello.txt" is missing, the MCP connection or tool execution failed.
-    assert items[2]["type"] == "function_call_output"
-    assert items[2]["call_id"] == "call_mcp_list_1"
-    output = items[2]["output"]
+    assert items[3]["type"] == "function_call_output"
+    assert items[3]["call_id"] == "call_mcp_list_1"
+    output = items[3]["output"]
     assert "hello.txt" in output, f"Expected 'hello.txt' in MCP output, got: {output!r}"
     assert "subdir/" in output, f"Expected 'subdir/' in MCP output, got: {output!r}"
 
     # Final assistant message — proves the second LLM call completed
-    assert items[3]["type"] == "message"
-    assert items[3]["role"] == "assistant"
-    assert items[3]["content"][0]["text"] == "Listed the directory."
+    assert items[4]["type"] == "message"
+    assert items[4]["role"] == "assistant"
+    assert items[4]["content"][0]["text"] == "Listed the directory."
 
 
 async def test_mcp_read_file_returns_real_content(
@@ -410,19 +416,20 @@ async def test_mcp_read_file_returns_real_content(
 
     items = await _get_items(client, conv_id)
 
-    # 4 items: user, function_call, function_call_output, assistant
-    assert len(items) == 4, (
-        f"Expected 4 items [user, fc, fco, assistant], got {len(items)}: "
+    # 5 items: user, empty assistant (before tool calls), function_call,
+    # function_call_output, final assistant
+    assert len(items) == 5, (
+        f"Expected 5 items [user, asst(empty), fc, fco, assistant], got {len(items)}: "
         f"{[i['type'] for i in items]}"
     )
 
     # function_call_output must contain the EXACT file content written
     # by the fixture. If it doesn't match, the MCP server read the
     # wrong file or the content was corrupted in transit.
-    assert items[2]["type"] == "function_call_output"
-    assert items[2]["call_id"] == "call_mcp_read_1"
-    assert items[2]["output"] == "Hello from MCP!", (
-        f"Expected exact file content, got: {items[2]['output']!r}"
+    assert items[3]["type"] == "function_call_output"
+    assert items[3]["call_id"] == "call_mcp_read_1"
+    assert items[3]["output"] == "Hello from MCP!", (
+        f"Expected exact file content, got: {items[3]['output']!r}"
     )
 
 
@@ -477,29 +484,36 @@ async def test_mcp_multi_tool_round_trip(
 
     items = await _get_items(client, conv_id)
 
-    # 6 items: user, fc1, fco1, fc2, fco2, assistant.
+    # 8 items: user, empty-assistant, fc1, fco1, empty-assistant, fc2, fco2, assistant.
+    # Each tool-call round is preceded by an empty assistant message.
     # If fewer, one of the tool calls was skipped; if more, extra rounds fired.
-    assert len(items) == 6, f"Expected 6 items, got {len(items)}: {[i['type'] for i in items]}"
+    assert len(items) == 8, f"Expected 8 items, got {len(items)}: {[i['type'] for i in items]}"
 
-    # Round 1: list_directory — real directory listing from the MCP server.
-    # "hello.txt" proves the list_directory tool executed against the fixture dir.
-    assert items[1]["type"] == "function_call"
-    assert items[1]["name"] == "list_directory"
-    assert items[2]["type"] == "function_call_output"
-    assert "hello.txt" in items[2]["output"], (
-        f"Expected 'hello.txt' in list_directory output: {items[2]['output']!r}"
+    # Round 1: empty assistant, then list_directory — real directory listing
+    # from the MCP server. "hello.txt" proves the tool executed against the fixture dir.
+    assert items[1]["type"] == "message"
+    assert items[1]["role"] == "assistant"
+    assert items[1]["content"][0]["text"] == ""
+    assert items[2]["type"] == "function_call"
+    assert items[2]["name"] == "list_directory"
+    assert items[3]["type"] == "function_call_output"
+    assert "hello.txt" in items[3]["output"], (
+        f"Expected 'hello.txt' in list_directory output: {items[3]['output']!r}"
     )
 
-    # Round 2: read_file — exact content of the nested file.
+    # Round 2: empty assistant, then read_file — exact content of the nested file.
     # "Nested content." is the exact text written by the mcp_work_dir fixture.
-    assert items[3]["type"] == "function_call"
-    assert items[3]["name"] == "read_file"
-    assert items[4]["type"] == "function_call_output"
-    assert items[4]["output"] == "Nested content.", (
-        f"Expected 'Nested content.', got: {items[4]['output']!r}"
+    assert items[4]["type"] == "message"
+    assert items[4]["role"] == "assistant"
+    assert items[4]["content"][0]["text"] == ""
+    assert items[5]["type"] == "function_call"
+    assert items[5]["name"] == "read_file"
+    assert items[6]["type"] == "function_call_output"
+    assert items[6]["output"] == "Nested content.", (
+        f"Expected 'Nested content.', got: {items[6]['output']!r}"
     )
 
     # Final text — proves the third LLM call completed and was persisted
-    assert items[5]["type"] == "message"
-    assert items[5]["role"] == "assistant"
-    assert items[5]["content"][0]["text"] == "Done with both tools."
+    assert items[7]["type"] == "message"
+    assert items[7]["role"] == "assistant"
+    assert items[7]["content"][0]["text"] == "Done with both tools."

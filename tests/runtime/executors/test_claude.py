@@ -220,8 +220,9 @@ def test_build_prompt_with_transcript_returns_latest_message(
     will also replay its transcript, causing duplicate context.
     """
     # Create a .claude dir with a file to simulate a transcript.
-    claude_dir = tmp_path / ".claude"
-    claude_dir.mkdir()
+    # _has_session_transcript checks storage_dir / "workspace" / ".claude".
+    claude_dir = tmp_path / "workspace" / ".claude"
+    claude_dir.mkdir(parents=True)
     (claude_dir / "transcript.json").write_text("{}")
 
     messages = [
