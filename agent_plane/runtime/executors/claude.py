@@ -29,7 +29,7 @@ import queue
 import shutil
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from pathlib import Path
@@ -90,7 +90,7 @@ class _CallbackHolder:
         or ``None`` between tasks (no active query running).
     """
 
-    callback: Callable[[ToolCallRequested], ToolResult] | None = None
+    callback: Callable[[ToolCallRequested], Awaitable[ToolResult]] | None = None
 
 
 @dataclass
@@ -464,35 +464,40 @@ class ClaudeAgentsExecutor(Executor):
         _client_registry.touch(context.conversation_id)
         _client_registry.evict_stale()
 
-    def run_turn(
+    async def run_turn(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         system_prompt: str,
         llm_config: LLMConfig,
         context: ExecutorContext,
-    ) -> Iterator[ExecutorEvent]:
+    ) -> AsyncIterator[ExecutorEvent]:
         """
-        Run one SDK turn. Bridges async SDK stream into sync iterator.
+        Run one SDK turn as an async generator.
+
+        The Claude SDK client is bound to a per-conversation
+        event loop (separate daemon thread). This method submits
+        SDK work to that loop and bridges events back via a
+        thread-safe ``queue.Queue``. The consumer side uses
+        ``asyncio.to_thread(queue.get)`` so the workflow's event
+        loop stays free.
 
         Server-side tools: SDK executes via built-in handlers.
-        Client-side tools: routed through an in-process MCP server
-        backed by ``context.call_tool``.
+        Client-side tools: routed through an in-process MCP
+        server backed by ``context.call_tool``.
 
         :param messages: Used to build prompt for fresh/recovery
-            sessions. Ignored for continuing sessions (SDK has context
-            in memory).
-        :param tools: Client-side tool schemas — used to build the
-            MCP server so the SDK can call these tools.
+            sessions. Ignored for continuing sessions (SDK has
+            context in memory).
+        :param tools: Client-side tool schemas — used to build
+            the MCP server so the SDK can call these tools.
         :param system_prompt: System instructions for the SDK.
         :param llm_config: LLM configuration (model override).
         :param context: Agent-plane capabilities and identifiers.
         """
-        event_queue: queue.Queue[ExecutorEvent | None] = queue.Queue(
-            maxsize=256,
-        )
-        # Each conversation has its own event loop so conversations
-        # are isolated — a slow SDK call in one can't starve others.
+        event_queue: queue.Queue[ExecutorEvent | None] = queue.Queue(maxsize=256)
+        # Each conversation has its own event loop so
+        # conversations are isolated.
         loop = _client_registry.get_or_create_loop(
             context.conversation_id,
         )
@@ -508,14 +513,15 @@ class ClaudeAgentsExecutor(Executor):
             ),
             loop,
         )
+        # Consume events without blocking the workflow's loop.
         while True:
-            event = event_queue.get()
+            event = await asyncio.to_thread(event_queue.get)
             if event is None:
                 break
             yield event
 
 
-# ── Async implementation (runs in the bridge thread) ──────
+# ── Async turn (runs in the per-conversation loop) ──────
 
 
 async def _async_turn(
@@ -531,9 +537,9 @@ async def _async_turn(
     Async implementation of one SDK turn.
 
     Runs in the per-conversation event loop. Builds the prompt,
-    configures the SDK client (on first task), sends the query, and
-    maps the SDK stream events into executor events pushed to the
-    queue. Puts ``None`` on ``event_queue`` when done.
+    configures the SDK client (on first task), sends the query,
+    and maps the SDK stream events into executor events pushed
+    to the queue. Puts ``None`` on ``event_queue`` when done.
 
     :param executor: The executor instance.
     :param messages: Responses API input items.
@@ -541,14 +547,19 @@ async def _async_turn(
     :param system_prompt: System instructions.
     :param llm_config: LLM configuration.
     :param context: Agent-plane capabilities and identifiers.
-    :param event_queue: Queue for bridging events to the sync caller.
+    :param event_queue: Queue for bridging events to the
+        async consumer in ``run_turn``.
     """
     sdk = _ensure_sdk()
     conv_id = context.conversation_id
     existing = _client_registry.get(conv_id)
     is_continuing = existing is not None
 
-    prompt = _build_prompt(messages, context.storage_dir, is_continuing)
+    prompt = _build_prompt(
+        messages,
+        context.storage_dir,
+        is_continuing,
+    )
     if prompt is None:
         event_queue.put(TurnComplete(text=None))
         event_queue.put(None)
@@ -559,7 +570,11 @@ async def _async_turn(
         holder = existing.callback_holder
     else:
         holder = _CallbackHolder()
-        mcp_server = _build_client_tool_mcp_server(sdk, tools, holder)
+        mcp_server = _build_client_tool_mcp_server(
+            sdk,
+            tools,
+            holder,
+        )
         options = _build_sdk_options(
             sdk,
             executor,
@@ -577,20 +592,25 @@ async def _async_turn(
             holder,
         )
 
-    # Point the MCP server's callback at this task before querying.
-    # Safe: runs in a single event loop thread. The MCP handler reads
-    # holder.callback only during client.query(), so the sequence
-    # set → query → clear is strictly sequential.
     holder.callback = context.call_tool
     try:
         await client.query(prompt, session_id=conv_id)
-        await _consume_sdk_stream(sdk, client, event_queue)
+        async for event in _consume_sdk_stream(
+            sdk,
+            client,
+        ):
+            event_queue.put(event)
     except Exception as exc:
         await _close_client_async(conv_id)
-        event_queue.put(ExecutorError(message=f"Claude SDK error: {exc}"))
+        event_queue.put(
+            ExecutorError(message=f"Claude SDK error: {exc}"),
+        )
     finally:
         holder.callback = None
         event_queue.put(None)
+
+
+# ── Prompt building ─────────────────────────────────────────
 
 
 def _build_prompt(
@@ -717,11 +737,9 @@ def _make_client_tool_handler(
             name=tool_name,
             arguments=args,
         )
-        loop = asyncio.get_running_loop()
-        # call_tool is sync (may block on server-side execution
-        # or client polling) — run in thread to avoid blocking
-        # the event loop.
-        result: ToolResult = await loop.run_in_executor(None, cb, call)
+        # call_tool is async — uses asyncio.sleep for client-side
+        # polling, so the event loop stays free.
+        result: ToolResult = await cb(call)
         response: dict[str, Any] = {
             "content": [{"type": "text", "text": result.content}],
         }
@@ -892,22 +910,22 @@ async def _get_or_create_client(
 async def _consume_sdk_stream(
     sdk: Any,
     client: Any,
-    event_queue: queue.Queue[ExecutorEvent | None],
-) -> None:
+) -> AsyncIterator[ExecutorEvent]:
     """
-    Consume the SDK message stream and push executor events.
+    Consume the SDK message stream and yield executor events.
 
-    Maps SDK event types to agent-plane executor events:
+    Async generator that maps SDK event types to agent-plane
+    executor events:
 
     - ``StreamEvent`` / ``text_delta`` → ``TextChunk``
     - ``StreamEvent`` / ``content_block_start`` (tool_use) → buffer
     - ``UserMessage`` / ``ToolResultBlock`` → ``ToolCallObserved``
     - ``ResultMessage`` → capture final text
-    - ``SystemMessage`` / ``api_retry`` with 401/403/404 → ``ExecutorError``
+    - ``SystemMessage`` / ``api_retry`` with 401/403/404 →
+      ``ExecutorError``
 
     :param sdk: The ``claude_agent_sdk`` module.
     :param client: The connected ``ClaudeSDKClient``.
-    :param event_queue: Queue for pushing executor events.
     """
     from claude_agent_sdk.types import (
         StreamEvent as _StreamEvent,
@@ -919,19 +937,28 @@ async def _consume_sdk_stream(
         async for message in message_stream:
             if isinstance(message, _StreamEvent):
                 state.got_stream_events = True
-                _handle_stream_event(message.event, state, event_queue)
+                for evt in _handle_stream_event(
+                    message.event,
+                    state,
+                ):
+                    yield evt
 
             elif isinstance(message, sdk.AssistantMessage):
                 if not state.got_stream_events:
-                    _handle_assistant_message(
+                    for evt in _handle_assistant_message(
                         sdk,
                         message,
                         state,
-                        event_queue,
-                    )
+                    ):
+                        yield evt
 
             elif isinstance(message, sdk.UserMessage):
-                _handle_tool_results(sdk, message, state, event_queue)
+                for evt in _handle_tool_results(
+                    sdk,
+                    message,
+                    state,
+                ):
+                    yield evt
 
             elif isinstance(message, sdk.ResultMessage):
                 if state.response_text is None and message.result:
@@ -940,27 +967,27 @@ async def _consume_sdk_stream(
             elif isinstance(message, sdk.SystemMessage):
                 error = _check_terminal_error(message)
                 if error is not None:
-                    event_queue.put(error)
+                    yield error
                     return
     finally:
         aclose = getattr(message_stream, "aclose", None)
         if aclose is not None:
             await aclose()
 
-    event_queue.put(TurnComplete(text=state.response_text or None))
+    yield TurnComplete(text=state.response_text or None)
 
 
 def _handle_stream_event(
     evt: dict[str, Any],
     state: _StreamState,
-    event_queue: queue.Queue[ExecutorEvent | None],
-) -> None:
+) -> list[ExecutorEvent]:
     """
     Handle a single SDK ``StreamEvent``.
 
     :param evt: The raw event dict from the SDK stream.
-    :param state: Mutable stream state for tracking tools and text.
-    :param event_queue: Queue for pushing executor events.
+    :param state: Mutable stream state for tracking tools
+        and text.
+    :returns: Executor events to yield (may be empty).
     """
     evt_type = evt.get("type", "")
 
@@ -974,22 +1001,24 @@ def _handle_stream_event(
                 start_time=time.monotonic(),
             )
             state.args_buffers[tool_id] = []
+        return []
 
-    elif evt_type == "content_block_delta":
-        _handle_content_delta(evt, state, event_queue)
+    if evt_type == "content_block_delta":
+        return _handle_content_delta(evt, state)
+
+    return []
 
 
 def _handle_content_delta(
     evt: dict[str, Any],
     state: _StreamState,
-    event_queue: queue.Queue[ExecutorEvent | None],
-) -> None:
+) -> list[ExecutorEvent]:
     """
     Handle a ``content_block_delta`` event (text or tool args).
 
     :param evt: The raw event dict from the SDK stream.
     :param state: Mutable stream state.
-    :param event_queue: Queue for pushing executor events.
+    :returns: Executor events to yield (may be empty).
     """
     delta = evt.get("delta", {})
     delta_type = delta.get("type", "")
@@ -1000,11 +1029,12 @@ def _handle_content_delta(
                 state.response_text = text
             else:
                 state.response_text += text
-            event_queue.put(TextChunk(text=text))
+            return [TextChunk(text=text)]
     elif delta_type == "input_json_delta":
         partial = delta.get("partial_json", "")
         if partial:
             _buffer_args(state, partial)
+    return []
 
 
 def _buffer_args(state: _StreamState, partial: str) -> None:
@@ -1027,37 +1057,42 @@ def _handle_assistant_message(
     sdk: Any,
     message: Any,
     state: _StreamState,
-    event_queue: queue.Queue[ExecutorEvent | None],
-) -> None:
+) -> list[ExecutorEvent]:
     """
-    Handle an ``AssistantMessage`` when no ``StreamEvent`` was received.
+    Handle an ``AssistantMessage`` when no ``StreamEvent``
+    was received.
 
-    Falls back to extracting text and tool calls from the full message.
+    Falls back to extracting text and tool calls from the
+    full message.
 
     :param sdk: The ``claude_agent_sdk`` module.
     :param message: The ``AssistantMessage`` from the SDK.
     :param state: Mutable stream state.
-    :param event_queue: Queue for pushing executor events.
+    :returns: Executor events to yield (may be empty).
     """
+    events: list[ExecutorEvent] = []
     for block in message.content:
         if isinstance(block, sdk.TextBlock):
-            event_queue.put(TextChunk(text=block.text))
+            events.append(TextChunk(text=block.text))
         elif isinstance(block, sdk.ToolUseBlock):
             state.pending[block.id] = _PendingToolCall(
                 name=block.name,
                 start_time=time.monotonic(),
             )
-            state.args_buffers[block.id] = [json.dumps(block.input)]
+            state.args_buffers[block.id] = [
+                json.dumps(block.input),
+            ]
+    return events
 
 
 def _handle_tool_results(
     sdk: Any,
     message: Any,
     state: _StreamState,
-    event_queue: queue.Queue[ExecutorEvent | None],
-) -> None:
+) -> list[ExecutorEvent]:
     """
-    Handle a ``UserMessage`` containing ``ToolResultBlock`` entries.
+    Handle a ``UserMessage`` containing ``ToolResultBlock``
+    entries.
 
     Matches each result to its pending request and emits
     ``ToolCallObserved``.
@@ -1065,27 +1100,31 @@ def _handle_tool_results(
     :param sdk: The ``claude_agent_sdk`` module.
     :param message: The ``UserMessage`` from the SDK.
     :param state: Mutable stream state.
-    :param event_queue: Queue for pushing executor events.
+    :returns: Executor events to yield (may be empty).
     """
     content = message.content
     if not isinstance(content, list):
-        return
+        return []
+    events: list[ExecutorEvent] = []
     for block in content:
         if isinstance(block, sdk.ToolResultBlock):
-            _emit_tool_call_observed(block, state, event_queue)
+            observed = _emit_tool_call_observed(block, state)
+            if observed is not None:
+                events.append(observed)
+    return events
 
 
 def _emit_tool_call_observed(
     block: Any,
     state: _StreamState,
-    event_queue: queue.Queue[ExecutorEvent | None],
-) -> None:
+) -> ToolCallObserved:
     """
-    Build and emit a ``ToolCallObserved`` event from a ``ToolResultBlock``.
+    Build a ``ToolCallObserved`` from a ``ToolResultBlock``.
 
     :param block: The ``ToolResultBlock`` from the SDK.
-    :param state: Mutable stream state (pending tools and args buffers).
-    :param event_queue: Queue for pushing executor events.
+    :param state: Mutable stream state (pending tools and
+        args buffers).
+    :returns: The ``ToolCallObserved`` event.
     """
     tool_id = block.tool_use_id
     pending_call = state.pending.pop(tool_id, None)
@@ -1106,15 +1145,13 @@ def _emit_tool_call_observed(
     )
     result_text = _extract_tool_result_text(block.content)
 
-    event_queue.put(
-        ToolCallObserved(
-            call_id=tool_id,
-            name=name,
-            arguments=arguments,
-            result=result_text,
-            status="error" if block.is_error else "success",
-            duration_ms=duration_ms,
-        )
+    return ToolCallObserved(
+        call_id=tool_id,
+        name=name,
+        arguments=arguments,
+        result=result_text,
+        status="error" if block.is_error else "success",
+        duration_ms=duration_ms,
     )
 
 

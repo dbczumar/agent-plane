@@ -10,7 +10,7 @@ consumes them uniformly — no branching on executor type.
 from __future__ import annotations
 
 import abc
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -281,16 +281,17 @@ class ExecutorContext:
         e.g. ``"conv_abc123"``.
     :param storage_dir: Scoped persistent directory for this
         conversation. The workflow manages artifact store I/O.
-    :param call_tool: Execute a tool by name. The workflow routes
-        to server-side execution (ToolManager) if the tool is
-        registered, otherwise tunnels to the client for execution.
-        Blocks until the result is available.
+    :param call_tool: Execute a tool by name. Async — uses
+        ``asyncio.sleep`` for client-side tool polling so the
+        event loop stays free. The workflow routes to server-side
+        execution (ToolManager) if the tool is registered,
+        otherwise tunnels to the client for execution.
     """
 
     task_id: str
     conversation_id: str
     storage_dir: Path
-    call_tool: Callable[[ToolCallRequested], ToolResult]
+    call_tool: Callable[[ToolCallRequested], Awaitable[ToolResult]]
 
 
 # ── Executor ABC ───────────────────────────────────────────
@@ -320,26 +321,37 @@ class Executor(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def run_turn(
+    async def run_turn(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         system_prompt: str,
         llm_config: LLMConfig,
         context: ExecutorContext,
-    ) -> Iterator[ExecutorEvent]:
+    ) -> AsyncIterator[ExecutorEvent]:
         """
         Run one executor turn and yield events.
 
-        :param messages: Conversation history as Responses API input items.
+        Async generator — callers consume with ``async for``.
+        Yields events as they arrive (text deltas, tool calls,
+        etc.) and terminates with ``TurnComplete`` or
+        ``ExecutorError``.
+
+        :param messages: Conversation history as Responses API
+            input items.
         :param tools: OpenAI-format tool schemas.
         :param system_prompt: Assembled system instructions string.
-        :param llm_config: LLM configuration (model, extra, connection,
-            timeout, retry). May differ from the spec's config due to
-            per-request overrides (e.g. reasoning effort).
-        :param context: Capabilities and identifiers from agent-plane.
+        :param llm_config: LLM configuration (model, extra,
+            connection, timeout, retry). May differ from the spec's
+            config due to per-request overrides (e.g. reasoning
+            effort).
+        :param context: Capabilities and identifiers from
+            agent-plane.
         """
-        ...
+        # Unreachable yield makes the type checker recognize this
+        # as an async generator. Subclasses use ``yield`` directly.
+        if False:  # pragma: no cover
+            yield
 
     def on_task_start(self, context: ExecutorContext) -> None:
         """

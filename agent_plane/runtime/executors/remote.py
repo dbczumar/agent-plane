@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from typing import Any
 
 from typing_extensions import Self
@@ -81,28 +81,29 @@ class RemoteExecutor(Executor):
         """
         return None
 
-    def run_turn(
+    async def run_turn(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         system_prompt: str,
         llm_config: LLMConfig,
         context: ExecutorContext,
-    ) -> Iterator[ExecutorEvent]:
+    ) -> AsyncIterator[ExecutorEvent]:
         """
         POST to the remote service and consume the SSE stream.
 
         On 404 (session not found), retries once with full
-        conversation history so the remote can rebuild its session.
-
-        Uses httpx streaming so events are yielded in real-time
-        as the remote service produces them.
+        conversation history so the remote can rebuild its
+        session. Uses async httpx streaming so events are
+        yielded in real-time.
 
         :param messages: Conversation history as input items.
         :param tools: Ignored — remote defines its own tools.
-        :param system_prompt: Ignored — remote defines its prompt.
+        :param system_prompt: Ignored — remote defines its
+            prompt.
         :param llm_config: Ignored — remote defines its config.
-        :param context: Agent-plane capabilities and identifiers.
+        :param context: Agent-plane capabilities and
+            identifiers.
         """
         import httpx
 
@@ -119,19 +120,19 @@ class RemoteExecutor(Executor):
             pool=30.0,
         )
 
-        with httpx.Client(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             try:
                 # First attempt — normal turn.
-                with client.stream(
+                async with client.stream(
                     "POST",
                     self._endpoint,
                     json=body,
                     headers=headers,
                 ) as response:
                     if response.status_code == 404:
-                        # Consume and discard the 404 body so the
-                        # connection is released for the retry.
-                        response.read()
+                        # Consume and discard the 404 body so
+                        # the connection is released for retry.
+                        await response.aread()
                     elif response.status_code != 200:
                         yield ExecutorError(
                             message=(f"Remote executor returned {response.status_code}"),
@@ -139,9 +140,8 @@ class RemoteExecutor(Executor):
                         )
                         return
                     else:
-                        yield from _consume_remote_sse_stream(
-                            response,
-                        )
+                        async for event in _consume_remote_sse_stream(response):
+                            yield event
                         return
             except Exception as exc:
                 yield ExecutorError(
@@ -153,7 +153,7 @@ class RemoteExecutor(Executor):
             # 404 recovery — resend with full history.
             body["history"] = _messages_to_history(messages)
             try:
-                with client.stream(
+                async with client.stream(
                     "POST",
                     self._endpoint,
                     json=body,
@@ -165,9 +165,8 @@ class RemoteExecutor(Executor):
                             code="remote_error",
                         )
                         return
-                    yield from _consume_remote_sse_stream(
-                        response,
-                    )
+                    async for event in _consume_remote_sse_stream(response):
+                        yield event
             except Exception as exc:
                 yield ExecutorError(
                     message=(f"Cannot connect to remote executor at {self._endpoint}: {exc}"),
@@ -215,21 +214,21 @@ def _messages_to_history(
     return list(messages)
 
 
-def _consume_remote_sse_stream(
+async def _consume_remote_sse_stream(
     response: Any,
-) -> Iterator[ExecutorEvent]:
+) -> AsyncIterator[ExecutorEvent]:
     """
-    Parse SSE data lines from a streaming httpx response.
+    Parse SSE data lines from an async streaming httpx response.
 
-    Uses ``iter_lines()`` on a streaming response so events
+    Uses ``aiter_lines()`` on a streaming response so events
     are yielded in real-time as the remote produces them.
     Heartbeat events are consumed silently (keepalive only).
     ``turn_complete`` and ``error`` are terminal.
 
-    :param response: An httpx streaming response (from
-        ``client.stream()`` context manager).
+    :param response: An async httpx streaming response (from
+        ``client.stream()`` async context manager).
     """
-    for line in response.iter_lines():
+    async for line in response.aiter_lines():
         if not line.startswith("data: "):
             continue
         payload = json.loads(line[6:])

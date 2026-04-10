@@ -90,11 +90,26 @@ def executor_context() -> ExecutorContext:
 
     :returns: An :class:`ExecutorContext` with stub values.
     """
+
+    async def _stub_call_tool(
+        _req: ToolCallRequested,
+    ) -> ToolResult:
+        """
+        Stub async call_tool for tests.
+
+        :param _req: Ignored.
+        :returns: A fixed successful result.
+        """
+        return ToolResult(
+            content="stub output",
+            status="success",
+        )
+
     return ExecutorContext(
         task_id="task_test_123",
         conversation_id="conv_test_456",
         storage_dir=Path("/tmp/test-storage"),
-        call_tool=lambda _req: ToolResult(content="stub output", status="success"),
+        call_tool=_stub_call_tool,
     )
 
 
@@ -970,7 +985,8 @@ def test_max_context_tokens_returns_none_for_unknown_model(
 # ── DefaultExecutor.run_turn ─────────────────────────────────────
 
 
-def test_run_turn_yields_events(
+@pytest.mark.asyncio
+async def test_run_turn_yields_events(
     monkeypatch: pytest.MonkeyPatch,
     llm_config: LLMConfig,
     executor_context: ExecutorContext,
@@ -990,15 +1006,16 @@ def test_run_turn_yields_events(
     )
 
     executor = DefaultExecutor(llm_config=llm_config)
-    events = list(
-        executor.run_turn(
+    events = [
+        e
+        async for e in executor.run_turn(
             messages=[{"role": "user", "content": "Hello"}],
             tools=[],
             system_prompt="You are helpful.",
             llm_config=llm_config,
             context=executor_context,
         )
-    )
+    ]
 
     text_chunks = [e for e in events if isinstance(e, TextChunk)]
     # One text chunk from the stream delta.
@@ -1010,7 +1027,8 @@ def test_run_turn_yields_events(
     assert events[-1].text == "Answer!"
 
 
-def test_run_turn_context_window_overflow(
+@pytest.mark.asyncio
+async def test_run_turn_context_window_overflow(
     monkeypatch: pytest.MonkeyPatch,
     llm_config: LLMConfig,
     executor_context: ExecutorContext,
@@ -1038,15 +1056,16 @@ def test_run_turn_context_window_overflow(
     )
 
     executor = DefaultExecutor(llm_config=llm_config)
-    events = list(
-        executor.run_turn(
+    events = [
+        e
+        async for e in executor.run_turn(
             messages=[{"role": "user", "content": "Long context"}],
             tools=[],
             system_prompt="system",
             llm_config=llm_config,
             context=executor_context,
         )
-    )
+    ]
 
     # Must yield ContextWindowExceeded so the workflow can compact and retry.
     assert len(events) == 1

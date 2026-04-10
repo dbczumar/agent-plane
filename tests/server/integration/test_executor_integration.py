@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -102,14 +102,14 @@ class _StorageTestExecutor(Executor):
             marker.write_text(_STORAGE_MARKER_CONTENT)
         self._probe.on_task_start_called.set()
 
-    def run_turn(
+    async def run_turn(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         system_prompt: str,
         llm_config: LLMConfig,
         context: ExecutorContext,
-    ) -> Iterator[TurnComplete]:
+    ) -> AsyncIterator[TurnComplete]:
         """
         Return a simple text response.
 
@@ -172,14 +172,14 @@ class _AwaitToolExecutor(Executor):
         """
         raise NotImplementedError
 
-    def run_turn(
+    async def run_turn(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         system_prompt: str,
         llm_config: LLMConfig,
         context: ExecutorContext,
-    ) -> Iterator[TurnComplete]:
+    ) -> AsyncIterator[TurnComplete]:
         """
         Call ``call_tool`` for a client-side tool, then
         yield the result as text.
@@ -195,7 +195,7 @@ class _AwaitToolExecutor(Executor):
             name="Read",
             arguments={"file_path": "/tmp/test.txt"},
         )
-        result = context.call_tool(call)
+        result = await context.call_tool(call)
         self._probe.tool_result_received = result.content
         self._probe.callback_returned.set()
         yield TurnComplete(text=f"Tool returned: {result.content}")
@@ -511,14 +511,14 @@ class _ObservedToolExecutor(Executor):
         """
         raise NotImplementedError
 
-    def run_turn(
+    async def run_turn(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         system_prompt: str,
         llm_config: LLMConfig,
         context: ExecutorContext,
-    ) -> Iterator[ToolCallObserved | TurnComplete]:
+    ) -> AsyncIterator[ToolCallObserved | TurnComplete]:
         """
         Yield two ``ToolCallObserved`` events and a ``TurnComplete``.
 
@@ -707,14 +707,14 @@ class _TextOnlyExecutor(Executor):
         """
         raise NotImplementedError
 
-    def run_turn(
+    async def run_turn(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         system_prompt: str,
         llm_config: LLMConfig,
         context: ExecutorContext,
-    ) -> Iterator[TurnComplete]:
+    ) -> AsyncIterator[TurnComplete]:
         """
         Yield a single ``TurnComplete`` with the configured text.
 

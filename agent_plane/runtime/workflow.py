@@ -12,7 +12,7 @@ import io
 import json
 import logging
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar, cast
@@ -754,21 +754,17 @@ async def _checkpointed_turn(
     :returns: Serialized event list (DBOS-cached on replay).
     """
 
-    def _blocking_turn() -> list[dict[str, Any]]:
-        """Consume executor events in a thread."""
-        events: list[dict[str, Any]] = []
-        for event in executor.run_turn(
-            messages,
-            tools,
-            system_prompt,
-            llm_config,
-            context,
-        ):
-            _emit_executor_streaming_event(task_id, event)
-            events.append(event_to_dict(event))
-        return events
-
-    return await _to_thread(_blocking_turn)
+    events: list[dict[str, Any]] = []
+    async for event in executor.run_turn(
+        messages,
+        tools,
+        system_prompt,
+        llm_config,
+        context,
+    ):
+        _emit_executor_streaming_event(task_id, event)
+        events.append(event_to_dict(event))
+    return events
 
 
 def _event_to_sse_dict(event: ExecutorEvent) -> dict[str, Any] | None:
@@ -976,23 +972,19 @@ async def _consume_executor_live(
     :returns: Collected list of all executor events.
     """
 
-    def _blocking_consume() -> list[ExecutorEvent]:
-        """Consume executor events in a thread."""
-        events: list[ExecutorEvent] = []
-        for event in executor.run_turn(
-            messages,
-            tools,
-            system_prompt,
-            llm_config,
-            context,
-        ):
-            _logger.info("executor event: %s", type(event).__name__)
-            _emit_executor_live_only(task_id, event)
-            events.append(event)
-        _logger.info("total executor events: %d", len(events))
-        return events
-
-    return await _to_thread(_blocking_consume)
+    events: list[ExecutorEvent] = []
+    async for event in executor.run_turn(
+        messages,
+        tools,
+        system_prompt,
+        llm_config,
+        context,
+    ):
+        _logger.info("executor event: %s", type(event).__name__)
+        _emit_executor_live_only(task_id, event)
+        events.append(event)
+    _logger.info("total executor events: %d", len(events))
+    return events
 
 
 def _events_to_response_dict(
@@ -3362,27 +3354,34 @@ def _build_executor_context(
     )
     server_names = frozenset(tool_mgr.get_tool_names())
 
-    def _call_tool(call: ToolCallRequested) -> ToolResult:
+    async def _call_tool(call: ToolCallRequested) -> ToolResult:
         """
         Route a tool call to server-side or client-side execution.
 
-        Server-side tools (registered in ToolManager and NOT
-        client-side stubs) are called directly. Client-side tools
-        and unknown tools are tunneled to the client via the
-        parking/polling mechanism.
+        Server-side tools are dispatched via ``to_thread`` so they
+        run in the default thread pool — not whichever event loop
+        the caller happens to be in. This matters for the Claude
+        executor, whose MCP handler runs in a per-conversation
+        event loop distinct from the DBOS workflow loop. Tools
+        like ``spawn_sub_agents`` start DBOS workflows that must
+        not run in the SDK's loop.
+
+        Client-side tools use async polling (``asyncio.sleep``)
+        which works correctly in any event loop.
 
         :param call: The tool call to execute.
         :returns: The tool's result.
         """
         bare = _strip_mcp_tool_prefix(call.name)
         if bare in server_names and not tool_mgr.is_client_side_tool(bare):
-            result_str = tool_mgr.call_tool(
+            result_str = await asyncio.to_thread(
+                tool_mgr.call_tool,
                 bare,
                 json.dumps(call.arguments),
                 tool_ctx,
             )
             return ToolResult(content=result_str, status="completed")
-        return await_tool_output(call)
+        return await await_tool_output(call)
 
     return ExecutorContext(
         task_id=task_id,
@@ -3405,32 +3404,32 @@ def _build_await_tool_output(
     task_id: str,
     root_task_id: str | None,
     task_store: TaskStore,
-) -> Callable[[ToolCallRequested], ToolResult]:
+) -> Callable[[ToolCallRequested], Awaitable[ToolResult]]:
     """
-    Build a callback that parks a client-side tool call until
-    the client delivers a result via PATCH.
+    Build an async callback that parks a client-side tool call
+    until the client delivers a result via PATCH.
 
-    Used by internal executors (Claude SDK) whose tool handlers
-    need to block until the client completes the tool. The
-    callback runs in the executor's thread (not the DBOS workflow
-    thread), so it uses direct DB operations and live SSE publish
-    instead of DBOS primitives.
+    Uses ``asyncio.sleep`` for polling so the event loop stays
+    free for concurrent work (parallel tool calls, SDK
+    housekeeping).
 
-    :param task_id: The current task ID, used as the sub-agent ID
-        in pending tool call rows, e.g. ``"task_sub2"``.
+    :param task_id: The current task ID, used as the sub-agent
+        ID in pending tool call rows, e.g. ``"task_sub2"``.
     :param root_task_id: The root task ID for SSE routing, or
         ``None`` for root-level tasks (publishes to own stream).
-    :param task_store: Task store for pending tool call operations.
-    :returns: A blocking callback suitable for
+    :param task_store: Task store for pending tool call
+        operations.
+    :returns: An async callback suitable for
         ``ExecutorContext.call_tool``.
     """
     # Sub-agents tunnel to the root task's stream; root tasks
     # publish to their own.
     publish_target = root_task_id if root_task_id is not None else task_id
 
-    def _callback(call: ToolCallRequested) -> ToolResult:
+    async def _callback(call: ToolCallRequested) -> ToolResult:
         """
-        Register, publish, and wait for a client-side tool call.
+        Register, publish, and async-wait for a client-side
+        tool call.
 
         :param call: The tool call to park.
         :returns: The client's tool result.
@@ -3442,7 +3441,10 @@ def _build_await_tool_output(
             task_store,
         )
         _publish_client_tool_call(call, publish_target)
-        return _poll_for_tool_result(call.call_id, task_store)
+        return await _poll_for_tool_result_async(
+            call.call_id,
+            task_store,
+        )
 
     return _callback
 
@@ -3542,6 +3544,47 @@ def _poll_for_tool_result(
                 status="success",
             )
         time.sleep(_TOOL_POLL_INTERVAL_SECONDS)
+    return ToolResult(
+        content=(
+            f"Timeout: client did not deliver result for"
+            f" {call_id} within {_TOOL_POLL_TIMEOUT_SECONDS}s"
+        ),
+        status="error",
+    )
+
+
+async def _poll_for_tool_result_async(
+    call_id: str,
+    task_store: TaskStore,
+) -> ToolResult:
+    """
+    Async variant of :func:`_poll_for_tool_result`.
+
+    Uses ``asyncio.sleep`` instead of ``time.sleep`` so the
+    event loop stays free for other work (concurrent tool calls,
+    SDK housekeeping). Same polling logic and timeout.
+
+    :param call_id: The tool call ID to wait for,
+        e.g. ``"call_abc123"``.
+    :param task_store: Task store for querying pending tool
+        calls.
+    :returns: The client's tool result, or a timeout error.
+    """
+    deadline = _monotonic() + _TOOL_POLL_TIMEOUT_SECONDS
+    while _monotonic() < deadline:
+        rows = task_store.list_pending_tool_calls(
+            call_id=call_id,
+            status="completed",
+        )
+        if rows:
+            result_text = rows[0].result
+            if result_text is None:
+                raise ValueError(f"Pending tool call {call_id} completed with None result")
+            return ToolResult(
+                content=result_text,
+                status="success",
+            )
+        await asyncio.sleep(_TOOL_POLL_INTERVAL_SECONDS)
     return ToolResult(
         content=(
             f"Timeout: client did not deliver result for"

@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -246,31 +246,35 @@ class DefaultExecutor(Executor):
         """
         return _get_model_context_window(self._llm_config.model)
 
-    def run_turn(
+    async def run_turn(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         system_prompt: str,
         llm_config: LLMConfig,
         context: ExecutorContext,
-    ) -> Iterator[ExecutorEvent]:
+    ) -> AsyncIterator[ExecutorEvent]:
         """
-        One streaming LLM call with retry.
+        One streaming LLM call with retry (async generator).
 
         Yields ``TextChunk``, ``ReasoningChunk``, and
         ``NativeToolOutput`` events as tokens arrive. After the
         stream completes, yields ``ToolCallRequested`` for each
         tool call and a final ``TurnComplete``.
 
-        On context window overflow, yields ``ContextWindowExceeded``
-        instead (no ``TurnComplete``). On permanent/exhausted errors,
-        yields ``ExecutorError``.
+        On context window overflow, yields
+        ``ContextWindowExceeded`` instead (no ``TurnComplete``).
+        On permanent/exhausted errors, yields ``ExecutorError``.
+
+        The internal LLM stream is sync (Phase 2 will make the
+        client async). Each ``yield`` gives the event loop a
+        chance to schedule other work.
 
         :param messages: Pre-compacted conversation history.
         :param tools: OpenAI-format tool schemas.
         :param system_prompt: System instructions.
-        :param llm_config: LLM configuration (may have per-request
-            reasoning overrides applied).
+        :param llm_config: LLM configuration (may have
+            per-request reasoning overrides applied).
         :param context: Agent-plane capabilities and identifiers.
         """
         args = _build_responses_args(
@@ -278,7 +282,7 @@ class DefaultExecutor(Executor):
             tools,
             llm_config.extra,
         )
-        yield from _run_streaming_turn(
+        for event in _run_streaming_turn(
             task_id=context.task_id,
             input_items=messages,
             instructions=system_prompt,
@@ -286,7 +290,8 @@ class DefaultExecutor(Executor):
             connection=llm_config.connection,
             timeout=llm_config.request_timeout,
             retry_config=llm_config.retry,
-        )
+        ):
+            yield event
 
 
 def _create_stream(
