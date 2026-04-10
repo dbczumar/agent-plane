@@ -514,7 +514,14 @@ def _build_agent(
     """
     sdk = _ensure_sdk()
 
-    function_tools = [_make_function_tool(schema, context) for schema in tools]
+    # Only wrap function-type tools. Passthrough tools
+    # (e.g. web_search_openai with type="web_search_preview")
+    # are handled via hosted_tools, not function tools.
+    function_tools = [
+        _make_function_tool(schema, context)
+        for schema in tools
+        if schema.get("type") == "function"
+    ]
     hosted_tools: list[Any] = []
     if _has_web_search(executor._builtins):
         hosted_tools.append(sdk.WebSearchTool())
