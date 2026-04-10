@@ -12,7 +12,7 @@ import io
 import json
 import logging
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar, cast
@@ -97,7 +97,10 @@ from agent_plane.runtime.executors import (
 )
 from agent_plane.runtime.live_stream import close as _live_close
 from agent_plane.runtime.live_stream import publish as _live_publish
-from agent_plane.runtime.llm_retry import detail_to_dict, execute_with_retry
+from agent_plane.runtime.llm_retry import (
+    detail_to_dict,
+    execute_with_retry_async,
+)
 from agent_plane.runtime.prompt import build_instructions, history_to_input_items
 from agent_plane.runtime.tool_retry import execute_tool_with_retry
 from agent_plane.spec import AgentSpec
@@ -533,31 +536,29 @@ async def _call_llm(
     """
     args = _build_responses_args(model, tools, extra)
 
-    def _blocking_call() -> dict[str, Any]:
-        """Execute the non-streaming LLM call in a thread."""
-
-        def do_call() -> dict[str, Any]:
-            resp = cast(
-                LLMResponse,
-                _get_llm_client().responses.create(
-                    input=input_items,
-                    instructions=instructions,
-                    reasoning=args.reasoning,
-                    connection_params=connection,
-                    timeout=timeout,
-                    **args.kwargs,
-                ),
-            )
-            return _response_to_dict(resp)
-
-        effective_retry = retry_config or RetryConfig(max_attempts=1)
-        return execute_with_retry(
-            do_call,
-            effective_retry,
-            on_retry=lambda event: _write_output(task_id, event),
+    async def do_call() -> dict[str, Any]:
+        """Execute the non-streaming LLM call."""
+        resp = cast(
+            LLMResponse,
+            await _get_llm_client().responses.create(
+                input=input_items,
+                instructions=instructions,
+                reasoning=args.reasoning,
+                connection_params=connection,
+                timeout=timeout,
+                **args.kwargs,
+            ),
         )
+        return _response_to_dict(resp)
 
-    return await _to_thread(_blocking_call)
+    effective_retry = retry_config or RetryConfig(
+        max_attempts=1,
+    )
+    return await execute_with_retry_async(
+        do_call,
+        effective_retry,
+        on_retry=lambda event: _write_output(task_id, event),
+    )
 
 
 @step()
@@ -611,32 +612,33 @@ async def _call_llm_streaming(
     """
     args = _build_responses_args(model, tools, extra)
 
-    def _blocking_call() -> dict[str, Any]:
-        """Execute the streaming LLM call in a thread."""
-
-        def do_call() -> dict[str, Any]:
-            stream_resp = cast(
-                Iterator[ResponseStreamEvent],
-                _get_llm_client().responses.create(
-                    input=input_items,
-                    instructions=instructions,
-                    reasoning=args.reasoning,
-                    stream=True,
-                    connection_params=connection,
-                    timeout=timeout,
-                    **args.kwargs,
-                ),
-            )
-            return _accumulate_stream(task_id, stream_resp)
-
-        effective_retry = retry_config or RetryConfig(max_attempts=1)
-        return execute_with_retry(
-            do_call,
-            effective_retry,
-            on_retry=lambda event: _write_output(task_id, event),
+    async def do_call() -> dict[str, Any]:
+        """Execute the streaming LLM call."""
+        stream_resp = cast(
+            AsyncIterator[ResponseStreamEvent],
+            await _get_llm_client().responses.create(
+                input=input_items,
+                instructions=instructions,
+                reasoning=args.reasoning,
+                stream=True,
+                connection_params=connection,
+                timeout=timeout,
+                **args.kwargs,
+            ),
+        )
+        return await _accumulate_stream_async(
+            task_id,
+            stream_resp,
         )
 
-    return await _to_thread(_blocking_call)
+    effective_retry = retry_config or RetryConfig(
+        max_attempts=1,
+    )
+    return await execute_with_retry_async(
+        do_call,
+        effective_retry,
+        on_retry=lambda event: _write_output(task_id, event),
+    )
 
 
 # SSE event types emitted for reasoning content
@@ -701,6 +703,83 @@ def _accumulate_stream(
 
     # Stream completed without a response.completed event (e.g. error).
     # Return an empty response so the loop can handle it gracefully.
+    return {
+        "model": None,
+        "text": None,
+        "tool_calls": [],
+        "native_tool_items": [],
+    }
+
+
+async def _accumulate_stream_async(
+    task_id: str,
+    stream_resp: AsyncIterator[ResponseStreamEvent],
+) -> dict[str, Any]:
+    """
+    Async variant of :func:`_accumulate_stream`.
+
+    Consumes an async Responses API streaming response, emits
+    text and reasoning delta events via :func:`_write_output`,
+    and returns the full response dict.
+
+    :param task_id: The task identifier, e.g.
+        ``"task_abc123"``.
+    :param stream_resp: The async Responses API streaming
+        response to iterate over.
+    :returns: The accumulated response dict.
+    """
+    completed_response: LLMResponse | None = None
+
+    async for event in stream_resp:
+        if isinstance(event, ResponseReasoningStartedEvent):
+            _write_output(
+                task_id,
+                {"type": _REASONING_STARTED_EVENT},
+            )
+        elif isinstance(event, ResponseTextDeltaEvent):
+            _write_output(
+                task_id,
+                {
+                    "type": "response.output_text.delta",
+                    "delta": event.delta,
+                },
+            )
+        elif isinstance(
+            event,
+            ResponseReasoningTextDeltaEvent,
+        ):
+            _write_output(
+                task_id,
+                {
+                    "type": _REASONING_TEXT_EVENT,
+                    "delta": event.delta,
+                },
+            )
+        elif isinstance(
+            event,
+            ResponseReasoningSummaryTextDeltaEvent,
+        ):
+            _write_output(
+                task_id,
+                {
+                    "type": _REASONING_SUMMARY_EVENT,
+                    "delta": event.delta,
+                },
+            )
+        elif isinstance(event, NativeToolOutputAddedEvent):
+            _write_output(
+                task_id,
+                {
+                    "type": "response.output_item.done",
+                    "item": event.item,
+                },
+            )
+        elif isinstance(event, ResponseCompletedEvent):
+            completed_response = event.response
+
+    if completed_response is not None:
+        return _response_to_dict(completed_response)
+
     return {
         "model": None,
         "text": None,
@@ -1091,7 +1170,7 @@ async def _executor_turn_with_compaction(
         compaction_state,
         content_cache,
     )
-    messages = _proactive_compact_if_needed(
+    messages = await _proactive_compact_if_needed(
         messages,
         history,
         sys_tokens,
@@ -1111,7 +1190,7 @@ async def _executor_turn_with_compaction(
         return result
 
     # Reactive compaction — compact and retry once.
-    messages = _reactive_compact_from_overflow(
+    messages = await _reactive_compact_from_overflow(
         messages,
         history,
         sys_tokens,
@@ -1181,7 +1260,7 @@ def _prepare_messages(
     return sys_instructions, messages, sys_tokens
 
 
-def _reactive_compact_from_overflow(
+async def _reactive_compact_from_overflow(
     messages: list[dict[str, Any]],
     history: list[ConversationItem],
     sys_tokens: int,
@@ -1223,7 +1302,7 @@ def _reactive_compact_from_overflow(
                 f"Context window exceeded: {overflow.actual_tokens} > {overflow.max_tokens}",
                 code="context_length_exceeded",
             )
-    result = compact(
+    result = await compact(
         messages,
         history,
         config=compaction_state.config,
@@ -2215,6 +2294,68 @@ async def _handle_tool_calls(
     return last_seen
 
 
+def _recover_spawn_ids_from_history(
+    history: list[ConversationItem],
+) -> tuple[set[str], set[str]]:
+    """
+    Recover spawned and collected sub-agent IDs from conversation history.
+
+    When a client-tool round-trip creates a new response (workflow),
+    sub-agents spawned in the previous response need to be recovered
+    so auto-collect runs. The task store query (``list_tasks`` with
+    ``root_task_id``) only finds children of the CURRENT task. This
+    function scans history for ``spawn_sub_agents`` results from
+    ANY prior response in the conversation.
+
+    :param history: The loaded conversation history.
+    :returns: ``(spawned_ids, collected_ids)`` — spawned IDs from
+        ``spawn_sub_agents`` results, collected IDs from
+        auto-collected system messages.
+    """
+    call_names: dict[str, str] = {}
+    for item in history:
+        if item.type == "function_call" and isinstance(item.data, FunctionCallData):
+            call_names[item.data.call_id] = _strip_mcp_tool_prefix(item.data.name)
+
+    spawned: set[str] = set()
+    collected: set[str] = set()
+
+    for item in history:
+        if item.type == "function_call_output" and isinstance(item.data, FunctionCallOutputData):
+            name = call_names.get(item.data.call_id, "")
+            if name != SpawnTool.name():
+                continue
+            try:
+                parsed = json.loads(item.data.output)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            for rid in parsed.get("response_ids", []):
+                spawned.add(rid)
+
+        # Auto-collected results are persisted as user messages
+        # with "[System: auto-collected sub-agent results]".
+        if item.type == "message" and isinstance(item.data, MessageData):
+            for block in item.data.content:
+                if not isinstance(block, dict):
+                    continue
+                text = block.get("text", "")
+                if not text.startswith("[System: auto-collected"):
+                    continue
+                json_part = text.split("\n", 1)
+                if len(json_part) < 2:
+                    continue
+                try:
+                    payload = json.loads(json_part[1])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                for r in payload.get("results", []):
+                    rid = r.get("response_id", "")
+                    if rid:
+                        collected.add(rid)
+
+    return spawned, collected
+
+
 def _strip_mcp_tool_prefix(name: str) -> str:
     """
     Strip the Claude SDK MCP tool prefix from a tool name.
@@ -2912,7 +3053,7 @@ def _load_initial_history(
     return compaction_to_history_items(compaction_item) + content_items
 
 
-def _proactive_compact_if_needed(
+async def _proactive_compact_if_needed(
     messages: list[dict[str, Any]],
     history: list[ConversationItem],
     sys_tokens: int,
@@ -2946,7 +3087,7 @@ def _proactive_compact_if_needed(
     budget = int(compaction_state.context_window * threshold)
     if count_tokens(messages, compaction_state.model) + sys_tokens <= budget:
         return messages
-    result = compact(
+    result = await compact(
         messages,
         history,
         config=config,
@@ -2962,7 +3103,7 @@ def _proactive_compact_if_needed(
     return result.messages
 
 
-def _reactive_compact(
+async def _reactive_compact(
     messages: list[dict[str, Any]],
     history: list[ConversationItem],
     sys_tokens: int,
@@ -3005,7 +3146,7 @@ def _reactive_compact(
                 task_id,
             )
             raise PermanentLLMError(str(exc), code=exc.code, detail=exc.detail) from exc
-    result = compact(
+    result = await compact(
         messages,
         history,
         config=compaction_state.config,
@@ -3071,7 +3212,7 @@ async def _call_llm_maybe_compact(
         [{"role": "system", "content": sys_instructions}],
         compaction_state.model,
     )
-    messages = _proactive_compact_if_needed(
+    messages = await _proactive_compact_if_needed(
         messages, resolved, sys_tokens, compaction_state, task_id
     )
     try:
@@ -3079,7 +3220,7 @@ async def _call_llm_maybe_compact(
             task_id, messages, sys_instructions, llm_config, tool_schemas
         )
     except ContextWindowExceededError as exc:
-        messages = _reactive_compact(
+        messages = await _reactive_compact(
             messages, resolved, sys_tokens, exc, compaction_state, task_id
         )
         try:
@@ -3684,8 +3825,7 @@ async def _run_agent_loop(
     # Recover state from history so sub-agents spawned in
     # previous responses (before a client-tool round-trip) are
     # still tracked for auto-collect.
-    spawned_ids: set[str] = set()
-    collected_ids: set[str] = set()
+    spawned_ids, collected_ids = _recover_spawn_ids_from_history(history)
     # Per-execution compaction state. context_window is seeded from
     # the executor's known limit (if any) so proactive compaction
     # can fire from the first iteration. Falls back to None when the
