@@ -26,7 +26,7 @@ import httpx
 import pytest
 
 from agent_plane.llms.errors import ContextWindowExceededError
-from agent_plane.runtime.compaction import SummaryMetadata, _CompactionState
+from agent_plane.runtime.compaction import CompactionResult, SummaryMetadata, _CompactionState
 from agent_plane.spec import AgentSpec
 from agent_plane.spec.types import LLMConfig
 from tests.server.conftest import ControllableMockClient
@@ -464,19 +464,35 @@ async def test_reactive_compact_overflow_then_retry_succeeds(
 
     # Patch compact() to return a minimal message list. We verify
     # compact was called by checking the second LLM call receives
-    # the compacted input.
+    # the compacted input.  The real compact() is async, so the
+    # replacement must also be async — a sync return would cause
+    # "object CompactionResult can't be used in 'await' expression".
     compacted_msgs = [
         {"role": "user", "content": [{"type": "input_text", "text": "Hello"}]},
     ]
-    monkeypatch.setattr(
-        "agent_plane.runtime.workflow.compact",
-        lambda messages, history, **kw: __import__(
-            "agent_plane.runtime.compaction",
-            fromlist=["CompactionResult"],
-        ).CompactionResult(
+
+    async def _fake_compact(
+        messages: list[dict[str, Any]],
+        history: list[Any],
+        **kw: Any,
+    ) -> CompactionResult:
+        """
+        Async stub that returns pre-built compacted messages.
+
+        :param messages: Input messages (ignored).
+        :param history: Conversation history (ignored).
+        :param kw: Remaining keyword arguments (ignored).
+        :returns: A CompactionResult with the pre-built compacted
+            messages and no summary metadata.
+        """
+        return CompactionResult(
             messages=compacted_msgs,
             summary_metadata=None,
-        ),
+        )
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.compact",
+        _fake_compact,
     )
 
     result = await create_test_response(

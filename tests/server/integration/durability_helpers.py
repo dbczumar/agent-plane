@@ -178,6 +178,14 @@ def build_server(
     wf_mod._get_llm_client = lambda: mock_llm  # type: ignore[assignment]
     exec_mod._get_llm_client = lambda: mock_llm  # type: ignore[assignment]
 
+    # Force a known context window so the executor uses
+    # _checkpointed_turn (@step) for LLM calls. Without this,
+    # unknown test models return None from max_context_tokens(),
+    # causing _consume_executor_live (no @step) to be used.
+    # Durability tests require the @step path so DBOS can
+    # checkpoint and replay LLM calls on crash recovery.
+    exec_mod._get_model_context_window = lambda model: 128000  # type: ignore[assignment]
+
     app = create_app(
         agent_store=agent_store,
         file_store=SqlAlchemyFileStore(db_uri),
@@ -320,8 +328,11 @@ async def run_server_1(
     assert created.body["status"] == "queued"
 
     # Gate: workflow passed the tool call and entered
-    # LLM call 2 (the blocked one)
-    call_block.call_event.wait(timeout=10)
+    # LLM call 2 (the blocked one).  Use asyncio.to_thread so the
+    # test event loop stays free — DBOS runs the async workflow on
+    # this loop, so a blocking wait() would deadlock it.
+    reached = await asyncio.to_thread(call_block.call_event.wait, 10)
+    assert reached, "LLM call 2 was never reached (workflow stalled)"
 
     assert len(tracking.invocations) == 1, (
         f"Expected 1 tool invocation pre-crash, got {len(tracking.invocations)}"
@@ -418,8 +429,11 @@ async def run_server_1_crash_mid_tool(
     response_id = created.body["id"]
     conv_id = created.body["conversation"]["id"]
 
-    # Wait for tool to be entered (blocked via gate)
-    gate.entered.wait(timeout=10)
+    # Wait for tool to be entered (blocked via gate).
+    # Use asyncio.to_thread so the test event loop stays free —
+    # DBOS runs the async workflow on this loop.
+    entered = await asyncio.to_thread(gate.entered.wait, 10)
+    assert entered, "Tool gate was never entered (workflow stalled)"
 
     # Crash: do NOT release gate — simulates process death
     # while tool is mid-execution. The _call_tool @step never
@@ -512,8 +526,11 @@ async def run_server_1_with_steering(
     response_id = created.body["id"]
     conv_id = created.body["conversation"]["id"]
 
-    # Wait for LLM to be entered (workflow is running)
-    call_block.call_event.wait(timeout=10)
+    # Wait for LLM to be entered (workflow is running).
+    # Use asyncio.to_thread so the test event loop stays free —
+    # DBOS runs the async workflow on this loop.
+    reached = await asyncio.to_thread(call_block.call_event.wait, 10)
+    assert reached, "LLM call was never reached (workflow stalled)"
 
     # Inject steered message via the API. try_deliver writes
     # to conversation_items in its own transaction, independent
@@ -597,7 +614,10 @@ async def assert_recovery_output(
     output = terminal_body["output"]
     assistant_outputs = [o for o in output if o.get("role") == "assistant"]
     assert len(assistant_outputs) >= 1, "No assistant output after recovery"
-    assert assistant_outputs[0]["content"][0]["text"] == recovery_text
+    # Use the last assistant output — earlier ones may be empty-text
+    # placeholders from tool-calling turns (the executor records an
+    # assistant message even when the LLM returned tool calls).
+    assert assistant_outputs[-1]["content"][0]["text"] == recovery_text
 
 
 async def assert_conversation_persisted(
@@ -630,7 +650,9 @@ async def assert_conversation_persisted(
     assert user_items[0]["content"][0]["text"] == user_text
 
     assert len(assistant_items) >= 1, "Assistant response not persisted after recovery"
-    assert assistant_items[0]["content"][0]["text"] == assistant_text
+    # Use the last assistant item — earlier ones may be empty-text
+    # placeholders from tool-calling turns.
+    assert assistant_items[-1]["content"][0]["text"] == assistant_text
 
 
 async def assert_steering_persisted(
