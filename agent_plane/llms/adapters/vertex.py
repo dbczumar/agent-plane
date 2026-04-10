@@ -70,18 +70,26 @@ class VertexAdapter(GeminiAdapter):
         self._cached_credentials = credentials
         return credentials
 
-    def _get_headers(
+    async def _get_headers(
         self,
         api_key_override: str | None = None,
     ) -> dict[str, str]:
         """
         Build Vertex AI headers with OAuth bearer token.
 
+        Offloads ``_get_credentials()`` to a thread because the
+        Google auth token refresh does a blocking HTTP request
+        to the metadata server / OAuth endpoint (100-500ms).
+
         :param api_key_override: Not used by Vertex AI (uses GCP
             OAuth). Accepted for interface compatibility.
         :returns: Headers dict with Authorization.
         """
-        credentials = self._get_credentials()
+        import asyncio
+
+        credentials = await asyncio.to_thread(
+            self._get_credentials,
+        )
         return {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {credentials.token}",

@@ -63,12 +63,15 @@ class GeminiAdapter(BaseAdapter):
         """
         return _BASE_URL
 
-    def _get_headers(
+    async def _get_headers(
         self,
         api_key_override: str | None = None,
     ) -> dict[str, str]:
         """
         Build HTTP headers. Overridden by VertexAdapter for OAuth.
+
+        Async so VertexAdapter can offload blocking auth refresh
+        to a thread. No I/O in this base implementation.
 
         :param api_key_override: API key from ``connection_params``.
         :returns: Headers dict with API key.
@@ -113,7 +116,7 @@ class GeminiAdapter(BaseAdapter):
         """
         params = connection_params or {}
         payload = _chat_to_gemini(messages, tools, extra)
-        headers = self._get_headers(
+        headers = await self._get_headers(
             api_key_override=params.get("api_key"),
         )
         override_base = params.get("base_url")
