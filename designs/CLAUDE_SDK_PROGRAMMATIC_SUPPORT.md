@@ -1,21 +1,24 @@
-# SDK Entrypoint: Deploying Claude Agent SDK Code to Agent-Plane
+# Programmatic Claude Agent SDK Support
 
 ## Problem
 
 Developers who have written code with the Claude Agent SDK want to
-deploy it on agent-plane without rewriting it as a declarative YAML
-spec. Today, `executor.type: claude_sdk` configures the SDK via YAML
-fields (`tools.builtins`, `instructions`, `llm.model`). This works
-for agents that can be fully described declaratively, but not for
-agents with custom `@tool` handlers, custom MCP servers, runtime
-logic, or programmatic `ClaudeAgentOptions` construction.
+deploy it on agent-plane without rewriting it. Today,
+`executor.type: claude_sdk` configures the SDK via YAML fields
+(`tools.builtins`, `instructions`, `llm.model`). This works for
+agents that can be fully described declaratively, but not for agents
+with custom `@tool` handlers, custom MCP servers, hooks, sub-agent
+definitions, or programmatic `ClaudeAgentOptions` construction.
 
 ### What SDK users write today
 
 ```python
-from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, tool
+from claude_agent_sdk import (
+    ClaudeAgentOptions, tool, create_sdk_mcp_server,
+    AgentDefinition, HookMatcher,
+)
 
-@tool("search_docs", "Search documentation", {...})
+@tool("search_docs", "Search documentation", {"query": str})
 async def search_docs(args):
     results = my_vector_db.search(args["query"])
     return {"content": [{"type": "text", "text": str(results)}]}
@@ -24,9 +27,12 @@ options = ClaudeAgentOptions(
     tools=["Bash", "Read", "Edit"],
     mcp_servers={"docs": create_sdk_mcp_server("docs", tools=[search_docs])},
     system_prompt="You are a coding assistant with access to docs.",
-    permission_mode="bypassPermissions",
+    agents={"researcher": AgentDefinition(...)},
+    hooks={"PreToolUse": [HookMatcher(...)]},
+    max_turns=50,
 )
 
+# They also write client lifecycle code:
 client = ClaudeSDKClient(options)
 await client.connect()
 await client.query("Fix the auth bug")
@@ -34,251 +40,340 @@ async for msg in client.receive_response():
     ...
 ```
 
-### What we want
+### Goal
+
+The user wraps their options construction in a function and deploys.
+No rewriting. No restructuring. Agent-plane handles the rest.
+
+---
+
+## Design
+
+### Agent spec
 
 ```yaml
-executor:
-  type: claude_sdk
-  entrypoint: agent.py
-```
-
-Agent-plane loads the module, gets the options, manages the rest.
-The developer's `@tool` handlers and MCP servers run as-is.
-
----
-
-## Proposal
-
-The agent bundle includes a Python file (e.g. `agent.py`). The spec
-declares `executor.entrypoint: agent.py`. Agent-plane imports the
-module and calls a known export to get `ClaudeAgentOptions`. The
-`ClaudeAgentsExecutor` uses these options instead of constructing
-them from YAML fields.
-
----
-
-## Open Questions
-
-### Q1: What does the entrypoint module export?
-
-**Option A: `create_options() -> ClaudeAgentOptions`**
-
-Zero-arg function. Agent-plane calls it once at executor construction
-time. Simple, but the function can't access runtime context
-(conversation_id, storage_dir, file stores).
-
-```python
-def create_options() -> ClaudeAgentOptions:
-    return ClaudeAgentOptions(
-        tools=["Bash", "Read"],
-        mcp_servers={"docs": my_mcp_server},
-        system_prompt="...",
-    )
-```
-
-**Option B: `create_options(context) -> ClaudeAgentOptions`**
-
-Receives an agent-plane context object with runtime info. The
-function can use `context.storage_dir`, `context.file_store`, etc.
-More powerful, but couples the entrypoint to agent-plane's API.
-
-```python
-def create_options(context: AgentPlaneContext) -> ClaudeAgentOptions:
-    return ClaudeAgentOptions(
-        tools=["Bash", "Read"],
-        system_prompt=f"Working in {context.storage_dir}",
-    )
-```
-
-**Option C: `create_options` is called per-turn, not once**
-
-Called before each `run_turn()`. Can vary options per conversation.
-More flexible, but heavier.
-
-**Decision:** ?
-
----
-
-### Q2: How do user `@tool` handlers interact with agent-plane's tool routing?
-
-Today `ClaudeAgentsExecutor` registers client-side tools as MCP
-handlers backed by `context.call_tool` (which parks for the client).
-If the user's entrypoint also defines `@tool` handlers:
-
-- **Conflict**: User defines `@tool("Read", ...)` AND the YAML spec
-  has `claude:Read`. Which runs?
-- **Merge**: User's MCP server tools + agent-plane's client-tool MCP
-  server both get registered. The SDK sees both.
-- **Replace**: When entrypoint is set, agent-plane does NOT register
-  its own MCP server. User owns all tool routing.
-
-**Decision:** ?
-
----
-
-### Q3: Dependency management
-
-The entrypoint module will import packages (`my_vector_db`,
-`langchain`, custom libraries). Options:
-
-- **Pre-installed**: Packages must be on the server already. Simple
-  but limits portability.
-- **requirements.txt in bundle**: Agent-plane installs deps at deploy
-  time (like `pip install -r requirements.txt`). Adds latency on
-  first deploy but self-contained.
-- **PEP 723 inline metadata**: The entrypoint file declares deps
-  inline (same as local Python tools). Consistent with existing
-  pattern.
-- **Docker**: The bundle includes a Dockerfile or specifies an image.
-  Full isolation but heavy.
-
-**Decision:** ?
-
----
-
-### Q4: Security — arbitrary code in the server process
-
-The entrypoint runs in the main server process. A crash, OOM, or
-infinite loop kills the server. Existing precedent:
-
-| Component | Runs in | Isolation |
-|-----------|---------|-----------|
-| Local Python tools | Subprocess | Crash-isolated, optional srt sandbox |
-| code_sandbox | Subprocess | Crash-isolated, optional srt sandbox |
-| MCP servers | Separate process | Full process isolation |
-| **Entrypoint (proposed)** | **Main process** | **None** |
-
-Options:
-
-- **Accept for v1**: Same trust model as importing any Python
-  library. The operator trusts the code they deploy.
-- **Subprocess**: Run the entrypoint in a subprocess. But the SDK
-  client is stateful and long-lived — subprocess isolation is
-  complex for persistent connections.
-- **Worker process**: The entrypoint runs in a dedicated worker
-  process that agent-plane communicates with via IPC. Crash-isolated
-  but complex.
-
-**Decision:** ?
-
----
-
-### Q5: ClaudeSDKClient lifecycle
-
-Today `ClaudeAgentsExecutor` manages the SDK client — creates it
-per-conversation, reuses across turns, disconnects on task end.
-Options when an entrypoint is set:
-
-- **Agent-plane manages client**: Entrypoint returns options.
-  Agent-plane creates, connects, queries, and disconnects the client.
-  User code is only the options factory + `@tool` handlers.
-- **User manages client**: Entrypoint returns a connected client (or
-  a factory that produces clients). More control for advanced users,
-  but agent-plane can't guarantee lifecycle (disconnect on task end,
-  crash recovery).
-- **Hybrid**: Agent-plane manages the client but calls user hooks
-  (`on_connect`, `on_disconnect`, `on_turn_start`).
-
-**Decision:** ?
-
----
-
-### Q6: How does the entrypoint interact with YAML spec fields?
-
-When `entrypoint: agent.py` is set alongside `executor.type: claude_sdk`:
-
-| YAML field | With entrypoint | Rationale |
-|-----------|----------------|-----------|
-| `llm.model` | ? | Entrypoint may set model in options |
-| `tools.builtins` | ? | Entrypoint defines its own tools |
-| `instructions` | ? | Entrypoint sets system_prompt in options |
-| `compaction` | ? | Workflow concern, independent of executor |
-| `executor.timeout` | Valid | Workflow concern |
-| `executor.max_iterations` | Valid | Workflow concern |
-
-Options:
-
-- **Entrypoint replaces all SDK-specific fields**: `llm.model`,
-  `tools.builtins`, and `instructions` are invalid when entrypoint
-  is set. Validator rejects them. Clean separation.
-- **Entrypoint overrides**: YAML fields are defaults. Entrypoint can
-  override any of them. Flexible but confusing (which one wins?).
-- **Merge**: YAML `tools.builtins` merged with entrypoint's tools.
-  Complex, error-prone.
-
-**Decision:** ?
-
----
-
-### Q7: What about non-Claude-SDK executors?
-
-The entrypoint concept could generalize beyond `claude_sdk`:
-
-- `executor.type: remote` + entrypoint: start a local HTTP server
-  from the entrypoint code instead of connecting to an external one.
-- `executor.type: llm` + entrypoint: custom pre/post-processing
-  around the default LLM call.
-
-Should the design support this from the start, or scope to
-`claude_sdk` only for v1?
-
-**Decision:** ?
-
----
-
-## Strawman Design (for discussion)
-
-Based on the simplest viable option for each question:
-
-```yaml
-# config.yaml
 spec_version: 1
 name: my-coding-agent
 
 executor:
   type: claude_sdk
-  entrypoint: agent.py   # relative to bundle root
+  entrypoint: agent.py    # Python module in the bundle
   timeout: 600
+  max_iterations: 20
 
 llm:
-  model: claude-sonnet-4-20250514   # optional override
+  model: claude-sonnet-4-20250514   # optional — overrides entrypoint
 ```
 
+### Entrypoint contract
+
+The module exports `create_options() -> ClaudeAgentOptions`:
+
 ```python
-# agent.py — the entrypoint module
+# agent.py
 from claude_agent_sdk import ClaudeAgentOptions, tool, create_sdk_mcp_server
 
-@tool("search_docs", "Search the documentation", {
-    "type": "object",
-    "properties": {"query": {"type": "string"}},
-    "required": ["query"],
-})
+@tool("search_docs", "Search documentation", {"query": str})
 async def search_docs(args):
-    # User's custom tool logic
-    return {"content": [{"type": "text", "text": "result..."}]}
+    results = my_vector_db.search(args["query"])
+    return {"content": [{"type": "text", "text": str(results)}]}
 
 def create_options() -> ClaudeAgentOptions:
     return ClaudeAgentOptions(
         tools=["Bash", "Read", "Edit"],
-        mcp_servers={
-            "docs": create_sdk_mcp_server("docs", tools=[search_docs]),
-        },
-        system_prompt="You are a coding assistant with docs access.",
-        permission_mode="bypassPermissions",
+        mcp_servers={"docs": create_sdk_mcp_server("docs", tools=[search_docs])},
+        system_prompt="You are a coding assistant with access to docs.",
+        agents={"researcher": AgentDefinition(
+            system_prompt="You research topics.",
+            allowed_tools=["WebSearch", "Read"],
+        )},
+        hooks={"PreToolUse": [HookMatcher(matcher="Bash", hooks=[my_hook])]},
+        can_use_tool=my_permission_handler,
+        max_turns=50,
+        max_budget_usd=1.0,
+        thinking={"type": "adaptive"},
     )
 ```
 
-Agent-plane:
-1. Extracts the bundle, imports `agent.py`
-2. Calls `agent.create_options()` to get `ClaudeAgentOptions`
-3. If `llm.model` is set in YAML, overrides `options.model`
-4. Creates `ClaudeSDKClient(options)`, manages lifecycle
-5. Client-side tools from the API request are merged as an
-   additional MCP server (agent-plane's existing mechanism)
-6. `@tool` handlers in the entrypoint run in-process
+**What the user changes from their existing code:** wrap the options
+construction in `create_options()`. Delete client lifecycle code
+(connect, query, stream loop, disconnect). That's it.
 
-What the user adapts:
-- Wrap their options construction in `create_options()`
-- Remove their `ClaudeSDKClient` lifecycle code (agent-plane owns it)
-- Remove their event streaming loop (agent-plane streams via SSE)
-- Keep all `@tool` handlers and MCP servers as-is
+---
+
+## How agent-plane handles each field
+
+### Fields used as-is
+
+These are passed directly to `ClaudeSDKClient`:
+
+| Field | Behavior |
+|-------|----------|
+| `tools` / `allowed_tools` | SDK tool configuration |
+| `system_prompt` | System instructions for the agent |
+| `mcp_servers` | User's MCP servers registered alongside agent-plane's |
+| `hooks` | PreToolUse, PostToolUse, etc. — run in-process |
+| `can_use_tool` | Permission callback — runs in-process |
+| `model` | Model selection (YAML `llm.model` overrides if set) |
+| `thinking` | Thinking/reasoning configuration |
+| `max_turns` | Turn limit |
+| `max_budget_usd` | Cost budget |
+| `output_format` | Structured output config |
+| `betas` | SDK beta features |
+| `plugins` | SDK plugins |
+
+### Fields agent-plane overrides
+
+These are set by agent-plane regardless of what the user provides:
+
+| Field | Agent-plane sets | Reason |
+|-------|-----------------|--------|
+| `cwd` | `storage_dir` workspace | Agent-plane manages the working directory |
+| `env` | `{"CLAUDECODE": ""}` + overrides | Prevents nested session errors |
+| `cli_path` | System `claude` binary | Agent-plane finds the CLI |
+| `permission_mode` | `bypassPermissions` | Server-side execution is trusted |
+| `disallowed_tools` | `["Task"]` (merged) | Agent-plane manages sub-agents |
+| `extra_args` | `{"no-session-persistence": None}` | Agent-plane manages session state |
+| `include_partial_messages` | `True` | Needed for streaming |
+
+### Fields silently ignored
+
+These don't apply in agent-plane's execution model. They are
+accepted without error but have no effect:
+
+| Field | Why ignored |
+|-------|-------------|
+| `continue_conversation` | Agent-plane manages sessions via `conversation_id` / `previous_response_id` |
+| `resume` | Agent-plane manages session continuity via `storage_dir` |
+| `fork_session` | Not applicable — each task is a fresh execution |
+| `setting_sources` | Agent-plane manages settings |
+| `settings` | Agent-plane manages settings |
+| `sandbox` | Agent-plane controls sandboxing at the tool level |
+| `add_dirs` | Agent-plane controls filesystem access |
+| `user` | Agent-plane manages user identity |
+| `stderr` | Agent-plane captures stderr |
+
+Agent-plane logs a one-time info message listing which fields were
+ignored, so users aren't surprised.
+
+---
+
+## Sub-agent auto-translation
+
+When the entrypoint's options include `agents={...}`, agent-plane
+automatically translates each `AgentDefinition` into an agent-plane
+sub-agent. The user's sub-agent definitions work as-is — no
+rewriting to YAML config files.
+
+### How it works
+
+1. Agent-plane extracts `options.agents` before passing options to
+   the SDK client.
+2. For each `AgentDefinition`, builds an in-memory `AgentSpec`:
+
+   | `AgentDefinition` field | `AgentSpec` field |
+   |---|---|
+   | `system_prompt` | `instructions` |
+   | `allowed_tools` | `tools.builtins` (with `claude:` prefix) |
+   | `model` | `llm.model` |
+   | `mcp_servers` | Passed to sub-agent's `ClaudeAgentsExecutor` |
+   | `hooks` | Passed to sub-agent's `ClaudeAgentOptions` |
+   | `can_use_tool` | Passed to sub-agent's `ClaudeAgentOptions` |
+
+3. Agent-plane sets `disallowed_tools=["Task"]` on the parent.
+4. Agent-plane registers its own `Task` MCP handler that routes to
+   the auto-generated sub-agent specs.
+5. When the parent SDK calls `Task("research X")`, agent-plane's
+   handler catches it and spawns a durable `agent_execution_workflow`
+   for the sub-agent.
+6. Each sub-agent gets its own conversation store, SSE streaming,
+   crash recovery — full durability.
+
+### What the user gets for free
+
+- Sub-agent tool calls are persisted to conversation store
+- Sub-agent crashes are recovered via DBOS re-invoke
+- Sub-agent output is visible on the parent's SSE stream
+- Client-side tools tunnel from sub-agents to the root
+- No changes to their `AgentDefinition` code
+
+### Nested sub-agents
+
+If a sub-agent's `AgentDefinition` itself has `agents={...}`, the
+translation recurses. Each level gets its own durable workflow.
+
+---
+
+## Client-side tools
+
+Client-side tools registered by the API caller (in
+`POST /v1/responses`) are merged as an additional MCP server on the
+SDK client — same as the existing `ClaudeAgentsExecutor` behavior.
+The user's MCP servers from `create_options()` coexist with
+agent-plane's client-tool MCP server.
+
+If a user-defined tool name conflicts with a client-side tool name,
+the user's MCP tool takes precedence (it's registered first). The
+client-side tool is shadowed. This is the expected behavior — the
+entrypoint defines the agent's capabilities, the client can't
+override them.
+
+---
+
+## YAML field interaction
+
+When `executor.entrypoint` is set:
+
+| YAML field | Behavior |
+|-----------|----------|
+| `llm.model` | Overrides `options.model` if set |
+| `tools.builtins` | **Invalid** — entrypoint defines tools |
+| `instructions` | **Invalid** — entrypoint sets `system_prompt` |
+| `compaction` | Valid — workflow concern, independent of executor |
+| `executor.timeout` | Valid — workflow concern |
+| `executor.max_iterations` | Valid — workflow concern |
+
+The validator rejects `tools.builtins` and `instructions` when
+`entrypoint` is set. These would conflict with the entrypoint's
+options. `llm.model` is allowed as a deployment-time override
+(e.g., swap models without changing code).
+
+---
+
+## Dependencies
+
+The entrypoint's imports must be available on the server. Options
+for v1 (in priority order):
+
+1. **Pre-installed**: Packages must be on the server. Simplest.
+   Works when the operator controls the server environment.
+
+2. **requirements.txt in bundle**: Agent-plane runs
+   `pip install -r requirements.txt` at deploy time. Self-contained
+   but adds deploy latency.
+
+3. **PEP 723 inline metadata**: The entrypoint file declares deps
+   inline. Consistent with local Python tools. Requires `uv`.
+
+**Decision for v1**: Pre-installed. Document it. Add
+`requirements.txt` support in a fast follow.
+
+---
+
+## Security
+
+The entrypoint runs in the main server process. Same trust model as
+any Python library the operator installs. Crash isolation is NOT
+provided for v1 — same as importing any pip package.
+
+| Risk | Mitigation |
+|------|-----------|
+| Crash kills server | Operator trusts deployed code (same as pip) |
+| Infinite loop | `executor.timeout` kills the task |
+| Memory leak | Operator monitors (same as any server) |
+| Malicious code | Operator controls what's deployed |
+
+Subprocess isolation for entrypoints is deferred — the SDK client
+is stateful and long-lived, making subprocess boundaries complex.
+
+---
+
+## Implementation plan
+
+### Phase 1: Entrypoint loading
+
+1. **`spec/types.py`** — Add `entrypoint: str | None = None` to
+   `ExecutorSpec`.
+2. **`spec/parser.py`** — Parse `executor.entrypoint` from YAML.
+3. **`spec/validator.py`** — Reject `tools.builtins` and
+   `instructions` when `entrypoint` is set.
+4. **`runtime/executors/claude.py`** — If spec has entrypoint:
+   - Import the module from the agent's workdir
+   - Call `create_options()`
+   - Use returned options instead of building from YAML
+
+### Phase 2: Sub-agent auto-translation
+
+5. **`runtime/executors/claude.py`** — Extract `options.agents`:
+   - Build in-memory `AgentSpec` for each `AgentDefinition`
+   - Register on the parent spec's `sub_agents` list
+   - Set `disallowed_tools=["Task"]` on parent options
+   - Agent-plane's existing `Task` MCP handler routes to them
+
+### Phase 3: requirements.txt
+
+6. **`runtime/agent_cache.py`** — At bundle extraction time, if
+   `requirements.txt` exists, run `pip install -r` into a
+   per-agent virtualenv.
+
+---
+
+## Example deployment
+
+### Bundle structure
+
+```
+my-agent/
+├── config.yaml
+├── agent.py          # entrypoint
+├── my_tools.py       # custom tool implementations
+└── requirements.txt  # optional (Phase 3)
+```
+
+### config.yaml
+
+```yaml
+spec_version: 1
+name: my-coding-agent
+
+executor:
+  type: claude_sdk
+  entrypoint: agent.py
+  timeout: 600
+```
+
+### agent.py
+
+```python
+from claude_agent_sdk import (
+    ClaudeAgentOptions, AgentDefinition,
+    tool, create_sdk_mcp_server,
+)
+from my_tools import search_docs, validate_code
+
+def create_options() -> ClaudeAgentOptions:
+    doc_server = create_sdk_mcp_server(
+        "docs", tools=[search_docs],
+    )
+    return ClaudeAgentOptions(
+        tools=["Bash", "Read", "Edit", "Write"],
+        mcp_servers={"docs": doc_server},
+        system_prompt="You are a senior engineer.",
+        agents={
+            "reviewer": AgentDefinition(
+                system_prompt="You review code for bugs.",
+                allowed_tools=["Read", "Grep"],
+            ),
+        },
+        hooks={
+            "PreToolUse": [
+                HookMatcher(
+                    matcher="Bash",
+                    hooks=[validate_code],
+                ),
+            ],
+        },
+        max_turns=30,
+        thinking={"type": "adaptive"},
+    )
+```
+
+### What the user adapted
+
+From their existing code, they:
+1. Wrapped options construction in `create_options()` ✅
+2. Deleted `ClaudeSDKClient` creation ✅
+3. Deleted `connect()` / `query()` / stream loop / `disconnect()` ✅
+4. Kept ALL `@tool` handlers, MCP servers, hooks, sub-agents ✅
+
+Zero rewriting of agent logic. Only lifecycle code is removed.
