@@ -8,7 +8,7 @@ provider that speaks the OpenAI Chat Completions API format.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -106,7 +106,7 @@ class OpenAICompatibleAdapter(BaseAdapter):
             payload.setdefault("stream_options", {"include_usage": True})
         return payload
 
-    def chat_completions(
+    async def chat_completions(
         self,
         messages: list[dict[str, Any]],
         model: str,
@@ -116,7 +116,7 @@ class OpenAICompatibleAdapter(BaseAdapter):
         *,
         connection_params: dict[str, str] | None = None,
         timeout: int | None = None,
-    ) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    ) -> dict[str, Any] | AsyncIterator[dict[str, Any]]:
         """
         Send a Chat Completions request to the provider.
 
@@ -129,21 +129,42 @@ class OpenAICompatibleAdapter(BaseAdapter):
             ``"api_key"``, ``"base_url"``.
         :param timeout: Request timeout in seconds. ``None`` uses
             the module default.
-        :returns: Response dict or iterator of chunk dicts.
+        :returns: Response dict or async iterator of chunk dicts.
         """
         params = connection_params or {}
-        payload = self._build_payload(messages, model, tools, stream, extra)
-        effective_base = _resolve_base_url(params.get("base_url"), self._base_url)
+        payload = self._build_payload(
+            messages,
+            model,
+            tools,
+            stream,
+            extra,
+        )
+        effective_base = _resolve_base_url(
+            params.get("base_url"),
+            self._base_url,
+        )
         url = f"{effective_base}/chat/completions"
-        headers = self._build_headers(api_key_override=params.get("api_key"))
+        headers = self._build_headers(
+            api_key_override=params.get("api_key"),
+        )
 
         if stream:
             effective_timeout = timeout if timeout is not None else _STREAM_TIMEOUT
-            return self._stream_request(url, headers, payload, effective_timeout)
+            return self._stream_request(
+                url,
+                headers,
+                payload,
+                effective_timeout,
+            )
         effective_timeout = timeout if timeout is not None else _REQUEST_TIMEOUT
-        return self._send_request(url, headers, payload, effective_timeout)
+        return await self._send_request(
+            url,
+            headers,
+            payload,
+            effective_timeout,
+        )
 
-    def _send_request(
+    async def _send_request(
         self,
         url: str,
         headers: dict[str, str],
@@ -160,19 +181,23 @@ class OpenAICompatibleAdapter(BaseAdapter):
         :returns: Parsed JSON response dict.
         :raises httpx.HTTPStatusError: On non-2xx status.
         """
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.post(url, headers=headers, json=payload)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                url,
+                headers=headers,
+                json=payload,
+            )
             resp.raise_for_status()
             result: dict[str, Any] = resp.json()
             return result
 
-    def _stream_request(
+    async def _stream_request(
         self,
         url: str,
         headers: dict[str, str],
         payload: dict[str, Any],
         timeout: int = _STREAM_TIMEOUT,
-    ) -> Iterator[dict[str, Any]]:
+    ) -> AsyncIterator[dict[str, Any]]:
         """
         Send a streaming HTTP POST and yield parsed SSE data chunks.
 
@@ -180,12 +205,18 @@ class OpenAICompatibleAdapter(BaseAdapter):
         :param headers: HTTP headers.
         :param payload: JSON payload with ``stream: true``.
         :param timeout: Request timeout in seconds, e.g. ``300``.
-        :returns: Iterator of parsed Chat Completions chunk dicts.
+        :returns: Async iterator of parsed Chat Completions chunk
+            dicts.
         """
-        with httpx.Client(timeout=timeout) as client:
-            with client.stream("POST", url, headers=headers, json=payload) as resp:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream(
+                "POST",
+                url,
+                headers=headers,
+                json=payload,
+            ) as resp:
                 resp.raise_for_status()
-                for line in resp.iter_lines():
+                async for line in resp.aiter_lines():
                     parsed = _parse_sse_line(line)
                     if parsed is not None:
                         yield parsed
@@ -392,7 +423,7 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
     :param api_key_env: Environment variable name for the API key.
     """
 
-    def responses_create(
+    async def responses_create(
         self,
         *,
         input: list[dict[str, Any]],  # noqa: A002 — mirrors OpenAI SDK parameter name
@@ -404,7 +435,7 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         connection_params: dict[str, str] | None = None,
         timeout: int | None = None,
         **kwargs: Any,
-    ) -> Response | Iterator[ResponseStreamEvent]:
+    ) -> Response | AsyncIterator[ResponseStreamEvent]:
         """
         Call the OpenAI Responses API (``/v1/responses``) directly.
 
@@ -418,18 +449,25 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
             ``"o4-mini"``.
         :param tools: OpenAI-format tool schemas, or ``None``.
         :param reasoning: Reasoning config dict, e.g.
-            ``{"effort": "high", "summary": "detailed"}``, or ``None``.
-        :param stream: If ``True``, return an iterator of
+            ``{"effort": "high", "summary": "detailed"}``,
+            or ``None``.
+        :param stream: If ``True``, return an async iterator of
             :class:`ResponseStreamEvent`. If ``False``, return a
             :class:`Response`.
         :param connection_params: Per-call overrides. Supported keys:
             ``"api_key"``, ``"base_url"``.
+        :param timeout: Request timeout in seconds. ``None`` uses
+            the module default.
         :param kwargs: Additional API kwargs (temperature, etc.).
-        :returns: A :class:`Response` or an iterator of
+        :returns: A :class:`Response` or an async iterator of
             :class:`ResponseStreamEvent`.
         """
         params = connection_params or {}
-        payload: dict[str, Any] = {"model": model, "input": input, **kwargs}
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": input,
+            **kwargs,
+        }
         if instructions:
             payload["instructions"] = instructions
         if tools:
@@ -442,24 +480,39 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         if stream:
             payload["stream"] = True
 
-        effective_base = _resolve_base_url(params.get("base_url"), self._base_url)
+        effective_base = _resolve_base_url(
+            params.get("base_url"),
+            self._base_url,
+        )
         url = f"{effective_base}/responses"
-        headers = self._build_headers(api_key_override=params.get("api_key"))
+        headers = self._build_headers(
+            api_key_override=params.get("api_key"),
+        )
 
         if stream:
             effective_to = timeout if timeout is not None else _STREAM_TIMEOUT
-            return self._stream_responses(url, headers, payload, effective_to)
+            return self._stream_responses(
+                url,
+                headers,
+                payload,
+                effective_to,
+            )
         effective_to = timeout if timeout is not None else _REQUEST_TIMEOUT
-        resp_data = self._send_request(url, headers, payload, effective_to)
+        resp_data = await self._send_request(
+            url,
+            headers,
+            payload,
+            effective_to,
+        )
         return _parse_responses_response(resp_data)
 
-    def _stream_responses(
+    async def _stream_responses(
         self,
         url: str,
         headers: dict[str, str],
         payload: dict[str, Any],
         timeout: int = _STREAM_TIMEOUT,
-    ) -> Iterator[ResponseStreamEvent]:
+    ) -> AsyncIterator[ResponseStreamEvent]:
         """
         Stream the Responses API and yield typed
         :class:`ResponseStreamEvent` instances.
@@ -475,10 +528,15 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         """
         current_event: str | None = None
         buf = ""
-        with httpx.Client(timeout=timeout) as client:
-            with client.stream("POST", url, headers=headers, json=payload) as resp:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream(
+                "POST",
+                url,
+                headers=headers,
+                json=payload,
+            ) as resp:
                 resp.raise_for_status()
-                for chunk in resp.iter_bytes():
+                async for chunk in resp.aiter_bytes():
                     buf += chunk.decode("utf-8", errors="replace")
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
@@ -488,7 +546,10 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
                         elif line.startswith("data: ") and current_event:
                             data_str = line[6:]
                             if data_str.strip() != "[DONE]":
-                                event = _parse_responses_event(current_event, json.loads(data_str))
+                                event = _parse_responses_event(
+                                    current_event,
+                                    json.loads(data_str),
+                                )
                                 if event is not None:
                                     yield event
                             current_event = None

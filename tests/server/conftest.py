@@ -9,6 +9,7 @@ deterministic race windows.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
@@ -267,15 +268,21 @@ class _MockResponsesNamespace:
     def __init__(self, client: ControllableMockClient) -> None:
         self._client = client
 
-    def create(self, **kwargs: Any) -> Response | Iterator[ResponseStreamEvent]:
+    async def create(
+        self,
+        **kwargs: Any,
+    ) -> Response | AsyncIterator[ResponseStreamEvent]:
         """
         Mock ``responses.create()``. Consumes the next MockCall,
         optionally blocking, then returns a Response or stream.
 
+        Async to match the real client's ``await create()``.
+
         :param kwargs: Responses API kwargs — captured on the
             ``MockCall.received_kwargs`` for test inspection.
         :returns: A ``Response`` if ``stream`` is falsy, or an
-            iterator of ``ResponseStreamEvent`` if ``stream=True``.
+            async iterator of ``ResponseStreamEvent`` if
+            ``stream=True``.
         """
         call = self._client._next_call()
         # Capture kwargs so tests can inspect what the LLM received
@@ -289,10 +296,13 @@ class _MockResponsesNamespace:
                 call.tool_calls = dynamic
         # Signal that this call has been entered
         call.call_event.set()
-        # Optionally block until the test releases us
+        # Optionally block until the test releases us.
+        # Use to_thread so the event loop stays free.
         if call.block_before_response is not None:
-            call.block_before_response.wait()
-        # Raise configured exception (simulates retryable LLM errors)
+            await asyncio.to_thread(
+                call.block_before_response.wait,
+            )
+        # Raise configured exception (simulates retryable errors)
         if call.exception is not None:
             raise call.exception
 
@@ -304,12 +314,14 @@ class _MockResponsesNamespace:
             tool_calls=call.tool_calls,
         ).response
 
-    def _stream(self, call: MockCall) -> Iterator[ResponseStreamEvent]:
+    async def _stream(
+        self,
+        call: MockCall,
+    ) -> AsyncIterator[ResponseStreamEvent]:
         """
         Yield streaming events for a call.
 
         :param call: The ``MockCall`` controlling this stream.
-        :returns: An iterator of ``ResponseStreamEvent``.
         """
         if call.stream_tokens and not call.tool_calls:
             # Yield individual word tokens as deltas

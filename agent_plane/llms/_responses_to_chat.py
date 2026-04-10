@@ -9,7 +9,7 @@ Responses API format that the public ``Client`` exposes.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from typing import Any
 
 from agent_plane.llms.types import (
@@ -258,29 +258,28 @@ def _extract_usage(usage_dict: dict[str, Any] | None) -> Usage | None:
 # ── Streaming: Chat Completions chunks -> Responses API events
 
 
-def chat_stream_to_response_events(
-    chunks: Iterator[dict[str, Any]],
+async def chat_stream_to_response_events(
+    chunks: AsyncIterator[dict[str, Any]],
     model: str,
-) -> Iterator[ResponseStreamEvent]:
+) -> AsyncIterator[ResponseStreamEvent]:
     """
-    Convert an iterator of Chat Completions streaming chunk dicts
-    into Responses API streaming events.
+    Convert an async iterator of Chat Completions streaming chunk
+    dicts into Responses API streaming events.
 
-    Emits ``ResponseTextDeltaEvent`` for each text token. Accumulates
-    tool call deltas across chunks. Emits a final
+    Emits ``ResponseTextDeltaEvent`` for each text token.
+    Accumulates tool call deltas across chunks. Emits a final
     ``ResponseCompletedEvent`` with the assembled ``Response``.
 
-    :param chunks: Iterator of Chat Completions chunk dicts, each
-        with ``choices[0].delta``.
+    :param chunks: Async iterator of Chat Completions chunk
+        dicts, each with ``choices[0].delta``.
     :param model: The model identifier for the ``Response``.
-    :returns: Iterator of :data:`ResponseStreamEvent` instances.
     """
     accumulated_text = ""
     # tool_calls_by_index: {index: {"id": ..., "name": ..., "arguments": ...}}
     tool_calls_by_index: dict[int, dict[str, str]] = {}
     usage_dict: dict[str, Any] | None = None
 
-    for chunk in chunks:
+    async for chunk in chunks:
         choices = chunk.get("choices") or []
         if not choices:
             # Usage-only final chunk (stream_options.include_usage=true)

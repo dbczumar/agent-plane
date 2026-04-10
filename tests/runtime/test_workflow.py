@@ -838,7 +838,8 @@ def test_split_preserves_tool_call_fields() -> None:
 # ── _reactive_compact tiktoken validation ────────────────────────────────────
 
 
-def test_reactive_compact_plausible_overflow_proceeds(
+@pytest.mark.asyncio
+async def test_reactive_compact_plausible_overflow_proceeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -851,12 +852,17 @@ def test_reactive_compact_plausible_overflow_proceeds(
         lambda msgs, model: 140000,
     )
     compacted_messages = [{"role": "user", "content": "compacted summary"}]
-    monkeypatch.setattr(
-        "agent_plane.runtime.workflow.compact",
-        lambda messages, history, **kw: CompactionResult(
+
+    async def _mock_compact(messages, history, **kw):
+        """Return pre-built compacted messages."""
+        return CompactionResult(
             messages=compacted_messages,
             summary_metadata=None,
-        ),
+        )
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.compact",
+        _mock_compact,
     )
 
     class _RaisesIfCalled:
@@ -889,7 +895,7 @@ def test_reactive_compact_plausible_overflow_proceeds(
     )
     messages = [{"role": "user", "content": "long conversation history"}]
 
-    result = _reactive_compact(messages, [], 1000, exc, state, "task_001")
+    result = await _reactive_compact(messages, [], 1000, exc, state, "task_001")
 
     # Compacted messages returned — proves compact() was called (not re-raised).
     assert result == compacted_messages, (
@@ -903,7 +909,8 @@ def test_reactive_compact_plausible_overflow_proceeds(
     )
 
 
-def test_reactive_compact_implausible_overflow_raises_permanent(
+@pytest.mark.asyncio
+async def test_reactive_compact_implausible_overflow_raises_permanent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -932,7 +939,7 @@ def test_reactive_compact_implausible_overflow_raises_permanent(
     messages = [{"role": "user", "content": "test"}]
 
     with pytest.raises(PermanentLLMError) as exc_info:
-        _reactive_compact(messages, [], 1000, exc, state, "task_001")
+        await _reactive_compact(messages, [], 1000, exc, state, "task_001")
 
     # Must be PermanentLLMError, not ContextWindowExceededError, to prevent retry loop.
     assert exc_info.value.code == exc.code, (
@@ -950,7 +957,8 @@ def test_reactive_compact_implausible_overflow_raises_permanent(
 # ── _proactive_compact_if_needed ──────────────────────────────────────────────
 
 
-def test_proactive_compact_skips_when_context_window_unknown(
+@pytest.mark.asyncio
+async def test_proactive_compact_skips_when_context_window_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -965,7 +973,7 @@ def test_proactive_compact_skips_when_context_window_unknown(
         model="openai/gpt-4o",
     )
 
-    result = _proactive_compact_if_needed(
+    result = await _proactive_compact_if_needed(
         messages,
         [],
         100,
@@ -982,7 +990,8 @@ def test_proactive_compact_skips_when_context_window_unknown(
     )
 
 
-def test_proactive_compact_skips_when_under_threshold(
+@pytest.mark.asyncio
+async def test_proactive_compact_skips_when_under_threshold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -1003,7 +1012,7 @@ def test_proactive_compact_skips_when_under_threshold(
         model="openai/gpt-4o",
     )
 
-    result = _proactive_compact_if_needed(
+    result = await _proactive_compact_if_needed(
         messages,
         [],
         100,
@@ -1019,7 +1028,8 @@ def test_proactive_compact_skips_when_under_threshold(
     )
 
 
-def test_proactive_compact_fires_when_over_threshold(
+@pytest.mark.asyncio
+async def test_proactive_compact_fires_when_over_threshold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -1032,12 +1042,17 @@ def test_proactive_compact_fires_when_over_threshold(
         lambda msgs, model: 110000,
     )
     compacted = [{"role": "user", "content": "compacted"}]
-    monkeypatch.setattr(
-        "agent_plane.runtime.workflow.compact",
-        lambda messages, history, **kw: CompactionResult(
+
+    async def _mock_compact(messages, history, **kw):
+        """Return pre-built compacted messages."""
+        return CompactionResult(
             messages=compacted,
             summary_metadata=None,
-        ),
+        )
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.compact",
+        _mock_compact,
     )
 
     class _RaisesIfCalled:
@@ -1064,7 +1079,7 @@ def test_proactive_compact_fires_when_over_threshold(
         model="openai/gpt-4o",
     )
 
-    result = _proactive_compact_if_needed(
+    result = await _proactive_compact_if_needed(
         messages,
         [],
         1000,
@@ -1080,7 +1095,8 @@ def test_proactive_compact_fires_when_over_threshold(
     )
 
 
-def test_proactive_compact_updates_last_summary_on_layer2(
+@pytest.mark.asyncio
+async def test_proactive_compact_updates_last_summary_on_layer2(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -1098,12 +1114,17 @@ def test_proactive_compact_updates_last_summary_on_layer2(
         model="openai/gpt-4o",
         token_count=200,
     )
-    monkeypatch.setattr(
-        "agent_plane.runtime.workflow.compact",
-        lambda messages, history, **kw: CompactionResult(
+
+    async def _mock_compact(messages, history, **kw):
+        """Return compacted messages with Layer 2 summary."""
+        return CompactionResult(
             messages=[{"role": "assistant", "content": "summary"}],
             summary_metadata=summary,
-        ),
+        )
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow.compact",
+        _mock_compact,
     )
 
     class _RaisesIfCalled:
@@ -1129,7 +1150,7 @@ def test_proactive_compact_updates_last_summary_on_layer2(
         model="openai/gpt-4o",
     )
 
-    _proactive_compact_if_needed(
+    await _proactive_compact_if_needed(
         [{"role": "user", "content": "long"}],
         [],
         1000,
@@ -1146,7 +1167,8 @@ def test_proactive_compact_updates_last_summary_on_layer2(
     )
 
 
-def test_proactive_compact_uses_config_threshold(
+@pytest.mark.asyncio
+async def test_proactive_compact_uses_config_threshold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -1168,7 +1190,7 @@ def test_proactive_compact_uses_config_threshold(
         model="openai/gpt-4o",
     )
 
-    result = _proactive_compact_if_needed(
+    result = await _proactive_compact_if_needed(
         messages,
         [],
         1000,
@@ -1882,7 +1904,8 @@ def test_poll_for_tool_result_timeout(
     assert call_id in result.content
 
 
-def test_build_await_tool_output_end_to_end(
+@pytest.mark.asyncio
+async def test_build_await_tool_output_end_to_end(
     db_uri: str,
     task_store: SqlAlchemyTaskStore,
     agent_store: SqlAlchemyAgentStore,
@@ -1920,7 +1943,7 @@ def test_build_await_tool_output_end_to_end(
     )
 
     call = _make_tool_call_requested(call_id="call_e2e_1")
-    _invoke_callback_with_completion(
+    await _invoke_callback_with_completion(
         callback,
         call,
         task_store,
@@ -1934,55 +1957,54 @@ def test_build_await_tool_output_end_to_end(
     assert published[0][0] == root_id
 
 
-def _invoke_callback_with_completion(
-    callback: Callable[[ToolCallRequested], ToolResult],
+async def _invoke_callback_with_completion(
+    callback: Callable[[ToolCallRequested], Any],
     call: ToolCallRequested,
     task_store: SqlAlchemyTaskStore,
     result_text: str,
 ) -> None:
     """
-    Start the ``await_tool_output`` callback in a thread, wait
-    for the pending row to appear, complete it, and assert the
-    callback returns the expected result.
+    Run the async ``await_tool_output`` callback in a background
+    task, wait for the pending row to appear, complete it, and
+    assert the callback returns the expected result.
 
-    Uses a ``threading.Event`` to synchronize: the callback's
+    Uses an ``asyncio.Event`` to synchronize: the monkeypatched
     ``create_pending_tool_call`` signals the event so the main
-    thread knows the row is ready to complete.
+    coroutine knows the row is ready to complete.
 
-    :param callback: The ``await_tool_output`` callback.
+    :param callback: The async ``await_tool_output`` callback.
     :param call: The tool call to submit.
     :param task_store: Task store for completing the call.
     :param result_text: The tool result text to deliver.
     """
-    import threading
-
-    registered = threading.Event()
+    registered = asyncio.Event()
     result_holder: list[ToolResult] = []
 
     # Wrap create_pending_tool_call to signal when the row exists.
     original_create = task_store.create_pending_tool_call
 
     def _create_and_signal(**kwargs: Any) -> None:
+        """Create the row and signal readiness."""
         original_create(**kwargs)
         registered.set()
 
     task_store.create_pending_tool_call = _create_and_signal  # type: ignore[assignment]
 
-    def _run() -> None:
-        result_holder.append(callback(call))
+    async def _run() -> None:
+        """Await the async callback and store the result."""
+        result_holder.append(await callback(call))
 
-    thread = threading.Thread(target=_run)
-    thread.start()
+    task = asyncio.create_task(_run())
 
-    # Block until the callback registers the pending row.
-    assert registered.wait(timeout=5), "Callback did not register the pending row within 5s."
+    # Wait until the callback registers the pending row.
+    await asyncio.wait_for(registered.wait(), timeout=5)
     task_store.create_pending_tool_call = original_create  # type: ignore[assignment]
 
     task_store.complete_pending_tool_call(
         call.call_id,
         result_text,
     )
-    thread.join(timeout=10)
+    await asyncio.wait_for(task, timeout=10)
 
     # The callback must have returned with the delivered result.
     assert len(result_holder) == 1, "Callback did not return within timeout."

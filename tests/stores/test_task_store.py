@@ -57,16 +57,37 @@ def _make_completed_event(
 
 def _make_mock_streaming_client() -> MagicMock:
     """
-    Build a mock OpenAI client whose ``responses.create()`` returns a
-    one-event stream yielding a ``response.completed`` event with a
-    single text output item.
+    Build a mock OpenAI client whose ``responses.create()`` returns
+    a one-event async stream yielding a ``response.completed`` event
+    with a single text output item.
 
     :returns: A MagicMock suitable for patching ``_get_llm_client``.
     """
+
+    async def _aiter_completed() -> Any:
+        """
+        Yield a single completed event.
+
+        :returns: Async iterator of one event.
+        """
+        yield _make_completed_event()
+
     mock_client = MagicMock()
-    # responses.create is called with stream=True; return an iterable
-    # that yields one completed event so _accumulate_stream terminates.
-    mock_client.responses.create.return_value = iter([_make_completed_event()])
+
+    # responses.create is async and called with stream=True;
+    # return an async iterable so _accumulate_stream_async works.
+    async def _mock_create(**kwargs: Any) -> Any:
+        """
+        Mock async create that returns an async stream.
+
+        :param kwargs: Ignored.
+        :returns: Async iterator of events, or a Response.
+        """
+        if kwargs.get("stream"):
+            return _aiter_completed()
+        return _make_completed_event().response
+
+    mock_client.responses.create = _mock_create
     return mock_client
 
 
@@ -384,6 +405,10 @@ async def test_start_and_get_completed(
         "agent_plane.runtime.workflow._get_llm_client",
         lambda: mock_client,
     )
+    monkeypatch.setattr(
+        "agent_plane.runtime.executors.default._get_llm_client",
+        lambda: mock_client,
+    )
 
     agent_id = _make_agent(agent_store, artifact_store)
     conv_id = _make_conversation(conversation_store)
@@ -434,6 +459,10 @@ async def test_wait_returns_completed_task(
     mock_client = _make_mock_streaming_client()
     monkeypatch.setattr(
         "agent_plane.runtime.workflow._get_llm_client",
+        lambda: mock_client,
+    )
+    monkeypatch.setattr(
+        "agent_plane.runtime.executors.default._get_llm_client",
         lambda: mock_client,
     )
 
@@ -488,6 +517,10 @@ async def test_stream_closed_on_workflow_exception(
     mock_client.responses.create.side_effect = RuntimeError("simulated LLM timeout")
     monkeypatch.setattr(
         "agent_plane.runtime.workflow._get_llm_client",
+        lambda: mock_client,
+    )
+    monkeypatch.setattr(
+        "agent_plane.runtime.executors.default._get_llm_client",
         lambda: mock_client,
     )
 
@@ -641,6 +674,10 @@ async def test_persist_first_prevents_ghost_tokens(
     mock_client = _make_streaming_client_with_steering(conversation_store, conv_id)
     monkeypatch.setattr(
         "agent_plane.runtime.workflow._get_llm_client",
+        lambda: mock_client,
+    )
+    monkeypatch.setattr(
+        "agent_plane.runtime.executors.default._get_llm_client",
         lambda: mock_client,
     )
 

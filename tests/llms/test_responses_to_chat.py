@@ -1,5 +1,7 @@
 """Tests for llms._responses_to_chat — bidirectional translation."""
 
+from typing import Any
+
 import pytest
 
 from agent_plane.llms._responses_to_chat import (
@@ -414,13 +416,26 @@ def test_chat_mixed_text_and_tool_calls() -> None:
 # ── Streaming: Chat Completions chunks -> events ──────────
 
 
-def test_streaming_text_deltas() -> None:
+async def _aiter(
+    items: list[dict[str, Any]],
+) -> Any:
+    """
+    Wrap a list as an async iterator for testing.
+
+    :param items: Items to yield.
+    """
+    for item in items:
+        yield item
+
+
+@pytest.mark.asyncio
+async def test_streaming_text_deltas() -> None:
     chunks = [
         {"choices": [{"delta": {"content": "Hello"}, "finish_reason": None}]},
         {"choices": [{"delta": {"content": " world"}, "finish_reason": None}]},
         {"choices": [{"delta": {}, "finish_reason": "stop"}]},
     ]
-    events = list(chat_stream_to_response_events(iter(chunks), model="test"))
+    events = [e async for e in chat_stream_to_response_events(_aiter(chunks), model="test")]
 
     # Two text deltas + one completed event
     assert len(events) == 3
@@ -432,7 +447,8 @@ def test_streaming_text_deltas() -> None:
     assert events[2].response.output[0].content[0].text == "Hello world"
 
 
-def test_streaming_tool_calls() -> None:
+@pytest.mark.asyncio
+async def test_streaming_tool_calls() -> None:
     chunks = [
         {
             "choices": [
@@ -483,7 +499,7 @@ def test_streaming_tool_calls() -> None:
         },
         {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
     ]
-    events = list(chat_stream_to_response_events(iter(chunks), model="test"))
+    events = [e async for e in chat_stream_to_response_events(_aiter(chunks), model="test")]
 
     # No text deltas, just the completed event
     completed = events[-1]
@@ -495,7 +511,8 @@ def test_streaming_tool_calls() -> None:
     assert fc.arguments == '{"city":"London"}'
 
 
-def test_streaming_with_usage() -> None:
+@pytest.mark.asyncio
+async def test_streaming_with_usage() -> None:
     chunks = [
         {"choices": [{"delta": {"content": "Hi"}, "finish_reason": None}]},
         {
@@ -507,7 +524,7 @@ def test_streaming_with_usage() -> None:
             },
         },
     ]
-    events = list(chat_stream_to_response_events(iter(chunks), model="test"))
+    events = [e async for e in chat_stream_to_response_events(_aiter(chunks), model="test")]
     completed = events[-1]
     assert isinstance(completed, ResponseCompletedEvent)
     assert completed.response.usage == Usage(input_tokens=5, output_tokens=1, total_tokens=6)

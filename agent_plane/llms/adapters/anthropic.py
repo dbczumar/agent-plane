@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -33,7 +33,7 @@ class AnthropicAdapter(BaseAdapter):
     at call time (from the ``connection:`` block in agent spec).
     """
 
-    def chat_completions(
+    async def chat_completions(
         self,
         messages: list[dict[str, Any]],
         model: str,
@@ -43,7 +43,7 @@ class AnthropicAdapter(BaseAdapter):
         *,
         connection_params: dict[str, str] | None = None,
         timeout: int | None = None,
-    ) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    ) -> dict[str, Any] | AsyncIterator[dict[str, Any]]:
         """
         Send a request to the Anthropic Messages API.
 
@@ -56,21 +56,34 @@ class AnthropicAdapter(BaseAdapter):
             ``"api_key"``, ``"base_url"``.
         :param timeout: Request timeout in seconds. ``None`` uses
             the module default.
-        :returns: Chat Completions response dict or chunk iterator.
+        :returns: Chat Completions response dict or async chunk
+            iterator.
         """
         params = connection_params or {}
         payload = _chat_to_anthropic(messages, model, tools, extra)
-        headers = _build_headers(api_key_override=params.get("api_key"))
+        headers = _build_headers(
+            api_key_override=params.get("api_key"),
+        )
         override_base = params.get("base_url")
         effective_base = override_base.rstrip("/") if override_base else _BASE_URL
 
         if stream:
             payload["stream"] = True
             effective_to = timeout if timeout is not None else _STREAM_TIMEOUT
-            return _stream_request(headers, payload, effective_base, effective_to)
+            return _stream_request(
+                headers,
+                payload,
+                effective_base,
+                effective_to,
+            )
 
         effective_to = timeout if timeout is not None else _REQUEST_TIMEOUT
-        return _send_request(headers, payload, effective_base, effective_to)
+        return await _send_request(
+            headers,
+            payload,
+            effective_base,
+            effective_to,
+        )
 
 
 # ── Request translation ───────────────────────────────────
@@ -404,20 +417,22 @@ def _anthropic_to_chat(resp: dict[str, Any]) -> dict[str, Any]:
 # ── Streaming ─────────────────────────────────────────────
 
 
-def _stream_to_chat_chunks(
-    lines: Iterator[str],
-) -> Iterator[dict[str, Any]]:
+async def _stream_to_chat_chunks(
+    lines: AsyncIterator[str],
+) -> AsyncIterator[dict[str, Any]]:
     """
     Parse Anthropic SSE stream into Chat Completions chunk dicts.
 
-    :param lines: Iterator of raw SSE lines from the HTTP response.
-    :returns: Iterator of Chat Completions streaming chunk dicts.
+    :param lines: Async iterator of raw SSE lines from the HTTP
+        response.
+    :returns: Async iterator of Chat Completions streaming chunk
+        dicts.
     """
     metadata: dict[str, str] = {}
     usage_data: dict[str, int] = {}
     tool_call_index = -1
 
-    for line in lines:
+    async for line in lines:
         if not line.startswith("data: "):
             continue
 
@@ -553,7 +568,7 @@ def _build_headers(
     }
 
 
-def _send_request(
+async def _send_request(
     headers: dict[str, str],
     payload: dict[str, Any],
     base_url: str,
@@ -571,31 +586,43 @@ def _send_request(
     :returns: Chat Completions response dict.
     """
     url = f"{base_url}/messages"
-    with httpx.Client(timeout=timeout) as client:
-        resp = client.post(url, headers=headers, json=payload)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(
+            url,
+            headers=headers,
+            json=payload,
+        )
         resp.raise_for_status()
         return _anthropic_to_chat(resp.json())
 
 
-def _stream_request(
+async def _stream_request(
     headers: dict[str, str],
     payload: dict[str, Any],
     base_url: str,
     timeout: int = _STREAM_TIMEOUT,
-) -> Iterator[dict[str, Any]]:
+) -> AsyncIterator[dict[str, Any]]:
     """
-    Send a streaming request to Anthropic and yield Chat Completions
-    chunk dicts.
+    Send a streaming request to Anthropic and yield Chat
+    Completions chunk dicts.
 
     :param headers: HTTP headers.
     :param payload: Anthropic API payload with ``stream: true``.
     :param base_url: API base URL, e.g.
         ``"https://api.anthropic.com/v1"``.
     :param timeout: Request timeout in seconds, e.g. ``300``.
-    :returns: Iterator of Chat Completions chunk dicts.
+    :returns: Async iterator of Chat Completions chunk dicts.
     """
     url = f"{base_url}/messages"
-    with httpx.Client(timeout=timeout) as client:
-        with client.stream("POST", url, headers=headers, json=payload) as resp:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream(
+            "POST",
+            url,
+            headers=headers,
+            json=payload,
+        ) as resp:
             resp.raise_for_status()
-            yield from _stream_to_chat_chunks(resp.iter_lines())
+            async for chunk in _stream_to_chat_chunks(
+                resp.aiter_lines(),
+            ):
+                yield chunk

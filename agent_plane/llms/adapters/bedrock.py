@@ -8,9 +8,10 @@ Ported from MLflow AI Gateway's Bedrock provider.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from typing import Any
 
 from agent_plane.llms.adapters._content import parse_data_uri
@@ -95,7 +96,7 @@ class BedrockAdapter(BaseAdapter):
             **boto_kwargs,
         )
 
-    def chat_completions(
+    async def chat_completions(
         self,
         messages: list[dict[str, Any]],
         model: str,
@@ -105,7 +106,7 @@ class BedrockAdapter(BaseAdapter):
         *,
         connection_params: dict[str, str] | None = None,
         timeout: int | None = None,
-    ) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    ) -> dict[str, Any] | AsyncIterator[dict[str, Any]]:
         """
         Send a request via Bedrock Converse API.
 
@@ -121,7 +122,8 @@ class BedrockAdapter(BaseAdapter):
         :param timeout: Read timeout in seconds, propagated from
             the agent spec's ``llm.timeout``. ``None`` uses the
             module default (300s).
-        :returns: Chat Completions response dict or chunk iterator.
+        :returns: Chat Completions response dict or async chunk
+            iterator.
         """
         converse_kwargs = _build_converse_kwargs(messages, model, tools, extra)
         # Default 300s matches the streaming default in other adapters.
@@ -130,7 +132,7 @@ class BedrockAdapter(BaseAdapter):
 
         if stream:
             return _stream_converse(client, converse_kwargs)
-        return _send_converse(client, converse_kwargs)
+        return await _send_converse(client, converse_kwargs)
 
 
 # ── Request translation ───────────────────────────────────
@@ -414,88 +416,145 @@ def _converse_to_chat(
 # ── HTTP (via boto3) ──────────────────────────────────────
 
 
-def _send_converse(
+async def _send_converse(
     client: Any,
     kwargs: dict[str, Any],
 ) -> dict[str, Any]:
     """
     Send a non-streaming Converse request.
 
+    Wraps the synchronous boto3 ``client.converse()`` call in
+    ``asyncio.to_thread`` to avoid blocking the event loop.
+
     :param client: boto3 ``bedrock-runtime`` client.
     :param kwargs: Converse API kwargs.
     :returns: Chat Completions response dict.
     """
     model = kwargs["modelId"]
-    response = client.converse(**kwargs)
+    response = await asyncio.to_thread(client.converse, **kwargs)
     return _converse_to_chat(response, model)
 
 
-def _stream_converse(
+async def _stream_converse(
     client: Any,
     kwargs: dict[str, Any],
-) -> Iterator[dict[str, Any]]:
+) -> AsyncIterator[dict[str, Any]]:
     """
-    Send a streaming Converse request and yield Chat Completions chunks.
+    Send a streaming Converse request and yield Chat Completions
+    chunks.
+
+    Wraps the synchronous boto3 ``client.converse_stream()`` call
+    in ``asyncio.to_thread`` to avoid blocking the event loop
+    during the initial HTTP round-trip. The returned event stream
+    is then iterated synchronously inside the async generator;
+    each ``yield`` gives the event loop a chance to run other
+    tasks.
 
     :param client: boto3 ``bedrock-runtime`` client.
     :param kwargs: Converse API kwargs.
-    :returns: Iterator of Chat Completions chunk dicts.
+    :returns: Async iterator of Chat Completions chunk dicts.
     """
     model = kwargs["modelId"]
-    response = client.converse_stream(**kwargs)
+    response = await asyncio.to_thread(client.converse_stream, **kwargs)
+    stream = response.get("stream", [])
 
-    for event in response.get("stream", []):
+    for event in stream:
         if "contentBlockDelta" in event:
             delta = event["contentBlockDelta"].get("delta", {})
             if text := delta.get("text"):
-                yield {
-                    "id": f"bedrock-{int(time.time())}",
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": text},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
+                yield _stream_text_chunk(model, text)
         elif "messageStop" in event:
-            # Bedrock always includes stopReason in messageStop; fail loud if missing.
+            # Bedrock always includes stopReason in messageStop;
+            # fail loud if missing.
             stop_reason = event["messageStop"]["stopReason"]
             finish = "tool_calls" if stop_reason == "tool_use" else "stop"
-            yield {
-                "id": f"bedrock-{int(time.time())}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": finish,
-                    }
-                ],
-            }
+            yield _stream_stop_chunk(model, finish)
         elif "metadata" in event:
             usage = event["metadata"].get("usage", {})
             if usage:
-                yield {
-                    "id": f"bedrock-{int(time.time())}",
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": None,
-                        }
-                    ],
-                    "usage": {
-                        "prompt_tokens": usage.get("inputTokens"),
-                        "completion_tokens": usage.get("outputTokens"),
-                        "total_tokens": usage.get("totalTokens"),
-                    },
-                }
+                yield _stream_usage_chunk(model, usage)
+
+
+def _stream_text_chunk(
+    model: str,
+    text: str,
+) -> dict[str, Any]:
+    """
+    Build a streaming chunk dict for a text delta.
+
+    :param model: Bedrock model ID for the response.
+    :param text: The text content of this delta.
+    :returns: Chat Completions chunk dict.
+    """
+    return {
+        "id": f"bedrock-{int(time.time())}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": text},
+                "finish_reason": None,
+            }
+        ],
+    }
+
+
+def _stream_stop_chunk(
+    model: str,
+    finish_reason: str,
+) -> dict[str, Any]:
+    """
+    Build a streaming chunk dict for a stop event.
+
+    :param model: Bedrock model ID for the response.
+    :param finish_reason: The finish reason, e.g. ``"stop"``
+        or ``"tool_calls"``.
+    :returns: Chat Completions chunk dict.
+    """
+    return {
+        "id": f"bedrock-{int(time.time())}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+
+
+def _stream_usage_chunk(
+    model: str,
+    usage: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Build a streaming chunk dict for a usage/metadata event.
+
+    :param model: Bedrock model ID for the response.
+    :param usage: Bedrock usage dict with ``inputTokens``,
+        ``outputTokens``, ``totalTokens``.
+    :returns: Chat Completions chunk dict with usage info.
+    """
+    return {
+        "id": f"bedrock-{int(time.time())}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {},
+                "finish_reason": None,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": usage.get("inputTokens"),
+            "completion_tokens": usage.get("outputTokens"),
+            "total_tokens": usage.get("totalTokens"),
+        },
+    }

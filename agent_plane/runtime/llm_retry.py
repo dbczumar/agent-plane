@@ -6,12 +6,13 @@ backoff delays, and provides a retry loop that emits SSE events.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import random
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -334,3 +335,95 @@ def _emit_retry_and_sleep(
         error.code,
     )
     time.sleep(delay)
+
+
+async def execute_with_retry_async(
+    call_fn: Callable[[], Awaitable[T]],
+    retry_config: RetryConfig,
+    on_retry: Callable[[dict[str, Any]], None],
+) -> T:
+    """
+    Async variant of :func:`execute_with_retry`.
+
+    Uses ``asyncio.sleep`` for backoff so the event loop stays
+    free during retry waits.
+
+    :param call_fn: Zero-argument async callable that performs
+        the LLM call.
+    :param retry_config: Retry policy (max_attempts, backoff,
+        etc.) from the agent's LLM config.
+    :param on_retry: Callback to emit a ``response.retry`` SSE
+        event. Called with the event dict before sleeping.
+    :returns: The successful result from ``call_fn``.
+    :raises PermanentLLMError: On non-retryable errors.
+    :raises RetryableLLMError: When all retry attempts are
+        exhausted.
+    """
+    last_error: RetryableLLMError | None = None
+
+    for attempt in range(retry_config.max_attempts):
+        try:
+            return await call_fn()
+        except Exception as exc:
+            classified = classify_llm_error(
+                exc,
+                retry_config.status_codes,
+            )
+            if isinstance(classified, PermanentLLMError):
+                raise classified from exc
+
+            last_error = classified
+            if attempt + 1 < retry_config.max_attempts:
+                await _emit_retry_and_sleep_async(
+                    attempt,
+                    retry_config,
+                    classified,
+                    on_retry,
+                )
+
+    assert last_error is not None
+    raise last_error
+
+
+async def _emit_retry_and_sleep_async(
+    attempt: int,
+    retry_config: RetryConfig,
+    error: RetryableLLMError,
+    on_retry: Callable[[dict[str, Any]], None],
+) -> None:
+    """
+    Async variant of :func:`_emit_retry_and_sleep`.
+
+    :param attempt: Current zero-based attempt index.
+    :param retry_config: Retry policy with backoff parameters.
+    :param error: The classified retryable error.
+    :param on_retry: Callback to emit the ``response.retry``
+        SSE event dict.
+    """
+    delay = compute_backoff_delay(
+        attempt_index=attempt,
+        backoff_base=retry_config.backoff_base,
+        backoff_max=retry_config.backoff_max,
+    )
+    event: dict[str, Any] = {
+        "type": "response.retry",
+        "source": "llm",
+        # next attempt number (1-based)
+        "attempt": attempt + 2,
+        "max_attempts": retry_config.max_attempts,
+        "delay_seconds": round(delay, 2),
+        "error": {
+            "code": error.code,
+            "message": str(error),
+            "detail": detail_to_dict(error.detail),
+        },
+    }
+    on_retry(event)
+    _logger.info(
+        "LLM retry %d/%d after %.1fs: %s",
+        attempt + 2,
+        retry_config.max_attempts,
+        delay,
+        error.code,
+    )
+    await asyncio.sleep(delay)

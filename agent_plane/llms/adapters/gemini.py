@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import httpx
@@ -85,7 +85,7 @@ class GeminiAdapter(BaseAdapter):
             "x-goog-api-key": api_key_override,
         }
 
-    def chat_completions(
+    async def chat_completions(
         self,
         messages: list[dict[str, Any]],
         model: str,
@@ -95,7 +95,7 @@ class GeminiAdapter(BaseAdapter):
         *,
         connection_params: dict[str, str] | None = None,
         timeout: int | None = None,
-    ) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    ) -> dict[str, Any] | AsyncIterator[dict[str, Any]]:
         """
         Send a request to the Gemini API.
 
@@ -108,24 +108,38 @@ class GeminiAdapter(BaseAdapter):
             ``"api_key"``, ``"base_url"``.
         :param timeout: Request timeout in seconds. ``None`` uses
             the module default.
-        :returns: Chat Completions response dict or chunk iterator.
+        :returns: Chat Completions response dict or async chunk
+            iterator.
         """
         params = connection_params or {}
         payload = _chat_to_gemini(messages, tools, extra)
-        headers = self._get_headers(api_key_override=params.get("api_key"))
+        headers = self._get_headers(
+            api_key_override=params.get("api_key"),
+        )
         override_base = params.get("base_url")
         effective_base = override_base.rstrip("/") if override_base else self._get_base_url()
 
         if stream:
             effective_to = timeout if timeout is not None else _STREAM_TIMEOUT
             url = f"{effective_base}/models/{model}:streamGenerateContent?alt=sse"
-            return self._stream_request(url, headers, payload, effective_to)
+            return self._stream_request(
+                url,
+                headers,
+                payload,
+                effective_to,
+            )
 
         effective_to = timeout if timeout is not None else _REQUEST_TIMEOUT
         url = f"{effective_base}/models/{model}:generateContent"
-        return self._send_request(url, headers, payload, model, effective_to)
+        return await self._send_request(
+            url,
+            headers,
+            payload,
+            model,
+            effective_to,
+        )
 
-    def _send_request(
+    async def _send_request(
         self,
         url: str,
         headers: dict[str, str],
@@ -143,18 +157,22 @@ class GeminiAdapter(BaseAdapter):
         :param timeout: Request timeout in seconds, e.g. ``120``.
         :returns: Chat Completions response dict.
         """
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.post(url, headers=headers, json=payload)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                url,
+                headers=headers,
+                json=payload,
+            )
             resp.raise_for_status()
             return _gemini_to_chat(resp.json(), model)
 
-    def _stream_request(
+    async def _stream_request(
         self,
         url: str,
         headers: dict[str, str],
         payload: dict[str, Any],
         timeout: int = _STREAM_TIMEOUT,
-    ) -> Iterator[dict[str, Any]]:
+    ) -> AsyncIterator[dict[str, Any]]:
         """
         Send a streaming Gemini request.
 
@@ -162,16 +180,24 @@ class GeminiAdapter(BaseAdapter):
         :param headers: HTTP headers.
         :param payload: Gemini API payload.
         :param timeout: Request timeout in seconds, e.g. ``300``.
-        :returns: Iterator of Chat Completions chunk dicts.
+        :returns: Async iterator of Chat Completions chunk dicts.
         """
-        with httpx.Client(timeout=timeout) as client:
-            with client.stream("POST", url, headers=headers, json=payload) as resp:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream(
+                "POST",
+                url,
+                headers=headers,
+                json=payload,
+            ) as resp:
                 resp.raise_for_status()
-                for line in resp.iter_lines():
+                async for line in resp.aiter_lines():
                     if not line.startswith("data: "):
                         continue
                     data = json.loads(line[len("data: ") :])
-                    yield from _gemini_stream_chunk_to_chat(data)
+                    for chunk in _gemini_stream_chunk_to_chat(
+                        data,
+                    ):
+                        yield chunk
 
 
 # ── Request translation ───────────────────────────────────

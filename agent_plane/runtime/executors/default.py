@@ -12,10 +12,10 @@ and surface as ``ExecutorError``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
-import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -255,7 +255,7 @@ class DefaultExecutor(Executor):
         context: ExecutorContext,
     ) -> AsyncIterator[ExecutorEvent]:
         """
-        One streaming LLM call with retry (async generator).
+        One async streaming LLM call with retry.
 
         Yields ``TextChunk``, ``ReasoningChunk``, and
         ``NativeToolOutput`` events as tokens arrive. After the
@@ -265,10 +265,6 @@ class DefaultExecutor(Executor):
         On context window overflow, yields
         ``ContextWindowExceeded`` instead (no ``TurnComplete``).
         On permanent/exhausted errors, yields ``ExecutorError``.
-
-        The internal LLM stream is sync (Phase 2 will make the
-        client async). Each ``yield`` gives the event loop a
-        chance to schedule other work.
 
         :param messages: Pre-compacted conversation history.
         :param tools: OpenAI-format tool schemas.
@@ -282,7 +278,7 @@ class DefaultExecutor(Executor):
             tools,
             llm_config.extra,
         )
-        for event in _run_streaming_turn(
+        async for event in _run_streaming_turn(
             task_id=context.task_id,
             input_items=messages,
             instructions=system_prompt,
@@ -294,44 +290,44 @@ class DefaultExecutor(Executor):
             yield event
 
 
-def _create_stream(
+async def _create_stream(
     input_items: list[dict[str, Any]],
     instructions: str,
     args: _ResponsesCallArgs,
     connection: dict[str, str] | None,
     timeout: int,
-) -> Iterator[ResponseStreamEvent]:
+) -> AsyncIterator[ResponseStreamEvent]:
     """
-    Create a streaming LLM response.
+    Create an async streaming LLM response.
 
-    Separated from retry logic so only the HTTP request (not stream
-    iteration) is retried. Once we have a stream, mid-stream failures
-    are fatal.
+    Separated from retry logic so only the HTTP request (not
+    stream iteration) is retried. Once we have a stream,
+    mid-stream failures are fatal.
 
     :param input_items: Responses API input items.
     :param instructions: System instructions.
-    :param args: Parsed call arguments (model, tools, reasoning).
+    :param args: Parsed call arguments (model, tools,
+        reasoning).
     :param connection: Provider connection overrides.
     :param timeout: Request timeout in seconds.
-    :returns: An iterator of raw streaming events.
+    :returns: An async iterator of raw streaming events.
     """
     from typing import cast
 
-    return cast(
-        Iterator[ResponseStreamEvent],
-        _get_llm_client().responses.create(
-            input=input_items,
-            instructions=instructions,
-            reasoning=args.reasoning,
-            stream=True,
-            connection_params=connection,
-            timeout=timeout,
-            **args.kwargs,
-        ),
+    result = await _get_llm_client().responses.create(
+        input=input_items,
+        instructions=instructions,
+        reasoning=args.reasoning,
+        stream=True,
+        connection_params=connection,
+        timeout=timeout,
+        **args.kwargs,
     )
+    # create() returns AsyncIterator when stream=True.
+    return cast(AsyncIterator[ResponseStreamEvent], result)
 
 
-def _run_streaming_turn(
+async def _run_streaming_turn(
     task_id: str,
     input_items: list[dict[str, Any]],
     instructions: str,
@@ -339,27 +335,30 @@ def _run_streaming_turn(
     connection: dict[str, str] | None,
     timeout: int,
     retry_config: RetryConfig,
-) -> Iterator[ExecutorEvent]:
+) -> AsyncIterator[ExecutorEvent]:
     """
-    Execute the streaming LLM call with retry and yield events.
+    Execute the async streaming LLM call with retry and yield
+    events.
 
     Retry wraps stream creation only — once a stream is opened,
-    events are yielded in real-time. Mid-stream failures are fatal.
+    events are yielded in real-time. Mid-stream failures are
+    fatal.
 
-    Catches ``ContextWindowExceededError``, ``PermanentLLMError``,
-    and ``RetryableLLMError`` from stream creation and converts
-    them to the corresponding executor event types.
+    Catches ``ContextWindowExceededError``,
+    ``PermanentLLMError``, and ``RetryableLLMError`` from stream
+    creation and converts them to executor event types.
 
     :param task_id: Task identifier for logging.
     :param input_items: Responses API input items.
     :param instructions: System instructions.
-    :param args: Parsed call arguments (model, tools, reasoning).
+    :param args: Parsed call arguments (model, tools,
+        reasoning).
     :param connection: Provider connection overrides.
     :param timeout: Request timeout in seconds.
     :param retry_config: Retry policy.
     """
     try:
-        stream = _open_stream_with_retry(
+        stream = await _open_stream_with_retry(
             input_items,
             instructions,
             args,
@@ -374,27 +373,32 @@ def _run_streaming_turn(
         )
         return
     except (PermanentLLMError, RetryableLLMError) as exc:
-        _logger.error("LLM call failed for task %s: %s", task_id, exc)
+        _logger.error(
+            "LLM call failed for task %s: %s",
+            task_id,
+            exc,
+        )
         yield ExecutorError(message=str(exc), code=exc.code)
         return
 
-    yield from _consume_stream(stream)
+    async for event in _consume_stream(stream):
+        yield event
 
 
-def _open_stream_with_retry(
+async def _open_stream_with_retry(
     input_items: list[dict[str, Any]],
     instructions: str,
     args: _ResponsesCallArgs,
     connection: dict[str, str] | None,
     timeout: int,
     retry_config: RetryConfig,
-) -> Iterator[ResponseStreamEvent]:
+) -> AsyncIterator[ResponseStreamEvent]:
     """
-    Open an LLM stream with retry on transient connection failures.
+    Open an async LLM stream with retry on transient failures.
 
-    Returns the open stream iterator on success. On permanent or
-    exhausted-retry failure, raises the classified error — the
-    caller catches and converts to executor events.
+    Returns the open async stream iterator on success. On
+    permanent or exhausted-retry failure, raises the classified
+    error — the caller catches and converts to executor events.
 
     :param input_items: Responses API input items.
     :param instructions: System instructions.
@@ -402,7 +406,7 @@ def _open_stream_with_retry(
     :param connection: Provider connection overrides.
     :param timeout: Request timeout in seconds.
     :param retry_config: Retry policy.
-    :returns: Open stream iterator.
+    :returns: Open async stream iterator.
     :raises ContextWindowExceededError: On context overflow.
     :raises PermanentLLMError: On non-retryable errors.
     :raises RetryableLLMError: When all retries exhausted.
@@ -411,7 +415,7 @@ def _open_stream_with_retry(
 
     for attempt in range(retry_config.max_attempts):
         try:
-            return _create_stream(
+            return await _create_stream(
                 input_items,
                 instructions,
                 args,
@@ -445,28 +449,29 @@ def _open_stream_with_retry(
                     delay,
                     classified,
                 )
-                time.sleep(delay)
+                await asyncio.sleep(delay)
 
     assert last_error is not None
     raise last_error
 
 
-def _consume_stream(
-    stream: Iterator[ResponseStreamEvent],
-) -> Iterator[ExecutorEvent]:
+async def _consume_stream(
+    stream: AsyncIterator[ResponseStreamEvent],
+) -> AsyncIterator[ExecutorEvent]:
     """
-    Iterate a raw LLM stream and yield executor events in real-time.
+    Iterate an async LLM stream and yield executor events in
+    real-time.
 
-    Streaming events (text deltas, reasoning, native tool outputs)
-    are yielded immediately as they arrive. After the stream
-    completes, tool calls and turn complete are yielded from the
-    accumulated response.
+    Streaming events (text deltas, reasoning, native tool
+    outputs) are yielded immediately as they arrive. After the
+    stream completes, tool calls and turn complete are yielded
+    from the accumulated response.
 
-    :param stream: The open streaming response iterator.
+    :param stream: The open async streaming response iterator.
     """
     completed_response: LLMResponse | None = None
 
-    for event in stream:
+    async for event in stream:
         if isinstance(event, ResponseTextDeltaEvent):
             yield TextChunk(text=event.delta)
         elif isinstance(event, ResponseReasoningTextDeltaEvent):
@@ -474,7 +479,10 @@ def _consume_stream(
                 delta=event.delta,
                 event_type="reasoning_text",
             )
-        elif isinstance(event, ResponseReasoningSummaryTextDeltaEvent):
+        elif isinstance(
+            event,
+            ResponseReasoningSummaryTextDeltaEvent,
+        ):
             yield ReasoningChunk(
                 delta=event.delta,
                 event_type="reasoning_summary",
@@ -490,7 +498,8 @@ def _consume_stream(
             completed_response = event.response
 
     if completed_response is not None:
-        yield from _yield_final_events(completed_response)
+        for evt in _yield_final_events(completed_response):
+            yield evt
     else:
         # Stream ended without response.completed (e.g. error).
         yield TurnComplete(text=None)
@@ -500,10 +509,11 @@ def _yield_final_events(
     response: LLMResponse,
 ) -> Iterator[ExecutorEvent]:
     """
-    Yield tool call and turn complete events from a completed response.
+    Yield tool call and turn complete events from a completed
+    response.
 
-    Native tool outputs from the completed response are also yielded
-    (they may not all appear during streaming).
+    Native tool outputs from the completed response are also
+    yielded (they may not all appear during streaming).
 
     :param response: The completed LLM response.
     """

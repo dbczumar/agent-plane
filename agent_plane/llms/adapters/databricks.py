@@ -12,7 +12,7 @@ via ``connection_params`` at call time — typically from the
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from typing import Any
 
 from agent_plane.errors import AgentPlaneError, ErrorCode
@@ -35,7 +35,7 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
     def __init__(self) -> None:
         super().__init__()
 
-    def chat_completions(
+    async def chat_completions(
         self,
         messages: list[dict[str, Any]],
         model: str,
@@ -45,7 +45,7 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
         *,
         connection_params: dict[str, str] | None = None,
         timeout: int | None = None,
-    ) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    ) -> dict[str, Any] | AsyncIterator[dict[str, Any]]:
         """
         Send a Chat Completions request to Databricks Model Serving.
 
@@ -58,9 +58,9 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
             ``"base_url"`` and ``"api_key"``.
         :param timeout: Request timeout in seconds. ``None`` uses
             the module default.
-        :returns: Response dict or iterator of chunk dicts.
-        :raises AgentPlaneError: If ``connection_params`` is missing or
-            lacks ``"base_url"``.
+        :returns: Response dict or async iterator of chunk dicts.
+        :raises AgentPlaneError: If ``connection_params`` is missing
+            or lacks ``"base_url"``.
         """
         if not connection_params or "base_url" not in connection_params:
             raise AgentPlaneError(
@@ -68,7 +68,7 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
                 " connection_params (from llm.connection config)",
                 code=ErrorCode.INVALID_INPUT,
             )
-        return super().chat_completions(
+        return await super().chat_completions(
             messages,
             model,
             tools,

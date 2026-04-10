@@ -12,7 +12,7 @@ Connection config (``project``, ``location``) must be provided via
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from typing import Any
 
 from agent_plane.errors import AgentPlaneError, ErrorCode
@@ -101,7 +101,7 @@ class VertexAdapter(GeminiAdapter):
             code=ErrorCode.INVALID_INPUT,
         )
 
-    def chat_completions(
+    async def chat_completions(
         self,
         messages: list[dict[str, Any]],
         model: str,
@@ -111,7 +111,7 @@ class VertexAdapter(GeminiAdapter):
         *,
         connection_params: dict[str, str] | None = None,
         timeout: int | None = None,
-    ) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    ) -> dict[str, Any] | AsyncIterator[dict[str, Any]]:
         """
         Send a request to Vertex AI.
 
@@ -124,12 +124,13 @@ class VertexAdapter(GeminiAdapter):
             ``"project"`` + ``"location"`` or ``"base_url"``.
         :param timeout: Request timeout in seconds. ``None`` uses
             the module default.
-        :returns: Chat Completions response dict or chunk iterator.
-        :raises AgentPlaneError: If ``connection_params`` is missing or
-            lacks required keys.
+        :returns: Chat Completions response dict or async chunk
+            iterator.
+        :raises AgentPlaneError: If ``connection_params`` is missing
+            or lacks required keys.
         """
         resolved_params = _resolve_vertex_params(connection_params)
-        return super().chat_completions(
+        return await super().chat_completions(
             messages,
             model,
             tools,

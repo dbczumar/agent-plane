@@ -47,7 +47,7 @@ class _RaisesIfCalled:
         """Namespace mirroring the real client's ``responses`` attribute."""
 
         @staticmethod
-        def create(**kwargs: Any) -> None:
+        async def create(**kwargs: Any) -> None:
             """
             Raise if called — Layer 2 must not have fired.
 
@@ -89,7 +89,7 @@ class _ReturnsTextClient:
         def __init__(self, outer: _ReturnsTextClient) -> None:
             self._outer = outer
 
-        def create(self, **kwargs: Any) -> Response:
+        async def create(self, **kwargs: Any) -> Response:
             """
             Return a real ``Response`` with the configured text.
 
@@ -274,13 +274,14 @@ def patch_compaction_side_effects(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_no_compaction_under_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_no_compaction_under_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
     """Layer 1 always runs but returns early if token count is within budget."""
     monkeypatch.setattr("agent_plane.runtime.compaction.count_tokens", lambda msgs, model: 50)
     messages = [_user_msg_dict("hi"), _assistant_msg_dict("hello")]
     history = [_user_msg("msg_001", "hi"), _assistant_msg("msg_002", "hello")]
 
-    result = compact(
+    result = await compact(
         messages,
         history,
         config=None,
@@ -301,7 +302,8 @@ def test_no_compaction_under_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.messages[1]["content"][0]["text"] == "hello"
 
 
-def test_layer1_clears_tool_results_outside_window(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_layer1_clears_tool_results_outside_window(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Layer 1 replaces function_call_output bodies outside the recent window
     with _TOOL_RESULT_CLEARED, while preserving bodies inside the window.
@@ -342,7 +344,7 @@ def test_layer1_clears_tool_results_outside_window(monkeypatch: pytest.MonkeyPat
         _assistant_msg_dict(),
     ]
 
-    result = compact(
+    result = await compact(
         messages,
         history,
         config=CompactionConfig(trigger_threshold=0.8, recent_window=2),
@@ -374,7 +376,8 @@ def test_layer1_clears_tool_results_outside_window(monkeypatch: pytest.MonkeyPat
     assert result.summary_metadata is None
 
 
-def test_layer1_never_touches_user_message_text(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_layer1_never_touches_user_message_text(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Layer 1 (tool result clearing) must never modify user message text content,
     even for messages outside the recent window.
@@ -398,7 +401,7 @@ def test_layer1_never_touches_user_message_text(monkeypatch: pytest.MonkeyPatch)
         _assistant_msg_dict(),
     ]
 
-    result = compact(
+    result = await compact(
         messages,
         history,
         config=CompactionConfig(trigger_threshold=0.8, recent_window=1),
@@ -418,7 +421,8 @@ def test_layer1_never_touches_user_message_text(monkeypatch: pytest.MonkeyPatch)
     assert result.messages[4]["content"][0]["text"] == "Another user message inside window"
 
 
-def test_layer1_clears_binary_content_and_preserves_file_id(
+@pytest.mark.asyncio
+async def test_layer1_clears_binary_content_and_preserves_file_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -441,7 +445,7 @@ def test_layer1_clears_binary_content_and_preserves_file_id(
     ]
     messages = [image_msg, _assistant_msg_dict()]
 
-    result = compact(
+    result = await compact(
         messages,
         history,
         config=CompactionConfig(trigger_threshold=0.8, recent_window=1),
@@ -469,7 +473,8 @@ def test_layer1_clears_binary_content_and_preserves_file_id(
     assert text_block["text"] == "Please describe this image"
 
 
-def test_layer1_binary_content_inside_window_untouched(
+@pytest.mark.asyncio
+async def test_layer1_binary_content_inside_window_untouched(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Binary content inside the recent window must not be cleared by Layer 1."""
@@ -495,7 +500,7 @@ def test_layer1_binary_content_inside_window_untouched(
     ]
     messages = [image_msg_outside, _assistant_msg_dict(), image_msg_inside, _assistant_msg_dict()]
 
-    result = compact(
+    result = await compact(
         messages,
         history,
         config=CompactionConfig(trigger_threshold=0.8, recent_window=2),
@@ -527,7 +532,8 @@ def test_layer1_binary_content_inside_window_untouched(
     ],
     ids=["window-2", "window-3", "window-4"],
 )
-def test_recent_window_boundary_parametrized(
+@pytest.mark.asyncio
+async def test_recent_window_boundary_parametrized(
     monkeypatch: pytest.MonkeyPatch,
     recent_window: int,
     outside_fco_idx: int,
@@ -560,7 +566,7 @@ def test_recent_window_boundary_parametrized(
             ]
         )
 
-    result = compact(
+    result = await compact(
         messages,
         history,
         config=CompactionConfig(trigger_threshold=0.8, recent_window=recent_window),
@@ -588,7 +594,8 @@ def test_recent_window_boundary_parametrized(
     )
 
 
-def test_layer2_triggers_when_layer1_insufficient(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_layer2_triggers_when_layer1_insufficient(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     When Layer 1 alone is insufficient (token count still above budget),
     Layer 2 (LLM summarization) is triggered.
@@ -609,12 +616,22 @@ def test_layer2_triggers_when_layer1_insufficient(monkeypatch: pytest.MonkeyPatc
         return 50  # all subsequent calls: below budget
 
     monkeypatch.setattr("agent_plane.runtime.compaction.count_tokens", mock_count_tokens)
-    monkeypatch.setattr(
-        "agent_plane.runtime.compaction.summarize_history",
-        lambda msgs, llm_client, model, connection=None: {
+
+    async def _stub_summarize(
+        msgs: list[dict[str, Any]],
+        llm_client: Any,
+        model: str,
+        connection: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Return a fixed summary result."""
+        return {
             "text": "Summary of earlier conversation",
             "token_count": 50,
-        },
+        }
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.compaction.summarize_history",
+        _stub_summarize,
     )
 
     # 2 iterations; recent_window=1 → boundary at index 7 (last assistant)
@@ -639,7 +656,7 @@ def test_layer2_triggers_when_layer1_insufficient(monkeypatch: pytest.MonkeyPatc
         _assistant_msg_dict(),
     ]
 
-    result = compact(
+    result = await compact(
         messages,
         history,
         config=CompactionConfig(trigger_threshold=0.8, recent_window=1),
@@ -677,7 +694,8 @@ def test_layer2_triggers_when_layer1_insufficient(monkeypatch: pytest.MonkeyPatc
     assert result.messages[1]["content"] == "Summary of earlier conversation"
 
 
-def test_layer2_failure_falls_back_to_layer3(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_layer2_failure_falls_back_to_layer3(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     When Layer 2 summarization fails, compact() falls back to Layer 3
     (truncation) without raising. summary_metadata is None.
@@ -696,7 +714,7 @@ def test_layer2_failure_falls_back_to_layer3(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr("agent_plane.runtime.compaction.count_tokens", mock_count_tokens)
 
-    def _raise_retryable(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    async def _raise_retryable(*args: Any, **kwargs: Any) -> dict[str, Any]:
         """Raise RetryableLLMError to simulate an unavailable LLM."""
         raise RetryableLLMError("LLM unavailable", code="503")
 
@@ -719,7 +737,7 @@ def test_layer2_failure_falls_back_to_layer3(monkeypatch: pytest.MonkeyPatch) ->
     ]
 
     # Must not raise even though summarize_history fails.
-    result = compact(
+    result = await compact(
         messages,
         history,
         config=CompactionConfig(trigger_threshold=0.8, recent_window=1),
@@ -741,13 +759,14 @@ def test_layer2_failure_falls_back_to_layer3(monkeypatch: pytest.MonkeyPatch) ->
     assert len(result.messages) > 0
 
 
-def test_summarize_history_returns_text_and_token_count() -> None:
+@pytest.mark.asyncio
+async def test_summarize_history_returns_text_and_token_count() -> None:
     """summarize_history calls the LLM and returns text + token_count > 0."""
     summary_text = "Summary of earlier conversation context."
     stub_llm = _ReturnsTextClient(text=summary_text, model="openai/gpt-4o")
 
     messages = [{"role": "user", "content": "prior conversation"}]
-    result = summarize_history(messages, stub_llm, "openai/gpt-4o")
+    result = await summarize_history(messages, stub_llm, "openai/gpt-4o")
 
     # The "text" field must match what the LLM returned.
     assert result["text"] == summary_text, (
@@ -764,7 +783,8 @@ def test_summarize_history_returns_text_and_token_count() -> None:
     )
 
 
-def test_summarize_history_recursive_prompt_includes_continuation_prefix() -> None:
+@pytest.mark.asyncio
+async def test_summarize_history_recursive_prompt_includes_continuation_prefix() -> None:
     """
     When history starts with a prior summary, the summarization prompt
     includes a 'Incorporate it' continuation instruction.
@@ -789,14 +809,18 @@ def test_summarize_history_recursive_prompt_includes_continuation_prefix() -> No
     )
 
     class _CapturingClient:
+        """LLM client stub that captures ``instructions`` from each call."""
+
         class responses:
+            """Namespace mirroring the real client's ``responses`` attribute."""
+
             @staticmethod
-            def create(**kwargs: Any) -> Response:
+            async def create(**kwargs: Any) -> Response:
                 """Capture the instructions kwarg and return the mock response."""
                 captured_instructions.append(kwargs.get("instructions", ""))
                 return mock_resp
 
-    result = summarize_history(messages, _CapturingClient(), "openai/gpt-4o")
+    result = await summarize_history(messages, _CapturingClient(), "openai/gpt-4o")
 
     assert len(captured_instructions) == 1
     # The continuation prefix must be present when history starts with a prior summary.
@@ -882,7 +906,8 @@ def test_count_tokens_unknown_model_falls_back() -> None:
     assert result > 0
 
 
-def test_layer2_emits_compaction_sse_event(
+@pytest.mark.asyncio
+async def test_layer2_emits_compaction_sse_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -920,12 +945,19 @@ def test_layer2_emits_compaction_sse_event(
         "agent_plane.runtime.compaction.count_tokens",
         mock_count_tokens,
     )
+
+    async def _stub_summarize(
+        msgs: list[dict[str, Any]],
+        llm_client: Any,
+        model: str,
+        connection: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Return a fixed summary result."""
+        return {"text": "Summary", "token_count": 10}
+
     monkeypatch.setattr(
         "agent_plane.runtime.compaction.summarize_history",
-        lambda msgs, llm_client, model, connection=None: {
-            "text": "Summary",
-            "token_count": 10,
-        },
+        _stub_summarize,
     )
 
     history = [
@@ -941,7 +973,7 @@ def test_layer2_emits_compaction_sse_event(
         _assistant_msg_dict(),
     ]
 
-    compact(
+    await compact(
         messages,
         history,
         config=CompactionConfig(trigger_threshold=0.8, recent_window=1),
@@ -962,7 +994,8 @@ def test_layer2_emits_compaction_sse_event(
     )
 
 
-def test_layer3_truncation_preserves_tool_call_pairs(
+@pytest.mark.asyncio
+async def test_layer3_truncation_preserves_tool_call_pairs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -988,12 +1021,20 @@ def test_layer3_truncation_preserves_tool_call_pairs(
         "agent_plane.runtime.compaction.count_tokens",
         mock_count_tokens,
     )
+
     # Layer 2 fails so we fall through to Layer 3.
+    async def _raise_layer2(
+        msgs: list[dict[str, Any]],
+        llm_client: Any,
+        model: str,
+        connection: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Raise to simulate Layer 2 failure."""
+        raise RuntimeError("Simulated Layer 2 failure")
+
     monkeypatch.setattr(
         "agent_plane.runtime.compaction.summarize_history",
-        lambda msgs, llm_client, model, connection=None: (_ for _ in ()).throw(
-            RuntimeError("Simulated Layer 2 failure"),
-        ),
+        _raise_layer2,
     )
 
     # Layout: user, fc+fco pair, assistant, user, assistant
@@ -1016,7 +1057,7 @@ def test_layer3_truncation_preserves_tool_call_pairs(
         _assistant_msg_dict(),
     ]
 
-    result = compact(
+    result = await compact(
         messages,
         history,
         config=CompactionConfig(trigger_threshold=0.8, recent_window=1),
@@ -1057,7 +1098,8 @@ def test_layer3_truncation_preserves_tool_call_pairs(
     )
 
 
-def test_layer2_receives_cleared_content(
+@pytest.mark.asyncio
+async def test_layer2_receives_cleared_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -1093,7 +1135,7 @@ def test_layer2_receives_cleared_content(
 
     captured_inputs: list[list[dict[str, Any]]] = []
 
-    def _capturing_summarize(
+    async def _capturing_summarize(
         msgs: list[dict[str, Any]],
         llm_client: Any,
         model: str,
@@ -1135,7 +1177,7 @@ def test_layer2_receives_cleared_content(
         _assistant_msg_dict(),
     ]
 
-    compact(
+    await compact(
         messages,
         history,
         config=CompactionConfig(trigger_threshold=0.8, recent_window=1),
@@ -1167,7 +1209,8 @@ def test_layer2_receives_cleared_content(
     )
 
 
-def test_layer3_fires_when_summary_plus_recent_exceeds_budget(
+@pytest.mark.asyncio
+async def test_layer3_fires_when_summary_plus_recent_exceeds_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -1211,12 +1254,22 @@ def test_layer3_fires_when_summary_plus_recent_exceeds_budget(
         "agent_plane.runtime.compaction.count_tokens",
         mock_count_tokens,
     )
-    monkeypatch.setattr(
-        "agent_plane.runtime.compaction.summarize_history",
-        lambda msgs, llm_client, model, connection=None: {
+
+    async def _stub_summarize(
+        msgs: list[dict[str, Any]],
+        llm_client: Any,
+        model: str,
+        connection: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Return a large summary that still exceeds budget."""
+        return {
             "text": "A very long summary that still exceeds budget",
             "token_count": 9000,
-        },
+        }
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.compaction.summarize_history",
+        _stub_summarize,
     )
 
     history = [
@@ -1236,7 +1289,7 @@ def test_layer3_fires_when_summary_plus_recent_exceeds_budget(
         _assistant_msg_dict("a3"),
     ]
 
-    result = compact(
+    result = await compact(
         messages,
         history,
         config=CompactionConfig(trigger_threshold=0.8, recent_window=1),
@@ -1264,7 +1317,8 @@ def test_layer3_fires_when_summary_plus_recent_exceeds_budget(
     )
 
 
-def test_no_compaction_event_when_under_threshold(
+@pytest.mark.asyncio
+async def test_no_compaction_event_when_under_threshold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -1287,7 +1341,7 @@ def test_no_compaction_event_when_under_threshold(
     history = [_user_msg("msg_u1"), _assistant_msg("msg_a1")]
     messages = [_user_msg_dict(), _assistant_msg_dict()]
 
-    result = compact(
+    result = await compact(
         messages,
         history,
         config=CompactionConfig(trigger_threshold=0.8, recent_window=1),
@@ -1421,7 +1475,8 @@ def test_truncate_oldest_preserves_tool_call_pairs(
     )
 
 
-def test_compaction_strips_annotations_before_summarization(
+@pytest.mark.asyncio
+async def test_compaction_strips_annotations_before_summarization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -1456,7 +1511,7 @@ def test_compaction_strips_annotations_before_summarization(
 
     captured_inputs: list[list[dict[str, Any]]] = []
 
-    def _capturing_summarize(
+    async def _capturing_summarize(
         msgs: list[dict[str, Any]],
         llm_client: Any,
         model: str,
@@ -1510,7 +1565,7 @@ def test_compaction_strips_annotations_before_summarization(
         _assistant_msg_dict(),
     ]
 
-    compact(
+    await compact(
         messages,
         history,
         config=CompactionConfig(trigger_threshold=0.8, recent_window=1),

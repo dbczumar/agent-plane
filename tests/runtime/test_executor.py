@@ -12,7 +12,7 @@ to avoid real LLM calls. All data objects use real types from
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -149,6 +149,22 @@ def _make_tool_call_response(
         ],
         model="test-model",
     )
+
+
+async def _aiter(
+    items: list[ResponseStreamEvent],
+) -> AsyncIterator[ResponseStreamEvent]:
+    """
+    Wrap a list as an async iterator for testing.
+
+    Used to adapt synchronous test data into the
+    ``AsyncIterator`` expected by the now-async stream
+    functions.
+
+    :param items: Stream events to yield.
+    """
+    for item in items:
+        yield item
 
 
 # ── Event serialization roundtrip ──────────────────────────────
@@ -408,7 +424,8 @@ def test_extract_native_tool_items_empty() -> None:
 # ── _consume_stream ──────────────────────────────────────────────
 
 
-def test_consume_stream_text_deltas() -> None:
+@pytest.mark.asyncio
+async def test_consume_stream_text_deltas() -> None:
     """
     Text delta events in the stream must yield TextChunk events.
     """
@@ -419,7 +436,7 @@ def test_consume_stream_text_deltas() -> None:
         ResponseCompletedEvent(response=response),
     ]
 
-    events = list(_consume_stream(iter(stream)))
+    events = [e async for e in _consume_stream(_aiter(stream))]
 
     # 2 text chunks + TurnComplete. If fewer, a delta was dropped.
     text_chunks = [e for e in events if isinstance(e, TextChunk)]
@@ -433,7 +450,8 @@ def test_consume_stream_text_deltas() -> None:
     assert turn_complete.text == "Hello!"
 
 
-def test_consume_stream_reasoning_events() -> None:
+@pytest.mark.asyncio
+async def test_consume_stream_reasoning_events() -> None:
     """
     All three reasoning event types must yield ReasoningChunk events.
     """
@@ -445,7 +463,7 @@ def test_consume_stream_reasoning_events() -> None:
         ResponseCompletedEvent(response=response),
     ]
 
-    events = list(_consume_stream(iter(stream)))
+    events = [e async for e in _consume_stream(_aiter(stream))]
     reasoning = [e for e in events if isinstance(e, ReasoningChunk)]
 
     # 3 reasoning events: started, text delta, summary delta.
@@ -458,7 +476,8 @@ def test_consume_stream_reasoning_events() -> None:
     assert reasoning[2].delta == "Summary: ok"
 
 
-def test_consume_stream_native_tool_during_streaming() -> None:
+@pytest.mark.asyncio
+async def test_consume_stream_native_tool_during_streaming() -> None:
     """
     NativeToolOutputAddedEvent during streaming must yield NativeToolOutput.
     """
@@ -469,7 +488,7 @@ def test_consume_stream_native_tool_during_streaming() -> None:
         ResponseCompletedEvent(response=response),
     ]
 
-    events = list(_consume_stream(iter(stream)))
+    events = [e async for e in _consume_stream(_aiter(stream))]
     native_events = [e for e in events if isinstance(e, NativeToolOutput)]
 
     # Native tool output must be yielded during streaming, not just at completion.
@@ -477,7 +496,8 @@ def test_consume_stream_native_tool_during_streaming() -> None:
     assert native_events[0].item == native_data
 
 
-def test_consume_stream_tool_calls() -> None:
+@pytest.mark.asyncio
+async def test_consume_stream_tool_calls() -> None:
     """
     A response with tool calls must yield ToolCallRequested events
     and a TurnComplete with text=None.
@@ -487,7 +507,7 @@ def test_consume_stream_tool_calls() -> None:
         ResponseCompletedEvent(response=response),
     ]
 
-    events = list(_consume_stream(iter(stream)))
+    events = [e async for e in _consume_stream(_aiter(stream))]
     tool_events = [e for e in events if isinstance(e, ToolCallRequested)]
 
     # One tool call must be extracted from the completed response.
@@ -503,7 +523,8 @@ def test_consume_stream_tool_calls() -> None:
     assert turn_complete[0].text is None
 
 
-def test_consume_stream_no_completed_event() -> None:
+@pytest.mark.asyncio
+async def test_consume_stream_no_completed_event() -> None:
     """
     If the stream ends without ResponseCompletedEvent (e.g. mid-stream
     error), TurnComplete(text=None) must still be yielded.
@@ -512,7 +533,7 @@ def test_consume_stream_no_completed_event() -> None:
         ResponseTextDeltaEvent(delta="partial"),
     ]
 
-    events = list(_consume_stream(iter(stream)))
+    events = [e async for e in _consume_stream(_aiter(stream))]
 
     # Must still end with TurnComplete even if response.completed never arrived.
     # If missing, the workflow would hang waiting for turn completion.
@@ -576,48 +597,73 @@ def test_yield_final_events_with_native_tools() -> None:
 # ── _open_stream_with_retry ──────────────────────────────────────
 
 
-def test_open_stream_with_retry_succeeds_first_attempt(
+@pytest.mark.asyncio
+async def test_open_stream_with_retry_succeeds_first_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    On success, the stream iterator is returned without retry.
+    On success, the async stream iterator is returned without retry.
     """
-    expected_stream = iter([ResponseTextDeltaEvent(delta="hi")])
+    stream_items = [ResponseTextDeltaEvent(delta="hi")]
+
+    async def _mock_create_stream(
+        *_args: Any,
+        **_kw: Any,
+    ) -> AsyncIterator[ResponseStreamEvent]:
+        """
+        Return a canned async stream.
+
+        :returns: Async iterator of stream events.
+        """
+        return _aiter(stream_items)
 
     monkeypatch.setattr(
         "agent_plane.runtime.executors.default._create_stream",
-        lambda *_args, **_kw: expected_stream,
+        _mock_create_stream,
     )
 
     from agent_plane.runtime.executors import _ResponsesCallArgs
 
-    result = _open_stream_with_retry(
+    result = await _open_stream_with_retry(
         input_items=[],
         instructions="test",
-        args=_ResponsesCallArgs(kwargs={"model": "test"}, reasoning=None),
+        args=_ResponsesCallArgs(
+            kwargs={"model": "test"},
+            reasoning=None,
+        ),
         connection=None,
         timeout=30,
-        retry_config=RetryConfig(max_attempts=3, backoff_base=0.001, backoff_max=0.01),
+        retry_config=RetryConfig(
+            max_attempts=3,
+            backoff_base=0.001,
+            backoff_max=0.01,
+        ),
     )
 
-    # Must return the same iterator object from _create_stream.
-    assert result is expected_stream
+    # Must return an async iterator from _create_stream.
+    collected = [e async for e in result]
+    assert len(collected) == 1
+    assert collected[0] == stream_items[0]
 
 
-def test_open_stream_with_retry_retries_on_transient(
+@pytest.mark.asyncio
+async def test_open_stream_with_retry_retries_on_transient(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Transient errors must be retried up to max_attempts, then succeed.
     """
     call_count = 0
-    expected_stream = iter([ResponseTextDeltaEvent(delta="ok")])
+    stream_items = [ResponseTextDeltaEvent(delta="ok")]
 
-    def _failing_then_succeeding(*_args: Any, **_kw: Any) -> Iterator[ResponseStreamEvent]:
+    async def _failing_then_succeeding(
+        *_args: Any,
+        **_kw: Any,
+    ) -> AsyncIterator[ResponseStreamEvent]:
         """
-        Fail with a retryable 429 on the first call, succeed on the second.
+        Fail with a retryable 429 on first call, succeed on second.
 
-        :returns: Stream iterator on the second call.
+        :returns: Async stream iterator on the second call.
         """
         nonlocal call_count
         call_count += 1
@@ -625,21 +671,44 @@ def test_open_stream_with_retry_retries_on_transient(
             import httpx
 
             request = httpx.Request("POST", "http://test")
-            response = httpx.Response(429, text="rate limited", request=request)
-            raise httpx.HTTPStatusError("rate limited", request=request, response=response)
-        return expected_stream
+            resp = httpx.Response(
+                429,
+                text="rate limited",
+                request=request,
+            )
+            raise httpx.HTTPStatusError(
+                "rate limited",
+                request=request,
+                response=resp,
+            )
+        return _aiter(stream_items)
 
     monkeypatch.setattr(
         "agent_plane.runtime.executors.default._create_stream",
         _failing_then_succeeding,
     )
 
+    async def _no_sleep(_duration: float) -> None:
+        """
+        No-op replacement for ``asyncio.sleep`` in tests.
+
+        :param _duration: Ignored.
+        """
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.executors.default.asyncio.sleep",
+        _no_sleep,
+    )
+
     from agent_plane.runtime.executors import _ResponsesCallArgs
 
-    result = _open_stream_with_retry(
+    result = await _open_stream_with_retry(
         input_items=[],
         instructions="test",
-        args=_ResponsesCallArgs(kwargs={"model": "test"}, reasoning=None),
+        args=_ResponsesCallArgs(
+            kwargs={"model": "test"},
+            reasoning=None,
+        ),
         connection=None,
         timeout=30,
         retry_config=RetryConfig(
@@ -652,17 +721,23 @@ def test_open_stream_with_retry_retries_on_transient(
 
     # 2 calls: first fails with 429 (retried), second succeeds.
     assert call_count == 2
-    assert result is expected_stream
+    collected = [e async for e in result]
+    assert len(collected) == 1
+    assert collected[0] == stream_items[0]
 
 
-def test_open_stream_with_retry_raises_permanent_error(
+@pytest.mark.asyncio
+async def test_open_stream_with_retry_raises_permanent_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Permanent LLM errors (e.g. 401 auth failure) must not be retried.
     """
 
-    def _permanent_failure(*_args: Any, **_kw: Any) -> Iterator[ResponseStreamEvent]:
+    async def _permanent_failure(
+        *_args: Any,
+        **_kw: Any,
+    ) -> AsyncIterator[ResponseStreamEvent]:
         """
         Always raise a 401 auth error.
 
@@ -671,8 +746,16 @@ def test_open_stream_with_retry_raises_permanent_error(
         import httpx
 
         request = httpx.Request("POST", "http://test")
-        response = httpx.Response(401, text="unauthorized", request=request)
-        raise httpx.HTTPStatusError("unauthorized", request=request, response=response)
+        resp = httpx.Response(
+            401,
+            text="unauthorized",
+            request=request,
+        )
+        raise httpx.HTTPStatusError(
+            "unauthorized",
+            request=request,
+            response=resp,
+        )
 
     monkeypatch.setattr(
         "agent_plane.runtime.executors.default._create_stream",
@@ -681,13 +764,16 @@ def test_open_stream_with_retry_raises_permanent_error(
 
     from agent_plane.runtime.executors import _ResponsesCallArgs
 
-    # 401 is not in the retryable list → PermanentLLMError must be raised
-    # immediately without exhausting retries.
+    # 401 is not in the retryable list -> PermanentLLMError must
+    # be raised immediately without exhausting retries.
     with pytest.raises(PermanentLLMError):
-        _open_stream_with_retry(
+        await _open_stream_with_retry(
             input_items=[],
             instructions="test",
-            args=_ResponsesCallArgs(kwargs={"model": "test"}, reasoning=None),
+            args=_ResponsesCallArgs(
+                kwargs={"model": "test"},
+                reasoning=None,
+            ),
             connection=None,
             timeout=30,
             retry_config=RetryConfig(
@@ -698,14 +784,18 @@ def test_open_stream_with_retry_raises_permanent_error(
         )
 
 
-def test_open_stream_with_retry_raises_context_window_exceeded(
+@pytest.mark.asyncio
+async def test_open_stream_with_retry_raises_context_window_exceeded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     ContextWindowExceededError must propagate immediately (not retried).
     """
 
-    def _context_overflow(*_args: Any, **_kw: Any) -> Iterator[ResponseStreamEvent]:
+    async def _context_overflow(
+        *_args: Any,
+        **_kw: Any,
+    ) -> AsyncIterator[ResponseStreamEvent]:
         """
         Raise a context window exceeded error.
 
@@ -726,13 +816,20 @@ def test_open_stream_with_retry_raises_context_window_exceeded(
     from agent_plane.runtime.executors import _ResponsesCallArgs
 
     with pytest.raises(ContextWindowExceededError) as exc_info:
-        _open_stream_with_retry(
+        await _open_stream_with_retry(
             input_items=[],
             instructions="test",
-            args=_ResponsesCallArgs(kwargs={"model": "test"}, reasoning=None),
+            args=_ResponsesCallArgs(
+                kwargs={"model": "test"},
+                reasoning=None,
+            ),
             connection=None,
             timeout=30,
-            retry_config=RetryConfig(max_attempts=3, backoff_base=0.001, backoff_max=0.01),
+            retry_config=RetryConfig(
+                max_attempts=3,
+                backoff_base=0.001,
+                backoff_max=0.01,
+            ),
         )
 
     # Token counts must be preserved through the raise chain.
@@ -743,7 +840,8 @@ def test_open_stream_with_retry_raises_context_window_exceeded(
 # ── _run_streaming_turn ──────────────────────────────────────────
 
 
-def test_run_streaming_turn_yields_events_on_success(
+@pytest.mark.asyncio
+async def test_run_streaming_turn_yields_events_on_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -755,24 +853,39 @@ def test_run_streaming_turn_yields_events_on_success(
         ResponseCompletedEvent(response=response),
     ]
 
+    async def _mock_open(
+        *_args: Any,
+        **_kw: Any,
+    ) -> AsyncIterator[ResponseStreamEvent]:
+        """
+        Return a canned async stream.
+
+        :returns: Async iterator of stream events.
+        """
+        return _aiter(stream)
+
     monkeypatch.setattr(
         "agent_plane.runtime.executors.default._open_stream_with_retry",
-        lambda *_args, **_kw: iter(stream),
+        _mock_open,
     )
 
     from agent_plane.runtime.executors import _ResponsesCallArgs
 
-    events = list(
-        _run_streaming_turn(
+    events = [
+        e
+        async for e in _run_streaming_turn(
             task_id="task_1",
             input_items=[],
             instructions="test",
-            args=_ResponsesCallArgs(kwargs={"model": "test"}, reasoning=None),
+            args=_ResponsesCallArgs(
+                kwargs={"model": "test"},
+                reasoning=None,
+            ),
             connection=None,
             timeout=30,
             retry_config=RetryConfig(max_attempts=1),
         )
-    )
+    ]
 
     text_chunks = [e for e in events if isinstance(e, TextChunk)]
     # One text delta must be yielded from the stream.
@@ -783,14 +896,18 @@ def test_run_streaming_turn_yields_events_on_success(
     assert events[-1] == TurnComplete(text="Hi!")
 
 
-def test_run_streaming_turn_context_window_exceeded(
+@pytest.mark.asyncio
+async def test_run_streaming_turn_context_window_exceeded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     ContextWindowExceededError must yield a ContextWindowExceeded event.
     """
 
-    def _overflow(*_args: Any, **_kw: Any) -> Iterator[ResponseStreamEvent]:
+    async def _overflow(
+        *_args: Any,
+        **_kw: Any,
+    ) -> AsyncIterator[ResponseStreamEvent]:
         """
         Raise context window exceeded.
 
@@ -810,17 +927,21 @@ def test_run_streaming_turn_context_window_exceeded(
 
     from agent_plane.runtime.executors import _ResponsesCallArgs
 
-    events = list(
-        _run_streaming_turn(
+    events = [
+        e
+        async for e in _run_streaming_turn(
             task_id="task_1",
             input_items=[],
             instructions="test",
-            args=_ResponsesCallArgs(kwargs={"model": "test"}, reasoning=None),
+            args=_ResponsesCallArgs(
+                kwargs={"model": "test"},
+                reasoning=None,
+            ),
             connection=None,
             timeout=30,
             retry_config=RetryConfig(max_attempts=1),
         )
-    )
+    ]
 
     # Must yield exactly one ContextWindowExceeded event — no TurnComplete.
     # If a TurnComplete also appears, the caller would try to process a
@@ -831,14 +952,18 @@ def test_run_streaming_turn_context_window_exceeded(
     assert events[0].actual_tokens == 150000
 
 
-def test_run_streaming_turn_permanent_error(
+@pytest.mark.asyncio
+async def test_run_streaming_turn_permanent_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     PermanentLLMError must yield an ExecutorError event.
     """
 
-    def _auth_fail(*_args: Any, **_kw: Any) -> Iterator[ResponseStreamEvent]:
+    async def _auth_fail(
+        *_args: Any,
+        **_kw: Any,
+    ) -> AsyncIterator[ResponseStreamEvent]:
         """
         Raise a permanent auth error.
 
@@ -853,17 +978,21 @@ def test_run_streaming_turn_permanent_error(
 
     from agent_plane.runtime.executors import _ResponsesCallArgs
 
-    events = list(
-        _run_streaming_turn(
+    events = [
+        e
+        async for e in _run_streaming_turn(
             task_id="task_1",
             input_items=[],
             instructions="test",
-            args=_ResponsesCallArgs(kwargs={"model": "test"}, reasoning=None),
+            args=_ResponsesCallArgs(
+                kwargs={"model": "test"},
+                reasoning=None,
+            ),
             connection=None,
             timeout=30,
             retry_config=RetryConfig(max_attempts=1),
         )
-    )
+    ]
 
     # Must yield exactly one ExecutorError — no TurnComplete.
     assert len(events) == 1
@@ -872,14 +1001,18 @@ def test_run_streaming_turn_permanent_error(
     assert events[0].code == "401"
 
 
-def test_run_streaming_turn_retryable_error_exhausted(
+@pytest.mark.asyncio
+async def test_run_streaming_turn_retryable_error_exhausted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     When all retries are exhausted, RetryableLLMError must yield ExecutorError.
     """
 
-    def _retryable_fail(*_args: Any, **_kw: Any) -> Iterator[ResponseStreamEvent]:
+    async def _retryable_fail(
+        *_args: Any,
+        **_kw: Any,
+    ) -> AsyncIterator[ResponseStreamEvent]:
         """
         Raise a retryable error (simulating exhausted retries).
 
@@ -894,17 +1027,21 @@ def test_run_streaming_turn_retryable_error_exhausted(
 
     from agent_plane.runtime.executors import _ResponsesCallArgs
 
-    events = list(
-        _run_streaming_turn(
+    events = [
+        e
+        async for e in _run_streaming_turn(
             task_id="task_1",
             input_items=[],
             instructions="test",
-            args=_ResponsesCallArgs(kwargs={"model": "test"}, reasoning=None),
+            args=_ResponsesCallArgs(
+                kwargs={"model": "test"},
+                reasoning=None,
+            ),
             connection=None,
             timeout=30,
             retry_config=RetryConfig(max_attempts=1),
         )
-    )
+    ]
 
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
@@ -1000,9 +1137,20 @@ async def test_run_turn_yields_events(
         ResponseCompletedEvent(response=response),
     ]
 
+    async def _mock_create_stream(
+        *_args: Any,
+        **_kw: Any,
+    ) -> AsyncIterator[ResponseStreamEvent]:
+        """
+        Return a canned async stream.
+
+        :returns: Async iterator of stream events.
+        """
+        return _aiter(stream)
+
     monkeypatch.setattr(
         "agent_plane.runtime.executors.default._create_stream",
-        lambda *_args, **_kw: iter(stream),
+        _mock_create_stream,
     )
 
     executor = DefaultExecutor(llm_config=llm_config)
@@ -1037,7 +1185,10 @@ async def test_run_turn_context_window_overflow(
     Context window overflow during run_turn must yield ContextWindowExceeded.
     """
 
-    def _overflow(*_args: Any, **_kw: Any) -> Iterator[ResponseStreamEvent]:
+    async def _overflow(
+        *_args: Any,
+        **_kw: Any,
+    ) -> AsyncIterator[ResponseStreamEvent]:
         """
         Raise context window exceeded.
 

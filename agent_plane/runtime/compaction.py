@@ -325,7 +325,7 @@ def _pair_aware_drop_count(messages: list[dict[str, Any]]) -> int:
 
 
 @step()
-def summarize_history(
+async def summarize_history(
     messages_to_summarize: list[dict[str, Any]],
     llm_client: Any,  # llms.Client — typed as Any to avoid circular import
     model: str,
@@ -352,7 +352,7 @@ def summarize_history(
         ``"token_count"`` (approximate token count).
     """
     system_prompt = _build_summarization_prompt(messages_to_summarize)
-    resp = llm_client.responses.create(
+    resp = await llm_client.responses.create(
         model=model,
         input=messages_to_summarize,
         instructions=system_prompt,
@@ -499,7 +499,7 @@ def compaction_to_history_items(
     return [user_item, assistant_item]
 
 
-def compact(
+async def compact(
     messages: list[dict[str, Any]],
     history: list[ConversationItem],
     *,
@@ -564,7 +564,7 @@ def compact(
         return CompactionResult(messages=working, summary_metadata=None)
 
     # --- Layer 2 ---
-    summary_metadata = _run_layer2(
+    summary_metadata = await _run_layer2(
         working,
         history,
         history_boundary,
@@ -634,7 +634,7 @@ def _history_idx_to_msg_idx(
     return msg_idx
 
 
-def _run_layer2(
+async def _run_layer2(
     messages: list[dict[str, Any]],
     history: list[ConversationItem],
     history_boundary: int,
@@ -675,7 +675,7 @@ def _run_layer2(
         _clear_binary_content(to_summarize, len(to_summarize))
 
     try:
-        result = summarize_history(
+        result = await summarize_history(
             to_summarize,
             llm_client,
             model,
