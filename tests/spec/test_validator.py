@@ -283,6 +283,13 @@ def test_agents_sdk_rejects_compaction() -> None:
     assert any("compaction" in e.path for e in result.errors), (
         f"Expected compaction error, got: {result.errors}"
     )
+    # Verify actual error message content, not just path.
+    assert any(
+        "agents_sdk" in e.message for e in result.errors
+    ), (
+        f"Error message should mention 'agents_sdk':"
+        f" {result.errors}"
+    )
 
 
 def test_agents_sdk_rejects_endpoint() -> None:
@@ -300,6 +307,12 @@ def test_agents_sdk_rejects_endpoint() -> None:
     assert not result.valid
     assert any("executor.endpoint" in e.path for e in result.errors), (
         f"Expected endpoint error, got: {result.errors}"
+    )
+    assert any(
+        "agents_sdk" in e.message for e in result.errors
+    ), (
+        f"Error message should mention 'agents_sdk':"
+        f" {result.errors}"
     )
 
 
