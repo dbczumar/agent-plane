@@ -304,7 +304,9 @@ When `executor.entrypoint` is set:
 | `executor.max_iterations` | Valid — workflow concern |
 
 Validator rejects `tools.builtins` and `instructions` when
-`entrypoint` is set.
+`entrypoint` is set. Also rejects `entrypoint` when
+`executor.type` is not `claude_sdk` (entrypoint is only valid
+for Claude SDK executors in v1).
 
 ---
 
@@ -447,25 +449,33 @@ accidental damage (crashes, OOM), not malicious code.
 ### Phase 2: Sub-agent auto-translation
 
 5. **`runtime/sdk_worker.py`** — Extract `options.agents` at
-   startup, report to agent-plane via a startup handshake
-   (`GET /v1/agent-info` or similar).
+   startup. Expose `GET /v1/agent-info` endpoint that returns
+   a JSON list of sub-agent definitions (name, system_prompt,
+   allowed_tools, model). Called once by agent-plane before the
+   first turn.
 
-6. **`runtime/executors/claude.py`** — Build `AgentSpec` from
-   reported `AgentDefinition` data, register on parent spec tree.
+6. **`runtime/executors/claude.py`** — After spawning worker,
+   call `GET /v1/agent-info` to discover sub-agents. Build
+   in-memory `AgentSpec` for each. Register on parent spec's
+   `sub_agents` list and add names to `tools.agents` so
+   `SpawnTool` can route to them.
 
 ### Phase 3: Dependency installation
 
-7. **`runtime/agent_cache.py`** — At bundle extraction:
-   - If `requirements.txt` exists: `pip install -r --target {dir}`
-   - If entrypoint has PEP 723 metadata: parse and install
-   - Pass `{dir}` to worker via env or CLI arg
+7. **`runtime/executors/claude.py`** — Detect deps at worker
+   spawn time:
+   - If `requirements.txt` in bundle: `uv run --requirements ...`
+   - If entrypoint has PEP 723 metadata: parse → `uv run --with ...`
+   - If neither: plain `python` (no uv)
+   - Fallback: if `uv` not on PATH, start without dep resolution
 
 ### Phase 4: Per-agent worker pooling
 
 8. Reuse worker subprocesses across tasks for the same agent.
    One worker per agent, handles multiple conversations via
-   `conversation_id` routing. Avoids subprocess startup cost
-   per task.
+   `conversation_id` routing in `/v1/turns` requests. The SDK
+   client's `session_id` parameter maps to `conversation_id`.
+   Avoids subprocess + dep resolution cost per task.
 
 ---
 
