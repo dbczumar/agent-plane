@@ -99,7 +99,7 @@ def _validate_spec_version(spec: AgentSpec, result: ValidationResult) -> None:
         result.add("spec_version", f"must be 1, got {spec.spec_version}")
 
 
-_VALID_EXECUTOR_TYPES = {"llm", "claude_sdk", "remote"}
+_VALID_EXECUTOR_TYPES = {"llm", "claude_sdk", "agents_sdk", "remote"}
 
 
 def _validate_executor_type(
@@ -128,6 +128,8 @@ def _validate_executor_type(
         _validate_remote_executor(spec, result)
     elif etype == "claude_sdk":
         _validate_claude_sdk_executor(spec, result)
+    elif etype == "agents_sdk":
+        _validate_agents_sdk_executor(spec, result)
     elif etype == "llm":
         _validate_llm_executor(spec, result)
 
@@ -199,6 +201,38 @@ def _validate_claude_sdk_executor(
         result.add(
             "compaction",
             "not supported when executor.type is 'claude_sdk'",
+        )
+
+
+def _validate_agents_sdk_executor(
+    spec: AgentSpec,
+    result: ValidationResult,
+) -> None:
+    """
+    Validate fields for ``executor.type: agents_sdk``.
+
+    The SDK manages its own context window. Remote-only fields
+    (endpoint, executor.request_timeout) are invalid. Unlike
+    ``claude_sdk``, ``llm.connection`` is allowed — the SDK
+    supports custom OpenAI clients.
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
+    if spec.executor.endpoint is not None:
+        result.add(
+            "executor.endpoint",
+            "not supported when executor.type is 'agents_sdk'",
+        )
+    if spec.executor.request_timeout is not None:
+        result.add(
+            "executor.request_timeout",
+            "not supported when executor.type is 'agents_sdk' — use llm.request_timeout instead",
+        )
+    if spec.compaction is not None:
+        result.add(
+            "compaction",
+            "not supported when executor.type is 'agents_sdk' — SDK manages context internally",
         )
 
 

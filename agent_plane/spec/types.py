@@ -62,8 +62,8 @@ class ExecutorSpec:
     it determines which other top-level sections and fields are
     valid. Invalid fields are rejected by the validator.
 
-    :param type: Executor type. ``"llm"`` (default), ``"claude_sdk"``,
-        or ``"remote"``.
+    :param type: Executor type. ``"llm"`` (default),
+        ``"claude_sdk"``, ``"agents_sdk"``, or ``"remote"``.
     :param timeout: Task deadline in seconds (wall-clock limit for
         the entire agent loop), e.g. ``3600``.
     :param max_iterations: Maximum ``run_turn()`` calls before the

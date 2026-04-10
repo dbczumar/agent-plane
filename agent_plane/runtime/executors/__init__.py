@@ -8,6 +8,7 @@ Import from this package rather than individual submodules::
     )
 """
 
+from agent_plane.runtime.executors.agents_sdk import AgentsSdkExecutor
 from agent_plane.runtime.executors.base import (
     ContextWindowExceeded,
     Executor,
@@ -40,6 +41,7 @@ from agent_plane.runtime.executors.default import (
 from agent_plane.runtime.executors.remote import RemoteExecutor
 
 __all__ = [
+    "AgentsSdkExecutor",
     "ContextWindowExceeded",
     "ClaudeAgentsExecutor",
     "DefaultExecutor",

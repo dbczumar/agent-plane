@@ -174,6 +174,7 @@ def _create_executor(spec: AgentSpec) -> Executor:
     Dispatches based on ``spec.executor.type``:
     ``"llm"`` (default) uses ``DefaultExecutor``,
     ``"claude_sdk"`` uses ``ClaudeAgentsExecutor``,
+    ``"agents_sdk"`` uses ``AgentsSdkExecutor``,
     ``"remote"`` uses ``RemoteExecutor``.
 
     :param spec: Agent spec. Must have ``llm`` set for the
@@ -188,6 +189,13 @@ def _create_executor(spec: AgentSpec) -> Executor:
 
         return ClaudeAgentsExecutor.from_spec(spec)
 
+    if executor_type == "agents_sdk":
+        from agent_plane.runtime.executors.agents_sdk import (
+            AgentsSdkExecutor,
+        )
+
+        return AgentsSdkExecutor.from_spec(spec)
+
     if executor_type == "remote":
         from agent_plane.runtime.executors import RemoteExecutor
 
@@ -195,7 +203,9 @@ def _create_executor(spec: AgentSpec) -> Executor:
 
     if executor_type != "llm":
         raise AgentPlaneError(
-            f"Unknown executor type: {executor_type!r}. Must be 'llm', 'claude_sdk', or 'remote'.",
+            f"Unknown executor type: {executor_type!r}."
+            " Must be 'llm', 'claude_sdk',"
+            " 'agents_sdk', or 'remote'.",
             code=ErrorCode.INVALID_INPUT,
         )
 
@@ -4257,10 +4267,20 @@ async def agent_execution_workflow(
             reasoning=reasoning,
         )
         return result.to_dict(task_id)
-    except Exception:
+    except Exception as exc:
         _logger.exception(
             "agent loop failed for task %s",
             task_id,
+        )
+        # Emit a terminal error event so live-stream subscribers
+        # see the failure before the stream closes.
+        _write_output(
+            task_id,
+            {
+                "type": "response.error",
+                "source": "llm",
+                "message": str(exc),
+            },
         )
         raise
     finally:

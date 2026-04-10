@@ -26,6 +26,7 @@ vertex = ["google-auth>=2.0,<3"]
 litellm = ["litellm>=1.0,<2"]
 # Executor backends
 claude-sdk = ["claude-agent-sdk>=1.0,<2"]
+agents-sdk = ["openai-agents>=0.1,<1"]
 # Storage backends
 databricks = ["databricks-sdk>=0.40,<1", "psycopg[binary]>=3.1,<4"]
 

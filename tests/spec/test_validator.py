@@ -6,6 +6,8 @@ import pytest
 
 from agent_plane.spec.types import (
     AgentSpec,
+    CompactionConfig,
+    ExecutorSpec,
     InteractionConfig,
     LLMConfig,
     LocalToolInfo,
@@ -262,3 +264,57 @@ def test_multiple_errors_reported() -> None:
     assert not result.valid
     # spec_version error + skill name pattern error + skill description length error
     assert len(result.errors) >= 3
+
+
+# ── agents_sdk executor validation ────────────────────────
+
+
+def test_agents_sdk_rejects_compaction() -> None:
+    """
+    ``agents_sdk`` executor forbids ``compaction`` — the SDK
+    manages context internally.
+    """
+    spec = _minimal_spec(
+        executor=ExecutorSpec(type="agents_sdk"),
+        compaction=CompactionConfig(),
+    )
+    result = validate(spec)
+    assert not result.valid
+    assert any("compaction" in e.path for e in result.errors), (
+        f"Expected compaction error, got: {result.errors}"
+    )
+
+
+def test_agents_sdk_rejects_endpoint() -> None:
+    """
+    ``agents_sdk`` executor forbids ``executor.endpoint`` —
+    that's remote-only.
+    """
+    spec = _minimal_spec(
+        executor=ExecutorSpec(
+            type="agents_sdk",
+            endpoint="http://localhost:8000",
+        ),
+    )
+    result = validate(spec)
+    assert not result.valid
+    assert any("executor.endpoint" in e.path for e in result.errors), (
+        f"Expected endpoint error, got: {result.errors}"
+    )
+
+
+def test_agents_sdk_accepts_connection() -> None:
+    """
+    ``agents_sdk`` executor allows ``llm.connection`` — unlike
+    ``claude_sdk`` which forbids it. The SDK supports custom
+    OpenAI clients with per-agent API keys.
+    """
+    spec = _minimal_spec(
+        executor=ExecutorSpec(type="agents_sdk"),
+        llm=LLMConfig(
+            model="gpt-5.4",
+            connection={"api_key": "sk-test"},
+        ),
+    )
+    result = validate(spec)
+    assert result.valid, f"Expected valid spec, got errors: {result.errors}"
