@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from collections.abc import AsyncIterator
 from typing import Any
 from uuid import uuid4
@@ -371,6 +372,267 @@ def _map_tool_called(item: Any) -> ToolCallObserved | None:
     )
 
 
+# ── Codex MCP integration (Layer 2) ─────────────────────
+
+
+class _CodexSessionRewriter:
+    """
+    Tracks Codex ``threadId`` for session continuity.
+
+    Filters ``codex-reply`` from tool discovery so the LLM
+    only sees ``codex``. Rewrites subsequent ``codex`` calls
+    to ``codex-reply`` with the stored ``threadId``.
+
+    :param thread_id: The current Codex thread ID, or ``None``
+        before the first call.
+    """
+
+    def __init__(self) -> None:
+        self._thread_id: str | None = None
+
+    def tool_filter(
+        self,
+        ctx: Any,
+        tool: Any,
+    ) -> bool:
+        """
+        Filter ``codex-reply`` from tool discovery.
+
+        The LLM only sees ``codex``. Session continuity is
+        handled transparently by ``rewrite_call``.
+
+        :param ctx: The SDK's ``ToolFilterContext`` (unused).
+        :param tool: The MCP tool definition.
+        :returns: True to include, False to exclude.
+        """
+        name = getattr(tool, "name", "")
+        return name != "codex-reply"
+
+    def rewrite_call(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """
+        Rewrite ``codex`` → ``codex-reply`` if session exists.
+
+        :param tool_name: The tool name from the SDK.
+        :param arguments: The tool arguments dict.
+        :returns: Possibly rewritten (tool_name, arguments).
+        """
+        if tool_name != "codex":
+            return tool_name, arguments
+        args = dict(arguments or {})
+        if self._thread_id is None:
+            # First call — inject defaults.
+            args.setdefault("approval-policy", "never")
+            args.setdefault("sandbox", "workspace-write")
+            return "codex", args
+        # Subsequent call — rewrite to codex-reply.
+        return "codex-reply", {
+            "prompt": args.get("prompt", ""),
+            "threadId": self._thread_id,
+        }
+
+    def capture_thread_id(
+        self,
+        result: Any,
+    ) -> None:
+        """
+        Extract ``threadId`` from a Codex tool result.
+
+        :param result: The ``CallToolResult`` from the MCP call.
+        """
+        sc = getattr(result, "structuredContent", None)
+        if isinstance(sc, dict):
+            tid = sc.get("threadId")
+            if tid is not None:
+                self._thread_id = tid
+
+    def clear_thread_id(self) -> None:
+        """
+        Clear stored ``threadId`` (e.g. after MCP restart).
+        """
+        self._thread_id = None
+
+
+def _build_codex_mcp(
+    codex_tools: list[str],
+    rewriter: _CodexSessionRewriter,
+    workspace: str,
+) -> Any | None:
+    """
+    Build a Codex MCP server with session rewriting.
+
+    Returns ``None`` if no Codex tools are declared or the
+    ``codex`` binary is not on PATH. The returned server
+    intercepts ``call_tool`` to rewrite ``codex`` calls to
+    ``codex-reply`` with the stored ``threadId`` for session
+    continuity.
+
+    :param codex_tools: Codex tool names (e.g. ``["Shell"]``).
+    :param rewriter: The session rewriter for this conversation.
+    :param workspace: Working directory for Codex, e.g.
+        ``"/tmp/storage/workspace"``.
+    :returns: A ``_SessionAwareMcpServer`` instance, or ``None``.
+    """
+    if not codex_tools:
+        return None
+    if shutil.which("codex") is None:
+        _logger.warning(
+            "codex: tools declared but 'codex' binary not"
+            " found on PATH — Codex tools will be"
+            " unavailable",
+        )
+        return None
+
+    return _SessionAwareMcpServer(
+        rewriter=rewriter,
+        params={
+            "command": "codex",
+            "args": ["mcp-server"],
+            "cwd": workspace,
+        },
+        name="Codex CLI",
+        # Long timeout — Codex sessions can be long-lived.
+        client_session_timeout_seconds=360000,
+        tool_filter=rewriter.tool_filter,
+    )
+
+
+class _SessionAwareMcpServer:
+    """
+    MCPServerStdio wrapper with Codex session rewriting.
+
+    Delegates all methods to an inner ``MCPServerStdio``.
+    Intercepts ``call_tool`` to rewrite ``codex`` calls to
+    ``codex-reply`` with the stored ``threadId``, and captures
+    ``threadId`` from results.
+
+    :param rewriter: The ``_CodexSessionRewriter`` for this
+        conversation.
+    :param kwargs: Forwarded to ``MCPServerStdio``.
+    """
+
+    def __init__(
+        self,
+        rewriter: _CodexSessionRewriter,
+        **kwargs: Any,
+    ) -> None:
+        from agents.mcp import MCPServerStdio
+
+        self._rewriter = rewriter
+        self._inner = MCPServerStdio(**kwargs)
+
+    async def connect(self) -> None:
+        """
+        Connect the inner MCP server.
+        """
+        await self._inner.connect()  # type: ignore[no-untyped-call]
+
+    @property
+    def session(self) -> Any:
+        """
+        The MCP session from the inner server.
+
+        :returns: The session object.
+        """
+        return self._inner.session
+
+    @property
+    def name(self) -> str | None:
+        """
+        The server name.
+
+        :returns: The name string.
+        """
+        return self._inner.name
+
+    async def list_tools(self) -> Any:
+        """
+        List tools from the inner server.
+
+        :returns: The tool list result.
+        """
+        return await self._inner.list_tools()
+
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        meta: dict[str, Any] | None = None,
+    ) -> Any:
+        """
+        Intercept tool calls for Codex session rewriting.
+
+        Rewrites ``codex`` → ``codex-reply`` with stored
+        ``threadId`` when a session exists. Captures
+        ``threadId`` from the result for future calls.
+
+        :param tool_name: The MCP tool name, e.g. ``"codex"``.
+        :param arguments: The tool arguments dict.
+        :param meta: Optional metadata (forwarded).
+        :returns: The ``CallToolResult``.
+        """
+        rewritten_name, rewritten_args = self._rewriter.rewrite_call(tool_name, arguments)
+        result = await self._inner.call_tool(
+            rewritten_name,
+            rewritten_args,
+            meta,
+        )
+        self._rewriter.capture_thread_id(result)
+        return result
+
+    async def cleanup(self) -> None:
+        """
+        Clean up the inner MCP server.
+        """
+        await self._inner.cleanup()  # type: ignore[no-untyped-call]
+
+    def create_streams(self) -> Any:
+        """
+        Create streams for the inner server.
+
+        :returns: The streams context manager.
+        """
+        return self._inner.create_streams()
+
+    @property
+    def cached_tools(self) -> Any:
+        """
+        Cached tools from the inner server.
+
+        :returns: The cached tools list.
+        """
+        return self._inner.cached_tools
+
+    def invalidate_tools_cache(self) -> None:
+        """
+        Invalidate the inner server's tools cache.
+        """
+        self._inner.invalidate_tools_cache()  # type: ignore[no-untyped-call]
+
+
+# Per-conversation Codex session rewriters. Persisted across
+# tasks so threadId survives between turns.
+_codex_rewriters: dict[str, _CodexSessionRewriter] = {}
+
+
+def _get_or_create_rewriter(
+    conv_id: str,
+) -> _CodexSessionRewriter:
+    """
+    Get or create a session rewriter for a conversation.
+
+    :param conv_id: The conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :returns: The rewriter for this conversation.
+    """
+    if conv_id not in _codex_rewriters:
+        _codex_rewriters[conv_id] = _CodexSessionRewriter()
+    return _codex_rewriters[conv_id]
+
+
 class AgentsSdkExecutor(Executor):
     """
     Executor wrapping the OpenAI Agents SDK.
@@ -443,14 +705,18 @@ class AgentsSdkExecutor(Executor):
 
     def on_task_start(self, context: ExecutorContext) -> None:
         """
-        No-op for Layer 1 (no Codex MCP lifecycle).
+        Ensure workspace directory exists for Codex.
 
         :param context: Agent-plane capabilities and identifiers.
         """
+        if self._codex_tools:
+            workspace = context.storage_dir / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
 
     def on_task_end(self, context: ExecutorContext) -> None:
         """
-        No-op for Layer 1 (no Codex MCP lifecycle).
+        No-op. Codex session rewriters persist in the module-level
+        ``_codex_rewriters`` dict for session continuity.
 
         :param context: Agent-plane capabilities and identifiers.
         """
@@ -505,6 +771,11 @@ def _build_agent(
     """
     Construct an Agents SDK ``Agent`` from executor config.
 
+    Attaches Codex MCP server when ``codex:`` tools are
+    declared. The MCP server provides Shell and ApplyPatch
+    capabilities with session continuity via
+    ``_CodexSessionRewriter``.
+
     :param executor: The executor instance.
     :param tools: Tool schemas in OpenAI format.
     :param system_prompt: System instructions.
@@ -526,6 +797,23 @@ def _build_agent(
     if _has_web_search(executor._builtins):
         hosted_tools.append(sdk.WebSearchTool())
 
+    # Codex MCP for coding tools (Shell, ApplyPatch).
+    mcp_servers: list[Any] = []
+    if executor._codex_tools:
+        rewriter = _get_or_create_rewriter(
+            context.conversation_id,
+        )
+        workspace = str(
+            context.storage_dir / "workspace",
+        )
+        codex_mcp = _build_codex_mcp(
+            executor._codex_tools,
+            rewriter,
+            workspace,
+        )
+        if codex_mcp is not None:
+            mcp_servers.append(codex_mcp)
+
     model_settings = _build_model_settings(llm_config)
     client = _build_openai_client(
         executor._connection,
@@ -540,6 +828,7 @@ def _build_agent(
         model=model,
         model_settings=model_settings,
         tools=[*function_tools, *hosted_tools],
+        mcp_servers=mcp_servers,
     )
 
 

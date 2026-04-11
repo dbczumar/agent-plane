@@ -1,7 +1,7 @@
 spec_version: 1
 
 name: openai-coder
-description: A coding assistant powered by the OpenAI Agents SDK with sub-agents, skills, and web search.
+description: A coding assistant powered by the OpenAI Agents SDK with Codex tools, sub-agents, and skills.
 
 executor:
   type: agents_sdk
@@ -16,6 +16,11 @@ llm:
 
 tools:
   builtins:
+    # Codex MCP tools — Shell for commands, ApplyPatch for
+    # file edits. Codex manages its own sandbox.
+    - codex:Shell
+    - codex:ApplyPatch
+    # Web search via OpenAI's hosted tool.
     - web_search_openai
   agents:
     - reviewer
