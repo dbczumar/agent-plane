@@ -504,10 +504,9 @@ class _SessionAwareMcpServer:
     """
     MCPServerStdio wrapper with Codex session rewriting.
 
-    Delegates all methods to an inner ``MCPServerStdio``.
-    Intercepts ``call_tool`` to rewrite ``codex`` calls to
-    ``codex-reply`` with the stored ``threadId``, and captures
-    ``threadId`` from results.
+    Delegates all attributes and methods to an inner
+    ``MCPServerStdio`` via ``__getattr__``. Only ``call_tool``
+    is intercepted for session rewriting.
 
     :param rewriter: The ``_CodexSessionRewriter`` for this
         conversation.
@@ -521,40 +520,26 @@ class _SessionAwareMcpServer:
     ) -> None:
         from agents.mcp import MCPServerStdio
 
-        self._rewriter = rewriter
-        self._inner = MCPServerStdio(**kwargs)
+        # Use object.__setattr__ to avoid triggering
+        # __getattr__ during __init__.
+        object.__setattr__(self, "_rewriter", rewriter)
+        object.__setattr__(
+            self,
+            "_inner",
+            MCPServerStdio(**kwargs),
+        )
 
-    async def connect(self) -> None:
+    def __getattr__(self, name: str) -> Any:
         """
-        Connect the inner MCP server.
-        """
-        await self._inner.connect()  # type: ignore[no-untyped-call]
+        Delegate attribute access to the inner server.
 
-    @property
-    def session(self) -> Any:
-        """
-        The MCP session from the inner server.
+        All methods and properties are forwarded except
+        ``call_tool`` which is overridden explicitly.
 
-        :returns: The session object.
+        :param name: The attribute name.
+        :returns: The attribute from the inner server.
         """
-        return self._inner.session
-
-    @property
-    def name(self) -> str | None:
-        """
-        The server name.
-
-        :returns: The name string.
-        """
-        return self._inner.name
-
-    async def list_tools(self) -> Any:
-        """
-        List tools from the inner server.
-
-        :returns: The tool list result.
-        """
-        return await self._inner.list_tools()
+        return getattr(self._inner, name)
 
     async def call_tool(
         self,
@@ -569,12 +554,16 @@ class _SessionAwareMcpServer:
         ``threadId`` when a session exists. Captures
         ``threadId`` from the result for future calls.
 
-        :param tool_name: The MCP tool name, e.g. ``"codex"``.
+        :param tool_name: The MCP tool name, e.g.
+            ``"codex"``.
         :param arguments: The tool arguments dict.
         :param meta: Optional metadata (forwarded).
         :returns: The ``CallToolResult``.
         """
-        rewritten_name, rewritten_args = self._rewriter.rewrite_call(tool_name, arguments)
+        rewritten_name, rewritten_args = self._rewriter.rewrite_call(
+            tool_name,
+            arguments,
+        )
         result = await self._inner.call_tool(
             rewritten_name,
             rewritten_args,
@@ -582,35 +571,6 @@ class _SessionAwareMcpServer:
         )
         self._rewriter.capture_thread_id(result)
         return result
-
-    async def cleanup(self) -> None:
-        """
-        Clean up the inner MCP server.
-        """
-        await self._inner.cleanup()  # type: ignore[no-untyped-call]
-
-    def create_streams(self) -> Any:
-        """
-        Create streams for the inner server.
-
-        :returns: The streams context manager.
-        """
-        return self._inner.create_streams()
-
-    @property
-    def cached_tools(self) -> Any:
-        """
-        Cached tools from the inner server.
-
-        :returns: The cached tools list.
-        """
-        return self._inner.cached_tools
-
-    def invalidate_tools_cache(self) -> None:
-        """
-        Invalidate the inner server's tools cache.
-        """
-        self._inner.invalidate_tools_cache()  # type: ignore[no-untyped-call]
 
 
 # Per-conversation Codex session rewriters. Persisted across
