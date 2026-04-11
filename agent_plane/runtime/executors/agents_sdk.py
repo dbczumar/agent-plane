@@ -486,7 +486,7 @@ def _build_codex_mcp(
         )
         return None
 
-    return _SessionAwareMcpServer(
+    return _make_session_aware_mcp_server(
         rewriter=rewriter,
         params={
             "command": "codex",
@@ -496,81 +496,67 @@ def _build_codex_mcp(
         name="Codex CLI",
         # Long timeout — Codex sessions can be long-lived.
         client_session_timeout_seconds=360000,
-        tool_filter=rewriter.tool_filter,
+        # Static filter — block codex-reply so the LLM only
+        # sees codex. Session rewriting in call_tool handles
+        # the rest. Dynamic (callable) filters require
+        # run_context/agent which aren't available at
+        # construction time.
+        tool_filter={"blocked_names": ["codex-reply"]},
     )
 
 
-class _SessionAwareMcpServer:
+def _make_session_aware_mcp_server(
+    rewriter: _CodexSessionRewriter,
+    **kwargs: Any,
+) -> Any:
     """
-    MCPServerStdio wrapper with Codex session rewriting.
+    Create an ``MCPServerStdio`` subclass instance that
+    intercepts ``call_tool`` for Codex session rewriting.
 
-    Delegates all attributes and methods to an inner
-    ``MCPServerStdio`` via ``__getattr__``. Only ``call_tool``
-    is intercepted for session rewriting.
+    Uses runtime subclassing so the instance passes all
+    ``isinstance`` checks the SDK performs internally.
 
     :param rewriter: The ``_CodexSessionRewriter`` for this
         conversation.
     :param kwargs: Forwarded to ``MCPServerStdio``.
+    :returns: A session-aware MCP server instance.
     """
+    from agents.mcp import MCPServerStdio
 
-    def __init__(
-        self,
-        rewriter: _CodexSessionRewriter,
-        **kwargs: Any,
-    ) -> None:
-        from agents.mcp import MCPServerStdio
+    class _SessionAware(MCPServerStdio):
+        """
+        ``MCPServerStdio`` subclass with ``call_tool``
+        intercepted for Codex session rewriting.
+        """
 
-        # Use object.__setattr__ to avoid triggering
-        # __getattr__ during __init__.
-        object.__setattr__(self, "_rewriter", rewriter)
-        object.__setattr__(
+        async def call_tool(
             self,
-            "_inner",
-            MCPServerStdio(**kwargs),
-        )
+            tool_name: str,
+            arguments: dict[str, Any] | None,
+            meta: dict[str, Any] | None = None,
+        ) -> Any:
+            """
+            Rewrite ``codex`` → ``codex-reply`` and capture
+            ``threadId``.
 
-    def __getattr__(self, name: str) -> Any:
-        """
-        Delegate attribute access to the inner server.
+            :param tool_name: The MCP tool name.
+            :param arguments: The tool arguments dict.
+            :param meta: Optional metadata (forwarded).
+            :returns: The ``CallToolResult``.
+            """
+            name, args = rewriter.rewrite_call(
+                tool_name,
+                arguments,
+            )
+            result = await super().call_tool(
+                name,
+                args,
+                meta,
+            )
+            rewriter.capture_thread_id(result)
+            return result
 
-        All methods and properties are forwarded except
-        ``call_tool`` which is overridden explicitly.
-
-        :param name: The attribute name.
-        :returns: The attribute from the inner server.
-        """
-        return getattr(self._inner, name)
-
-    async def call_tool(
-        self,
-        tool_name: str,
-        arguments: dict[str, Any] | None,
-        meta: dict[str, Any] | None = None,
-    ) -> Any:
-        """
-        Intercept tool calls for Codex session rewriting.
-
-        Rewrites ``codex`` → ``codex-reply`` with stored
-        ``threadId`` when a session exists. Captures
-        ``threadId`` from the result for future calls.
-
-        :param tool_name: The MCP tool name, e.g.
-            ``"codex"``.
-        :param arguments: The tool arguments dict.
-        :param meta: Optional metadata (forwarded).
-        :returns: The ``CallToolResult``.
-        """
-        rewritten_name, rewritten_args = self._rewriter.rewrite_call(
-            tool_name,
-            arguments,
-        )
-        result = await self._inner.call_tool(
-            rewritten_name,
-            rewritten_args,
-            meta,
-        )
-        self._rewriter.capture_thread_id(result)
-        return result
+    return _SessionAware(**kwargs)
 
 
 # Per-conversation Codex session rewriters. Persisted across
@@ -694,7 +680,8 @@ class AgentsSdkExecutor(Executor):
 
         Builds an ``Agent`` with function tools, calls
         ``Runner.run_streamed()``, and yields executor events.
-        No queue bridge needed — the SDK is async-native.
+        MCP servers (Codex) are connected via
+        ``MCPServerManager`` for proper lifecycle management.
 
         :param messages: Conversation history as Responses API
             input items.
@@ -706,7 +693,7 @@ class AgentsSdkExecutor(Executor):
         :param context: Agent-plane capabilities and
             identifiers.
         """
-        agent = _build_agent(
+        agent, mcp_servers = _build_agent(
             self,
             tools,
             system_prompt,
@@ -714,11 +701,30 @@ class AgentsSdkExecutor(Executor):
             context,
         )
         input_items = _messages_to_input(messages)
-        async for event in _stream_sdk_turn(
-            agent,
-            input_items,
-        ):
-            yield event
+
+        if mcp_servers:
+            # MCP servers must be connected before the SDK
+            # can use them. MCPServerManager handles the
+            # connect/cleanup lifecycle.
+            from agents.mcp import MCPServerManager
+
+            async with MCPServerManager(
+                mcp_servers,
+            ) as mgr:
+                # Replace agent's mcp_servers with the
+                # connected ones from the manager.
+                agent.mcp_servers = mgr.active_servers
+                async for event in _stream_sdk_turn(
+                    agent,
+                    input_items,
+                ):
+                    yield event
+        else:
+            async for event in _stream_sdk_turn(
+                agent,
+                input_items,
+            ):
+                yield event
 
 
 def _build_agent(
@@ -727,21 +733,20 @@ def _build_agent(
     system_prompt: str,
     llm_config: LLMConfig,
     context: ExecutorContext,
-) -> Any:
+) -> tuple[Any, list[Any]]:
     """
     Construct an Agents SDK ``Agent`` from executor config.
 
-    Attaches Codex MCP server when ``codex:`` tools are
-    declared. The MCP server provides Shell and ApplyPatch
-    capabilities with session continuity via
-    ``_CodexSessionRewriter``.
+    Returns the agent and its MCP servers separately so the
+    caller can manage MCP lifecycle via ``MCPServerManager``.
 
     :param executor: The executor instance.
     :param tools: Tool schemas in OpenAI format.
     :param system_prompt: System instructions.
     :param llm_config: LLM configuration.
     :param context: Agent-plane executor context.
-    :returns: A configured ``Agent`` instance.
+    :returns: A tuple of (agent, mcp_servers). The caller
+        must connect MCP servers before running the agent.
     """
     sdk = _ensure_sdk()
 
@@ -782,14 +787,17 @@ def _build_agent(
     )
     model = _build_model(llm_config.model, client)
 
-    return sdk.Agent(
+    agent = sdk.Agent(
         name="agent",
         instructions=system_prompt,
         model=model,
         model_settings=model_settings,
         tools=[*function_tools, *hosted_tools],
+        # MCP servers are passed here but must be connected
+        # by the caller via MCPServerManager before running.
         mcp_servers=mcp_servers,
     )
+    return agent, mcp_servers
 
 
 async def _stream_sdk_turn(

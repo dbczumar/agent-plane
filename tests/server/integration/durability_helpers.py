@@ -328,11 +328,11 @@ async def run_server_1(
     assert created.body["status"] == "queued"
 
     # Gate: workflow passed the tool call and entered
-    # LLM call 2 (the blocked one).  Use asyncio.to_thread so the
-    # test event loop stays free — DBOS runs the async workflow on
-    # this loop, so a blocking wait() would deadlock it.
-    reached = await asyncio.to_thread(call_block.call_event.wait, 10)
-    assert reached, "LLM call 2 was never reached (workflow stalled)"
+    # LLM call 2 (the blocked one).  asyncio.Event.wait() yields
+    # to the event loop so the workflow can progress.
+    await asyncio.wait_for(call_block.call_event.wait(), timeout=10)
+    # wait_for raises TimeoutError if 10s exceeded; reaching here
+    # means the LLM call was entered.
 
     assert len(tracking.invocations) == 1, (
         f"Expected 1 tool invocation pre-crash, got {len(tracking.invocations)}"
@@ -430,8 +430,8 @@ async def run_server_1_crash_mid_tool(
     conv_id = created.body["conversation"]["id"]
 
     # Wait for tool to be entered (blocked via gate).
-    # Use asyncio.to_thread so the test event loop stays free —
-    # DBOS runs the async workflow on this loop.
+    # ToolGate.entered is a threading.Event because call_tool is
+    # sync — use asyncio.to_thread so the event loop stays free.
     entered = await asyncio.to_thread(gate.entered.wait, 10)
     assert entered, "Tool gate was never entered (workflow stalled)"
 
@@ -527,10 +527,11 @@ async def run_server_1_with_steering(
     conv_id = created.body["conversation"]["id"]
 
     # Wait for LLM to be entered (workflow is running).
-    # Use asyncio.to_thread so the test event loop stays free —
-    # DBOS runs the async workflow on this loop.
-    reached = await asyncio.to_thread(call_block.call_event.wait, 10)
-    assert reached, "LLM call was never reached (workflow stalled)"
+    # asyncio.Event.wait() yields to the event loop so the
+    # workflow can progress.
+    await asyncio.wait_for(call_block.call_event.wait(), timeout=10)
+    # wait_for raises TimeoutError if 10s exceeded; reaching here
+    # means the LLM call was entered.
 
     # Inject steered message via the API. try_deliver writes
     # to conversation_items in its own transaction, independent

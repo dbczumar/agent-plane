@@ -57,11 +57,12 @@ class MockCall:
         instead of text. Each dict must have ``"call_id"``,
         ``"name"``, and ``"arguments"`` keys, e.g.
         ``[{"call_id": "c1", "name": "grep", "arguments": "{}"}]``.
-    :param block_before_response: If set, the mock blocks on this
+    :param block_before_response: If set, the mock awaits this
         event before producing any output. Call ``release()`` from
         the test to unblock.
     :param call_event: Set by the mock when this call is entered.
-        Tests can ``call_event.wait()`` to know the LLM was called.
+        Tests can ``await call_event.wait()`` to know the LLM was
+        called.
     :param stream_tokens: If ``True``, yield individual text delta
         events before the completed event. If ``False``, yield only
         the completed event.
@@ -81,8 +82,8 @@ class MockCall:
 
     text: str = "Hello from the test agent."
     tool_calls: list[dict[str, str]] | None = None
-    block_before_response: threading.Event | None = None
-    call_event: threading.Event = field(default_factory=threading.Event)
+    block_before_response: asyncio.Event | None = None
+    call_event: asyncio.Event = field(default_factory=asyncio.Event)
     stream_tokens: bool = False
     exception: Exception | None = None
     # Callable[[dict[str, Any]], list[dict[str, str]]] — generates
@@ -152,7 +153,7 @@ class ControllableMockClient:
         # First LLM call blocks until released
         call_1 = client.add_call(text="First", block=True)
         # ... start workflow ...
-        call_1.call_event.wait()  # know the LLM was called
+        await call_1.call_event.wait()  # know the LLM was called
         # ... inject steering message ...
         call_1.release()  # unblock
 
@@ -201,7 +202,7 @@ class ControllableMockClient:
             text=text or self._default_text,
             tool_calls=tool_calls,
             tool_calls_fn=tool_calls_fn,
-            block_before_response=threading.Event() if block else None,
+            block_before_response=asyncio.Event() if block else None,
             stream_tokens=stream_tokens,
             exception=exception,
         )
@@ -224,7 +225,7 @@ class ControllableMockClient:
 
     def release_all(self) -> None:
         """
-        Release every blocked call so DBOS workflow threads can exit.
+        Release every blocked call so DBOS workflow tasks can exit.
 
         Called during fixture teardown to prevent the event loop from
         hanging on shutdown.
@@ -274,7 +275,8 @@ class _MockResponsesNamespace:
     ) -> Response | AsyncIterator[ResponseStreamEvent]:
         """
         Mock ``responses.create()``. Consumes the next MockCall,
-        optionally blocking, then returns a Response or stream.
+        optionally awaiting a gate, then returns a Response or
+        stream.
 
         Async to match the real client's ``await create()``.
 
@@ -297,11 +299,10 @@ class _MockResponsesNamespace:
         # Signal that this call has been entered
         call.call_event.set()
         # Optionally block until the test releases us.
-        # Use to_thread so the event loop stays free.
+        # asyncio.Event.wait() yields to the event loop, so
+        # other tasks (e.g. the test) can proceed.
         if call.block_before_response is not None:
-            await asyncio.to_thread(
-                call.block_before_response.wait,
-            )
+            await call.block_before_response.wait()
         # Raise configured exception (simulates retryable errors)
         if call.exception is not None:
             raise call.exception
@@ -344,7 +345,7 @@ def mock_llm() -> Iterator[ControllableMockClient]:
     Tests that need to control LLM timing should call
     ``mock_llm.add_call(block=True)`` before creating responses.
 
-    On teardown, releases all blocked calls so DBOS workflow threads
+    On teardown, releases all blocked calls so DBOS workflow tasks
     can exit cleanly and the event loop shuts down.
     """
     client = ControllableMockClient()
