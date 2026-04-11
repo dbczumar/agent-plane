@@ -30,7 +30,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CODER_DIR = _REPO_ROOT / "examples" / "agents" / "coder"
 _ARCHER_DIR = _REPO_ROOT / "examples" / "agents" / "archer"
 _CLAUDE_CODER_DIR = _REPO_ROOT / "examples" / "agents" / "claude-coder"
-_OPENAI_BASIC_DIR = _REPO_ROOT / "examples" / "agents" / "openai-basic"
+_OPENAI_CODER_DIR = _REPO_ROOT / "examples" / "agents" / "openai-coder"
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -197,14 +197,15 @@ def claude_coder_agent(http_client: httpx.Client) -> str:
 
 
 @pytest.fixture(scope="session")
-def openai_basic_agent(http_client: httpx.Client) -> str:
+def openai_coder_agent(http_client: httpx.Client) -> str:
     """
-    Upload the openai-basic agent and return its name.
+    Upload the openai-coder agent (with reviewer sub-agent
+    and skills) and return its name.
 
     :param http_client: HTTP client pointed at the server.
-    :returns: The agent name, ``"openai-basic"``.
+    :returns: The agent name, ``"openai-coder"``.
     """
-    return _upload_agent(http_client, _OPENAI_BASIC_DIR)
+    return _upload_agent(http_client, _OPENAI_CODER_DIR)
 
 
 @pytest.fixture(scope="session")

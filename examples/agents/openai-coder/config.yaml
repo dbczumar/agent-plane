@@ -1,0 +1,23 @@
+spec_version: 1
+
+name: openai-coder
+description: A coding assistant powered by the OpenAI Agents SDK with sub-agents, skills, and web search.
+
+executor:
+  type: agents_sdk
+  timeout: 1800
+
+llm:
+  model: gpt-5.4
+  reasoning_effort: medium
+  max_completion_tokens: 16384
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  builtins:
+    - web_search_openai
+  agents:
+    - reviewer
+
+instructions: INSTRUCTIONS.md

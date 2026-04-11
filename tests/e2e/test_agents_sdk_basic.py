@@ -1,7 +1,8 @@
-"""E2E test: OpenAI Agents SDK executor basic functionality.
+"""E2E test: OpenAI Agents SDK executor with openai-coder agent.
 
-Verifies that the AgentsSdkExecutor runs a single turn with a
-real LLM and produces a completed response.
+Verifies that the AgentsSdkExecutor runs single-turn and
+multi-turn conversations with a real LLM. Uses the openai-coder
+agent which has sub-agents, skills, and web search.
 
 Usage::
 
@@ -38,7 +39,7 @@ def _extract_all_text(body: dict[str, Any]) -> str:
 
 def test_agents_sdk_single_turn_completes(
     http_client: httpx.Client,
-    openai_basic_agent: str,
+    openai_coder_agent: str,
 ) -> None:
     """
     Basic smoke test: the Agents SDK executor runs a single
@@ -58,7 +59,7 @@ def test_agents_sdk_single_turn_completes(
     resp = http_client.post(
         "/v1/responses",
         json={
-            "model": openai_basic_agent,
+            "model": openai_coder_agent,
             "input": ("What is 2 + 2? Reply with just the number."),
             "background": True,
         },
@@ -81,7 +82,7 @@ def test_agents_sdk_single_turn_completes(
 
 def test_agents_sdk_multi_turn_remembers(
     http_client: httpx.Client,
-    openai_basic_agent: str,
+    openai_coder_agent: str,
 ) -> None:
     """
     Two-turn conversation: the agent remembers turn 1 content
@@ -100,7 +101,7 @@ def test_agents_sdk_multi_turn_remembers(
     resp_1 = http_client.post(
         "/v1/responses",
         json={
-            "model": openai_basic_agent,
+            "model": openai_coder_agent,
             "input": ("My name is Zephyr and I live in Portland."),
             "background": True,
         },
@@ -118,7 +119,7 @@ def test_agents_sdk_multi_turn_remembers(
     resp_2 = http_client.post(
         "/v1/responses",
         json={
-            "model": openai_basic_agent,
+            "model": openai_coder_agent,
             "input": ("What is my name and where do I live?"),
             "background": True,
             "previous_response_id": id_1,
