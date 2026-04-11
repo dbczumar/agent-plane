@@ -310,12 +310,28 @@ resilience behavior.
 
 #### Claude SDK executor
 
-The Claude Agent SDK does not expose per-request timeout or retry knobs
-through `ClaudeAgentOptions`. The SDK manages its own retry loop internally,
-surfacing retries as `SystemMessage(subtype="api_retry")` events.
+The Claude Agent SDK (`ClaudeAgentOptions`) does **not** expose
+`request_timeout`, retry count, backoff, or status code configuration.
+The full `ClaudeAgentOptions` dataclass (from `claude_agent_sdk/types.py`)
+has execution-control fields (`max_turns`, `max_budget_usd`) but nothing
+for per-API-call resilience. The SDK manages its own retry loop
+internally with a hardcoded ~10-minute API timeout (`API_TIMEOUT_MS:
+600000`), surfacing retries as `SystemMessage(subtype="api_retry")`
+events. There are open issues about this being non-configurable
+(anthropics/claude-agent-sdk-python#533, #701).
 
-Since we cannot configure the SDK's internal retry behavior, the approach
-is external enforcement:
+Available `ClaudeAgentOptions` fields relevant to execution limits:
+
+| Field | Type | Effect |
+|---|---|---|
+| `max_turns` | `int \| None` | Cap on agentic turns (tool-use round trips). |
+| `max_budget_usd` | `float \| None` | Spend ceiling in USD for the session. |
+| `fallback_model` | `str \| None` | Automatic failover model. |
+
+None of these control per-request timeout or retry behavior.
+
+Since we cannot configure the SDK's internal retry/timeout behavior,
+the approach is external enforcement:
 
 - **`executor.timeout`**: Enforced by the `asyncio.wait_for` wrapper
   (change 1). No SDK-side config needed.
@@ -323,11 +339,15 @@ is external enforcement:
   (change 2). When the SDK fails (exception or terminal `api_retry`
   system message), the workflow retries the entire `run_turn` call
   according to `llm.retry`.
-- **`llm.request_timeout`**: Cannot be injected into the SDK's internal
-  Anthropic client today. Document this as a known limitation. The
-  execution deadline (`executor.timeout`) provides an upper bound. If
-  the Claude Agent SDK adds a `request_timeout` option in the future,
-  pass it through.
+- **`llm.request_timeout`**: Cannot be injected into the SDK today.
+  The SDK's internal `API_TIMEOUT_MS` (600s / 10 minutes) is the
+  de facto per-request timeout. Document this as a known limitation.
+  The execution deadline (`executor.timeout`) provides an upper bound.
+  If the Claude Agent SDK adds a `request_timeout` option in the
+  future, pass `llm.request_timeout` through.
+- **`max_turns`**: Wire `executor.max_iterations` to
+  `ClaudeAgentOptions.max_turns` so the agent spec controls the
+  SDK's internal iteration cap. Today it is unset (unlimited).
 
 ##### Interaction with SDK internal retries
 
@@ -378,7 +398,8 @@ Missing pieces:
 | Config field | Claude SDK | OpenAI SDK |
 |---|---|---|
 | `executor.timeout` | `asyncio.wait_for` (external) | `asyncio.wait_for` (external) |
-| `llm.request_timeout` | Not injectable (SDK limitation) | `AsyncOpenAI(timeout=...)` (already wired) |
+| `executor.max_iterations` | `ClaudeAgentOptions.max_turns` (new) | Hardcoded `_SDK_MAX_TURNS=200` (wire to spec) |
+| `llm.request_timeout` | Not injectable — SDK uses internal 600s `API_TIMEOUT_MS` | `AsyncOpenAI(timeout=...)` (already wired) |
 | `llm.retry.max_attempts` | Workflow-level retry count | `AsyncOpenAI(max_retries=...)` + workflow-level retry |
 | `llm.retry.backoff_*` | Workflow-level backoff | SDK internal (not configurable) + workflow-level backoff |
 | `llm.retry.status_codes` | Workflow-level classification via `_is_retryable_claude_error` | SDK internal (not configurable) + workflow-level classification |
@@ -424,16 +445,21 @@ Tests:
 ### Phase 3: Config propagation (change 3)
 
 Files:
-- `runtime/executors/claude.py` — document SDK limitation for
+- `runtime/executors/claude.py` — pass `executor.max_iterations` as
+  `ClaudeAgentOptions.max_turns`, document SDK limitation for
   `request_timeout`, wire workflow retry to `llm.retry`
-- `runtime/executors/agents_sdk.py` — verify existing `timeout`/
-  `max_retries` wiring, document backoff/status_codes limitations
+- `runtime/executors/agents_sdk.py` — wire `executor.max_iterations`
+  to `max_turns` (replacing hardcoded `_SDK_MAX_TURNS=200`), verify
+  existing `timeout`/`max_retries` wiring, document backoff/status_codes
+  limitations
 
 Tests:
 - Unit test: verify `llm.retry` config flows to
   `_executor_turn_with_retry` for SDK executors
 - Unit test: verify `AsyncOpenAI` receives correct `timeout` and
   `max_retries` from spec
+- Unit test: verify `max_turns` is set from `executor.max_iterations`
+  for both Claude and OpenAI SDK executors
 
 ---
 
