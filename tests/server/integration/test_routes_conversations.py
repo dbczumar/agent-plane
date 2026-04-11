@@ -329,32 +329,23 @@ async def test_tool_call_items_position_order(
 
     items = await _get_items(client, conv_id)
 
-    # 5 items: user, empty assistant (before tool calls), function_call,
-    # function_call_output, final assistant.
-    assert len(items) == 5, (
-        f"Expected [user, assistant(empty), fc, fco, assistant], got {len(items)}"
-    )
+    assert len(items) == 4, f"Expected [user, fc, fco, assistant], got {len(items)}"
     assert items[0]["type"] == "message"
     assert items[0]["role"] == "user"
     assert items[0]["content"][0]["text"] == "Use a tool please"
 
-    # Empty assistant message persisted before tool calls
-    assert items[1]["type"] == "message"
-    assert items[1]["role"] == "assistant"
-    assert items[1]["content"][0]["text"] == ""
+    assert items[1]["type"] == "function_call"
+    assert items[1]["call_id"] == "call_order_1"
+    assert items[1]["name"] == "load_skill"
 
-    assert items[2]["type"] == "function_call"
+    assert items[2]["type"] == "function_call_output"
     assert items[2]["call_id"] == "call_order_1"
-    assert items[2]["name"] == "load_skill"
-
-    assert items[3]["type"] == "function_call_output"
-    assert items[3]["call_id"] == "call_order_1"
     # Tool produced some output string
-    assert isinstance(items[3]["output"], str)
+    assert isinstance(items[2]["output"], str)
 
-    assert items[4]["type"] == "message"
-    assert items[4]["role"] == "assistant"
-    assert items[4]["content"][0]["text"] == "Done with tools"
+    assert items[3]["type"] == "message"
+    assert items[3]["role"] == "assistant"
+    assert items[3]["content"][0]["text"] == "Done with tools"
 
 
 async def test_multiple_tool_call_rounds_ordering(
@@ -403,37 +394,28 @@ async def test_multiple_tool_call_rounds_ordering(
 
     items = await _get_items(client, conv_id)
 
-    # 8 items: user, empty-assistant, fc_1, fco_1, empty-assistant, fc_2, fco_2,
-    # final assistant. Each tool-call round is preceded by an empty assistant message.
-    assert len(items) == 8, (
-        f"Expected [user, asst(empty), fc_1, fco_1, asst(empty), fc_2, fco_2, assistant], "
-        f"got {len(items)}"
+    assert len(items) == 6, (
+        f"Expected [user, fc_1, fco_1, fc_2, fco_2, assistant], got {len(items)}"
     )
     assert items[0]["type"] == "message"
     assert items[0]["role"] == "user"
     assert items[0]["content"][0]["text"] == "Two tools please"
 
-    # Round 1: empty assistant, then function_call + output
-    assert items[1]["type"] == "message"
-    assert items[1]["role"] == "assistant"
-    assert items[1]["content"][0]["text"] == ""
-    assert items[2]["type"] == "function_call"
+    # Round 1
+    assert items[1]["type"] == "function_call"
+    assert items[1]["call_id"] == "call_round_1"
+    assert items[2]["type"] == "function_call_output"
     assert items[2]["call_id"] == "call_round_1"
-    assert items[3]["type"] == "function_call_output"
-    assert items[3]["call_id"] == "call_round_1"
 
-    # Round 2: empty assistant, then function_call + output
-    assert items[4]["type"] == "message"
-    assert items[4]["role"] == "assistant"
-    assert items[4]["content"][0]["text"] == ""
-    assert items[5]["type"] == "function_call"
-    assert items[5]["call_id"] == "call_round_2"
-    assert items[6]["type"] == "function_call_output"
-    assert items[6]["call_id"] == "call_round_2"
+    # Round 2
+    assert items[3]["type"] == "function_call"
+    assert items[3]["call_id"] == "call_round_2"
+    assert items[4]["type"] == "function_call_output"
+    assert items[4]["call_id"] == "call_round_2"
 
-    assert items[7]["type"] == "message"
-    assert items[7]["role"] == "assistant"
-    assert items[7]["content"][0]["text"] == "Both tools done"
+    assert items[5]["type"] == "message"
+    assert items[5]["role"] == "assistant"
+    assert items[5]["content"][0]["text"] == "Both tools done"
 
 
 async def test_multi_turn_after_steering_sees_full_history(
@@ -563,15 +545,11 @@ async def test_steering_position_among_tool_items(
     items = await _get_items(client, conv_id)
     types = [i["type"] for i in items]
 
-    # Positional assertions: user, empty-assistant, fc, fco, steered-user,
+    # Positional assertions: user, fc, fco, steered-user,
     # post-tool assistant, steered-continuation assistant
     assert types[0] == "message", "First item must be user message"
-    # Empty assistant message persisted before tool calls
-    assert types[1] == "message"
-    assert items[1]["role"] == "assistant"
-    assert items[1]["content"][0]["text"] == ""
-    assert types[2] == "function_call"
-    assert types[3] == "function_call_output"
+    assert types[1] == "function_call"
+    assert types[2] == "function_call_output"
 
     # Steered message appears after tool items
     steered_idx = next(
@@ -579,7 +557,7 @@ async def test_steering_position_among_tool_items(
         for idx, i in enumerate(items)
         if i.get("role") == "user" and i["content"][0]["text"] == "Steering during tools"
     )
-    assert steered_idx > 3, "Steered message must appear after function_call/output items"
+    assert steered_idx > 2, "Steered message must appear after function_call/output items"
 
     # Verify both user messages
     user_texts = [i["content"][0]["text"] for i in items if i.get("role") == "user"]
@@ -654,18 +632,15 @@ async def test_client_side_tool_completes_with_function_call(
     items = await _get_items(client, conv_id)
     types = [i["type"] for i in items]
 
-    # [user message, empty assistant, function_call] — no function_call_output
-    assert types == ["message", "message", "function_call"], (
-        f"Expected [message, message(empty assistant), function_call] for client-side "
+    # [user message, function_call] — no function_call_output
+    assert types == ["message", "function_call"], (
+        f"Expected [message, function_call] for client-side "
         f"tool; got {types}. If function_call_output is "
         f"present, the tool was executed server-side."
     )
-    # Empty assistant message persisted before function_call
-    assert items[1]["role"] == "assistant"
-    assert items[1]["content"][0]["text"] == ""
-    assert items[2]["name"] == "get_weather"
-    assert items[2]["call_id"] == "call_weather_1"
-    assert items[2]["arguments"] == '{"city": "San Francisco"}'
+    assert items[1]["name"] == "get_weather"
+    assert items[1]["call_id"] == "call_weather_1"
+    assert items[1]["arguments"] == '{"city": "San Francisco"}'
 
     # 1 LLM call only — no tool execution loop
     assert mock_llm.call_count == 1, (

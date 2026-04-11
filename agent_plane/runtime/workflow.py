@@ -2248,28 +2248,36 @@ async def _handle_tool_calls(
     """
     tool_calls = _get_tool_calls(llm_resp)
 
-    # Persist an assistant message before function_call items so
-    # the Responses API sees a valid turn structure. Without this,
-    # native tool items (web_search_call) followed by function_calls
-    # are rejected with 400 — the API requires an assistant message
-    # between native tool results and function calls.
-    assistant_text = llm_resp.get("text") or ""
-    assistant_msg = NewConversationItem(
-        type="message",
-        response_id=task_id,
-        data=MessageData(
-            role="assistant",
-            content=[{"type": "output_text", "text": assistant_text}],
-            agent=agent_name,
-        ),
-    )
     fc_new_items = _build_function_call_items(task_id, agent_name, tool_calls)
+
+    # Only persist an assistant message before function_call items
+    # when native tool items (web_search_call, reasoning) are in the
+    # conversation history. OpenAI rejects function_calls that follow
+    # native tool items without an intervening assistant message.
+    # When no native tools are present, the extra message is
+    # unnecessary and pollutes the conversation with empty items.
+    has_native_tools = any(ci.type == "native_tool" for ci in history)
+    items_to_persist: list[NewConversationItem] = []
+    if has_native_tools:
+        assistant_text = llm_resp.get("text") or ""
+        items_to_persist.append(
+            NewConversationItem(
+                type="message",
+                response_id=task_id,
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": assistant_text}],
+                    agent=agent_name,
+                ),
+            )
+        )
+    items_to_persist.extend(fc_new_items)
 
     fc_items = _persist_and_stream(
         task_id,
         conv_store,
         conversation_id,
-        [assistant_msg] + fc_new_items,
+        items_to_persist,
         output_items,
     )
     history.extend(fc_items)

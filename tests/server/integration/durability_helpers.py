@@ -614,10 +614,7 @@ async def assert_recovery_output(
     output = terminal_body["output"]
     assistant_outputs = [o for o in output if o.get("role") == "assistant"]
     assert len(assistant_outputs) >= 1, "No assistant output after recovery"
-    # Use the last assistant output — earlier ones may be empty-text
-    # placeholders from tool-calling turns (the executor records an
-    # assistant message even when the LLM returned tool calls).
-    assert assistant_outputs[-1]["content"][0]["text"] == recovery_text
+    assert assistant_outputs[0]["content"][0]["text"] == recovery_text
 
 
 async def assert_conversation_persisted(
@@ -650,9 +647,7 @@ async def assert_conversation_persisted(
     assert user_items[0]["content"][0]["text"] == user_text
 
     assert len(assistant_items) >= 1, "Assistant response not persisted after recovery"
-    # Use the last assistant item — earlier ones may be empty-text
-    # placeholders from tool-calling turns.
-    assert assistant_items[-1]["content"][0]["text"] == assistant_text
+    assert assistant_items[0]["content"][0]["text"] == assistant_text
 
 
 async def assert_steering_persisted(
