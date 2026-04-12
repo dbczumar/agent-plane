@@ -1,6 +1,6 @@
 spec_version: 1
 
-name: onboarding
+name: onboarding-buddy
 description: Built-in assistant that guides users through creating new agent plane agents.
 
 # The model and connection fields are dynamically replaced at runtime
@@ -15,6 +15,7 @@ tools:
   builtins:
     - web_search
     - web_fetch
+    - introspect
 
 interaction:
   modalities:

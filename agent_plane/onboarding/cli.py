@@ -101,14 +101,14 @@ def _prompt_shell_access(console: Console) -> bool:
     """
     console.print()
     console.print(
-        "  [bold]• Shell access[/bold] — full access to your filesystem, "
-        "shell commands, and network. Can read your existing code and "
-        "write the generated agent directly to disk.\n"
-    )
-    console.print(
         "  [bold]• Sandbox mode[/bold] (default) — restricted to an "
         "isolated workspace. Creates the agent in a sandbox, then "
-        "exports it to your chosen path."
+        "exports it to your chosen path.\n"
+    )
+    console.print(
+        "  [bold]• Shell access[/bold] — full access to your filesystem, "
+        "shell commands, and network. Can read your existing code and "
+        "write the generated agent directly to disk."
     )
     answer = click.prompt(
         "\n  Allow shell access? (y/n)",
@@ -158,7 +158,7 @@ def _run_with_server(
     server_proc = _start_server(agent_dir, port)
     try:
         _wait_for_server(server_proc, port)
-        agent_id = _get_agent_id(port, "onboarding")
+        agent_id = _get_agent_id(port, "onboarding-buddy")
         if message is not None:
             _run_non_interactive(port, agent_id, message, allow_shell_access)
         else:
@@ -316,7 +316,7 @@ def _get_agent_id(port: int, agent_name: str) -> str:
     Look up the agent ID by name from the running server.
 
     :param port: The server port.
-    :param agent_name: The agent name to find, e.g. ``"onboarding"``.
+    :param agent_name: The agent name to find, e.g. ``"onboarding-buddy"``.
     :returns: The agent's ID string.
     :raises click.ClickException: If the agent is not found.
     """
@@ -361,20 +361,27 @@ def _run_interactive(
     :param allow_shell_access: Whether to pass ``--client-tools coder``
         for full shell access.
     """
-    terminal_path = _find_terminal_frontend()
+    import asyncio
 
-    cmd = [
-        sys.executable,
-        str(terminal_path),
-        "--server",
-        f"http://127.0.0.1:{port}",
-        "onboarding",
-    ]
+    from agent_plane_ui_sdk import AgentPlaneClient
+
+    from agent_plane.repl import run_repl
+
+    tool_handler = None
     if allow_shell_access:
-        cmd.extend(["--client-tools", "coder"])
+        tool_handler = _load_coder_tool_handler()
+
+    async def _run() -> None:
+        async with AgentPlaneClient(base_url=f"http://127.0.0.1:{port}") as client:
+            await run_repl(
+                client,
+                "onboarding-buddy",
+                tool_handler,
+                initial_message="Introduce yourself and help me get started.",
+            )
 
     try:
-        subprocess.run(cmd, check=False)
+        asyncio.run(_run())
     except KeyboardInterrupt:
         pass
 
@@ -451,7 +458,7 @@ def _send_request(
     :returns: Parsed JSON response dict.
     """
     body: dict[str, str | bool | list[dict[str, Any]]] = {
-        "model": "onboarding",
+        "model": "onboarding-buddy",
         "input": pending_input,
         "stream": False,
     }
@@ -516,20 +523,23 @@ def _execute_tool_calls(
     return outputs
 
 
-def _find_terminal_frontend() -> Path:
-    """
-    Locate the terminal.py frontend script.
+def _load_coder_tool_handler() -> Any:
+    """Load the coder tool set as a ToolHandler for client-side tools."""
+    import sys
 
-    :returns: Path to the terminal frontend.
-    :raises click.ClickException: If not found.
-    """
-    path = Path(__file__).parent.parent.parent / "examples" / "frontends" / "terminal.py"
-    if path.exists():
-        return path.resolve()
-    raise click.ClickException(
-        "Could not find the terminal frontend (examples/frontends/terminal.py). "
-        "Make sure you're running from the agent plane repository."
-    )
+    from agent_plane_ui_sdk import ToolCallInfo, ToolHandler
+
+    frontends_dir = str(Path(__file__).parent.parent.parent / "examples" / "frontends")
+    if frontends_dir not in sys.path:
+        sys.path.insert(0, frontends_dir)
+    from tool_sets import get_tool_set
+
+    tool_set = get_tool_set("coder")
+
+    def execute(call: ToolCallInfo) -> str:
+        return str(tool_set.execute_tool(call.name, call.arguments))
+
+    return ToolHandler(schemas=tool_set.TOOLS, execute=execute)
 
 
 def _load_coder_tools() -> ModuleType | None:
