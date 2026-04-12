@@ -4,7 +4,7 @@ version = "0.1.4"
 description = "MLflow AgentPlane — agent specification, runtime, server"
 requires-python = ">=3.10"
 dependencies = [
-    "agent-plane-ui-sdk @ file:frontends/sdks/python",
+    # agent_plane_ui_sdk is bundled via package-dir (not a separate install).
     "alembic>=1.0,<2",
     "anyio>=4.0,<5",
     "cachetools>=5.0,<7",
@@ -38,7 +38,10 @@ ap = "agent_plane.cli:cli"
 agent-plane-acp = "integrations.toad.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["agent_plane*", "integrations*"]
+include = ["agent_plane*", "agent_plane_ui_sdk*", "integrations*"]
+
+[tool.setuptools.package-dir]
+agent_plane_ui_sdk = "frontends/sdks/python/agent_plane_ui_sdk"
 
 [build-system]
 requires = ["setuptools>=68.0"]
