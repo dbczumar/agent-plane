@@ -38,10 +38,10 @@ ap = "agent_plane.cli:cli"
 agent-plane-acp = "integrations.toad.__main__:main"
 
 [tool.setuptools.packages.find]
+where = [".", "frontends/sdks/python"]
 include = ["agent_plane*", "agent_plane_ui_sdk*", "integrations*"]
 
-[tool.setuptools.package-dir]
-agent_plane_ui_sdk = "frontends/sdks/python/agent_plane_ui_sdk"
+
 
 [build-system]
 requires = ["setuptools>=68.0"]
