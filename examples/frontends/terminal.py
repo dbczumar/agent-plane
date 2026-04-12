@@ -4,7 +4,7 @@
 Usage:
     python examples/frontends/terminal.py <agent-dir-or-tarball>
     python terminal.py ../agents/archer/
-    python terminal.py ../agents/coder/ --client-tools coder
+    python terminal.py ../agents/coder/ --client-tools coding
 
 Starts a temporary server, deploys the agent, and opens an
 interactive chat TUI with streaming responses, markdown
@@ -2147,7 +2147,7 @@ def _load_tool_set(name: str) -> ModuleType:
     """
     Load a client-side tool set by name.
 
-    :param name: Tool set name, e.g. ``"coder"``.
+    :param name: Tool set name, e.g. ``"coding"``.
     :returns: The tool set module with ``TOOLS`` and
         ``execute_tool`` attributes.
     """
@@ -2174,7 +2174,7 @@ def _print_usage() -> None:
     print()
     print("Examples:")
     print("  python terminal.py ../agents/archer/")
-    print("  python terminal.py ../agents/coder/ --client-tools coder")
+    print("  python terminal.py ../agents/coder/ --client-tools coding")
     print("  python terminal.py ../agents/archer/ --auto-send 'say hello'")
 
 

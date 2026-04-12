@@ -1,10 +1,10 @@
 """
-Client-side tool set for the ``coder`` agent.
+Client-side ``coding`` tool set.
 
 Provides 7 coding tools: Read, Write, Edit, Glob, Grep, Bash, LSP.
 All tools execute locally on the caller's machine.
 
-Used by ``terminal.py --tools coder`` and ``examples/agents/coder/client.py``.
+Used by ``ap chat --client-tools coding`` and the terminal TUI.
 """
 
 from __future__ import annotations

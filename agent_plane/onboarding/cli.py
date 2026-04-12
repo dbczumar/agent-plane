@@ -52,44 +52,52 @@ def run_create(
         (``provider/model_name``). Required for non-interactive mode.
         Skips provider selection in interactive mode.
     :param allow_shell_access: Whether to give the onboarding
-        assistant full shell access (read/write filesystem, run
-        commands, make network calls). When False, the assistant
-        works in a code sandbox and uses ``export_agent`` to copy
-        the finished agent to the user's chosen path.
+        assistant full shell access.
+    """
+    if message is None:
+        allow_shell_access = _show_welcome_and_prompt(allow_shell_access)
+
+    selection = _resolve_selection(message, model)
+
+    from rich.console import Console
+    Console().print(f"\n  [bold]Onboarding model:[/bold] {selection.model}")
+
+    agent_dir = _prepare_onboarding_agent(selection, allow_shell_access)
+    try:
+        _run_with_server(agent_dir, message, allow_shell_access)
+    finally:
+        shutil.rmtree(agent_dir, ignore_errors=True)
+
+
+def _show_welcome_and_prompt(allow_shell_access: bool) -> bool:
+    """
+    Show the welcome banner and prompt for shell access if needed.
+
+    :param allow_shell_access: Whether shell access was already
+        granted via CLI flag.
+    :returns: The resolved shell access setting.
     """
     from rich.console import Console
     from rich.panel import Panel
 
     console = Console()
-
-    if message is None:
-        # Interactive mode — show welcome banner.
-        console.print()
-        console.print(
-            Panel(
-                "[bold]Agent Plane Onboarding[/bold]\n\n"
-                "You're about to launch an [cyan]onboarding assistant[/cyan] — "
-                "an AI agent that will help you create a new agent plane agent "
-                "through an interactive conversation.\n\n"
-                "First, choose an access mode, then pick a model provider "
-                "and model to power the assistant.",
-                border_style="blue",
-                padding=(1, 2),
-            )
+    console.print()
+    console.print(
+        Panel(
+            "[bold]Agent Plane Onboarding[/bold]\n\n"
+            "You're about to launch an [cyan]onboarding assistant[/cyan] — "
+            "an AI agent that will help you create a new agent plane agent "
+            "through an interactive conversation.\n\n"
+            "First, choose an access mode, then pick a model provider "
+            "and model to power the assistant.",
+            border_style="blue",
+            padding=(1, 2),
         )
+    )
 
-        # Ask about shell access if the flag wasn't set.
-        if not allow_shell_access:
-            allow_shell_access = _prompt_shell_access(console)
-
-    selection = _resolve_selection(message, model)
-    console.print(f"\n  [bold]Onboarding model:[/bold] {selection.model}")
-    agent_dir = _prepare_onboarding_agent(selection, allow_shell_access)
-
-    try:
-        _run_with_server(agent_dir, message, allow_shell_access)
-    finally:
-        shutil.rmtree(agent_dir, ignore_errors=True)
+    if not allow_shell_access:
+        return _prompt_shell_access(console)
+    return allow_shell_access
 
 
 def _prompt_shell_access(console: Console) -> bool:
@@ -358,7 +366,7 @@ def _run_interactive(
     Launch the terminal TUI for an interactive onboarding session.
 
     :param port: The server port.
-    :param allow_shell_access: Whether to pass ``--client-tools coder``
+    :param allow_shell_access: Whether to pass ``--tools coding``
         for full shell access.
     """
     import asyncio
@@ -369,7 +377,7 @@ def _run_interactive(
 
     tool_handler = None
     if allow_shell_access:
-        tool_handler = _load_coder_tool_handler()
+        tool_handler = _load_coding_tool_handler()
 
     async def _run() -> None:
         async with AgentPlaneClient(base_url=f"http://127.0.0.1:{port}") as client:
@@ -403,7 +411,7 @@ def _run_non_interactive(
     :param message: The user's message.
     :param allow_shell_access: Whether to enable full shell tools.
     """
-    tool_set = _load_coder_tools() if allow_shell_access else None
+    tool_set = _load_coding_tools() if allow_shell_access else None
     _non_interactive_loop(
         port=port,
         tool_set=tool_set,
@@ -523,7 +531,7 @@ def _execute_tool_calls(
     return outputs
 
 
-def _load_coder_tool_handler() -> Any:
+def _load_coding_tool_handler() -> Any:
     """Load the coder tool set as a ToolHandler for client-side tools."""
 
     from agent_plane_ui_sdk import ToolCallInfo, ToolHandler
@@ -533,12 +541,17 @@ def _load_coder_tool_handler() -> Any:
     tool_set = get_tool_set("coding")
 
     def execute(call: ToolCallInfo) -> str:
+        """Execute a client-side tool call.
+
+        :param call: Tool call info with name and arguments.
+        :returns: The tool result string.
+        """
         return str(tool_set.execute_tool(call.name, call.arguments))
 
     return ToolHandler(schemas=tool_set.TOOLS, execute=execute)
 
 
-def _load_coder_tools() -> ModuleType | None:
+def _load_coding_tools() -> ModuleType | None:
     """
     Load the coder tool set for full shell access.
 

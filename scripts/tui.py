@@ -5,7 +5,7 @@ Usage:
     python scripts/tui.py <agent-dir-or-tarball>
     python scripts/tui.py ./my-agent/
     python scripts/tui.py ./my-agent.tar.gz
-    python scripts/tui.py ./coder/ --tools coder
+    python scripts/tui.py ./coder/ --tools coding
 
 Starts a temporary server, deploys the agent, and opens an
 interactive chat TUI with streaming responses, markdown
@@ -1716,7 +1716,7 @@ def _load_tool_set(name: str) -> ModuleType:
     """
     Load a client-side tool set by name.
 
-    :param name: Tool set name, e.g. ``"coder"``.
+    :param name: Tool set name, e.g. ``"coding"``.
     :returns: The tool set module with ``TOOLS`` and
         ``execute_tool`` attributes.
     """
@@ -1741,7 +1741,7 @@ def _print_usage() -> None:
     print()
     print("Examples:")
     print("  python scripts/tui.py ./my-agent/")
-    print("  python scripts/tui.py examples/agents/coder/ --tools coder")
+    print("  python scripts/tui.py examples/agents/coder/ --tools coding")
     print("  python scripts/tui.py ./my-agent/ --auto-send 'say hello'")
 
 

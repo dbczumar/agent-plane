@@ -1,5 +1,5 @@
 """
-Registry of client-side tool sets for the TUI.
+Registry of client-side tool sets.
 
 Each tool set is a module in this package that exports:
 
@@ -8,8 +8,8 @@ Each tool set is a module in this package that exports:
 
 Usage::
 
-    from tool_sets import get_tool_set
-    tool_set = get_tool_set("coder")
+    from agent_plane.client_tools import get_tool_set
+    tool_set = get_tool_set("coding")
     schemas = tool_set.TOOLS
     result = tool_set.execute_tool("Read", {"file_path": "/tmp/foo.py"})
 """
@@ -24,8 +24,9 @@ def get_tool_set(name: str) -> ModuleType:
     """
     Load a tool set module by name.
 
-    :param name: Tool set name, e.g. ``"coder"``. Must correspond
-        to a module in this package (``tool_sets.coder``).
+    :param name: Tool set name, e.g. ``"coding"``. Must correspond
+        to a module in this package
+        (``agent_plane.client_tools.coding``).
     :returns: The tool set module with ``TOOLS`` and ``execute_tool``.
     :raises SystemExit: If the tool set is not found.
     """
@@ -35,5 +36,5 @@ def get_tool_set(name: str) -> ModuleType:
         import sys
 
         print(f"Error: unknown tool set {name!r}")
-        print("Available tool sets: coder")
+        print("Available tool sets: coding")
         sys.exit(1)
