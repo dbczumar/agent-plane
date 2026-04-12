@@ -66,6 +66,16 @@ class ToolGroup(RenderBlock):
 
 
 @dataclass
+class ToolResultBlock(RenderBlock):
+    """A tool result, emitted after the tool executes."""
+
+    name: str = ""
+    call_id: str = ""
+    agent_name: str = ""
+    output: str = ""
+
+
+@dataclass
 class NativeToolBlock(RenderBlock):
     """A provider-native tool output (web_search, mcp, etc.)."""
 
@@ -158,6 +168,7 @@ class ResponseEndBlock(RenderBlock):
 AnyBlock = (
     ResponseStartBlock
     | ToolGroup
+    | ToolResultBlock
     | NativeToolBlock
     | TextChunk
     | TextDone

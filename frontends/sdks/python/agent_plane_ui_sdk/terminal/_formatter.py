@@ -31,6 +31,7 @@ from .._blocks import (
     TextDone,
     ToolExecution,
     ToolGroup,
+    ToolResultBlock,
 )
 
 
@@ -94,6 +95,8 @@ class RichBlockFormatter:
             return self.format_text_done(block)
         if isinstance(block, ToolGroup):
             return self.format_tool_group(block)
+        if isinstance(block, ToolResultBlock):
+            return self.format_tool_result(block)
         if isinstance(block, NativeToolBlock):
             return self.format_native_tool(block)
         if isinstance(block, ReasoningStartBlock):
@@ -137,6 +140,14 @@ class RichBlockFormatter:
             if ex.output is not None:
                 items.append(self._tool_result_panel(ex))
         return items
+
+    def format_tool_result(self, block: ToolResultBlock) -> list[FormattedItem]:
+        """Render a tool result panel (no call line — already displayed)."""
+        ex = ToolExecution(
+            name=block.name, call_id=block.call_id,
+            agent_name=block.agent_name, output=block.output,
+        )
+        return [self._tool_result_panel(ex)]
 
     def format_native_tool(self, block: NativeToolBlock) -> list[FormattedItem]:
         return [Text.from_markup(f"   [{self.accent}]⏵ {block.label}[/{self.accent}]")]

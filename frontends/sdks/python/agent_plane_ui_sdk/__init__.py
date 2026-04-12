@@ -23,6 +23,7 @@ from ._blocks import (
     TextDone,
     ToolExecution,
     ToolGroup,
+    ToolResultBlock,
 )
 from ._client import AgentPlaneClient
 from ._errors import AgentPlaneError, ToolCallDenied

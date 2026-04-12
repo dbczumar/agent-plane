@@ -27,6 +27,7 @@ from ._blocks import (
     TextDone,
     ToolExecution,
     ToolGroup,
+    ToolResultBlock,
 )
 from ._events import (
     CompactionInProgress,
@@ -133,10 +134,15 @@ class StreamRenderer:
         async for event in session.send(input, files=files):
             # ── Response lifecycle ───────────────────
             if isinstance(event, ResponseCreated):
-                # Emit pending tool group from previous iteration.
-                if pending_tools:
-                    yield ToolGroup(executions=list(pending_tools.values()), ctx=_ctx())
-                    pending_tools.clear()
+                # Tool calls were already yielded immediately. Emit
+                # result-only groups for tools that got output between
+                # ResponseCompleted and this ResponseCreated.
+                for ex in list(pending_tools.values()):
+                    if ex.output is not None:
+                        # Re-emit with output populated — formatter
+                        # renders the result panel.
+                        yield ToolGroup(executions=[ex], ctx=_ctx())
+                pending_tools.clear()
                 agent = event.response.model
                 if not started:
                     started = True
@@ -173,9 +179,15 @@ class StreamRenderer:
                         summary_text=summary_text,
                         ctx=_ctx(),
                     )
-                if pending_tools:
-                    yield ToolGroup(executions=list(pending_tools.values()), ctx=_ctx())
-                    pending_tools.clear()
+                # Emit results for tools that completed.
+                for ex in list(pending_tools.values()):
+                    if ex.output is not None:
+                        yield ToolResultBlock(
+                            name=ex.name, call_id=ex.call_id,
+                            agent_name=ex.agent_name, output=ex.output,
+                            ctx=_ctx(),
+                        )
+                pending_tools.clear()
 
                 in_text = True
                 accumulated += event.delta
@@ -212,7 +224,7 @@ class StreamRenderer:
                     in_text = False
                     full_text = ""
 
-                pending_tools[event.call_id] = ToolExecution(
+                execution = ToolExecution(
                     name=event.name,
                     arguments=event.arguments,
                     args_summary=_format_args_brief(event.name, event.arguments),
@@ -220,6 +232,11 @@ class StreamRenderer:
                     agent_name=event.agent_name,
                     executed_by="server",
                 )
+                pending_tools[event.call_id] = execution
+                # Yield immediately so the user sees the tool call
+                # before execution. output=None means the formatter
+                # shows the call line but no result panel.
+                yield ToolGroup(executions=[execution], ctx=_ctx())
 
             elif isinstance(event, ToolResult):
                 ex = pending_tools.get(event.call_id)
