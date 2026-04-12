@@ -245,6 +245,9 @@ def _validate_llm_executor(
 
     Remote-only fields (endpoint, executor.request_timeout) are
     invalid — per-call timeout belongs in ``llm.request_timeout``.
+    A model without a connection block is invalid because the
+    runtime would fall back to server-side env vars for credentials,
+    violating spec self-containment.
 
     :param spec: The agent spec to check.
     :param result: Accumulator for any validation errors found.
@@ -258,6 +261,12 @@ def _validate_llm_executor(
         result.add(
             "executor.request_timeout",
             "not supported when executor.type is 'llm' — use llm.request_timeout instead",
+        )
+    if spec.llm is not None and spec.llm.model and spec.llm.connection is None:
+        result.add(
+            "llm.connection",
+            "required when executor.type is 'llm' and llm.model is set — "
+            "credentials must come from the spec, not server-side env vars",
         )
 
 

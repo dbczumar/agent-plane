@@ -64,7 +64,8 @@ def test_chat_local_starts_server_and_agent_responds(
         _wait_for_server,
     )
 
-    # Ensure the API key is in the environment for the server subprocess.
+    # The archer spec's connection block uses ${OPENAI_API_KEY}, which
+    # the spec parser expands at load time from the subprocess's env.
     os.environ["OPENAI_API_KEY"] = llm_api_key
 
     port = find_free_port()
@@ -72,7 +73,7 @@ def test_chat_local_starts_server_and_agent_responds(
 
     base_url = f"http://127.0.0.1:{port}"
     try:
-        _wait_for_server(port)
+        _wait_for_server(port, server_proc)
 
         # Verify agent is registered.
         agents_resp = httpx.get(f"{base_url}/api/agents", timeout=10.0)
@@ -101,7 +102,10 @@ def test_chat_local_starts_server_and_agent_responds(
         )
 
         text = _extract_all_text(body)
-        assert len(text) > 0, "Agent produced no text output."
+        # Verify the agent actually produced non-whitespace text, not
+        # just an empty or whitespace-only response that len() > 0
+        # would let through.
+        assert text.strip(), f"Agent produced no meaningful text output. Raw: {text!r}"
 
     finally:
         _stop_server(server_proc)
@@ -122,6 +126,8 @@ def test_chat_remote_pick_agent(
     """
     from agent_plane.chat import _pick_agent, _start_local_server, _stop_server
 
+    # The archer spec's connection block uses ${OPENAI_API_KEY}, which
+    # the spec parser expands at load time from the subprocess's env.
     os.environ["OPENAI_API_KEY"] = llm_api_key
 
     port = find_free_port()

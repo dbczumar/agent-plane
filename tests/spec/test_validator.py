@@ -38,7 +38,7 @@ def test_invalid_spec_version() -> None:
 
 
 def test_llm_valid() -> None:
-    spec = _minimal_spec(llm=LLMConfig(model="openai/gpt-5.4"))
+    spec = _minimal_spec(llm=LLMConfig(model="openai/gpt-5.4", connection={"api_key": "sk-test"}))
     result = validate(spec)
     assert result.valid
 
@@ -55,6 +55,7 @@ def test_llm_arbitrary_extra_passes_validation() -> None:
     spec = _minimal_spec(
         llm=LLMConfig(
             model="openai/gpt-5.4",
+            connection={"api_key": "sk-test"},
             extra={"temperature": 0.7, "reasoning_effort": "extreme"},
         )
     )
@@ -176,7 +177,10 @@ def test_duplicate_tool_names_across_mcp_and_local() -> None:
 
 
 def test_sub_agent_reference_valid() -> None:
-    sub = _minimal_spec(name="helper", llm=LLMConfig(model="openai/gpt-4o"))
+    sub = _minimal_spec(
+        name="helper",
+        llm=LLMConfig(model="openai/gpt-4o", connection={"api_key": "sk-test"}),
+    )
     spec = _minimal_spec(
         tools=ToolsConfig(agents=["helper"]),
         sub_agents=[sub],
@@ -237,7 +241,10 @@ def test_agent_name_valid(valid_name: str) -> None:
 
 def test_agent_name_invalid_in_sub_agent() -> None:
     """Invalid name on a sub-agent (not just the root) is caught."""
-    sub = _minimal_spec(name="bad.name", llm=LLMConfig(model="openai/gpt-4o"))
+    sub = _minimal_spec(
+        name="bad.name",
+        llm=LLMConfig(model="openai/gpt-4o", connection={"api_key": "sk-test"}),
+    )
     spec = _minimal_spec(
         tools=ToolsConfig(agents=["bad.name"]),
         sub_agents=[sub],
@@ -307,6 +314,24 @@ def test_agents_sdk_rejects_endpoint() -> None:
     )
     assert any("agents_sdk" in e.message for e in result.errors), (
         f"Error message should mention 'agents_sdk': {result.errors}"
+    )
+
+
+def test_llm_executor_rejects_model_without_connection() -> None:
+    """
+    Default (llm) executor with a model but no connection block is invalid.
+
+    Without a connection block the runtime would fall back to server-side
+    env vars for credentials, violating spec self-containment.
+    """
+    spec = _minimal_spec(llm=LLMConfig(model="openai/gpt-5.4"))
+    result = validate(spec)
+    assert not result.valid
+    assert any("llm.connection" in e.path for e in result.errors), (
+        f"Expected llm.connection error, got: {result.errors}"
+    )
+    assert any("required" in e.message for e in result.errors), (
+        f"Error message should say 'required': {result.errors}"
     )
 
 
