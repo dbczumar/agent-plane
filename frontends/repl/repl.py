@@ -282,8 +282,10 @@ class Repl:
                         continue
 
                 # Show user message.
+                user_text = renderer._escape(renderer._truncate_user_text(line))
                 rprint(
-                    f" [{renderer.ACCENT}]❯[/{renderer.ACCENT}] [on #1a1a1a]{renderer._escape(renderer._truncate_user_text(line))}[/on #1a1a1a]"
+                    f" [{renderer.ACCENT}]❯[/{renderer.ACCENT}]"
+                    f" [on #1a1a1a]{user_text}[/on #1a1a1a]"
                 )
 
                 # If a stream is running, this is steering.
@@ -300,7 +302,10 @@ class Repl:
         model = self._session.model
         prompt_text = _make_prompt_text(model)
         is_busy = self._stream_task is not None and not self._stream_task.done()
-        toolbar = lambda: _make_bottom_toolbar(model, self._session, is_busy)
+
+        def toolbar() -> FormattedText:
+            return _make_bottom_toolbar(model, self._session, is_busy)
+
         line = await self._prompt.prompt_async(
             prompt_text,
             bottom_toolbar=toolbar,
@@ -427,7 +432,9 @@ class Repl:
 
                 elif isinstance(event, OutputFileDone):
                     rprint(
-                        f"   [{renderer.SUCCESS}]📎 {event.filename or event.file_id}[/{renderer.SUCCESS}]"
+                        f"   [{renderer.SUCCESS}]📎 "
+                        f"{event.filename or event.file_id}"
+                        f"[/{renderer.SUCCESS}]"
                     )
 
                 elif isinstance(event, CompactionInProgress):
@@ -441,7 +448,8 @@ class Repl:
 
                 elif isinstance(event, ErrorEvent):
                     rprint(
-                        f"   [{renderer.ERROR}]Error [{event.source}]: {event.error.message}[/{renderer.ERROR}]"
+                        f"   [{renderer.ERROR}]Error [{event.source}]:"
+                        f" {event.error.message}[/{renderer.ERROR}]"
                     )
 
                 elif isinstance(event, ResponseCompleted):
@@ -462,7 +470,9 @@ class Repl:
                     in_text = False
                     err = event.response.error
                     rprint(
-                        f"   [{renderer.ERROR}]Error: {err.message if err else 'Unknown error'}[/{renderer.ERROR}]"
+                        f"   [{renderer.ERROR}]Error: "
+                        f"{err.message if err else 'Unknown error'}"
+                        f"[/{renderer.ERROR}]"
                     )
 
                 elif isinstance(event, ResponseIncomplete):

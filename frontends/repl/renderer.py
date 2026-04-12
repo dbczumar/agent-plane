@@ -110,7 +110,8 @@ def render_steering_message(console: Console, text: str) -> None:
     truncated = _truncate_user_text(text)
     console.print(
         Text.from_markup(
-            f" [{ACCENT}]❯[/{ACCENT}] [{DIM}](steering)[/{DIM}] [on #1a1a1a]{_escape(truncated)}[/on #1a1a1a]"
+            f" [{ACCENT}]❯[/{ACCENT}] [{DIM}](steering)[/{DIM}]"
+            f" [on #1a1a1a]{_escape(truncated)}[/on #1a1a1a]"
         )
     )
 
@@ -388,7 +389,8 @@ def render_welcome(console: Console, agent_name: str) -> None:
                 f"[{ACCENT}]agent-plane[/{ACCENT}]  [{DIM}]·[/{DIM}]  "
                 f"[bold]{agent_name}[/bold]\n"
                 f"[{DIM}]Type a message to chat · Ctrl+C to cancel · Ctrl+D to exit[/{DIM}]\n"
-                f"[{DIM}]Commands: /new /cancel /agents /conversations /history /attach /model /quit[/{DIM}]"
+                f"[{DIM}]Commands: /new /cancel /agents /conversations"
+                f" /history /attach /model /quit[/{DIM}]"
             ),
             box=box.ROUNDED,
             border_style=ACCENT,

@@ -116,7 +116,7 @@ class Session:
             if steer_resp.id == self._current_response_id:
                 # Case 1: steering delivered. Nothing to yield.
                 return
-                yield  # noqa: makes this an async generator
+                yield  # noqa: RUF058 - makes this an async generator
 
             # Case 2: agent finished — server created a new response.
             # Stream it like a normal turn. The input was already
