@@ -117,6 +117,95 @@ executor:
 instructions: AGENTS.md
 ```
 
+### Agent with MCP server integration
+
+**Directory structure:**
+```
+{agent_name}/
+  config.yaml
+  AGENTS.md
+  tools/
+    mcp/
+      github.yaml
+```
+
+**config.yaml:**
+```yaml
+spec_version: 1
+name: {agent_name}
+description: {description}
+llm:
+  model: {provider}/{model}
+  connection:
+    api_key: ${{{env_var}}}
+instructions: AGENTS.md
+```
+
+**tools/mcp/github.yaml:**
+```yaml
+transport: http
+url: https://your-mcp-server.example.com/sse
+headers:
+  Authorization: Bearer ${{{mcp_token_var}}}
+```
+
+### Multi-agent system with sub-agents
+
+**Directory structure:**
+```
+{agent_name}/
+  config.yaml
+  AGENTS.md
+  agents/
+    {sub_agent_1}/
+      config.yaml
+    {sub_agent_2}/
+      config.yaml
+```
+
+**Parent config.yaml:**
+```yaml
+spec_version: 1
+name: {agent_name}
+description: {description}
+llm:
+  model: {provider}/{model}
+  connection:
+    api_key: ${{{env_var}}}
+tools:
+  agents:
+    - {sub_agent_1}
+    - {sub_agent_2}
+  builtins:
+    - web_search
+instructions: AGENTS.md
+```
+
+**Sub-agent config (agents/{sub_agent_1}/config.yaml):**
+```yaml
+spec_version: 1
+name: {sub_agent_1}
+description: {sub_agent_1_description}
+llm:
+  model: {provider}/{model}
+  connection:
+    api_key: ${{{env_var}}}
+tools:
+  builtins:
+    - web_search
+instructions: |
+  You are {sub_agent_1}. {sub_agent_1_instructions}
+```
+
+**Parent AGENTS.md should reference sub-agents:**
+```markdown
+You have sub-agents you can delegate to:
+- **{sub_agent_1}** — {sub_agent_1_description}
+- **{sub_agent_2}** — {sub_agent_2_description}
+
+Use spawn_sub_agents to launch them when appropriate.
+```
+
 ## Environment variable naming conventions
 
 Map providers to their standard env var names:

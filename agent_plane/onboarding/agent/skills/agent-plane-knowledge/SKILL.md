@@ -144,23 +144,109 @@ Rules:
 ## Tools
 
 ### Built-in tools
-Available built-in tools include: `web_search`,
-`code_sandbox`, `upload_file`, `search_conversations`. Reference by name in
-`tools.builtins`.
 
-### MCP tools
-External MCP servers are declared in `tools/mcp/*.yaml`:
+Available built-in tools — recommend these based on what the user
+wants to build:
+
+| Tool | When to recommend | Config needed |
+|------|------------------|---------------|
+| `web_search` | Research, finding info, Q&A | OpenAI models: none. Others: `search_provider` + `api_key` |
+| `web_fetch` | Reading web pages, fetching live data | None (spawns a sub-agent with code_sandbox) |
+| `code_sandbox` | Writing/running code, data analysis, scripting | None |
+| `upload_file` | Agents that produce downloadable files | None |
+| `search_conversations` | Agents that reference prior conversations | None |
+| `list_files` | Agents that browse uploaded files | None |
+| `download_file` | Agents that read uploaded files | None |
+
+**Tool recommendation guide:**
+
+- "I want a research agent" → `web_search` + `web_fetch`
+- "I want a coding agent" → `code_sandbox` + `upload_file`
+- "I want a data analysis agent" → `code_sandbox` + `upload_file` + `download_file`
+- "I want a conversational assistant" → no tools needed (or `web_search` for current info)
+- "I want an agent that can access external APIs" → consider MCP servers (see below)
+
+### MCP servers (external tool integrations)
+
+MCP (Model Context Protocol) lets agents connect to external services —
+databases, APIs, Slack, GitHub, etc. Each MCP server is declared as a
+YAML file in `tools/mcp/`:
+
+```
+my-agent/
+  tools/
+    mcp/
+      github.yaml
+      slack.yaml
+```
+
+**MCP server config format** (`tools/mcp/github.yaml`):
 
 ```yaml
 transport: http
 url: https://mcp-server.example.com/sse
 headers:
-  Authorization: Bearer ${MCP_TOKEN}
+  Authorization: Bearer ${GITHUB_TOKEN}
 ```
 
-### Local tools
+- `transport`: must be `http`
+- `url`: the MCP server's SSE endpoint URL
+- `headers`: optional auth headers (use `${ENV_VAR}` for secrets)
+
+**When to recommend MCP:**
+
+- User wants to connect to an external service (database, API, SaaS tool)
+- User mentions Slack, GitHub, Jira, Postgres, etc.
+- The integration isn't covered by built-in tools
+
+**Finding MCP servers:** Use `web_search` (if available) or `web_fetch`
+to search for available MCP servers. Good starting points:
+- https://modelcontextprotocol.io — official MCP directory
+- https://github.com/modelcontextprotocol — official GitHub org
+- Search for "<service-name> MCP server" (e.g. "Slack MCP server",
+  "Postgres MCP server")
+
+If the user mentions a specific service they want to connect to,
+use `web_search` or `web_fetch` to find if an MCP server exists
+for it and how to configure it.
+
+**What to tell the user:** MCP servers are external processes that
+expose tools via HTTP. The user needs to run the MCP server separately
+(or use a hosted one) and provide the URL in the config.
+
+### Local tools (custom Python/TypeScript)
+
 Python or TypeScript files in `tools/python/` or `tools/typescript/` are
-auto-discovered and registered as tools.
+auto-discovered and registered as tools. Each file must export:
+
+- `SCHEMA`: OpenAI function-format dict
+- `async def run(arguments: dict) -> str`: the tool implementation
+
+```python
+# tools/python/my_tool.py
+from typing import Any
+
+SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "my_tool",
+        "description": "Does something useful.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "input": {"type": "string", "description": "The input."},
+            },
+            "required": ["input"],
+        },
+    },
+}
+
+async def run(arguments: dict[str, Any]) -> str:
+    return f"Result: {arguments['input']}"
+```
+
+**When to recommend local tools:** When the user needs custom logic that
+isn't covered by builtins or MCP servers.
 
 ## Example: Minimal Agent
 
@@ -199,6 +285,84 @@ interaction:
     output: [text]
 instructions: AGENTS.md
 ```
+
+## Sub-Agents (multi-agent systems)
+
+An agent can spawn child agents to delegate tasks. Sub-agents are
+full agents with their own config.yaml, living in the `agents/`
+directory:
+
+```
+my-agent/
+  config.yaml
+  AGENTS.md
+  agents/
+    researcher/
+      config.yaml        # sub-agent spec
+    fact-checker/
+      config.yaml        # another sub-agent
+```
+
+### Declaring sub-agents
+
+The parent's config.yaml lists sub-agent names under `tools.agents`:
+
+```yaml
+tools:
+  agents:
+    - researcher
+    - fact-checker
+  builtins:
+    - web_search
+```
+
+Each name must match a directory under `agents/`.
+
+### Sub-agent config
+
+Each sub-agent has its own complete config.yaml:
+
+```yaml
+# agents/researcher/config.yaml
+spec_version: 1
+name: researcher
+description: Sub-agent that searches the web for information.
+llm:
+  model: openai/gpt-5.4
+  connection:
+    api_key: ${OPENAI_API_KEY}
+tools:
+  builtins:
+    - web_search
+    - web_fetch
+instructions: |
+  You are a researcher. When given a topic, search the web
+  and return a summary with sources.
+```
+
+### How spawning works
+
+The parent agent gets `spawn_sub_agents` and `check_sub_agents` tools
+automatically when sub-agents are declared. The parent's AGENTS.md
+should reference them:
+
+```markdown
+You have two sub-agents you can delegate to:
+- **researcher** — searches the web for information
+- **fact-checker** — verifies claims with evidence
+
+Use spawn_sub_agents to launch them. You can spawn multiple
+sub-agents in parallel.
+```
+
+### When to recommend sub-agents
+
+- User wants specialized roles (researcher + summarizer + reviewer)
+- User wants parallel execution (search multiple sources at once)
+- User wants separation of concerns (each sub-agent has focused instructions)
+
+**For simple agents, sub-agents are overkill.** Only suggest them when
+the user describes a workflow with distinct steps or roles.
 
 ## Running an Agent
 

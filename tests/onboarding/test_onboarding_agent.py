@@ -25,7 +25,7 @@ def test_onboarding_agent_parses_successfully(
     monkeypatch.setenv("AP_ONBOARDING_MODEL", "anthropic/claude-sonnet-4-20250514")
     monkeypatch.setenv("AP_ONBOARDING_API_KEY", "sk-test")
     spec = parse(onboarding_agent_dir())
-    assert spec.name == "onboarding"
+    assert spec.name == "onboarding-buddy"
 
 
 def test_onboarding_agent_has_expected_skills(

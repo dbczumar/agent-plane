@@ -38,7 +38,7 @@ behind it is production-grade.
 
 ## Quick Start
 
-The `examples/` directory has ready-to-run agents and a terminal frontend that
+The `examples/` directory has ready-to-run agents. The `ap chat` command
 starts a server, uploads the agent, and opens an interactive chat.
 
 https://github.com/user-attachments/assets/419c9951-c05b-451f-9914-892c156acba0
@@ -50,7 +50,7 @@ Archer is a resourceful research assistant with skills for deep research and
 explanation. It uses web search and accepts text, image, and file input.
 
 ```bash
-python examples/frontends/terminal.py examples/agents/archer/
+ap chat examples/agents/archer/
 ```
 
 This starts a temporary server, uploads the archer agent, and drops you into
@@ -68,7 +68,7 @@ execution. The frontend receives `function_call` items from the server,
 executes them locally, and sends results back.
 
 ```bash
-python examples/frontends/terminal.py examples/agents/coder/ --client-tools coder
+ap chat examples/agents/coder/ --client-tools coder
 ```
 
 The `--client-tools coder` flag loads client-side tool schemas (Read, Write,
@@ -385,8 +385,8 @@ Three namespaces:
 ```
 ┌──────────────────────────────────────────────┐
 │  Frontend Layer                               │
-│  Terminal TUI, GUIs, and other rich          │
-│  experiences (early — see examples/)         │
+│  Terminal TUI (ap chat), GUIs, and other    │
+│  rich experiences                            │
 └─────────────────────┬────────────────────────┘
                       │
 ┌─────────────────────▼────────────────────────┐

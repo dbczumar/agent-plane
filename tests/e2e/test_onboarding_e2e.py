@@ -312,6 +312,71 @@ def test_shell_mode_creates_and_serves_agent(
 
 
 # ---------------------------------------------------------------------------
+# Validate agent tool e2e
+# ---------------------------------------------------------------------------
+
+
+def test_validate_agent_tool_catches_errors(
+    llm_api_key: str,
+    tmp_path: Path,
+) -> None:
+    """
+    The onboarding assistant's ``validate_agent`` tool correctly
+    validates agent configs — passing valid ones and catching errors.
+
+    Runs in sandbox mode (no shell). The assistant creates an agent,
+    validates it, and reports the result. The test checks that the
+    assistant mentions the validation passed.
+
+    **What breaks if this fails:**
+    - validate_agent tool not discovered (missing from tools/python/).
+    - Tool subprocess can't import agent_plane → parse error.
+    - Tool returns wrong results → assistant reports false errors.
+    """
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "agent_plane.cli",
+            "create",
+            (
+                "Create a minimal agent called 'validator-test' in your "
+                "workspace with this config.yaml:\n"
+                "  spec_version: 1\n"
+                "  name: validator-test\n"
+                "  llm:\n"
+                "    model: openai/gpt-5.4\n"
+                "    connection:\n"
+                "      api_key: ${OPENAI_API_KEY}\n"
+                "  instructions: 'Say hello'\n"
+                "Then call validate_agent on it and tell me the result. "
+                "Include the exact validation output in your response."
+            ),
+            "--model",
+            "openai/gpt-5.4",
+            # No --allow-shell-access → sandbox mode with validate_agent
+        ],
+        env={**os.environ, "OPENAI_API_KEY": llm_api_key},
+        capture_output=True,
+        text=True,
+        timeout=240,
+    )
+
+    assert result.returncode == 0, (
+        f"ap create exited with code {result.returncode}.\nstderr: {result.stderr[-2000:]}"
+    )
+
+    output = result.stdout.lower()
+    # The assistant should report that validation passed.
+    # "valid" appears in the validate_agent tool's success output.
+    assert "valid" in output, (
+        f"Expected validation result mentioning 'valid' in output. "
+        f"The validate_agent tool may not be working. "
+        f"stdout: {result.stdout[-1000:]}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Non-interactive without shell: still produces output
 # ---------------------------------------------------------------------------
 

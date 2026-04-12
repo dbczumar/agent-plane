@@ -15,6 +15,7 @@ tools:
     - web_search
     - web_fetch
     - code_sandbox
+    - introspect
     - upload_file
     - search_conversations
   agents:

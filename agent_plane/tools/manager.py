@@ -157,6 +157,8 @@ class ToolManager:
             return self._create_web_search(config)
         if name == "web_fetch":
             return self._create_web_fetch()
+        if name == "introspect":
+            return self._create_introspect()
         if name == "code_sandbox":
             return self._create_code_sandbox()
         if name == "upload_file":
@@ -193,6 +195,16 @@ class ToolManager:
         from agent_plane.tools.builtins.web_fetch import WebFetchTool
 
         return WebFetchTool(parent_spec=self._spec)
+
+    def _create_introspect(self) -> Tool:
+        """
+        Build an IntrospectTool with the agent's own spec.
+
+        :returns: An IntrospectTool for self-examination.
+        """
+        from agent_plane.tools.builtins.introspect import IntrospectTool
+
+        return IntrospectTool(spec=self._spec)
 
     def _create_code_sandbox(self) -> Tool:
         """
