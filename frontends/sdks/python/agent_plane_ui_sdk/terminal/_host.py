@@ -10,8 +10,11 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+import pathlib
+import shlex
 import textwrap
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import FormattedText
@@ -23,6 +26,74 @@ from rich.console import Console
 from wcwidth import wcswidth
 
 from ._formatter import FormattedItem, StreamingText
+
+# Image extensions recognized for inline display.
+_IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"})
+
+# File extensions recognized for attachment.
+_FILE_EXTENSIONS = (
+    frozenset(
+        {
+            ".pdf",
+            ".txt",
+            ".csv",
+            ".json",
+            ".md",
+            ".py",
+            ".js",
+            ".ts",
+            ".html",
+            ".css",
+            ".xml",
+            ".yaml",
+            ".yml",
+            ".toml",
+            ".go",
+            ".rs",
+            ".java",
+            ".c",
+            ".cpp",
+            ".h",
+            ".rb",
+            ".sh",
+            ".sql",
+        }
+    )
+    | _IMAGE_EXTENSIONS
+)
+
+
+@dataclass
+class PendingAttachment:
+    """A file queued for upload with the next message."""
+
+    path: str
+    is_image: bool
+
+
+def _extract_file_paths(text: str) -> list[PendingAttachment]:
+    """Detect file paths in pasted text (drag-and-drop).
+
+    Terminals like iTerm2 and Kitty convert drag-and-drop into
+    pasted text with file paths (possibly shell-escaped).
+    """
+    attachments: list[PendingAttachment] = []
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        tokens = text.split()
+
+    for token in tokens:
+        token = token.strip("'\"")
+        p = pathlib.Path(token).resolve()
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in _FILE_EXTENSIONS:
+            continue
+        is_image = p.suffix.lower() in _IMAGE_EXTENSIONS
+        attachments.append(PendingAttachment(path=str(p), is_image=is_image))
+
+    return attachments
 
 
 def _display_width(text: str) -> int:
@@ -82,7 +153,8 @@ class TerminalHost:
         self._text_buffer: str = ""
         self._streamed_line_count: int = 0  # Lines printed from streaming text.
         self.text_indent: str = "   "  # Indent for streaming text lines.
-        self.on_help: Callable[[], None] | None = None  # Ctrl+H callback.
+        self.on_help: Callable[[], None] | None = None  # F1 callback.
+        self._pending_attachments: list[PendingAttachment] = []
 
         style = PTStyle.from_dict(
             {
@@ -116,6 +188,17 @@ class TerminalHost:
 
     async def __aexit__(self, *exc: object) -> None:
         self.cancel()
+
+    @property
+    def pending_attachments(self) -> list[PendingAttachment]:
+        """Files queued for the next message."""
+        return self._pending_attachments
+
+    def take_attachments(self) -> list[PendingAttachment]:
+        """Take and clear pending attachments."""
+        attachments = self._pending_attachments
+        self._pending_attachments = []
+        return attachments
 
     async def run(self, handler: Callable[[str], Awaitable[None]]) -> None:
         """Run the input loop.
@@ -152,7 +235,40 @@ class TerminalHost:
                     if line is None or not line.strip():
                         continue
 
-                    task = asyncio.create_task(handler(line.strip()))
+                    line = line.strip()
+
+                    # Detect file paths from drag-and-drop paste.
+                    attachments = _extract_file_paths(line)
+                    if attachments:
+                        # If the entire input is file paths, queue them
+                        # without sending. Otherwise, queue + send.
+                        self._pending_attachments.extend(attachments)
+                        # Show what was attached.
+                        for att in attachments:
+                            if att.is_image:
+                                self.output(
+                                    StreamingText(
+                                        text=f"   📎 [Image] {pathlib.Path(att.path).name}\n"
+                                    )
+                                )
+                            else:
+                                self.output(
+                                    StreamingText(text=f"   📎 {pathlib.Path(att.path).name}\n")
+                                )
+                        # Strip file paths from text to get just the message.
+                        try:
+                            tokens = shlex.split(line)
+                        except ValueError:
+                            tokens = line.split()
+                        remaining = [
+                            t for t in tokens if not pathlib.Path(t.strip("'\"")).is_file()
+                        ]
+                        line = " ".join(remaining).strip()
+                        if not line:
+                            # Only files pasted, no text — wait for a message.
+                            continue
+
+                    task = asyncio.create_task(handler(line))
                     self._tasks.append(task)
                     task.add_done_callback(
                         lambda t: self._tasks.remove(t) if t in self._tasks else None
@@ -280,12 +396,18 @@ class TerminalHost:
     def build_prompt(self) -> FormattedText:
         width = _term_width()
         bar = "─" * width
-        return FormattedText(
-            [
-                ("class:bar", bar + "\n"),
-                ("class:prompt-marker", f" {self._marker} "),
-            ]
-        )
+        parts: list[tuple[str, str]] = [("class:bar", bar + "\n")]
+        # Show pending attachments above the input.
+        for i, att in enumerate(self._pending_attachments):
+            name = pathlib.Path(att.path).name
+            if att.is_image:
+                parts.append(("class:prompt-marker", f" [Image #{i + 1}] "))
+                parts.append(("class:model-name", f"{name}\n"))
+            else:
+                parts.append(("class:prompt-marker", " 📎 "))
+                parts.append(("class:model-name", f"{name}\n"))
+        parts.append(("class:prompt-marker", f" {self._marker} "))
+        return FormattedText(parts)
 
     def build_toolbar(self) -> FormattedText:
         import time as _time

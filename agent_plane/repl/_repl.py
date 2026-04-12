@@ -84,12 +84,17 @@ async def run_repl(
         if text.startswith("/"):
             await handle_slash_command(text, session, client, host, fmt)
             return
+
+        # Collect any pending file attachments.
+        attachments = host.take_attachments()
+        files = [a.path for a in attachments] if attachments else None
+
         host.output(fmt.user_message(text))
         host.start_timer()
         await asyncio.sleep(0)  # Flush user message immediately.
         try:
             stream = pipe(
-                renderer.stream(session, text),
+                renderer.stream(session, text, files=files),
                 skip_intermediate_ends(),
             )
             from agent_plane_ui_sdk import TextDone
