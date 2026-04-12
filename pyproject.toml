@@ -73,10 +73,6 @@ module = "google.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "tool_sets.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
 module = "claude_agent_sdk.*"
 ignore_missing_imports = true
 

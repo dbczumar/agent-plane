@@ -525,16 +525,12 @@ def _execute_tool_calls(
 
 def _load_coder_tool_handler() -> Any:
     """Load the coder tool set as a ToolHandler for client-side tools."""
-    import sys
 
     from agent_plane_ui_sdk import ToolCallInfo, ToolHandler
 
-    frontends_dir = str(Path(__file__).parent.parent.parent / "examples" / "frontends")
-    if frontends_dir not in sys.path:
-        sys.path.insert(0, frontends_dir)
-    from tool_sets import get_tool_set
+    from agent_plane.client_tools import get_tool_set
 
-    tool_set = get_tool_set("coder")
+    tool_set = get_tool_set("coding")
 
     def execute(call: ToolCallInfo) -> str:
         return str(tool_set.execute_tool(call.name, call.arguments))
@@ -551,12 +547,9 @@ def _load_coder_tools() -> ModuleType | None:
         package is not available (e.g. running from an installed
         package without the examples/ directory).
     """
-    frontends_dir = str(Path(__file__).parent.parent.parent / "examples" / "frontends")
-    if frontends_dir not in sys.path:
-        sys.path.insert(0, frontends_dir)
     try:
-        from tool_sets import get_tool_set
+        from agent_plane.client_tools import get_tool_set
 
-        return get_tool_set("coder")  # type: ignore[no-any-return]
+        return get_tool_set("coding")
     except ImportError:
         return None

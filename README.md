@@ -68,12 +68,12 @@ execution. The frontend receives `function_call` items from the server,
 executes them locally, and sends results back.
 
 ```bash
-ap chat examples/agents/coder/ --client-tools coder
+ap chat examples/agents/coder/ --tools coding
 ```
 
-The `--client-tools coder` flag loads client-side tool schemas (Read, Write,
+The `--tools coding` flag loads client-side tool schemas (Read, Write,
 Edit, Glob, Grep, Bash) and their local execution logic from
-`examples/frontends/tool_sets/coder.py`.
+`agent_plane/client_tools/coding.py`.
 
 ### Using the API directly
 

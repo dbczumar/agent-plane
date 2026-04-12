@@ -80,6 +80,7 @@ class TerminalHost:
         self._stream_start: float | None = None
         self._last_was_streaming: bool = False
         self._text_buffer: str = ""
+        self._streamed_line_count: int = 0  # Lines printed from streaming text.
         self.text_indent: str = "   "  # Indent for streaming text lines.
         self.on_help: Callable[[], None] | None = None  # Ctrl+H callback.
 
@@ -185,6 +186,7 @@ class TerminalHost:
                 line = self._text_buffer[:wrap_at]
                 self._text_buffer = self._text_buffer[wrap_at:].lstrip()
                 print(f"{self.text_indent}{line}", flush=True)
+                self._streamed_line_count += 1
             self._last_was_streaming = True
             return
         # Flush any remaining streaming text buffer (partial line).
@@ -193,10 +195,15 @@ class TerminalHost:
             self._text_buffer = ""
             if buf.strip():
                 print(f"{self.text_indent}{buf}", flush=True)
+                self._streamed_line_count += 1
             else:
                 print(flush=True)
+                self._streamed_line_count += 1
         if self._last_was_streaming:
             self._last_was_streaming = False
+        # Non-streaming output — reset streamed line counter.
+        # (clear_streamed_text must be called before this if needed.)
+        self._streamed_line_count = 0
         # Render Rich content to ANSI string, print through proxy.
         buf = io.StringIO()
         temp = Console(
@@ -212,6 +219,7 @@ class TerminalHost:
         """Print a line of streaming text, wrapped and indented."""
         if not text.strip():
             print(flush=True)
+            self._streamed_line_count += 1
             return
         width = _term_width()
         indent = self.text_indent
@@ -222,7 +230,20 @@ class TerminalHost:
             initial_indent=indent,
             subsequent_indent=indent,
         )
+        self._streamed_line_count += wrapped.count("\n") + 1
         print(wrapped, flush=True)
+
+    def clear_streamed_text(self) -> None:
+        """Clear the previously streamed text lines using ANSI escapes.
+
+        Call this before outputting a re-render (e.g., markdown) to
+        avoid showing duplicate content.
+        """
+        if self._streamed_line_count > 0:
+            # Move cursor up and clear each line.
+            for _ in range(self._streamed_line_count):
+                print("\033[A\033[2K", end="", flush=True)
+            self._streamed_line_count = 0
 
     @property
     def is_busy(self) -> bool:

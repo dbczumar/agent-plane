@@ -12,7 +12,7 @@ interactive chat TUI with streaming responses, markdown
 rendering, and steering support.
 
 When ``--tools <name>`` is provided, loads a client-side tool
-set from ``scripts/tool_sets/<name>.py``. Tool schemas are
+set from ``agent_plane.client_tools.<name>``. Tool schemas are
 passed to the server, and ``function_call`` items are executed
 locally by the TUI — results are sent back as
 ``function_call_output`` items to continue the conversation.
@@ -1716,18 +1716,11 @@ def _load_tool_set(name: str) -> ModuleType:
     """
     Load a client-side tool set by name.
 
-    Adds the ``scripts/`` directory to ``sys.path`` so that
-    ``tool_sets.<name>`` can be imported regardless of the
-    caller's working directory.
-
     :param name: Tool set name, e.g. ``"coder"``.
     :returns: The tool set module with ``TOOLS`` and
         ``execute_tool`` attributes.
     """
-    scripts_dir = str(pathlib.Path(__file__).resolve().parent)
-    if scripts_dir not in sys.path:
-        sys.path.insert(0, scripts_dir)
-    from tool_sets import get_tool_set
+    from agent_plane.client_tools import get_tool_set
 
     return get_tool_set(name)
 

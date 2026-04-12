@@ -92,11 +92,15 @@ async def run_repl(
                 renderer.stream(session, text),
                 skip_intermediate_ends(),
             )
+            from agent_plane_ui_sdk import TextDone
+
             async for block in stream:
+                # If TextDone has code blocks, clear the raw streamed
+                # text before showing the rendered markdown.
+                if isinstance(block, TextDone) and block.has_code_blocks:
+                    host.clear_streamed_text()
                 for item in fmt.format(block):
                     host.output(item)
-                # Yield to the event loop so prompt_toolkit's
-                # stdout proxy flushes output to the terminal.
                 await asyncio.sleep(0)
         finally:
             host.stop_timer()

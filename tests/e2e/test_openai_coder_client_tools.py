@@ -17,23 +17,17 @@ Usage::
 
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+# Load the coder tool set for client-side tool execution.
+from agent_plane.client_tools import get_tool_set as _get_tool_set
 from tests.e2e.conftest import poll_for_pending_tool_calls
 
-# Load the coder tool set for client-side tool execution.
-_TOOL_SET_PATH = (
-    Path(__file__).resolve().parents[2] / "examples" / "frontends" / "tool_sets" / "coder.py"
-)
-_spec = importlib.util.spec_from_file_location("coder_tools", _TOOL_SET_PATH)
-assert _spec is not None and _spec.loader is not None
-_tool_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_tool_mod)
+_tool_mod = _get_tool_set("coding")
 TOOLS: list[dict[str, Any]] = _tool_mod.TOOLS
 execute_tool = _tool_mod.execute_tool
 

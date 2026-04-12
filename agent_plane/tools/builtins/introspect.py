@@ -321,7 +321,8 @@ def _resolve_sub_agents(spec: AgentSpec, rest: list[str]) -> str:
 
     sa_name = rest[0]
     matched: AgentSpec | None = next(
-        (s for s in spec.sub_agents if s.name == sa_name), None,
+        (s for s in spec.sub_agents if s.name == sa_name),
+        None,
     )
     if matched is None:
         available = ", ".join(s.name or "?" for s in spec.sub_agents) or "(none)"

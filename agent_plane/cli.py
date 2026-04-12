@@ -567,9 +567,12 @@ def create(
 @click.option(
     "--tools",
     default=None,
-    help="Client-side tool set name (e.g. 'coder') for shell access.",
+    help="Client-side tool set name (e.g. 'coding') for shell access.",
 )
 def chat(target: str, tools: str | None) -> None:
+    # Click uses docstring as --help text, so :param: docs go here.
+    # :param target: Agent dir path or server URL.
+    # :param tools: Client-side tool set name.
     """Open the REPL to chat with an agent.
 
     TARGET is either a path to an agent directory/bundle (starts a
@@ -579,7 +582,7 @@ def chat(target: str, tools: str | None) -> None:
     Examples:
       ap chat ./my-agent/
       ap chat http://localhost:8000
-      ap chat ./my-agent/ --tools coder
+      ap chat ./my-agent/ --tools coding
     """
     from agent_plane.chat import run_chat
 

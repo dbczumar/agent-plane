@@ -283,16 +283,12 @@ def _load_tool_handler(name: str) -> ToolHandler:
     :returns: A ToolHandler with schemas and execute function.
     :raises click.ClickException: If the tool set is not found.
     """
-    frontends_dir = str(Path(__file__).parent.parent / "examples" / "frontends")
-    if frontends_dir not in sys.path:
-        sys.path.insert(0, frontends_dir)
-
     try:
-        from tool_sets import get_tool_set
+        from agent_plane.client_tools import get_tool_set
 
         tool_set = get_tool_set(name)
     except (ImportError, SystemExit):
-        raise click.ClickException(f"Tool set {name!r} not found. Available: coder")
+        raise click.ClickException(f"Tool set {name!r} not found. Available: coding")
 
     def execute(call: ToolCallInfo) -> str:
         """
