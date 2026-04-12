@@ -10,7 +10,7 @@ llm:
 
 tools:
   builtins:
-    - web_search_openai
+    - web_search
 
 instructions: |
   You are a fact-checker. When given a claim or statement, search the web

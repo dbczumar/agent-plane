@@ -10,7 +10,7 @@ llm:
 
 tools:
   builtins:
-    - web_search_openai
+    - web_search
 
 instructions: |
   You are a research assistant. When asked about a topic, use web search

@@ -1,0 +1,24 @@
+spec_version: 1
+
+name: onboarding
+description: Built-in assistant that guides users through creating new agent plane agents.
+
+# The model and connection fields are dynamically replaced at runtime
+# by the `ap create` CLI based on the user's provider selection.
+# These placeholders ensure the spec parses but are never used as-is.
+llm:
+  model: ${AP_ONBOARDING_MODEL}
+  connection:
+    api_key: ${AP_ONBOARDING_API_KEY}
+
+tools:
+  builtins:
+    - web_search
+    - web_fetch
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

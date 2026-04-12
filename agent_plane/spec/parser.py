@@ -228,8 +228,8 @@ def _parse_builtin_tools(
     or a dict with a ``name`` key and tool-specific config fields::
 
         builtins:
-          - web_search_openai
-          - name: web_search_google
+          - web_search
+          - name: web_search
             api_key: ${GOOGLE_SEARCH_API_KEY}
             engine_id: ${GOOGLE_SEARCH_ENGINE_ID}
 

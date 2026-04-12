@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 
 # Any: the OpenAI tool schema is a heterogeneous dict with string
 # keys and mixed value types (str, dict, list).
@@ -114,17 +113,12 @@ def _search_google(
         and ``engine_id`` before falling back to env vars.
     :returns: Formatted results or an error message.
     """
-    api_key = config.get("api_key") or os.environ.get(
-        "GOOGLE_SEARCH_API_KEY",
-    )
-    engine_id = config.get("engine_id") or os.environ.get(
-        "GOOGLE_SEARCH_ENGINE_ID",
-    )
+    api_key = config.get("api_key")
+    engine_id = config.get("engine_id")
     if not api_key or not engine_id:
         return (
             "Error: api_key and engine_id must be provided in "
-            "the spec config or via GOOGLE_SEARCH_API_KEY and "
-            "GOOGLE_SEARCH_ENGINE_ID environment variables."
+            "the web_search config in config.yaml."
         )
     try:
         resp = httpx.get(

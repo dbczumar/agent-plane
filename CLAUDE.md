@@ -1,5 +1,69 @@
 # Agent-Plane Project Instructions
 
+## Design Principles — MUST ADHERE
+
+**🚨 CRITICAL: Read and follow [designs/DESIGN_PRINCIPLES.md](designs/DESIGN_PRINCIPLES.md)
+before, during, and after every implementation task. These are hard
+constraints, not guidelines. The most important principles:**
+
+1. **Spec self-containment** — agent behavior is fully determined by
+   the spec. Never read server-side env vars at runtime to change
+   behavior. No "if env var X is set, use Y" patterns.
+2. **One correct path** — no dual-mode fallbacks or feature flags.
+3. **Fail loud** — required values fail with clear errors, never
+   silently substitute defaults.
+
+**Check these principles at three points:**
+- **Before** starting: does the design comply?
+- **During** implementation: does the code comply?
+- **After** completion: does the review confirm compliance?
+
+## Mandatory TUI Verification for E2E Tests
+
+**🚨 CRITICAL — DO THIS BEFORE CLAIMING E2E TESTS WORK: When writing
+or modifying e2e tests for any agent, you MUST verify the agent works
+through the terminal TUI (`examples/frontends/terminal.py`) before
+committing. E2E tests that use the polling API (`background=True` +
+`poll_until_terminal`) exercise a DIFFERENT code path than the
+streaming TUI. A test can pass while the TUI shows "no response."**
+
+### Why this matters
+
+The polling API and the SSE streaming TUI are separate code paths.
+Known failure modes that tests miss but the TUI surfaces:
+
+- **Missing SDK packages** — The executor fails with an import error.
+  The polling API returns `status: "failed"` with an error message,
+  but the TUI silently shows nothing (it doesn't render the error
+  field). Tests catch this via `assert status == "completed"` but
+  only if the test actually runs — a missing dependency means the
+  test environment itself is broken.
+- **Missing binaries** (e.g. `codex` not on PATH) — The agent
+  silently loses tools. Tests that pass client-side tools won't
+  notice. The TUI user gets an agent that claims to have tools
+  but can't use them.
+- **Streaming rendering bugs** — Text deltas may arrive but not
+  render in the TUI due to widget lifecycle issues.
+
+### How to verify
+
+After writing e2e tests for an agent, start the TUI and manually
+confirm the golden path works:
+
+```bash
+# For openai-coder (requires openai-agents SDK + codex binary):
+python examples/frontends/terminal.py examples/agents/openai-coder/ --client-tools coder
+
+# For coder:
+python examples/frontends/terminal.py examples/agents/coder/ --client-tools coder
+
+# For archer:
+python examples/frontends/terminal.py examples/agents/archer/
+```
+
+If you cannot run the TUI (e.g. no API key, headless environment),
+say so explicitly — do NOT claim the tests verify the feature works.
+
 ## Mandatory Post-Change Review
 
 **🚨 EXTREMELY IMPORTANT: After completing ANY set of code changes (before committing), you MUST spawn a review subagent. This is the SINGLE MOST IMPORTANT step in the development workflow. NEVER skip it. NEVER forget it. Run it after EVERY code change, no matter how small. Failure to run the review subagent is a BLOCKING issue.**
@@ -12,7 +76,15 @@ Spawn an `Explore` subagent with the following prompt structure:
 Review the following changed files for anti-patterns and spec deviations:
 [list the files you changed]
 
-Check each file against this checklist:
+Check each file against this checklist. **Start with the design
+principles — they are the most important check.**
+
+0. DESIGN PRINCIPLES COMPLIANCE: Every change must comply with
+   designs/DESIGN_PRINCIPLES.md. The most critical: (a) spec
+   self-containment — no runtime env var reads that change agent
+   behavior, no "if env var X is set, use Y" patterns; (b) one
+   correct path — no dual-mode fallbacks; (c) fail loud — no
+   invented defaults. Flag any violation as BLOCKING.
 
 1. EMPTY STRING DEFAULTS: No `field: str = ""` or `field: int = 0` as
    placeholder/sentinel values. If a field is optional, use `Optional[str] = None`.
@@ -221,7 +293,18 @@ Check each file against this checklist:
     over all pairs. The simpler form is easier to read, harder to
     get wrong, and produces a clearer error message.
 
-32. NO BACKWARDS COMPATIBILITY SHIMS: This project has NO external
+32. SPEC SELF-CONTAINMENT: Agent behavior must be fully determined
+    by the agent spec (config.yaml + bundled files). Never read
+    server-side environment variables at runtime to change tool
+    behavior, select backends, or provide credential fallbacks.
+    All configuration — API keys, backend selection, feature
+    flags — must come from the spec's config blocks, resolved
+    at deploy time via `${ENV_VAR}` expansion on the client.
+    "If env var X is set on the server, use backend Y" is an
+    antipattern — it makes the same spec behave differently on
+    different servers, breaking reproducibility and debugging.
+
+33. NO BACKWARDS COMPATIBILITY SHIMS: This project has NO external
     consumers yet. Never add backwards-compat aliases (`OldName =
     NewName`), re-export shim modules, deprecation wrappers,
     `warnings.warn(DeprecationWarning)`, or any code whose sole

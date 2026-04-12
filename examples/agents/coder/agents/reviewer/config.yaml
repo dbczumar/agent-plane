@@ -10,7 +10,7 @@ llm:
 
 tools:
   builtins:
-    - web_search_openai
+    - web_search
 
 instructions: |
   You are a code reviewer. When given code or a description of a code change,

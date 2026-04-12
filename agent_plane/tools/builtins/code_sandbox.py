@@ -79,11 +79,16 @@ def system_read_allowlist() -> list[str]:
         if resolved.exists() and len(resolved.parts) >= 2:
             roots.add("/" + resolved.parts[1])
     # /dev for device nodes (e.g. /dev/null, /dev/urandom).
+    # /etc for system config (ssl certs, hostname, etc.).
+    # /run for runtime state — critically, /etc/resolv.conf is a
+    #   symlink to /run/systemd/resolve/stub-resolv.conf on systemd
+    #   systems. Without /run, DNS resolution fails in the sandbox.
+    # /proc and /sys for system info on Linux.
     # /private/etc is the real path behind the macOS /etc symlink.
     # /private/var/run is needed for runtime sockets/daemons.
     # NOT /private (contains /private/tmp) or /private/var
     # (contains /private/var/folders, the per-user temp cache).
-    roots.update(["/dev", "/private/etc", "/private/var/run"])
+    roots.update(["/dev", "/etc", "/run", "/proc", "/sys", "/private/etc", "/private/var/run"])
     return sorted(roots)
 
 
@@ -141,8 +146,7 @@ def build_srt_config(workspace: Path) -> str:
     resolved = str(workspace.resolve())
 
     allow_read = [resolved]
-    if platform.system() == "Darwin":
-        allow_read += system_read_allowlist()
+    allow_read += system_read_allowlist()
 
     config = {
         "filesystem": {

@@ -219,10 +219,11 @@ async def test_cancel_active_response(
     call = mock_llm.add_call(block=True)
     created = await create_test_response(client)
     response_id = created.body["id"]
+    conv_id = created.body["conversation"]["id"]
     assert created.body["status"] == "queued"
 
     # Wait for the LLM call to start so we know the workflow is active
-    call.call_event.wait(timeout=5)
+    await asyncio.wait_for(call.call_event.wait(), timeout=5)
 
     resp = await client.post(f"/v1/responses/{response_id}/cancel")
     assert resp.status_code == 200
@@ -232,6 +233,15 @@ async def test_cancel_active_response(
     assert body["output"] == []
     # The blocked LLM call was the only one — no second call happened
     assert mock_llm.call_count == 1
+
+    # Cancellation must append an interruption marker to the conversation
+    items_resp = await client.get(f"/v1/conversations/{conv_id}/items")
+    items = items_resp.json()["data"]
+    # Last item: user message indicating the interruption
+    last = items[-1]
+    assert last["type"] == "message"
+    assert last["data"]["role"] == "user"
+    assert "interrupted" in last["data"]["content"][0]["text"]
 
 
 async def test_cancel_response_not_found(client: httpx.AsyncClient) -> None:

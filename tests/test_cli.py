@@ -95,8 +95,8 @@ def test_expand_config_expands_builtin_tool_config(
         "spec_version": 1,
         "tools": {
             "builtins": [
-                "web_search_openai",
-                {"name": "web_search_perplexity", "api_key": "${PPLX_KEY}"},
+                "web_search",
+                {"name": "web_search_pplx", "api_key": "${PPLX_KEY}"},
             ],
         },
     }
@@ -104,14 +104,14 @@ def test_expand_config_expands_builtin_tool_config(
 
     assert changed is True
     # String entries are untouched.
-    assert raw["tools"]["builtins"][0] == "web_search_openai"
+    assert raw["tools"]["builtins"][0] == "web_search"
     # Dict entry api_key should be expanded.
     entry = raw["tools"]["builtins"][1]
     assert entry["api_key"] == "pplx-resolved", (
         "builtin tool api_key should be expanded from env var"
     )
     # 'name' is preserved.
-    assert entry["name"] == "web_search_perplexity"
+    assert entry["name"] == "web_search_pplx"
 
 
 def test_expand_config_no_env_vars_returns_false() -> None:
@@ -245,7 +245,7 @@ def test_resolve_bundle_missing_env_var_raises(
             "tools": {
                 "builtins": [
                     {
-                        "name": "web_search_google",
+                        "name": "web_search_goog",
                         "api_key": "${NONEXISTENT_DEPLOY_KEY}",
                     },
                 ],
@@ -303,9 +303,9 @@ def test_bundle_resolves_config_env_vars(
             },
             "tools": {
                 "builtins": [
-                    "web_search_openai",
+                    "web_search",
                     {
-                        "name": "web_search_perplexity",
+                        "name": "web_search_pplx",
                         "api_key": "${BUNDLE_PPLX_KEY}",
                     },
                 ],
@@ -326,11 +326,11 @@ def test_bundle_resolves_config_env_vars(
     assert perplexity_entry["api_key"] == "pplx-live-xyz", (
         "Builtin tool api_key should be resolved in the bundle tarball"
     )
-    assert perplexity_entry["name"] == "web_search_perplexity", (
+    assert perplexity_entry["name"] == "web_search_pplx", (
         "Builtin tool name must be preserved after expansion"
     )
     # String entries pass through unchanged.
-    assert parsed["tools"]["builtins"][0] == "web_search_openai", (
+    assert parsed["tools"]["builtins"][0] == "web_search", (
         "String builtin entries should be unchanged in the bundle"
     )
     # Non-secret fields survive bundling.

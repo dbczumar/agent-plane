@@ -84,6 +84,43 @@ def _build_response_object(
     )
 
 
+def _append_cancellation_item(
+    task: Task,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Append a user-role message indicating the response was cancelled.
+
+    Called after ``task_store.cancel()`` so the conversation history
+    records that the user interrupted the agent. Subsequent turns
+    (and the agent itself on replay) will see this marker and know
+    the preceding assistant output may be incomplete.
+
+    :param task: The cancelled task entity. Uses ``task.id`` as the
+        ``response_id`` and ``task.conversation_id`` to locate the
+        conversation.
+    :param conversation_store: Store for appending the item.
+    """
+    item = NewConversationItem(
+        type="message",
+        response_id=task.id,
+        data=MessageData(
+            role="user",
+            content=[
+                {
+                    "type": "input_text",
+                    "text": (
+                        "[The user interrupted and halted the agent response. "
+                        "The preceding assistant message may be incomplete — "
+                        "the user may not have seen the full response.]"
+                    ),
+                }
+            ],
+        ),
+    )
+    conversation_store.append(task.conversation_id, [item])
+
+
 def _apply_tool_results(
     req: PatchResponseRequest,
     task_store: TaskStore,
@@ -643,6 +680,7 @@ async def _build_terminal_event(
 async def _stream_events(
     task: Task,
     task_store: TaskStore,
+    conversation_store: ConversationStore,
     background: bool,
 ) -> AsyncIterator[str]:
     """
@@ -660,6 +698,8 @@ async def _stream_events(
     :param task: The task entity to stream events for.
     :param task_store: Store for task lifecycle operations
         (wait, cancel, get).
+    :param conversation_store: Store for appending the
+        cancellation marker item on disconnect.
     :param background: Whether this is a background task.
         Background tasks are not cancelled on disconnect.
     :yields: Formatted SSE frame strings.
@@ -705,12 +745,14 @@ async def _stream_events(
                 # cancel() is sync (DBOS cancel_workflow) — offload
                 # to avoid "called while event loop is running" error.
                 await asyncio.to_thread(task_store.cancel, task.id)
+                await asyncio.to_thread(_append_cancellation_item, current, conversation_store)
 
 
 async def _handle_blocking_wait(
     task: Task,
     request: Request,
     task_store: TaskStore,
+    conversation_store: ConversationStore,
 ) -> ResponseObject:
     """
     Race task completion against client disconnect so foreground
@@ -721,6 +763,8 @@ async def _handle_blocking_wait(
         client disconnect.
     :param task_store: Store for waiting on and cancelling the
         task.
+    :param conversation_store: Store for appending the
+        cancellation marker item on disconnect.
     :returns: A :class:`ResponseObject` for the completed (or
         cancelled) task.
     """
@@ -743,6 +787,7 @@ async def _handle_blocking_wait(
     # cancel() is sync (DBOS cancel_workflow) — offload to avoid
     # "called while event loop is running" error.
     cancelled = await asyncio.to_thread(task_store.cancel, task.id)
+    await asyncio.to_thread(_append_cancellation_item, task, conversation_store)
     return _build_response_object(cancelled)
 
 
@@ -864,11 +909,11 @@ def create_responses_router(
         # -- streaming (both background and foreground) --
         if req.stream:
             return StreamingResponse(
-                _stream_events(task, task_store, req.background),
+                _stream_events(task, task_store, conversation_store, req.background),
                 media_type="text/event-stream",
             )
 
-        return await _handle_blocking_wait(task, request, task_store)
+        return await _handle_blocking_wait(task, request, task_store, conversation_store)
 
     # ── GET /responses/{response_id} ─────────────────────────────
 
@@ -971,6 +1016,7 @@ def create_responses_router(
             task_store.cancel,
             response_id,
         )
+        await asyncio.to_thread(_append_cancellation_item, task, conversation_store)
         return _build_response_object(cancelled_task)
 
     # ── DELETE /responses/{response_id} ──────────────────────────

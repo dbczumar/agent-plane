@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -96,12 +98,12 @@ def _has_web_search(
     builtins: list[BuiltinToolConfig],
 ) -> bool:
     """
-    Check if ``web_search_openai`` is in the builtins list.
+    Check if ``web_search`` is in the builtins list.
 
     :param builtins: The agent spec's builtin tool configs.
-    :returns: True if ``web_search_openai`` is declared.
+    :returns: True if ``web_search`` is declared.
     """
-    return any(b.name == "web_search_openai" for b in builtins)
+    return any(b.name == "web_search" for b in builtins)
 
 
 def _build_model_settings(llm_config: LLMConfig) -> Any:
@@ -320,8 +322,17 @@ def _map_run_item_event(event: Any) -> ExecutorEvent | None:
     """
     name = getattr(event, "name", None)
 
+    if name == "tool_output":
+        return _map_tool_output(event.item)
+
     if name == "tool_called":
-        return _map_tool_called(event.item)
+        # Only emit if the item already has output populated
+        # (true for function tools, false for MCP tools like
+        # codex where the result arrives in a later
+        # "tool_output" event).
+        item_output = getattr(event.item, "output", None)
+        if item_output is not None:
+            return _map_tool_called(event.item)
 
     if name == "tool_search_output_created":
         raw_item = getattr(event.item, "raw_item", None)
@@ -336,9 +347,55 @@ def _map_run_item_event(event: Any) -> ExecutorEvent | None:
     return None
 
 
+def _map_tool_output(item: Any) -> ToolCallObserved | None:
+    """
+    Map a tool output item to ``ToolCallObserved``.
+
+    The ``tool_output`` event fires AFTER the tool executes and
+    carries the result. This is the preferred source for
+    ``ToolCallObserved`` because it includes the actual output.
+    For MCP tools (e.g. Codex), the ``tool_called`` event's
+    output is always empty — the real result only appears here.
+
+    :param item: The SDK's ``ToolCallOutputItem``.
+    :returns: A ``ToolCallObserved`` event, or ``None``.
+    """
+    raw = getattr(item, "raw_item", None)
+    if raw is None:
+        return None
+
+    # raw is a FunctionCallOutput dict or similar.
+    if isinstance(raw, dict):
+        call_id = raw.get("call_id", str(uuid4().hex[:12]))
+        output = raw.get("output", "")
+    else:
+        call_id = getattr(raw, "call_id", None) or str(
+            uuid4().hex[:12],
+        )
+        output = getattr(raw, "output", "")
+
+    # The item-level output is the coerced string form.
+    item_output = getattr(item, "output", None)
+    result_str = str(item_output) if item_output is not None else str(output) if output else ""
+
+    return ToolCallObserved(
+        call_id=call_id,
+        name="codex",
+        arguments={},
+        result=result_str,
+        status="success",
+        duration_ms=0.0,
+    )
+
+
 def _map_tool_called(item: Any) -> ToolCallObserved | None:
     """
-    Map a completed tool call item to ``ToolCallObserved``.
+    Map a tool call invocation to ``ToolCallObserved``.
+
+    The ``tool_called`` event fires when a tool is invoked but
+    BEFORE the result is available. For function tools, ``output``
+    is populated; for MCP tools (e.g. Codex), it is empty — the
+    result arrives later in a ``tool_output`` event.
 
     :param item: The SDK's tool call run item.
     :returns: A ``ToolCallObserved`` event, or ``None`` if the
@@ -456,10 +513,51 @@ class _CodexSessionRewriter:
         self._thread_id = None
 
 
+def _build_codex_home(
+    workspace: str,
+    connection: dict[str, str] | None,
+) -> str:
+    """
+    Create an isolated ``CODEX_HOME`` for the Codex subprocess.
+
+    The Codex CLI reads auth from ``$CODEX_HOME/auth.json``.
+    Using a per-workspace home avoids mutating the global
+    ``~/.codex/`` directory, which is critical for multi-tenant
+    servers where different agents may use different API keys.
+
+    :param workspace: The agent's workspace directory, e.g.
+        ``"/tmp/storage/workspace"``.
+    :param connection: Per-provider connection overrides from
+        the agent spec, e.g. ``{"api_key": "sk-..."}``.
+    :returns: Path to the isolated CODEX_HOME directory.
+    """
+    codex_home = Path(workspace) / ".codex_home"
+    codex_home.mkdir(parents=True, exist_ok=True)
+
+    api_key: str | None = None
+    if connection is not None:
+        api_key = connection.get("api_key")
+    if not api_key:
+        api_key = os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        auth_path = codex_home / "auth.json"
+        auth_path.write_text(
+            json.dumps(
+                {"auth_mode": "apikey", "OPENAI_API_KEY": api_key},
+            ),
+        )
+    else:
+        _logger.warning(
+            "codex: no API key found in agent config or environment — codex auth.json not written",
+        )
+    return str(codex_home)
+
+
 def _build_codex_mcp(
     codex_tools: list[str],
     rewriter: _CodexSessionRewriter,
     workspace: str,
+    connection: dict[str, str] | None = None,
 ) -> Any | None:
     """
     Build a Codex MCP server with session rewriting.
@@ -470,10 +568,17 @@ def _build_codex_mcp(
     ``codex-reply`` with the stored ``threadId`` for session
     continuity.
 
+    Each agent gets an isolated ``CODEX_HOME`` under its
+    workspace so that different agents on a multi-tenant
+    server don't share or overwrite each other's auth.
+
     :param codex_tools: Codex tool names (e.g. ``["Shell"]``).
     :param rewriter: The session rewriter for this conversation.
     :param workspace: Working directory for Codex, e.g.
         ``"/tmp/storage/workspace"``.
+    :param connection: Per-provider connection overrides, e.g.
+        ``{"api_key": "sk-..."}``. Used to provision auth
+        for the Codex subprocess.
     :returns: A ``_SessionAwareMcpServer`` instance, or ``None``.
     """
     if not codex_tools:
@@ -486,12 +591,19 @@ def _build_codex_mcp(
         )
         return None
 
+    codex_home = _build_codex_home(workspace, connection)
+
     return _make_session_aware_mcp_server(
         rewriter=rewriter,
         params={
             "command": "codex",
             "args": ["mcp-server"],
             "cwd": workspace,
+            # CODEX_HOME isolates auth per-agent. The MCP
+            # default env provides HOME/PATH/SHELL; we add
+            # CODEX_HOME so the subprocess reads its own
+            # auth.json instead of the global ~/.codex/.
+            "env": {"CODEX_HOME": codex_home},
         },
         name="Codex CLI",
         # Long timeout — Codex sessions can be long-lived.
@@ -751,7 +863,7 @@ def _build_agent(
     sdk = _ensure_sdk()
 
     # Only wrap function-type tools. Passthrough tools
-    # (e.g. web_search_openai with type="web_search_preview")
+    # (e.g. web_search with type="web_search_preview")
     # are handled via hosted_tools, not function tools.
     function_tools = [
         _make_function_tool(schema, context)
@@ -775,6 +887,7 @@ def _build_agent(
             executor._codex_tools,
             rewriter,
             workspace,
+            connection=executor._connection,
         )
         if codex_mcp is not None:
             mcp_servers.append(codex_mcp)

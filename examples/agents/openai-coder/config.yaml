@@ -21,7 +21,7 @@ tools:
     - codex:Shell
     - codex:ApplyPatch
     # Web search via OpenAI's hosted tool.
-    - web_search_openai
+    - web_search
   agents:
     - reviewer
 

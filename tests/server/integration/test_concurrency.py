@@ -738,7 +738,7 @@ async def test_steering_during_streaming_processed_after_complete(
 ) -> None:
     """
     Steering delivered during a streaming LLM call (simulating
-    native tools like web_search_openai) is processed after the
+    native tools like web_search) is processed after the
     stream completes.
 
     Race window: the LLM is streaming tokens (stream_tokens=True).

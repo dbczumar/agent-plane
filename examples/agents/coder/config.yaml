@@ -11,7 +11,7 @@ llm:
 
 tools:
   builtins:
-    - web_search_openai
+    - web_search
   agents:
     - researcher
     - reviewer

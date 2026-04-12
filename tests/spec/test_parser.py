@@ -686,7 +686,7 @@ def test_parse_builtins_string_entries(tmp_path: Path) -> None:
     config = {
         "spec_version": 1,
         "tools": {
-            "builtins": ["web_search_openai", "web_search_google"],
+            "builtins": ["web_search", "web_search_alt"],
         },
     }
     (tmp_path / "config.yaml").write_text(yaml.dump(config))
@@ -694,9 +694,9 @@ def test_parse_builtins_string_entries(tmp_path: Path) -> None:
 
     # Two entries parsed, both with empty config.
     assert len(spec.tools.builtins) == 2
-    assert spec.tools.builtins[0].name == "web_search_openai"
+    assert spec.tools.builtins[0].name == "web_search"
     assert spec.tools.builtins[0].config == {}
-    assert spec.tools.builtins[1].name == "web_search_google"
+    assert spec.tools.builtins[1].name == "web_search_alt"
     assert spec.tools.builtins[1].config == {}
 
 
@@ -707,7 +707,7 @@ def test_parse_builtins_dict_entries(tmp_path: Path) -> None:
         "tools": {
             "builtins": [
                 {
-                    "name": "web_search_google",
+                    "name": "web_search_alt",
                     "api_key": "AIza-test",
                     "engine_id": "eng-123",
                 },
@@ -719,7 +719,7 @@ def test_parse_builtins_dict_entries(tmp_path: Path) -> None:
 
     assert len(spec.tools.builtins) == 1
     entry = spec.tools.builtins[0]
-    assert entry.name == "web_search_google"
+    assert entry.name == "web_search_alt"
     # Config contains all keys except 'name'.
     assert entry.config == {
         "api_key": "AIza-test",
@@ -733,9 +733,9 @@ def test_parse_builtins_mixed_entries(tmp_path: Path) -> None:
         "spec_version": 1,
         "tools": {
             "builtins": [
-                "web_search_openai",
+                "web_search",
                 {
-                    "name": "web_search_perplexity",
+                    "name": "web_search_cfg",
                     "api_key": "pplx-test",
                 },
             ],
@@ -746,10 +746,10 @@ def test_parse_builtins_mixed_entries(tmp_path: Path) -> None:
 
     assert len(spec.tools.builtins) == 2
     # First entry: string → no config.
-    assert spec.tools.builtins[0].name == "web_search_openai"
+    assert spec.tools.builtins[0].name == "web_search"
     assert spec.tools.builtins[0].config == {}
     # Second entry: dict → has config.
-    assert spec.tools.builtins[1].name == "web_search_perplexity"
+    assert spec.tools.builtins[1].name == "web_search_cfg"
     assert spec.tools.builtins[1].config == {"api_key": "pplx-test"}
 
 

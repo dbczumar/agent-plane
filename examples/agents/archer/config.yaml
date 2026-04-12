@@ -12,7 +12,8 @@ llm:
 tools:
   timeout: 300
   builtins:
-    - web_search_openai
+    - web_search
+    - web_fetch
     - code_sandbox
     - upload_file
     - search_conversations

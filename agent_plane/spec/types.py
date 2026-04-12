@@ -195,7 +195,7 @@ class BuiltinToolConfig:
     ``tools.builtins``.
 
     :param name: The registered tool name, e.g.
-        ``"web_search_google"``.
+        ``"web_search"``.
     :param config: Tool-specific key-value pairs, e.g.
         ``{"api_key": "AIza...", "engine_id": "abc123"}``.
         Empty when the tool needs no configuration.
@@ -232,7 +232,7 @@ class ToolsConfig:
         e.g. ``["summarizer", "code-reviewer"]``. Each name must
         match a directory under ``agents/``.
     :param builtins: Built-in tools to enable, e.g.
-        ``[BuiltinToolConfig(name="web_search_openai")]``. Each
+        ``[BuiltinToolConfig(name="web_search")]``. Each
         entry carries the tool name and optional config fields
         (API keys, engine IDs, etc.).
     :param timeout: Default timeout in seconds for all tool calls,

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 
 # Any: the OpenAI tool schema is a heterogeneous dict with string
 # keys and mixed value types (str, dict, list).
@@ -119,15 +118,9 @@ def _search_perplexity(
         before falling back to the env var.
     :returns: The answer text with citations, or an error message.
     """
-    api_key = config.get("api_key") or os.environ.get(
-        "PERPLEXITY_API_KEY",
-    )
+    api_key = config.get("api_key")
     if not api_key:
-        return (
-            "Error: api_key must be provided in the spec "
-            "config or via PERPLEXITY_API_KEY environment "
-            "variable."
-        )
+        return "Error: api_key must be provided in the web_search config in config.yaml."
     try:
         resp = httpx.post(
             _PERPLEXITY_URL,

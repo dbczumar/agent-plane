@@ -16,11 +16,15 @@ situations:
    agent (LangChain, CrewAI, AutoGen, a custom Python script, etc.) and
    wants to plug it into agent-plane without rewriting it.
 
-3. **"I want a model but I don't know what's available."** The user
-   doesn't know which LLM providers/models they can use or which API
-   keys they have configured.
+In both cases, the user needs an LLM API key to proceed — the
+onboarding agent is itself an agent and needs a model to run. The
+setup flow begins by having the user select a provider and supply an
+API key. Each supported provider has a sensible default model so the
+user doesn't need to know model identifiers upfront. This provider/key
+selection then powers the onboarding agent and becomes the default
+model configuration for the generated agent.
 
-The onboarding system should handle all three cases with minimal manual
+The onboarding system should handle both cases with minimal manual
 steps, leveraging the user's existing tools (Claude Code, Codex, etc.)
 where available and falling back to a CLI-driven flow otherwise.
 
@@ -30,9 +34,9 @@ where available and falling back to a CLI-driven flow otherwise.
 |-----------|--------|
 | Agent spec format (`config.yaml`, `AGENTS.md`, skills, tools) | Stable |
 | Executor types (`llm`, `claude_sdk`, `agents_sdk`, `remote`) | Stable |
-| CLI (`ap server`) | Stable, no `onboard`/`init` command |
+| CLI (`ap server`) | Stable, no `create` command |
 | Claude Code skills for agent-plane development | Exists in `.claude/skills/agent-plane-dev/` |
-| MLflow model config discovery | Not implemented |
+| Provider selection / model resolution | Not implemented |
 | Coding assistant integration (Claude Code, Codex, Gemini) | Not implemented |
 | Framework detection / scaffolding | Not implemented |
 
@@ -40,11 +44,13 @@ where available and falling back to a CLI-driven flow otherwise.
 
 ## Design Premise
 
-The onboarding CLI (`ap onboard` or `ap init`) launches an **agent-plane
-onboarding agent** — an agent-plane agent that guides the user through
-setup. This dogfoods agent-plane itself: the onboarding agent runs on
-agent-plane, has filesystem access (with user approval), and can
-generate agent directories, install skills, and configure models.
+The onboarding CLI (`ap create`) collects a model provider and API key,
+then boots a temporary agent-plane server and drops the user into an
+interactive shell connected to a built-in **onboarding agent**. This
+dogfoods agent-plane itself: the onboarding agent runs on agent-plane
+with client tools enabled (filesystem access, environment detection,
+code scaffolding), and conversationally guides the user through setting
+up a new agent or integrating an existing one.
 
 ### Guiding principles
 
@@ -68,70 +74,45 @@ applicable, a recommended default.
 
 ### Architecture & Scope
 
-**Q1. Onboarding agent vs. CLI wizard — which is primary?**
+**Q1. Onboarding agent vs. CLI wizard — which is primary?** *(Resolved)*
 
-The premise says the CLI "just launches an agent-plane onboarding agent
-with access to file system." Two interpretations:
+**Hybrid.** The CLI handles two things before handing off:
 
-- **(a) Agent-only.** `ap onboard` starts a temporary agent-plane server,
-  loads the onboarding agent, and opens a conversational session. The
-  agent does all the work (detect environment, generate files, install
-  skills). No traditional CLI prompts.
-- **(b) Hybrid.** A thin CLI collects a few mandatory inputs (target
-  directory, approval scope), then hands off to the onboarding agent
-  for the rest.
+1. **Provider selection** — user picks a model provider and supplies
+   an API key (see "Provider & Model Selection" section).
+2. **Server startup** — boots a temporary agent-plane server, loads
+   the built-in onboarding agent using the selected model, and drops
+   the user into an interactive shell.
 
-Recommended default: **(b) Hybrid** — the CLI handles server lifecycle
-and approval gating; the agent handles discovery and generation.
+From there the user is in a conversational shell talking to the
+onboarding agent. The agent has **client tools enabled** — filesystem
+access, environment detection, code generation — and drives the rest
+of the setup: detecting existing agents or frameworks, scaffolding new
+agent directories, installing IDE skills, and configuring `config.yaml`.
+The user stays in this shell until setup is complete.
 
-**Q2. Where does the onboarding agent live?**
+**Q2. Where does the onboarding agent live?** *(Resolved)*
 
-Options:
+`agent_plane/onboarding/agent/` — first-class built-in, shipped with
+the package and referenced by `ap create`.
 
-- **(a)** `examples/agents/onboarding/` — example agent, not shipped with
-  the package.
-- **(b)** `agent_plane/onboarding/agent/` — first-class built-in, shipped
-  with the package and referenced by `ap onboard`.
-- **(c)** Separate package/repo.
-
-Recommended default: **(b)** — the onboarding agent is part of
-agent-plane and `ap onboard` knows where to find it.
-
-**Q3. "Implement MLflow assistant on agent plane" — scope and relationship**
-
-Is the MLflow assistant:
-
-- **(a)** A separate agent (`examples/agents/mlflow-assistant/`) that
-  helps users interact with MLflow (query experiments, compare runs,
-  deploy models to serving endpoints)?
-- **(b)** A capability of the onboarding agent (it queries MLflow to
-  discover available models)?
-- **(c)** Both — the onboarding agent uses MLflow for model discovery,
-  and there is also a standalone MLflow assistant agent?
-
-This determines whether the MLflow assistant design belongs in this doc
-or in a separate `MLFLOW_ASSISTANT.md`.
+**Q3. MLflow assistant** *(Deferred — see Deferred section)*
 
 ---
 
 ### Framework Detection & Agent Generation
 
-**Q4. "Supported frameworks" — detection semantics**
+**Q4. "Supported frameworks" — detection semantics** *(Resolved)*
 
-Agent-plane supports four executor types. When the premise says "if it's
-one of the supported frameworks," does this mean:
+**(c)** — detect frameworks from the user's code and wire them to the
+appropriate executor. If a native executor exists for the framework,
+use it. Otherwise, scaffold a `remote` executor HTTP wrapper.
 
-- **(a)** The user has a **Claude SDK** or **OpenAI Agents SDK** agent
-  and we wire it to the corresponding executor (`claude_sdk`,
-  `agents_sdk`).
-- **(b)** The user has a **LangChain / CrewAI / AutoGen / etc.** agent
-  and we detect the framework from their code, then generate a `remote`
-  executor config that wraps it via an HTTP adapter.
-- **(c)** Both (a) and (b).
-
-Recommended default: **(c)** — detect Claude SDK and OpenAI Agents SDK
-for native executors; detect other frameworks for remote executor
-scaffolding.
+The executor set is expanding. LangGraph and DeepAgents will get native
+executors soon, and others (LangChain, CrewAI, AutoGen) may follow.
+The detection table below reflects current state; the onboarding agent
+should be designed so that adding a new native executor only requires
+updating this mapping, not changing the detection flow.
 
 Detection signals (in priority order):
 
@@ -139,157 +120,140 @@ Detection signals (in priority order):
 |--------|-----------|----------|
 | `import anthropic` + Claude agent patterns | Claude SDK | `claude_sdk` |
 | `import openai` + Agents SDK patterns | OpenAI Agents SDK | `agents_sdk` |
-| `from langchain` imports | LangChain | `remote` (scaffold HTTP wrapper) |
+| `from langgraph` imports | LangGraph | Native (planned) |
+| `from deepagents` imports | DeepAgents | Native (planned) |
+| `from langchain` imports | LangChain | `remote` (native planned) |
 | `from crewai` imports | CrewAI | `remote` (scaffold HTTP wrapper) |
 | `from autogen` imports | AutoGen | `remote` (scaffold HTTP wrapper) |
 | None of the above | Unknown | `remote` (scaffold HTTP wrapper) + file issue |
 
-**Q5. Remote executor scaffolding**
+**Q5. Remote executor scaffolding** *(Partially resolved — details deferred)*
 
-For unsupported frameworks, the onboarding agent generates a thin HTTP
-wrapper implementing the remote executor protocol (as defined in
-`EXECUTOR_CONTRACT.md`). Questions:
+For unsupported frameworks, the onboarding agent generates a standalone
+FastAPI app inside the user's agent directory that implements the remote
+executor protocol (as defined in `EXECUTOR_CONTRACT.md`). Agent-plane
+launches it as a subprocess, similar to the approach described in
+[CLAUDE_SDK_PROGRAMMATIC_SUPPORT.md](CLAUDE_SDK_PROGRAMMATIC_SUPPORT.md)
+for code-based program imports.
 
-- Is the generated wrapper a standalone FastAPI app?
-- Does it live inside the user's agent directory or beside it?
-- Should the onboarding agent also generate a `Dockerfile`?
+Remaining details (Dockerfile generation, subprocess lifecycle
+management, etc.) to be resolved later.
 
-**Q6. "File a GitHub issue" — automatic or manual?**
+**Q6. "File a GitHub issue" — automatic or manual?** *(Resolved)*
 
-For unsupported frameworks, should the onboarding flow:
-
-- **(a)** Automatically file an issue on `dbczumar/agent-plane` requesting
-  first-class support (requires GitHub auth).
-- **(b)** Print a pre-filled issue URL that the user can click to file.
-- **(c)** Ask the user whether they want to file an issue and do (a) or
-  (b) based on their answer.
-
-Recommended default: **(c)** — ask, then use whichever method the user
-has auth for.
+Ask the user if they want to request first-class support for their
+framework. If yes, print a pre-filled GitHub issue URL they can click
+to file. No automatic issue filing — keep it low-friction and
+transparent.
 
 ---
 
-### Model Configuration & MLflow
+### Provider & Model Selection *(Resolved)*
 
-**Q7. "Default model based on list of model confs from MLflow"**
+The onboarding agent is itself an agent — it needs an LLM to run.
+Provider/model selection is therefore a **prerequisite step** that
+happens before the onboarding agent starts, not a question the
+onboarding agent answers.
 
-Model configs are currently static in `config.yaml`. The onboarding
-agent needs to pick a default. Options:
+**Flow:** In interactive mode, `ap create` presents the user with a
+list of supported providers. The user picks one, supplies an API key,
+and picks a model. The `--model provider/model_name` flag skips this
+prompt entirely. In non-interactive mode, `--model` is required and
+credentials come from environment variables.
 
-- **(a)** Query MLflow model serving endpoints (or Databricks serving
-  endpoints) to discover models available to the user, then select one.
-- **(b)** Probe for API keys in the environment (`OPENAI_API_KEY`,
-  `ANTHROPIC_API_KEY`, `DATABRICKS_TOKEN`, etc.) and select the best
-  available model from a hardcoded priority list.
-- **(c)** Combine: check environment for API keys first, then optionally
-  query MLflow/Databricks serving if credentials are present.
+Agent-plane's routing layer (`agent_plane/llms/routing.py`) already
+supports the following providers. The onboarding flow must support all
+of them, matching the breadth of providers available in the MLflow AI
+Gateway.
 
-Implementation note: MLflow's model serving endpoint listing is
-available via `GET /api/2.0/serving-endpoints` on Databricks workspaces.
-The onboarding agent would need `DATABRICKS_HOST` and
-`DATABRICKS_TOKEN` to call this.
+**Data source:** The MLflow model catalog
+(`mlflow/utils/model_catalog/`) contains 68 per-provider JSON files
+with model metadata (pricing, context windows, capabilities,
+deprecation dates). The provider registry
+(`mlflow/utils/providers.py`) defines auth modes and credential fields
+for each provider.
 
-**Q8. Provider priority**
+**Important:** The relevant code and data (catalog JSON files, provider
+auth mode definitions, model listing logic) should be **copied** into
+agent-plane, not imported from MLflow. MLflow must not be a dependency
+of agent-plane. The copied code should be kept minimal — only what's
+needed for provider selection, auth field prompting, and model listing.
 
-If multiple API keys are present, what is the default model selection
-order? Proposed:
+The onboarding flow should use this copied catalog as the source
+of truth for:
 
-| Priority | Provider | Model | Env var |
-|----------|----------|-------|---------|
-| 1 | Anthropic | `anthropic/claude-sonnet-4-20250514` | `ANTHROPIC_API_KEY` |
-| 2 | OpenAI | `openai/gpt-5.4` | `OPENAI_API_KEY` |
-| 3 | Databricks | `databricks/<serving-endpoint>` | `DATABRICKS_TOKEN` |
-| 4 | Google | `gemini/gemini-2.5-pro` | `GOOGLE_API_KEY` |
+- **Provider list** — `get_all_providers()` returns all available
+  providers, normalized and deduplicated.
+- **Model list per provider** — `get_onboarding_models(provider)`
+  returns text chat models with function calling support (the
+  onboarding agent needs tools). Excludes audio, realtime, image,
+  and embedding models. Sorted newest first (by version, then date).
+- **Auth requirements** — `get_provider_config_response(provider)`
+  returns the credential fields needed (API key, access keys, service
+  account JSON, etc.) with support for multiple auth modes per
+  provider (e.g. Bedrock supports API key, access keys, IAM role, and
+  default credential chain).
 
-This also determines what model the **onboarding agent itself** uses.
-The onboarding agent needs a model to run — it should use whatever is
-available, with the priority above.
+The user explicitly picks a provider and supplies a key — no implicit
+env var scanning. This means the provider table is not hardcoded in
+agent-plane — it comes from the MLflow catalog and stays up to date
+as providers and models are added there.
 
----
-
-### Skills Installation & IDE Integration
-
-**Q9. "Install Claude skills if user has Claude Code"**
-
-Clarify what "Claude skills" means here:
-
-- **(a)** Agent-plane skills (files in the generated agent's `skills/`
-  directory) that teach the agent how to perform tasks.
-- **(b)** Claude Code skills (files in `.claude/skills/`) that teach
-  Claude Code how to work with agent-plane — e.g., the existing
-  `agent-plane-dev` skill.
-- **(c)** Both — install agent-plane dev skills into Claude Code AND
-  generate agent skills for the new agent.
-
-Recommended default: **(c)** — when Claude Code is detected, install
-the `agent-plane-dev` skill into the user's `.claude/skills/` so their
-Claude Code sessions understand agent-plane conventions. Also generate
-starter skills for the new agent.
-
-Detection: check for `~/.claude/` directory or `claude` on `$PATH`.
-
-**Q10. Codex support**
-
-What does Codex onboarding look like?
-
-- **(a)** Detect Codex installation, configure the agent to use
-  `agents_sdk` executor with `codex:Shell` and `codex:ApplyPatch`
-  tools.
-- **(b)** Install Codex-specific skills (analogous to Claude Code
-  skills) that teach Codex how to work with agent-plane.
-- **(c)** Both.
-
-Detection: check for `codex` on `$PATH` or OpenAI Codex SDK imports.
-
-**Q11. Gemini support**
-
-Include Gemini as a supported IDE/assistant for skills installation, or
-defer? The LLM layer already supports `gemini/` as a provider, but
-there is no Gemini IDE integration today.
-
-Recommended default: **Defer** — support Gemini as a model provider but
-not as an IDE/assistant for skills installation. Revisit when Gemini has
-a coding assistant with a skills/plugin system.
+The selected provider and model are used for two things:
+1. **Running the onboarding agent itself** during the setup session.
+2. **Configuring the generated agent's `config.yaml`** as the default
+   model.
 
 ---
 
-### User Flow & Approval
+---
 
-**Q12. Approval granularity**
+### User Flow
 
-The onboarding agent has filesystem access and needs user approval.
-Options:
+**Q13. CLI entry point** *(Resolved)*
 
-- **(a)** Approve the overall plan ("I'll create an agent at
-  `./my-agent/` with config X, skills Y, tools Z"). Single approval,
-  then the agent executes.
-- **(b)** Approve each file write individually.
-- **(c)** Approve the plan, then show a summary diff before final write.
+Command: `ap create`
 
-Recommended default: **(c)** — plan approval + final diff confirmation.
-Individual file approval is too noisy; plan-only approval doesn't let
-the user review the output.
-
-**Q13. CLI entry point**
-
-Proposed command: `ap init`
+**Interactive mode** (no positional argument):
 
 ```
-ap init [--target DIR] [--model MODEL] [--framework FRAMEWORK] [--non-interactive]
+ap create [--model PROVIDER/MODEL] [--allow-filesystem-access]
 ```
 
-- `--target`: Directory to create the agent in (default: current
-  directory).
-- `--model`: Override model selection (skip auto-detection).
-- `--framework`: Override framework detection (skip auto-detection).
-- `--non-interactive`: Skip the onboarding agent, use defaults +
-  flags only. For CI/scripted use.
+Launches the provider selection prompt (unless `--model` is given),
+then drops the user into an interactive shell with the onboarding
+agent. The agent drives everything from there.
 
-The command starts a temporary agent-plane server, loads the onboarding
-agent, and opens a conversational session. When the session ends, the
-server shuts down.
+**Non-interactive mode** (positional message argument):
 
-Alternative name: `ap onboard`. Preference?
+```
+ap create "create a research agent with web search" \
+    --model anthropic/claude-sonnet-4-20250514 \
+    --allow-filesystem-access
+```
+
+Like Claude Code's `-p` pattern: passing a message makes it
+non-interactive. The onboarding agent runs with that message as
+its initial prompt and executes without further user input.
+
+- `--model`: Model in litellm format (`provider/model_name`).
+  Required for non-interactive mode. In interactive mode, skips the
+  provider selection prompt if provided.
+- `--allow-filesystem-access`: Enable filesystem client-side tools
+  (read/write files, detect frameworks from code). Off by default
+  for safety — some users may not want the agent to have free reign
+  of their filesystem. Recommended on for the best onboarding
+  experience; without it the agent can only generate output to
+  stdout and the user must copy files manually.
+
+Auth credentials for non-interactive mode are read from environment
+variables (matching the provider's expected env var, e.g.
+`ANTHROPIC_API_KEY` for `anthropic/*` models). This keeps the
+CLI simple and works naturally in CI/scripted environments.
+
+The command starts a temporary agent-plane server, loads the
+onboarding agent, and opens a session. When the session ends,
+the server shuts down.
 
 ---
 
@@ -298,103 +262,76 @@ Alternative name: `ap onboard`. Preference?
 Pending resolution of the open questions above, the following flows are
 sketched at high level.
 
-### Flow 1: "I don't have an agent"
+### Flow 1: Interactive — "I don't have an agent"
 
 ```
-$ ap init
-Detecting environment...
-  Claude Code: found (v2.1.0)
-  API keys: ANTHROPIC_API_KEY, OPENAI_API_KEY
-  Default model: anthropic/claude-sonnet-4-20250514
+$ ap create --allow-filesystem-access
+Select a model provider (popular first, 68 total):
+  1. openai           7. azure            13. ollama
+  2. anthropic        8. xai              14. together_ai
+  3. databricks       9. mistral          15. cohere
+  4. bedrock         10. groq             16. fireworks_ai
+  5. gemini          11. deepseek         17. ai21
+  6. vertex_ai       12. openrouter       18. aleph_alpha
+  ... (68 providers from MLflow model catalog)
+
+Provider [1]: 2
+ANTHROPIC_API_KEY: sk-ant-***  ✓ valid
 
 Starting onboarding agent...
 
-Agent: I see you have Claude Code and Anthropic API access. I'll help
-       you create an agent. What would you like your agent to do?
+Agent: I'll help you create an agent. What would you like it to do?
 
 User:  I want a research assistant that can search the web and
        summarize findings.
 
-Agent: I'll create a research agent with:
-       - Model: anthropic/claude-sonnet-4-20250514
-       - Tools: web_search, summarize
-       - Skills: deep-research
-       - Executor: llm (default)
-
-       Target directory: ./research-agent/
-
-       [Approve plan? y/n]
-
-User:  y
-
-Agent: [generates files, shows diff summary]
-
-       Created:
-         research-agent/config.yaml
-         research-agent/AGENTS.md
-         research-agent/skills/deep-research/SKILL.md
-
-       Also installed agent-plane-dev skill into .claude/skills/
-
-       To start: ap server --agent ./research-agent/
-       [Approve writes? y/n]
-
-User:  y
-
-Agent: Done! Run `ap server --agent ./research-agent/` to start.
+Agent: [detects environment, scaffolds agent directory, shows plan]
+       ...
 ```
 
-### Flow 2: "I have a LangChain agent"
+### Flow 2: Interactive — "I have a LangChain agent"
 
 ```
-$ ap init --target ./my-langchain-agent/
-Detecting environment...
-  Framework detected: LangChain (from ./agent.py imports)
-  Claude Code: not found
-  API keys: OPENAI_API_KEY
-  Default model: openai/gpt-5.4
+$ ap create --allow-filesystem-access
+[provider selection...]
 
-Starting onboarding agent...
-
-Agent: I detected a LangChain agent in your code. LangChain isn't
-       natively supported as an executor, but I can create a remote
-       executor wrapper that exposes your agent via HTTP and plugs it
-       into agent-plane.
-
-       I'll generate:
-       - A FastAPI wrapper around your LangChain agent
-       - An agent-plane config.yaml with executor type: remote
-       - A Dockerfile for the wrapper
-
-       Want me to also file a GitHub issue requesting first-class
-       LangChain support? [y/n]
-
-User:  y
-
-Agent: [generates files, shows diff, files issue]
+Agent: I detected a LangChain agent in the current directory.
+       LangChain isn't natively supported as an executor yet, but
+       I can create a remote executor wrapper that exposes your
+       agent via HTTP and plugs it into agent-plane.
+       ...
 ```
 
-### Flow 3: "I have a Claude SDK agent"
+### Flow 3: Non-interactive — new agent
 
 ```
-$ ap init --target ./my-claude-agent/
-Detecting environment...
-  Framework detected: Claude SDK (from ./agent.py imports)
-  Claude Code: found (v2.1.0)
-  API keys: ANTHROPIC_API_KEY
-  Default model: anthropic/claude-sonnet-4-20250514
+$ ANTHROPIC_API_KEY=sk-ant-*** ap create \
+    "create a research agent with web search" \
+    --model anthropic/claude-sonnet-4-20250514 \
+    --allow-filesystem-access
 
-Starting onboarding agent...
+Creating agent...
+  research-agent/config.yaml
+  research-agent/AGENTS.md
+  research-agent/skills/deep-research/SKILL.md
 
-Agent: I detected a Claude SDK agent. I'll configure agent-plane to
-       use the claude_sdk executor, which runs your agent natively.
+Done. Run `ap server --agent ./research-agent/` to start.
+```
 
-       I'll generate:
-       - config.yaml with executor type: claude_sdk
-       - AGENTS.md with your agent's instructions
-       - Skills ported from your existing prompts
+### Flow 4: Non-interactive — existing agent
 
-       [Approve plan? y/n]
+```
+$ OPENAI_API_KEY=sk-*** ap create \
+    "integrate the LangChain agent in ./my-agent into agent-plane" \
+    --model openai/gpt-5.4 \
+    --allow-filesystem-access
+
+Detected LangChain framework in ./my-agent/agent.py
+Generating remote executor wrapper...
+  my-agent/ap_wrapper.py
+  my-agent/config.yaml
+
+Done. Run `ap server --agent ./my-agent/` to start.
 ```
 
 ---
@@ -412,57 +349,128 @@ agent_plane/
       config.yaml          # Onboarding agent spec
       AGENTS.md            # Onboarding agent instructions
       skills/
-        detect-environment/
-          SKILL.md          # Detect installed tools, API keys, frameworks
+        agent-plane-knowledge/
+          SKILL.md          # Deep knowledge of agent-plane: config.yaml
+                            # format, AGENTS.md conventions, skill/tool
+                            # structure, executor types. References
+                            # existing example agents and design docs.
+        detect-framework/
+          SKILL.md          # Detect frameworks from user code (imports,
+                            # dependencies) and map to executor types.
+                            # Includes the detection signal table.
         generate-agent/
-          SKILL.md          # Generate agent directory from template
-        install-skills/
-          SKILL.md          # Install IDE skills (Claude Code, Codex)
-      tools/
-        python/
-          detect_env.py     # Environment detection tool
-          scaffold.py       # File scaffolding tool
-    cli.py                  # `ap init` command implementation
+          SKILL.md          # Generate agent directory: config.yaml,
+                            # AGENTS.md, skills/, tools/. Knows the
+                            # spec format and produces valid output.
+    providers/              # Copied from mlflow — NOT an mlflow dependency
+      model_catalog/        # 68 per-provider JSON files
+      __init__.py           # get_all_providers, get_models, etc.
+    cli.py                  # `ap create` command implementation
 ```
+
+### Onboarding agent skills
+
+Each skill has a detailed SKILL.md with reference examples and file
+paths so the onboarding agent has deep knowledge of agent-plane
+conventions. The three core skills are:
+
+- **agent-plane-knowledge** — the agent's understanding of agent-plane
+  itself: config format, executor types, skill/tool structure, what
+  makes a good AGENTS.md. References existing example agents and
+  design docs as concrete examples.
+- **detect-framework** — detect the user's framework from code imports
+  and map it to the right executor type. Includes the full detection
+  signal table and knows how to scaffold remote executor wrappers for
+  unsupported frameworks.
+- **generate-agent** — produce a valid agent directory (config.yaml,
+  AGENTS.md, skills/, tools/) from the information gathered during
+  the conversation.
+
+Additional skills to add as the onboarding agent matures:
+
+- **MCP discovery** — find and recommend relevant MCP servers for the
+  agent being created (search registries, match to agent's purpose).
+- **Dependency resolution** — detect missing packages and generate
+  `requirements.txt` or `pyproject.toml` entries.
+
+The onboarding agent should also have **web search** capability to
+debug issues and find additional resources (MCP servers, tool
+packages, example configs, etc.) during the creation flow. Strategy:
+
+- If the selected model provider supports native web search (e.g.
+  OpenAI), use it directly.
+- Otherwise, fall back to bash tools (`curl`/`wget`) for web lookups.
 
 ### CLI entry point addition
 
 ```python
-# In agent_plane/cli.py, add:
+# In agent_plane/cli.py (Click group registered as `ap` in pyproject.toml),
+# add alongside existing `server` and `deploy` commands:
 @cli.command()
-@click.option("--target", default=".", help="Directory to create the agent in.")
-@click.option("--model", default=None, help="Override model selection.")
-@click.option("--framework", default=None, help="Override framework detection.")
-@click.option("--non-interactive", is_flag=True, help="Use defaults, no agent session.")
-def init(target: str, model: str | None, framework: str | None, non_interactive: bool) -> None:
-    """Initialize a new agent-plane agent with guided onboarding."""
+@click.argument("message", required=False, default=None)
+@click.option("--model", default=None, help="Model in litellm format (provider/model_name).")
+@click.option(
+    "--allow-filesystem-access", is_flag=True, default=False,
+    help="Enable filesystem client-side tools for the onboarding agent. "
+    "Recommended for the best experience — lets the agent read your "
+    "existing code and write the generated agent directory directly.",
+)
+def create(
+    message: str | None,
+    model: str | None,
+    allow_filesystem_access: bool,
+) -> None:
+    """Create a new agent-plane agent.
+
+    Interactive (no message): prompts for provider/key, then opens
+    a shell with the onboarding agent.
+
+    Non-interactive (message provided): requires --model; reads
+    credentials from environment variables.
+    """
     ...
 ```
 
-### Model discovery
+### Provider selection and model resolution
 
 ```python
-# Pseudocode for model selection
-def discover_default_model() -> str:
-    """
-    Discover the best available model based on environment.
+# Pseudocode — driven by MLflow model catalog, not hardcoded
 
-    Probes for API keys in priority order, optionally queries
-    MLflow/Databricks serving endpoints if credentials are present.
+# Copied from mlflow/utils/providers.py and mlflow/utils/model_catalog/
+# into agent_plane/onboarding/. MLflow is NOT a dependency.
+from agent_plane.onboarding.providers import (
+    get_all_providers,
+    get_models,
+    get_provider_config_response,
+)
 
-    :return: Model identifier string, e.g. "anthropic/claude-sonnet-4-20250514".
+def prompt_provider_selection() -> ProviderSelection:
     """
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return "anthropic/claude-sonnet-4-20250514"
-    if os.environ.get("OPENAI_API_KEY"):
-        return "openai/gpt-5.4"
-    if os.environ.get("DATABRICKS_TOKEN"):
-        # Optionally query serving endpoints
-        return discover_databricks_model()
-    if os.environ.get("GOOGLE_API_KEY"):
-        return "gemini/gemini-2.5-pro"
-    raise ValueError("No API keys found. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or another provider key.")
+    Present providers, collect credentials, resolve model.
+
+    1. List providers via get_all_providers() (sourced from
+       mlflow/utils/model_catalog/*.json).
+    2. User picks a provider. Prompt for credentials using the
+       auth mode fields from get_provider_config_response(provider).
+    3. List chat-capable models via get_models(provider), filtered
+       to mode="chat". User picks one.
+
+    :return: ProviderSelection with provider, model, and credentials.
+    """
+    ...
 ```
+
+---
+
+## Deferred
+
+- **MLflow assistant on agent-plane** — reimplement the MLflow assistant UI as an agent-plane agent, runnable with any LLM API key. Separate design doc (`MLFLOW_ASSISTANT.md`).
+- **Claude Code skills installation** — detect Claude Code, install `agent-plane-dev` skill into `.claude/skills/`.
+- **Codex skills installation** — detect Codex, install agent-plane skills and configure `agents_sdk` executor with Codex tools.
+- **Gemini IDE integration** — deferred until Gemini has a coding assistant with a skills/plugin system. Already supported as a model provider.
+- **Approval granularity** — how the onboarding agent gets user approval for file writes (plan-level, per-file, or plan + diff review). Recommended: plan approval + final diff confirmation.
+- **REPL frontend** — replace the TUI-based terminal frontend with a line-based REPL (like Claude Code's interface) for the `ap create` interactive session. The TUI works for now but a REPL is more natural for onboarding.
+- **Remote executor scaffolding details** — Dockerfile generation, subprocess lifecycle management for the FastAPI wrapper.
 
 ---
 

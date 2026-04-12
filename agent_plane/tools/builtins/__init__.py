@@ -29,15 +29,7 @@ from agent_plane.tools.builtins.spawn import (
     CheckSubAgentsTool,
     SpawnTool,
 )
-from agent_plane.tools.builtins.web_search_google import (
-    WebSearchGoogleTool,
-)
-from agent_plane.tools.builtins.web_search_openai import (
-    WebSearchOpenAITool,
-)
-from agent_plane.tools.builtins.web_search_perplexity import (
-    WebSearchPerplexityTool,
-)
+from agent_plane.tools.builtins.web_search import WebSearchTool
 
 __all__ = [
     "CancelSubAgentTool",
@@ -45,9 +37,7 @@ __all__ = [
     "LoadSkillTool",
     "ReadSkillFileTool",
     "SpawnTool",
-    "WebSearchGoogleTool",
-    "WebSearchOpenAITool",
-    "WebSearchPerplexityTool",
+    "WebSearchTool",
     "any_skill_has_resources",
     "get_builtin_tool",
     "list_skill_resources",
@@ -128,15 +118,33 @@ def _create_download_file(config: dict[str, str]) -> Tool:
     return DownloadFileTool()
 
 
+def _create_export_agent(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for ExportAgentTool.
+
+    :param config: Tool config (unused).
+    :returns: An ExportAgentTool instance.
+    """
+    from agent_plane.tools.builtins.export_agent import ExportAgentTool
+
+    return ExportAgentTool()
+
+
 _BUILTIN_REGISTRY: dict[str, _BuiltinFactory] = {
-    "web_search_openai": WebSearchOpenAITool,
-    "web_search_google": WebSearchGoogleTool,
-    "web_search_perplexity": WebSearchPerplexityTool,
+    # web_search and web_fetch are handled specially by
+    # ToolManager._create_builtin (they need extra context from
+    # the parent spec). Registered here so get_builtin_tool
+    # doesn't return None for them.
+    "web_search": lambda config: WebSearchTool(config=config),
+    # web_fetch is handled by ToolManager._create_web_fetch (needs
+    # parent spec). Not registered here — ToolManager catches it
+    # before reaching the registry.
     "code_sandbox": _create_code_sandbox,
     "upload_file": _create_upload_file,
     "list_files": _create_list_files,
     "download_file": _create_download_file,
     "search_conversations": _create_search_conversations,
+    "export_agent": _create_export_agent,
 }
 
 
@@ -148,7 +156,7 @@ def get_builtin_tool(
     Instantiate a built-in tool by name with optional config.
 
     :param name: The tool name from ``tools.builtins`` in
-        config.yaml, e.g. ``"web_search_openai"``.
+        config.yaml, e.g. ``"web_search"``.
     :param config: Tool-specific key-value pairs from the spec,
         e.g. ``{"api_key": "sk-...", "engine_id": "abc"}``.
         ``None`` or empty dict means no spec-level config was

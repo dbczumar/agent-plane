@@ -33,6 +33,39 @@ _CLAUDE_CODER_DIR = _REPO_ROOT / "examples" / "agents" / "claude-coder"
 _OPENAI_CODER_DIR = _REPO_ROOT / "examples" / "agents" / "openai-coder"
 
 
+def find_free_port() -> int:
+    """
+    Find a free TCP port by binding to port 0.
+
+    :returns: An available port number.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def wait_for_server(base_url: str, timeout: float = 20.0) -> None:
+    """
+    Poll until the server responds on its conversations endpoint.
+
+    :param base_url: Server base URL, e.g. ``"http://127.0.0.1:8000"``.
+    :param timeout: Max seconds to wait.
+    :raises RuntimeError: If the server doesn't respond.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            resp = httpx.get(f"{base_url}/v1/conversations", timeout=2.0)
+            if resp.status_code in (200, 404):
+                return
+        except httpx.ConnectError:
+            pass
+        time.sleep(0.5)
+    raise RuntimeError(f"Server did not respond within {timeout}s")
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     """
     Register ``--llm-api-key`` CLI option.

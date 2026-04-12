@@ -398,7 +398,7 @@ class _BuiltinEntry(BaseModel):
     ``tools.builtins`` during deploy-time env var expansion.
 
     :param name: The built-in tool name, e.g.
-        ``"web_search_google"``.
+        ``"web_search"``.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -412,7 +412,7 @@ class _ToolsDeploy(BaseModel):
 
     :param builtins: Mixed list of string tool names and dict
         entries with config fields, e.g.
-        ``["web_search_openai", {"name": "web_search_google",
+        ``["web_search", {"name": "web_search",
         "api_key": "${KEY}"}]``.
     """
 
@@ -514,6 +514,52 @@ def _expand_builtin_env_vars(
             raw_builtins[i] = {"name": parsed.name, **expanded}
             changed = True
     return changed
+
+
+@cli.command()
+@click.argument("message", required=False, default=None)
+@click.option(
+    "--model",
+    default=None,
+    help="Model in litellm format (provider/model_name), e.g. 'anthropic/claude-sonnet-4-20250514'.",
+)
+@click.option(
+    "--allow-shell-access",
+    is_flag=True,
+    default=False,
+    help=(
+        "Give the onboarding assistant full shell access — read/write "
+        "the filesystem, run commands, make network calls. Recommended "
+        "for the best experience. Without this, the assistant works in "
+        "a sandbox and exports the finished agent to your chosen path."
+    ),
+)
+def create(
+    message: str | None,
+    model: str | None,
+    allow_shell_access: bool,
+) -> None:
+    # Click uses the docstring as --help text, so param docs go in
+    # a code comment instead to avoid leaking into CLI output.
+    #
+    # :param message: Non-interactive mode prompt, or None for interactive.
+    # :param model: litellm format (provider/model_name).
+    # :param allow_shell_access: Enable full shell client-side tools.
+    """Create a new agent plane agent.
+
+    Interactive (no message): prompts for provider/key, then opens
+    a shell with the onboarding assistant.
+
+    Non-interactive (message provided): requires --model; reads
+    credentials from environment variables.
+    """
+    from agent_plane.onboarding.cli import run_create
+
+    run_create(
+        message=message,
+        model=model,
+        allow_shell_access=allow_shell_access,
+    )
 
 
 if __name__ == "__main__":

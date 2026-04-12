@@ -14,9 +14,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import httpx
+from integrations.toad.jsonrpc import Server
 
 from integrations.toad.events import EventTranslator
-from integrations.toad.jsonrpc import Server
 from integrations.toad.mcp_client import (
     McpConnection,
     parse_mcp_server_params,

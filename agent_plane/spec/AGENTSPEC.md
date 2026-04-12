@@ -126,29 +126,37 @@ config fields (API keys, engine IDs, etc.):
 ```yaml
 tools:
   builtins:
-    - web_search_openai                    # string — no config needed
-    - name: web_search_google              # dict — with config
+    - web_search                           # string — auto-detects backend
+    - name: web_search                     # dict — explicit Google config
       api_key: ${GOOGLE_SEARCH_API_KEY}
       engine_id: ${GOOGLE_SEARCH_ENGINE_ID}
-    - name: web_search_perplexity
+    - name: web_search                     # dict — explicit Perplexity
+      search_provider: perplexity
       api_key: ${PERPLEXITY_API_KEY}
 ```
 
-Keys can be hardcoded or use `${ENV_VAR}` references. When config fields are
-omitted, tools fall back to reading from environment variables.
+Keys can be hardcoded or use `${ENV_VAR}` references (resolved at deploy time
+by the client, not at runtime by the server — the spec is self-contained).
 
-**Available built-in tools:**
+**`web_search` backend selection:**
 
-| Name | Provider | Type | Config Fields |
-|---|---|---|---|
-| `web_search_openai` | OpenAI | Passthrough (provider-native) | None (uses LLM API key) |
-| `web_search_google` | Google | Function (server-executed) | `api_key`, `engine_id` |
-| `web_search_perplexity` | Perplexity | Function (server-executed) | `api_key` |
+- **OpenAI models:** `web_search` works automatically with no config —
+  it uses OpenAI's native `web_search_preview` (server-side). Just add
+  `- web_search` to builtins.
+- **Other models:** `search_provider` must be set to `"google"` or
+  `"perplexity"` with credentials. All config comes from the spec (no
+  environment variable fallbacks).
 
-**Passthrough vs function tools**: `web_search_openai` sends
-`{"type": "web_search_preview"}` directly to the OpenAI Responses API — the LLM
-handles search server-side. The other tools are standard function tools that
-agent-plane executes and returns results to the LLM.
+**`web_fetch` — zero-config web research:** Spawns an internal sub-agent with
+`code_sandbox` to search the web and fetch pages using plain HTTP. No API keys
+needed — works with any model provider. The sub-agent inherits the parent's
+LLM model and credentials. Only works with the default `llm` executor.
+
+```yaml
+tools:
+  builtins:
+    - web_fetch                            # no config needed
+```
 
 ---
 

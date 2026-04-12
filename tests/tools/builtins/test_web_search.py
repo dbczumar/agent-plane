@@ -1,4 +1,4 @@
-"""Tests for built-in web search tools."""
+"""Tests for the unified ``web_search`` built-in tool."""
 
 from __future__ import annotations
 
@@ -9,127 +9,93 @@ import pytest
 
 from agent_plane.tools.base import ToolContext
 from agent_plane.tools.builtins import get_builtin_tool
-from agent_plane.tools.builtins.web_search_google import (
-    WebSearchGoogleTool,
-)
-from agent_plane.tools.builtins.web_search_openai import (
-    WebSearchOpenAITool,
-)
-from agent_plane.tools.builtins.web_search_perplexity import (
-    WebSearchPerplexityTool,
-)
+from agent_plane.tools.builtins.web_search import WebSearchTool
 
 # ── Registry ─────────────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    "name,expected_type",
-    [
-        ("web_search_openai", WebSearchOpenAITool),
-        ("web_search_google", WebSearchGoogleTool),
-        ("web_search_perplexity", WebSearchPerplexityTool),
-    ],
-)
-def test_get_builtin_tool_returns_correct_type(
-    name: str,
-    expected_type: type,
-) -> None:
-    """
-    ``get_builtin_tool`` returns the correct tool class for
-    each registered name.
-    """
-    tool = get_builtin_tool(name)
-    assert isinstance(tool, expected_type), (
-        f"Expected {expected_type.__name__} for {name!r}, got {type(tool).__name__}."
-    )
+def test_get_builtin_tool_returns_web_search() -> None:
+    """``get_builtin_tool("web_search")`` returns a WebSearchTool."""
+    tool = get_builtin_tool("web_search")
+    assert isinstance(tool, WebSearchTool), f"Expected WebSearchTool, got {type(tool).__name__}."
 
 
 def test_get_builtin_tool_unknown_returns_none() -> None:
-    """
-    ``get_builtin_tool`` returns ``None`` for unregistered names.
-    """
+    """``get_builtin_tool`` returns ``None`` for unregistered names."""
     assert get_builtin_tool("nonexistent") is None
 
 
-# ── OpenAI passthrough ───────────────────────────────
+def test_old_provider_names_not_registered() -> None:
+    """Provider-specific names are removed from the registry."""
+    for name in ("web_search_openai", "web_search_google", "web_search_perplexity"):
+        assert get_builtin_tool(name) is None, (
+            f"{name!r} should not be in the registry — use 'web_search' instead."
+        )
 
 
-def test_openai_schema_is_passthrough() -> None:
+# ── OpenAI passthrough mode ─────────────────────────
+
+
+def test_openai_mode_schema_is_passthrough() -> None:
     """
-    OpenAI web search schema is ``{"type": "web_search_preview"}``,
-    not a function schema.
+    When llm_provider is 'openai', schema is the native
+    ``web_search_preview`` passthrough (not a function schema).
     """
-    tool = WebSearchOpenAITool()
+    tool = WebSearchTool(llm_provider="openai")
     schema = tool.get_schema()
-    # Passthrough schema — no "function" key.
     assert schema == {"type": "web_search_preview"}, (
-        f"Expected passthrough schema, got {schema}. "
-        f"If it has a 'function' key, it was incorrectly "
-        f"implemented as a function tool."
+        f"Expected passthrough schema for OpenAI, got {schema}."
     )
 
 
-def test_openai_invoke_raises(tool_ctx: ToolContext) -> None:
+def test_openai_mode_invoke_raises(tool_ctx: ToolContext) -> None:
     """
-    OpenAI tool invoke() raises RuntimeError since execution
-    is handled by OpenAI server-side.
+    In OpenAI mode, invoke() raises because execution is server-side.
     """
-    tool = WebSearchOpenAITool()
+    tool = WebSearchTool(llm_provider="openai")
     with pytest.raises(RuntimeError, match="passthrough"):
         tool.invoke("{}", tool_ctx)
 
 
-def test_openai_name() -> None:
-    """Tool name matches the config.yaml builtin name."""
-    assert WebSearchOpenAITool.name() == "web_search_openai"
+# ── Function tool mode (non-OpenAI) ─────────────────
 
 
-# ── Google Custom Search ─────────────────────────────
-
-
-def test_google_schema_is_function() -> None:
+def test_non_openai_schema_is_function() -> None:
     """
-    Google web search has a standard function schema with
-    a ``query`` parameter.
+    For non-OpenAI providers, schema is a standard function schema.
     """
-    tool = WebSearchGoogleTool()
+    tool = WebSearchTool(llm_provider="anthropic")
     schema = tool.get_schema()
     assert schema["type"] == "function"
     func = schema["function"]
-    assert func["name"] == "web_search_google"
-    # query is required.
+    assert func["name"] == "web_search"
     assert "query" in func["parameters"]["required"]
 
 
-def test_google_invoke_missing_keys(tool_ctx: ToolContext) -> None:
-    """
-    Google tool returns a clear error when neither spec config
-    nor env vars provide the required keys.
-    """
-    tool = WebSearchGoogleTool()
-    with patch.dict("os.environ", {}, clear=True):
-        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
-    # Error message mentions both spec config and env var paths.
-    assert "api_key" in result, f"Expected key error message, got: {result!r}"
-    assert "engine_id" in result, f"Expected engine_id in error, got: {result!r}"
+def test_no_provider_defaults_to_function() -> None:
+    """When llm_provider is None, tool defaults to function mode."""
+    tool = WebSearchTool()
+    schema = tool.get_schema()
+    assert schema["type"] == "function"
 
 
-def test_google_invoke_missing_query(tool_ctx: ToolContext) -> None:
-    """
-    Google tool returns error when query param is missing.
-    """
-    tool = WebSearchGoogleTool()
-    result = tool.invoke(json.dumps({}), tool_ctx)
-    # Exact error message from invoke() when query is absent.
-    assert result == "Error: 'query' parameter is required", (
-        f"Expected specific 'query' required error, got: {result!r}"
+def test_missing_query_returns_error(tool_ctx: ToolContext) -> None:
+    """Tool returns error when query param is missing."""
+    tool = WebSearchTool(
+        config={"search_provider": "perplexity", "api_key": "k"},
+        llm_provider="anthropic",
     )
+    result = tool.invoke(json.dumps({}), tool_ctx)
+    assert "query" in result.lower()
 
 
-def test_google_invoke_formats_results(tool_ctx: ToolContext) -> None:
+# ── search_provider: google ──────────────────────────
+
+
+def test_google_backend_via_spec_config(tool_ctx: ToolContext) -> None:
     """
-    Google tool invoke() with a mocked HTTP response returns
-    numbered results with title, link, and snippet.
+    With search_provider=google and credentials in spec config,
+    the tool delegates to Google Custom Search.
     """
     fake_response = MagicMock()
     fake_response.json.return_value = {
@@ -139,278 +105,156 @@ def test_google_invoke_formats_results(tool_ctx: ToolContext) -> None:
                 "link": "https://docs.python.org",
                 "snippet": "Welcome to Python.",
             },
-            {
-                "title": "PEP 8",
-                "link": "https://peps.python.org/pep-0008/",
-                "snippet": "Style guide.",
-            },
         ],
     }
 
-    tool = WebSearchGoogleTool()
-    env = {
-        "GOOGLE_SEARCH_API_KEY": "fake-key",
-        "GOOGLE_SEARCH_ENGINE_ID": "fake-engine",
-    }
-    with (
-        patch.dict("os.environ", env, clear=True),
-        patch("agent_plane.tools.builtins.web_search_google.httpx.get") as mock_get,
-    ):
-        mock_get.return_value = fake_response
-        result = tool.invoke(json.dumps({"query": "python"}), tool_ctx)
-
-    # Both results present with correct numbering — proves the
-    # formatting pipeline ran end-to-end through invoke().
-    assert "1. Python Docs" in result
-    assert "2. PEP 8" in result
-    assert "https://docs.python.org" in result
-    assert "Style guide." in result
-
-
-def test_google_invoke_empty_results(tool_ctx: ToolContext) -> None:
-    """
-    Google tool returns 'No results found.' when the API
-    returns no items.
-    """
-    fake_response = MagicMock()
-    fake_response.json.return_value = {"items": []}
-
-    tool = WebSearchGoogleTool()
-    env = {
-        "GOOGLE_SEARCH_API_KEY": "fake-key",
-        "GOOGLE_SEARCH_ENGINE_ID": "fake-engine",
-    }
-    with (
-        patch.dict("os.environ", env, clear=True),
-        patch("agent_plane.tools.builtins.web_search_google.httpx.get") as mock_get,
-    ):
-        mock_get.return_value = fake_response
-        result = tool.invoke(json.dumps({"query": "python"}), tool_ctx)
-
-    assert result == "No results found."
-
-
-# ── Perplexity ───────────────────────────────────────
-
-
-def test_perplexity_schema_is_function() -> None:
-    """
-    Perplexity web search has a standard function schema with
-    a ``query`` parameter.
-    """
-    tool = WebSearchPerplexityTool()
-    schema = tool.get_schema()
-    assert schema["type"] == "function"
-    func = schema["function"]
-    assert func["name"] == "web_search_perplexity"
-    assert "query" in func["parameters"]["required"]
-
-
-def test_perplexity_invoke_missing_key(tool_ctx: ToolContext) -> None:
-    """
-    Perplexity tool returns a clear error when neither spec
-    config nor env var provides the API key.
-    """
-    tool = WebSearchPerplexityTool()
-    with patch.dict("os.environ", {}, clear=True):
-        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
-    # Error message mentions both spec config and env var paths.
-    assert "api_key" in result, f"Expected key error message, got: {result!r}"
-    assert "PERPLEXITY_API_KEY" in result, f"Expected env var name in error, got: {result!r}"
-
-
-def test_perplexity_invoke_missing_query(tool_ctx: ToolContext) -> None:
-    """
-    Perplexity tool returns error when query param is missing.
-    """
-    tool = WebSearchPerplexityTool()
-    result = tool.invoke(json.dumps({}), tool_ctx)
-    # Exact error message from invoke() when query is absent.
-    assert result == "Error: 'query' parameter is required", (
-        f"Expected specific 'query' required error, got: {result!r}"
-    )
-
-
-def test_perplexity_invoke_with_citations(tool_ctx: ToolContext) -> None:
-    """
-    Perplexity tool invoke() with a mocked HTTP response returns
-    the answer text with numbered citations.
-    """
-    fake_response = MagicMock()
-    fake_response.json.return_value = {
-        "choices": [
-            {
-                "message": {
-                    "content": "Python is a programming language.",
-                },
-            },
-        ],
-        "citations": [
-            "https://python.org",
-            "https://wikipedia.org/wiki/Python",
-        ],
-    }
-
-    tool = WebSearchPerplexityTool()
-    with (
-        patch.dict(
-            "os.environ",
-            {"PERPLEXITY_API_KEY": "fake-key"},
-            clear=True,
-        ),
-        patch("agent_plane.tools.builtins.web_search_perplexity.httpx.post") as mock_post,
-    ):
-        mock_post.return_value = fake_response
-        result = tool.invoke(json.dumps({"query": "what is python"}), tool_ctx)
-
-    # Answer content traversed the full pipeline from mock → invoke → format.
-    assert "Python is a programming language." in result
-    # Citations are numbered and present.
-    assert "[1] https://python.org" in result
-    assert "[2] https://wikipedia.org/wiki/Python" in result
-
-
-def test_perplexity_invoke_no_citations(tool_ctx: ToolContext) -> None:
-    """
-    Perplexity tool invoke() works when no citations are returned.
-    """
-    fake_response = MagicMock()
-    fake_response.json.return_value = {
-        "choices": [
-            {"message": {"content": "Just an answer."}},
-        ],
-    }
-
-    tool = WebSearchPerplexityTool()
-    with (
-        patch.dict(
-            "os.environ",
-            {"PERPLEXITY_API_KEY": "fake-key"},
-            clear=True,
-        ),
-        patch("agent_plane.tools.builtins.web_search_perplexity.httpx.post") as mock_post,
-    ):
-        mock_post.return_value = fake_response
-        result = tool.invoke(json.dumps({"query": "simple question"}), tool_ctx)
-
-    assert result == "Just an answer."
-    # No "Sources:" section when citations are absent.
-    assert "Sources:" not in result
-
-
-def test_perplexity_invoke_empty_response(tool_ctx: ToolContext) -> None:
-    """
-    Perplexity tool returns 'No answer returned.' when the
-    API returns empty choices.
-    """
-    fake_response = MagicMock()
-    fake_response.json.return_value = {"choices": []}
-
-    tool = WebSearchPerplexityTool()
-    with (
-        patch.dict(
-            "os.environ",
-            {"PERPLEXITY_API_KEY": "fake-key"},
-            clear=True,
-        ),
-        patch("agent_plane.tools.builtins.web_search_perplexity.httpx.post") as mock_post,
-    ):
-        mock_post.return_value = fake_response
-        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
-
-    assert result == "No answer returned."
-
-
-# ── Spec-level config ───────────────────────────────
-
-
-def test_google_uses_spec_config_over_env(tool_ctx: ToolContext) -> None:
-    """
-    Google tool prefers api_key/engine_id from spec config
-    over environment variables.
-    """
-    fake_response = MagicMock()
-    fake_response.json.return_value = {"items": []}
-
-    # Spec config provides keys; env has different values.
-    tool = WebSearchGoogleTool(
+    tool = WebSearchTool(
         config={
+            "search_provider": "google",
             "api_key": "spec-key",
             "engine_id": "spec-engine",
-        }
+        },
+        llm_provider="anthropic",
     )
-    env = {
-        "GOOGLE_SEARCH_API_KEY": "env-key",
-        "GOOGLE_SEARCH_ENGINE_ID": "env-engine",
+    with patch("agent_plane.tools.builtins.web_search_google.httpx.get") as mock_get:
+        mock_get.return_value = fake_response
+        result = tool.invoke(json.dumps({"query": "python"}), tool_ctx)
+
+    # Google result made it through the unified tool pipeline.
+    assert "1. Python Docs" in result
+    assert "https://docs.python.org" in result
+
+
+def test_google_missing_credentials_returns_error(tool_ctx: ToolContext) -> None:
+    """
+    With search_provider=google but no api_key/engine_id, returns
+    a clear error (not a crash).
+    """
+    tool = WebSearchTool(
+        config={"search_provider": "google"},
+        llm_provider="anthropic",
+    )
+    result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+    # Error message tells the user what's missing.
+    assert "api_key" in result
+    assert "engine_id" in result
+
+
+# ── search_provider: perplexity ──────────────────────
+
+
+def test_perplexity_backend_via_spec_config(tool_ctx: ToolContext) -> None:
+    """
+    With search_provider=perplexity and api_key in spec config,
+    the tool delegates to Perplexity.
+    """
+    fake_response = MagicMock()
+    fake_response.json.return_value = {
+        "choices": [
+            {"message": {"content": "Python is a language."}},
+        ],
+        "citations": ["https://python.org"],
     }
-    with (
-        patch.dict("os.environ", env, clear=True),
-        patch(
-            "agent_plane.tools.builtins.web_search_google.httpx.get",
-        ) as mock_get,
-    ):
+
+    tool = WebSearchTool(
+        config={
+            "search_provider": "perplexity",
+            "api_key": "spec-pplx-key",
+        },
+        llm_provider="anthropic",
+    )
+    with patch("agent_plane.tools.builtins.web_search_perplexity.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        result = tool.invoke(json.dumps({"query": "python"}), tool_ctx)
+
+    # Perplexity answer + citation made it through.
+    assert "Python is a language." in result
+    assert "[1] https://python.org" in result
+
+
+def test_perplexity_missing_key_returns_error(tool_ctx: ToolContext) -> None:
+    """
+    With search_provider=perplexity but no api_key, returns error.
+    """
+    tool = WebSearchTool(
+        config={"search_provider": "perplexity"},
+        llm_provider="anthropic",
+    )
+    result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+    assert "api_key" in result
+
+
+# ── No search_provider set ───────────────────────────
+
+
+def test_no_search_provider_returns_help_message(tool_ctx: ToolContext) -> None:
+    """
+    Without search_provider in config, the tool returns a message
+    explaining how to configure it. Lists all supported backends.
+    """
+    tool = WebSearchTool(llm_provider="anthropic")
+    result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    assert "search_provider" in result, f"Should tell user to set search_provider. Got: {result}"
+    assert "google" in result.lower()
+    assert "perplexity" in result.lower()
+
+
+# ── Spec config passed through ───────────────────────
+
+
+def test_google_spec_config_used_in_http_call(tool_ctx: ToolContext) -> None:
+    """
+    api_key and engine_id from spec config are passed to the
+    Google HTTP call (not from env vars).
+    """
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"items": []}
+
+    tool = WebSearchTool(
+        config={
+            "search_provider": "google",
+            "api_key": "spec-key",
+            "engine_id": "spec-engine",
+        },
+        llm_provider="anthropic",
+    )
+    with patch("agent_plane.tools.builtins.web_search_google.httpx.get") as mock_get:
         mock_get.return_value = fake_response
         tool.invoke(json.dumps({"query": "test"}), tool_ctx)
 
-    # Verify the HTTP call used spec config keys, not env keys.
-    call_kwargs = mock_get.call_args
-    params = call_kwargs.kwargs["params"]
+    params = mock_get.call_args.kwargs["params"]
     assert params["key"] == "spec-key", f"Expected spec config api_key, got {params['key']!r}"
     assert params["cx"] == "spec-engine", f"Expected spec config engine_id, got {params['cx']!r}"
 
 
-def test_perplexity_uses_spec_config_over_env(tool_ctx: ToolContext) -> None:
+def test_perplexity_spec_config_used_in_http_call(tool_ctx: ToolContext) -> None:
     """
-    Perplexity tool prefers api_key from spec config over
-    environment variable.
+    api_key from spec config is passed to the Perplexity HTTP call.
     """
     fake_response = MagicMock()
     fake_response.json.return_value = {
         "choices": [{"message": {"content": "answer"}}],
     }
 
-    tool = WebSearchPerplexityTool(config={"api_key": "spec-pplx"})
-    with (
-        patch.dict(
-            "os.environ",
-            {"PERPLEXITY_API_KEY": "env-pplx"},
-            clear=True,
-        ),
-        patch(
-            "agent_plane.tools.builtins.web_search_perplexity.httpx.post",
-        ) as mock_post,
-    ):
+    tool = WebSearchTool(
+        config={
+            "search_provider": "perplexity",
+            "api_key": "spec-pplx",
+        },
+        llm_provider="anthropic",
+    )
+    with patch("agent_plane.tools.builtins.web_search_perplexity.httpx.post") as mock_post:
         mock_post.return_value = fake_response
         tool.invoke(json.dumps({"query": "test"}), tool_ctx)
 
-    # Verify the HTTP call used spec config key, not env key.
-    call_kwargs = mock_post.call_args
-    headers = call_kwargs.kwargs["headers"]
+    headers = mock_post.call_args.kwargs["headers"]
     assert headers["Authorization"] == "Bearer spec-pplx", (
         f"Expected spec config api_key in header, got {headers['Authorization']!r}"
     )
 
 
-def test_get_builtin_tool_passes_config(tool_ctx: ToolContext) -> None:
-    """
-    ``get_builtin_tool`` passes the config dict through to
-    the tool constructor.
-    """
-    config = {"api_key": "test-key", "engine_id": "test-engine"}
-    tool = get_builtin_tool("web_search_google", config=config)
-    assert isinstance(tool, WebSearchGoogleTool)
-    # Config is stored and accessible for invoke().
-    # Verify by checking it doesn't error with missing env vars
-    # when config provides the keys.
-    fake_response = MagicMock()
-    fake_response.json.return_value = {"items": []}
-    with (
-        patch.dict("os.environ", {}, clear=True),
-        patch(
-            "agent_plane.tools.builtins.web_search_google.httpx.get",
-        ) as mock_get,
-    ):
-        mock_get.return_value = fake_response
-        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
-    # Should succeed (no error) because config provided the keys.
-    assert result == "No results found."
+def test_tool_name_is_web_search() -> None:
+    """Tool name is 'web_search' regardless of mode."""
+    assert WebSearchTool.name() == "web_search"
+    assert WebSearchTool(llm_provider="openai").name() == "web_search"

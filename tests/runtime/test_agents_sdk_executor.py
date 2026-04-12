@@ -194,7 +194,7 @@ def test_extract_codex_tools_strips_prefix() -> None:
     spec.tools.builtins = [
         BuiltinToolConfig(name="codex:Shell"),
         BuiltinToolConfig(name="codex:ApplyPatch"),
-        BuiltinToolConfig(name="web_search_openai"),
+        BuiltinToolConfig(name="web_search"),
     ]
     result = _extract_codex_tools(spec)
     assert result == ["Shell", "ApplyPatch"]
@@ -209,7 +209,7 @@ def test_extract_codex_tools_empty_when_no_prefix() -> None:
         tools=AgentSpec(spec_version=1).tools,
     )
     spec.tools.builtins = [
-        BuiltinToolConfig(name="web_search_openai"),
+        BuiltinToolConfig(name="web_search"),
     ]
     result = _extract_codex_tools(spec)
     assert result == []
@@ -220,17 +220,17 @@ def test_extract_codex_tools_empty_when_no_prefix() -> None:
 
 def test_has_web_search_true() -> None:
     """
-    Returns True when ``web_search_openai`` is present.
+    Returns True when ``web_search`` is present.
     """
     builtins = [
-        BuiltinToolConfig(name="web_search_openai"),
+        BuiltinToolConfig(name="web_search"),
     ]
     assert _has_web_search(builtins) is True
 
 
 def test_has_web_search_false() -> None:
     """
-    Returns False when ``web_search_openai`` is absent.
+    Returns False when ``web_search`` is absent.
     """
     builtins = [
         BuiltinToolConfig(name="codex:Shell"),

@@ -55,7 +55,7 @@ class ToolManager:
     Registers at init:
     - ``load_skill`` (if the agent has skills)
     - ``read_skill_file`` (if any skill has bundled resources)
-    - Built-in tools from ``tools.builtins`` (e.g. ``web_search_openai``)
+    - Built-in tools from ``tools.builtins`` (e.g. ``web_search``)
     - One :class:`LocalPythonTool` per ``tools/python/*.py`` file
     - One :class:`ClientSideTool` per entry in ``client_tool_specs``
 
@@ -134,8 +134,8 @@ class ToolManager:
             if tool is None:
                 _logger.warning(
                     "Unknown built-in tool %r — skipping. "
-                    "Available: web_search_openai, web_search_google, "
-                    "web_search_perplexity, code_sandbox, upload_file",
+                    "Available: web_search, code_sandbox, upload_file, "
+                    "search_conversations, list_files, download_file",
                     entry.name,
                 )
                 continue
@@ -153,22 +153,59 @@ class ToolManager:
         :param config: Optional spec-level config dict.
         :returns: A :class:`Tool` instance, or ``None``.
         """
+        if name == "web_search":
+            return self._create_web_search(config)
+        if name == "web_fetch":
+            return self._create_web_fetch()
         if name == "code_sandbox":
-            from agent_plane.tools.builtins.code_sandbox import (
-                CodeSandboxTool,
-            )
-
-            return CodeSandboxTool(
-                srt_available=self._srt_available,
-                sandbox_enabled=self._sandbox_enabled,
-            )
+            return self._create_code_sandbox()
         if name == "upload_file":
-            from agent_plane.tools.builtins.upload_file import (
-                UploadFileTool,
-            )
+            from agent_plane.tools.builtins.upload_file import UploadFileTool
 
             return UploadFileTool()
         return get_builtin_tool(name, config=config)
+
+    def _create_web_search(self, config: dict[str, str] | None) -> Tool:
+        """
+        Build a WebSearchTool with the parent's LLM provider.
+
+        Uses ``parse_model_string`` to resolve the provider from
+        the model string (e.g. ``"gpt-5.4"`` → ``"openai"``).
+
+        :param config: Spec-level tool config.
+        :returns: A configured WebSearchTool.
+        """
+        from agent_plane.tools.builtins.web_search import WebSearchTool
+
+        llm_provider = None
+        if self._spec.llm is not None and self._spec.llm.model:
+            from agent_plane.llms.routing import parse_model_string
+
+            llm_provider = parse_model_string(self._spec.llm.model).provider
+        return WebSearchTool(config=config, llm_provider=llm_provider)
+
+    def _create_web_fetch(self) -> Tool:
+        """
+        Build a WebFetchTool with the parent's spec.
+
+        :returns: A WebFetchTool that inherits the parent's LLM config.
+        """
+        from agent_plane.tools.builtins.web_fetch import WebFetchTool
+
+        return WebFetchTool(parent_spec=self._spec)
+
+    def _create_code_sandbox(self) -> Tool:
+        """
+        Build a CodeSandboxTool with runtime capability flags.
+
+        :returns: A CodeSandboxTool with srt/sandbox settings.
+        """
+        from agent_plane.tools.builtins.code_sandbox import CodeSandboxTool
+
+        return CodeSandboxTool(
+            srt_available=self._srt_available,
+            sandbox_enabled=self._sandbox_enabled,
+        )
 
     def _register_sub_agent_tools(self) -> None:
         """
@@ -284,7 +321,7 @@ class ToolManager:
         Return the names of all registered tools.
 
         :returns: Tool names, e.g. ``["spawn_sub_agents",
-            "load_skill", "web_search_openai"]``.
+            "load_skill", "web_search"]``.
         """
         return list(self._tools.keys())
 
