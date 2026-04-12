@@ -61,14 +61,14 @@ class VertexAdapter(GeminiAdapter):
         import google.auth
         import google.auth.transport.requests
 
-        credentials, _ = google.auth.default(scopes=_DEFAULT_SCOPES)
-        request = google.auth.transport.requests.Request()
+        credentials, _ = google.auth.default(  # type: ignore[no-untyped-call]
+            scopes=_DEFAULT_SCOPES,
+        )
+        request = google.auth.transport.requests.Request()  # type: ignore[no-untyped-call]
         # 30s timeout for the OAuth token refresh HTTP request.
         # The SDK default is 120s; we tighten it so a hanging
         # metadata server doesn't block the LLM call too long.
-        credentials.refresh(  # type: ignore[no-untyped-call]
-            functools.partial(request, timeout=_AUTH_REFRESH_TIMEOUT)
-        )
+        credentials.refresh(functools.partial(request, timeout=_AUTH_REFRESH_TIMEOUT))
         self._cached_credentials = credentials
         return credentials
 

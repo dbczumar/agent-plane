@@ -144,8 +144,10 @@ class RichBlockFormatter:
     def format_tool_result(self, block: ToolResultBlock) -> list[FormattedItem]:
         """Render a tool result panel (no call line — already displayed)."""
         ex = ToolExecution(
-            name=block.name, call_id=block.call_id,
-            agent_name=block.agent_name, output=block.output,
+            name=block.name,
+            call_id=block.call_id,
+            agent_name=block.agent_name,
+            output=block.output,
         )
         return [self._tool_result_panel(ex)]
 
