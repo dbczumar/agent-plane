@@ -3,7 +3,7 @@
 Requires ``--llm-api-key`` and a real server. Run with::
 
     pytest tests/e2e/test_archer_local_tool.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 
 Exercises:
 - Local tool discovery (``tools/python/word_count.py`` in the archer bundle)

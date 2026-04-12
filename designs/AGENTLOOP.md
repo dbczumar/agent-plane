@@ -429,7 +429,7 @@ mcp>=1.0
    persisted to conversation, steering works, inbox drained on exit
 3. **Manual smoke test**: A checked-in script (e.g. `scripts/smoke_test.sh`)
    that accepts an LLM API key as input (e.g.
-   `./scripts/smoke_test.sh $(cat /tmp/mykey)`). The script starts the
+   `./scripts/smoke_test.sh $LLM_API_KEY`). The script starts the
    server, registers an agent bundle with a real LLM config using the
    provided key, `POST /v1/responses`, and verifies the response comes
    back with real LLM output.

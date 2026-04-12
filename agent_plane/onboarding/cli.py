@@ -60,6 +60,7 @@ def run_create(
     selection = _resolve_selection(message, model)
 
     from rich.console import Console
+
     Console().print(f"\n  [bold]Onboarding model:[/bold] {selection.model}")
 
     agent_dir = _prepare_onboarding_agent(selection, allow_shell_access)

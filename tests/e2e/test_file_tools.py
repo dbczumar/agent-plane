@@ -7,7 +7,7 @@ to find it and download_file to retrieve it.
 Usage::
 
     pytest tests/e2e/test_file_tools.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 """
 
 from __future__ import annotations

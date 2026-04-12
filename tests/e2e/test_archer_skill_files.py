@@ -9,7 +9,7 @@ Uses the ``deep-research`` skill which has a
 Usage::
 
     pytest tests/e2e/test_archer_skill_files.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 """
 
 from __future__ import annotations

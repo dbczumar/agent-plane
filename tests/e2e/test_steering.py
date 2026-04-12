@@ -8,7 +8,7 @@ acknowledges the steer.
 Usage::
 
     pytest tests/e2e/test_steering.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 """
 
 from __future__ import annotations

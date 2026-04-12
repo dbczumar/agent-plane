@@ -1,7 +1,7 @@
 """Integration tests — StreamRenderer against a real agent-plane server.
 
 These require an LLM API key. Run with:
-    pytest tests/frontends/sdk/test_integration.py --llm-api-key $(cat /tmp/mykey) -v
+    pytest tests/frontends/sdk/test_integration.py --llm-api-key $LLM_API_KEY -v
 
 Skipped automatically if no API key is provided.
 """

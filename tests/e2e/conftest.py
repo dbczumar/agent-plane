@@ -2,7 +2,7 @@
 
 Usage::
 
-    pytest tests/e2e/ --llm-api-key $(cat /tmp/mykey) -v
+    pytest tests/e2e/ --llm-api-key $LLM_API_KEY -v
 
 These tests start a real ``ap server`` subprocess, upload real
 agent bundles, and call real LLM APIs. They are excluded from

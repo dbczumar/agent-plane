@@ -12,7 +12,7 @@ causing the function-tool path instead of the passthrough.
 Usage::
 
     pytest tests/e2e/test_archer_web_search.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 """
 
 from __future__ import annotations

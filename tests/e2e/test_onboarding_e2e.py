@@ -6,7 +6,7 @@ and that the generated agent can be served by agent-plane.
 Usage::
 
     pytest tests/e2e/test_onboarding_e2e.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 
 These tests use a real LLM API key and real server. They are
 excluded from the default ``pytest`` run.

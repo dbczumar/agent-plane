@@ -8,7 +8,7 @@ searches in a loop.
 Usage::
 
     pytest tests/e2e/test_native_tool_persistence.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 """
 
 from __future__ import annotations

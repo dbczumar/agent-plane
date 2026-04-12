@@ -8,7 +8,7 @@ sub-agent's output — no second message or manual polling needed.
 Usage::
 
     pytest tests/e2e/test_claude_coder_auto_collect.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 """
 
 from __future__ import annotations

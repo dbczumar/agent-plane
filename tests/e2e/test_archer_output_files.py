@@ -9,7 +9,7 @@ via ``GET /v1/files/{file_id}/content``.
 Usage::
 
     pytest tests/e2e/test_archer_output_files.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 """
 
 from __future__ import annotations

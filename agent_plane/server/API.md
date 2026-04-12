@@ -15,7 +15,7 @@ and files (`/v1/files`).
 
 **How to verify consistency**: When implementing or modifying these APIs, test the
 corresponding endpoint on the reference implementation using an OpenAI API key
-(stored at `/tmp/mykey`). Compare request/response shapes, field names, status codes,
+(stored at `$LLM_API_KEY`). Compare request/response shapes, field names, status codes,
 and edge case behavior. Our APIs should accept a superset of the reference input
 (additional fields like `conversation`) and return a superset of the reference output
 (additional fields like `conversation`, `response_id` on items).

@@ -8,7 +8,7 @@ whether the fetched content is relevant.
 Usage::
 
     pytest tests/e2e/test_web_fetch_e2e.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 """
 
 from __future__ import annotations

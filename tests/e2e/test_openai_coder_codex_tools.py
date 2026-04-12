@@ -12,7 +12,7 @@ end-to-end without any client-side tools or code_sandbox.
 Usage::
 
     pytest tests/e2e/test_openai_coder_codex_tools.py \\
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 """
 
 from __future__ import annotations

@@ -464,7 +464,7 @@ empty sub-agent output, "Unknown tool" errors, the DBOS thread pool
 deadlock, and turns completing before sub-agents finish.
 
 ```bash
-pytest tests/e2e/ --llm-api-key $(cat /tmp/mykey) -v
+pytest tests/e2e/ --llm-api-key $LLM_API_KEY -v
 ```
 
 The e2e tests are excluded from the default `pytest` run (no API key

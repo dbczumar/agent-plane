@@ -7,7 +7,7 @@ agent which has sub-agents, skills, and web search.
 Usage::
 
     pytest tests/e2e/test_agents_sdk_basic.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 """
 
 from __future__ import annotations

@@ -7,7 +7,7 @@ callback, and that the sub-agent executes and returns results.
 Usage::
 
     pytest tests/e2e/test_claude_coder_subagent.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 """
 
 from __future__ import annotations

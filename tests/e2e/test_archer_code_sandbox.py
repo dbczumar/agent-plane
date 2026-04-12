@@ -3,7 +3,7 @@
 Requires ``--llm-api-key`` and a real server. Run with::
 
     pytest tests/e2e/test_archer_code_sandbox.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 
 Exercises:
 - code_sandbox tool executing pip and npm install commands

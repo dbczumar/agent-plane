@@ -10,7 +10,7 @@ Uses the ``archer`` agent which has ``code_sandbox`` enabled.
 Usage::
 
     pytest tests/e2e/test_sandbox_dependencies.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 """
 
 from __future__ import annotations

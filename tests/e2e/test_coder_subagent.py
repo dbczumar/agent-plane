@@ -3,7 +3,7 @@
 Requires ``--llm-api-key`` and a real server. Run with::
 
     pytest tests/e2e/test_coder_subagent.py \\
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 
 Tests exercise:
 - Sub-agent spawning with real LLM

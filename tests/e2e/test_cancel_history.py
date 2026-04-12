@@ -3,7 +3,7 @@
 Requires ``--llm-api-key`` and a real server. Run with::
 
     pytest tests/e2e/test_cancel_history.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 
 Exercises:
 - Cancelling an in-progress response via the cancel endpoint

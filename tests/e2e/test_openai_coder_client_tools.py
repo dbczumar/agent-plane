@@ -12,7 +12,7 @@ server-side codex MCP tools (Shell, ApplyPatch) directly.
 Usage::
 
     pytest tests/e2e/test_openai_coder_client_tools.py \\
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 """
 
 from __future__ import annotations

@@ -3,7 +3,7 @@
 Requires ``--llm-api-key`` and a real server. Run with::
 
     pytest tests/e2e/test_compaction_e2e.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 
 Uses ``AP_CONTEXT_WINDOW_OVERRIDE=4096`` so the server thinks the
 model has a tiny context window. With ``trigger_threshold: 0.01``

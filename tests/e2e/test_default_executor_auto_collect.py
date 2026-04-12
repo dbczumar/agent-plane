@@ -8,7 +8,7 @@ and summarizer sub-agents.
 Usage::
 
     pytest tests/e2e/test_default_executor_auto_collect.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 """
 
 from __future__ import annotations

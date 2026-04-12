@@ -6,7 +6,7 @@ its own configuration — tools, skills, sub-agents. Uses LLM judges.
 Usage::
 
     pytest tests/e2e/test_archer_introspect.py \
-        --llm-api-key $(cat /tmp/mykey) -v
+        --llm-api-key $LLM_API_KEY -v
 """
 
 from __future__ import annotations
