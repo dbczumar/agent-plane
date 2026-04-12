@@ -81,6 +81,29 @@ SPINNER_VERBS = [
 _MAX_RESULT_LINES = 30
 _MAX_RESULT_CHARS = 4000
 
+# Pygments lexer name → Rich Syntax language name.
+_LEXER_NAME_MAP: dict[str, str] = {
+    "python": "python",
+    "python 3": "python",
+    "javascript": "javascript",
+    "typescript": "typescript",
+    "bash": "bash",
+    "shell": "bash",
+    "go": "go",
+    "rust": "rust",
+    "java": "java",
+    "c": "c",
+    "c++": "cpp",
+    "ruby": "ruby",
+    "yaml": "yaml",
+    "json": "json",
+    "toml": "toml",
+    "html": "html",
+    "css": "css",
+    "sql": "sql",
+    "markdown": "markdown",
+}
+
 
 def _tool_color(name: str) -> str:
     """Get the accent color for a tool, with fallback for unknown tools."""
@@ -98,25 +121,27 @@ _MAX_USER_MSG_LINES = 4
 
 def render_user_message(console: Console, text: str) -> None:
     """Render the user's message with gray background, truncated to 4 lines."""
-    truncated = _truncate_user_text(text)
+    truncated = truncate_user_text(text)
     console.print()
     console.print(
-        Text.from_markup(f" [{ACCENT}]❯[/{ACCENT}] [on #1a1a1a]{_escape(truncated)}[/on #1a1a1a]")
+        Text.from_markup(
+            f" [{ACCENT}]❯[/{ACCENT}] [on #1a1a1a]{escape_markup(truncated)}[/on #1a1a1a]"
+        )
     )
 
 
 def render_steering_message(console: Console, text: str) -> None:
     """Render a steering message with gray background."""
-    truncated = _truncate_user_text(text)
+    truncated = truncate_user_text(text)
     console.print(
         Text.from_markup(
             f" [{ACCENT}]❯[/{ACCENT}] [{DIM}](steering)[/{DIM}]"
-            f" [on #1a1a1a]{_escape(truncated)}[/on #1a1a1a]"
+            f" [on #1a1a1a]{escape_markup(truncated)}[/on #1a1a1a]"
         )
     )
 
 
-def _truncate_user_text(text: str) -> str:
+def truncate_user_text(text: str) -> str:
     """Truncate user text to _MAX_USER_MSG_LINES lines."""
     lines = text.split("\n")
     if len(lines) <= _MAX_USER_MSG_LINES:
@@ -181,19 +206,19 @@ def build_tool_result_panel(name: str, output: str) -> RenderableType:
             renderable = Group(*parts) if len(parts) > 1 else parts[0]
         except (ValueError, KeyError):
             body = "\n".join(visible)
-            renderable = Text.from_markup(f"[{DIM}]{_escape(body)}[/{DIM}]")
+            renderable = Text.from_markup(f"[{DIM}]{escape_markup(body)}[/{DIM}]")
             if footer is not None:
                 renderable = Group(renderable, footer)
     else:
         body = "\n".join(visible)
-        renderable = Text.from_markup(f"[{DIM}]{_escape(body)}[/{DIM}]")
+        renderable = Text.from_markup(f"[{DIM}]{escape_markup(body)}[/{DIM}]")
         if footer is not None:
             renderable = Group(renderable, footer)
 
     return Padding(
         Panel(
             renderable,
-            title=f"[{DIM}]{_escape(first_line)}[/{DIM}]",
+            title=f"[{DIM}]{escape_markup(first_line)}[/{DIM}]",
             title_align="left",
             border_style=color,
             box=box.ROUNDED,
@@ -240,7 +265,7 @@ def render_reasoning_end(console: Console, reasoning: str, summary: str) -> None
     console.print(
         Padding(
             Panel(
-                Text.from_markup(f"[{REASONING}]{_escape(preview)}[/{REASONING}]"),
+                Text.from_markup(f"[{REASONING}]{escape_markup(preview)}[/{REASONING}]"),
                 title=f"[{MUTED}]thinking[/{MUTED}]",
                 title_align="left",
                 border_style=MUTED,
@@ -286,7 +311,7 @@ def _build_reasoning_panel(reasoning: str, summary: str) -> RenderableType:
 
     return Padding(
         Panel(
-            Text.from_markup(f"[{REASONING}]{_escape(preview)}[/{REASONING}]"),
+            Text.from_markup(f"[{REASONING}]{escape_markup(preview)}[/{REASONING}]"),
             title=f"[{MUTED}]thinking[/{MUTED}]",
             title_align="left",
             border_style=MUTED,
@@ -326,7 +351,7 @@ def render_error(console: Console, message: str) -> None:
     console.print(
         Padding(
             Panel(
-                Text.from_markup(f"[{ERROR}]{_escape(message)}[/{ERROR}]"),
+                Text.from_markup(f"[{ERROR}]{escape_markup(message)}[/{ERROR}]"),
                 border_style="#ff6b80",
                 box=box.ROUNDED,
                 padding=(0, 1),
@@ -419,7 +444,7 @@ def render_server_ready(console: Console, url: str) -> None:
 # ── Helpers ──────────────────────────────────────────────
 
 
-def _escape(text: str) -> str:
+def escape_markup(text: str) -> str:
     """Escape Rich markup characters in text."""
     return text.replace("[", "\\[").replace("]", "\\]")
 
@@ -504,30 +529,7 @@ def _guess_language(tool_name: str, output: str) -> str:
         from pygments.lexers import guess_lexer
 
         lexer = guess_lexer(output[:2000])
-        # Pygments returns lexer names like "Python", "JavaScript".
-        # Map to short names that Rich's Syntax accepts.
         name = lexer.name.lower()
-        _LEXER_NAME_MAP = {
-            "python": "python",
-            "python 3": "python",
-            "javascript": "javascript",
-            "typescript": "typescript",
-            "bash": "bash",
-            "shell": "bash",
-            "go": "go",
-            "rust": "rust",
-            "java": "java",
-            "c": "c",
-            "c++": "cpp",
-            "ruby": "ruby",
-            "yaml": "yaml",
-            "json": "json",
-            "toml": "toml",
-            "html": "html",
-            "css": "css",
-            "sql": "sql",
-            "markdown": "markdown",
-        }
         return _LEXER_NAME_MAP.get(name, "text")
     except Exception:
         return "text"

@@ -282,7 +282,7 @@ class Repl:
                         continue
 
                 # Show user message.
-                user_text = renderer._escape(renderer._truncate_user_text(line))
+                user_text = renderer.escape_markup(renderer.truncate_user_text(line))
                 rprint(
                     f" [{renderer.ACCENT}]❯[/{renderer.ACCENT}]"
                     f" [on #1a1a1a]{user_text}[/on #1a1a1a]"
@@ -380,7 +380,7 @@ class Repl:
                     # Flush complete lines immediately.
                     while "\n" in accumulated_text:
                         line_out, accumulated_text = accumulated_text.split("\n", 1)
-                        rprint(f"   {renderer._escape(line_out)}")
+                        rprint(f"   {renderer.escape_markup(line_out)}")
                     # For text without newlines: flush at word boundaries
                     # once we've buffered ~30+ chars. This gives a few
                     # words per flush — fast enough to feel real-time,
@@ -388,7 +388,7 @@ class Repl:
                     if len(accumulated_text) >= 30:
                         last_space = accumulated_text.rfind(" ")
                         if last_space > 0:
-                            rprint(f"   {renderer._escape(accumulated_text[:last_space])}")
+                            rprint(f"   {renderer.escape_markup(accumulated_text[:last_space])}")
                             accumulated_text = accumulated_text[last_space + 1 :]
 
                 elif isinstance(event, ToolCall):
@@ -399,7 +399,7 @@ class Repl:
                     if in_text:
                         in_text = False
                         if accumulated_text.strip():
-                            rprint(f"   {renderer._escape(accumulated_text)}")
+                            rprint(f"   {renderer.escape_markup(accumulated_text)}")
                         accumulated_text = ""
                     rprint(
                         renderer._build_tool_call_line(
@@ -422,7 +422,7 @@ class Repl:
                         in_text = False
                         # Flush remaining partial line.
                         if accumulated_text.strip():
-                            rprint(f"   {renderer._escape(accumulated_text)}")
+                            rprint(f"   {renderer.escape_markup(accumulated_text)}")
                         # Re-render full text as rich markdown if it
                         # contains code blocks (syntax highlighting).
                         if full_text.strip() and "```" in full_text:
@@ -459,7 +459,7 @@ class Repl:
                     if in_text:
                         in_text = False
                         if accumulated_text.strip():
-                            rprint(f"   {renderer._escape(accumulated_text)}")
+                            rprint(f"   {renderer.escape_markup(accumulated_text)}")
                         if full_text.strip() and "```" in full_text:
                             rprint(renderer._build_message_text(full_text))
                     accumulated_text = ""
@@ -479,7 +479,7 @@ class Repl:
                     if in_text:
                         in_text = False
                         if accumulated_text.strip():
-                            rprint(f"   {renderer._escape(accumulated_text)}")
+                            rprint(f"   {renderer.escape_markup(accumulated_text)}")
                         accumulated_text = ""
                         full_text = ""
                     rprint(
