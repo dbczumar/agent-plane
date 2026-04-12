@@ -1147,8 +1147,8 @@ async def test_steering_during_auto_collect(
 
     # Gate: both blocked calls are entered. Now we know the
     # parent and sub-agent are each sitting on a blocked call.
-    call_a.call_event.wait(timeout=10)
-    call_b.call_event.wait(timeout=10)
+    await asyncio.wait_for(call_a.call_event.wait(), timeout=10)
+    await asyncio.wait_for(call_b.call_event.wait(), timeout=10)
 
     parent_call, sub_call = _identify_parent_and_sub(
         call_a,
@@ -1309,8 +1309,8 @@ async def test_ghost_text_persisted_before_auto_collect(
     conv_id = first.body["conversation"]["id"]
 
     # Gate: both blocked calls are entered.
-    call_a.call_event.wait(timeout=10)
-    call_b.call_event.wait(timeout=10)
+    await asyncio.wait_for(call_a.call_event.wait(), timeout=10)
+    await asyncio.wait_for(call_b.call_event.wait(), timeout=10)
 
     parent_call, sub_call = _identify_parent_and_sub(
         call_a,

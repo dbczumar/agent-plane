@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 
-from sqlalchemy import and_, asc, delete, desc, func, or_, select, text
-from sqlalchemy.orm import Session
+from sqlalchemy import Select, and_, asc, delete, desc, func, or_, select, text
+from sqlalchemy.orm import QueryableAttribute, Session
 
 from agent_plane.db.db_models import SqlConversation, SqlConversationItem, SqlTask
 from agent_plane.db.utils import (
@@ -40,6 +40,7 @@ def _to_conversation(row: SqlConversation) -> Conversation:
     return Conversation(
         id=row.id,
         created_at=row.created_at,
+        updated_at=row.updated_at,
         title=row.title,
         kind=row.kind,
     )
@@ -122,9 +123,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             execution conversations.
         :returns: The newly created :class:`Conversation`.
         """
+        now = now_epoch()
         row = SqlConversation(
             id=generate_conversation_id(),
-            created_at=now_epoch(),
+            created_at=now,
+            updated_at=now,
             kind=kind,
         )
         with self._session() as session:
@@ -358,6 +361,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             # SQLite the database-level lock already serializes.
             self._lock_conversation(session, conversation_id)
 
+            # Bump updated_at on the conversation.
+            conv_row = session.get(SqlConversation, conversation_id)
+            if conv_row is not None:
+                conv_row.updated_at = now
+
             # coalesce to -1 so the first appended item gets position 0.
             max_pos = session.execute(
                 select(func.coalesce(func.max(SqlConversationItem.position), -1)).where(
@@ -403,6 +411,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         before: str | None = None,
         order: str = "desc",
         kind: str | None = "default",
+        sort_by: str = "created_at",
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -414,11 +423,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param before: Cursor conversation ID; return
             conversations appearing before this one in sort
             order.
-        :param order: Sort direction on ``created_at``,
-            ``"desc"`` or ``"asc"``.
+        :param order: Sort direction, ``"desc"`` or ``"asc"``.
+        :param kind: Filter to conversations of this kind.
+        :param sort_by: Column to sort on, ``"created_at"``
+            or ``"updated_at"``.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
+        sort_col = self._resolve_sort_column(sort_by)
         with self._session() as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
@@ -427,36 +439,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             if kind is not None:
                 stmt = stmt.where(SqlConversation.kind == kind)
             if after:
-                sub = (
-                    select(SqlConversation.created_at)
-                    .where(SqlConversation.id == after)
-                    .scalar_subquery()
-                )
-                # "after" = further in the sort direction:
-                # desc → smaller created_at, asc → larger created_at
-                ts_cmp = (
-                    SqlConversation.created_at < sub
-                    if is_desc
-                    else SqlConversation.created_at > sub
-                )
-                id_cmp = SqlConversation.id < after if is_desc else SqlConversation.id > after
-                stmt = stmt.where(or_(ts_cmp, and_(SqlConversation.created_at == sub, id_cmp)))
+                stmt = self._apply_cursor(stmt, after, sort_col, is_desc, forward=True)
             if before:
-                sub = (
-                    select(SqlConversation.created_at)
-                    .where(SqlConversation.id == before)
-                    .scalar_subquery()
-                )
-                # "before" = opposite of sort direction
-                ts_cmp = (
-                    SqlConversation.created_at > sub
-                    if is_desc
-                    else SqlConversation.created_at < sub
-                )
-                id_cmp = SqlConversation.id > before if is_desc else SqlConversation.id < before
-                stmt = stmt.where(or_(ts_cmp, and_(SqlConversation.created_at == sub, id_cmp)))
+                stmt = self._apply_cursor(stmt, before, sort_col, is_desc, forward=False)
             stmt = stmt.order_by(
-                sort_fn(SqlConversation.created_at),
+                sort_fn(sort_col),
                 sort_fn(SqlConversation.id),
             ).limit(limit + 1)
             rows = list(session.execute(stmt).scalars().all())
@@ -471,6 +458,60 @@ class SqlAlchemyConversationStore(ConversationStore):
                 has_more=has_more,
             )
 
+    @staticmethod
+    def _resolve_sort_column(sort_by: str) -> QueryableAttribute[int]:
+        """
+        Map a ``sort_by`` string to the corresponding
+        :class:`SqlConversation` column.
+
+        :param sort_by: ``"created_at"`` or ``"updated_at"``.
+        :returns: The mapped column attribute.
+        :raises ValueError: If ``sort_by`` is not a valid column
+            name.
+        """
+        allowed = {
+            "created_at": SqlConversation.created_at,
+            "updated_at": SqlConversation.updated_at,
+        }
+        col = allowed.get(sort_by)
+        if col is None:
+            raise ValueError(f"invalid sort_by: {sort_by!r}")
+        return col
+
+    @staticmethod
+    def _apply_cursor(
+        stmt: Select[tuple[SqlConversation]],
+        cursor_id: str,
+        sort_col: QueryableAttribute[int],
+        is_desc: bool,
+        forward: bool,
+    ) -> Select[tuple[SqlConversation]]:
+        """
+        Add a cursor-based WHERE clause to the query.
+
+        Uses a (sort_col, id) composite comparison to handle
+        ties deterministically.
+
+        :param stmt: The current SELECT statement.
+        :param cursor_id: The conversation ID acting as cursor.
+        :param sort_col: The column being sorted on.
+        :param is_desc: Whether the sort direction is descending.
+        :param forward: ``True`` for ``after`` cursors (further
+            in sort direction), ``False`` for ``before`` cursors
+            (opposite of sort direction).
+        :returns: The statement with cursor filter applied.
+        """
+        sub = select(sort_col).where(SqlConversation.id == cursor_id).scalar_subquery()
+        # "after" (forward=True) = further in sort direction;
+        # "before" (forward=False) = opposite of sort direction.
+        if forward:
+            ts_cmp = sort_col < sub if is_desc else sort_col > sub
+            id_cmp = SqlConversation.id < cursor_id if is_desc else SqlConversation.id > cursor_id
+        else:
+            ts_cmp = sort_col > sub if is_desc else sort_col < sub
+            id_cmp = SqlConversation.id > cursor_id if is_desc else SqlConversation.id < cursor_id
+        return stmt.where(or_(ts_cmp, and_(sort_col == sub, id_cmp)))
+
     def update_conversation(
         self, conversation_id: str, title: str | None = None
     ) -> Conversation | None:
@@ -480,6 +521,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
         :param title: New title, or ``None`` to leave unchanged.
+            When provided, ``updated_at`` is bumped to the
+            current epoch time.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
         """
@@ -489,6 +532,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 return None
             if title is not None:
                 row.title = title
+                row.updated_at = now_epoch()
             return _to_conversation(row)
 
     async def delete_conversation(self, conversation_id: str) -> bool:

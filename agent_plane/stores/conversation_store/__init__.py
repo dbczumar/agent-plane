@@ -151,12 +151,14 @@ class ConversationStore(ABC):
         before: str | None = None,
         order: str = "desc",
         kind: str | None = "default",
+        sort_by: str = "created_at",
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
 
-        ``order`` controls the sort direction on ``created_at``
-        (``"desc"`` = newest-first, ``"asc"`` = oldest-first).
+        ``order`` controls the sort direction on the column
+        selected by ``sort_by`` (``"desc"`` = newest-first,
+        ``"asc"`` = oldest-first).
 
         :param limit: Maximum number of conversations to return.
         :param after: Cursor conversation ID; return conversations
@@ -169,6 +171,8 @@ class ConversationStore(ABC):
             match. ``"default"`` returns only user-initiated.
             ``"sub_agent"`` returns only sub-agent conversations.
             ``None`` disables the filter and returns all.
+        :param sort_by: Column to sort on, ``"created_at"`` or
+            ``"updated_at"``.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """

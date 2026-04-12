@@ -18,6 +18,8 @@ class Conversation:
     :param id: Unique conversation identifier,
         e.g. ``"conv_abc123"``.
     :param created_at: Unix epoch timestamp of creation.
+    :param updated_at: Unix epoch timestamp of the last
+        update (item append, title change, etc.).
     :param title: Optional user-assigned title.
     :param kind: Conversation type. ``"default"`` for
         user-initiated, ``"sub_agent"`` for sub-agent
@@ -26,6 +28,7 @@ class Conversation:
 
     id: str
     created_at: int
+    updated_at: int
     title: str | None = None
     kind: str = "default"
 

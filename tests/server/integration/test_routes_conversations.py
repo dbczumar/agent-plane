@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -79,6 +80,56 @@ async def test_get_conversation(client: httpx.AsyncClient) -> None:
     assert isinstance(body["created_at"], int)
     # New conversation has no title
     assert body["title"] is None
+
+
+async def test_get_conversation_includes_updated_at(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    GET /conversations/{id} returns an updated_at timestamp.
+
+    On a freshly created conversation, updated_at equals
+    created_at. After a second turn, updated_at is >=
+    created_at (may still be equal if the turn completes
+    within the same epoch second).
+    """
+    await create_test_agent(client)
+    first = await create_test_response(
+        client,
+        input_text="Hello",
+        background=False,
+        stream=False,
+    )
+    conv_id = first.body["conversation"]["id"]
+
+    resp = await client.get(f"/v1/conversations/{conv_id}")
+    body = resp.json()
+    assert "updated_at" in body, "Conversation object must include updated_at field."
+    assert isinstance(body["updated_at"], int)
+    assert body["updated_at"] >= body["created_at"], (
+        f"updated_at ({body['updated_at']}) must be >= created_at ({body['created_at']})."
+    )
+
+
+async def test_list_conversations_includes_updated_at(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    GET /conversations list items include updated_at with a
+    value >= created_at.
+    """
+    await create_test_agent(client)
+    await create_test_response(client, input_text="Hi")
+
+    resp = await client.get("/v1/conversations")
+    body = resp.json()
+    assert len(body["data"]) == 1
+    conv = body["data"][0]
+    assert "updated_at" in conv, "Conversation list items must include updated_at."
+    assert isinstance(conv["updated_at"], int)
+    assert conv["updated_at"] >= conv["created_at"], (
+        f"updated_at ({conv['updated_at']}) must be >= created_at ({conv['created_at']})."
+    )
 
 
 async def test_get_conversation_not_found(client: httpx.AsyncClient) -> None:
@@ -212,6 +263,76 @@ async def test_list_conversations_pagination(
     body2 = resp2.json()
     assert len(body2["data"]) == 1
     assert body2["has_more"] is False
+
+
+async def test_sort_by_updated_at(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    sort_by=updated_at reorders conversations by last activity.
+
+    Create two conversations. Then add a second turn to the
+    FIRST conversation so its updated_at advances. Listing with
+    sort_by=updated_at desc should return the first conversation
+    before the second, even though the second was created later.
+    """
+    await create_test_agent(client)
+
+    # Conv A: created first
+    first = await create_test_response(
+        client,
+        input_text="Conv A",
+        background=False,
+        stream=False,
+    )
+    conv_a_id = first.body["conversation"]["id"]
+    resp_a_id = first.body["id"]
+
+    # Conv B: created second (newer created_at)
+    second = await create_test_response(
+        client,
+        input_text="Conv B",
+        background=False,
+        stream=False,
+    )
+    conv_b_id = second.body["conversation"]["id"]
+
+    # Add a second turn to Conv A so its updated_at advances
+    await create_test_response(
+        client,
+        input_text="Follow-up in A",
+        previous_response_id=resp_a_id,
+        background=False,
+        stream=False,
+    )
+
+    # Default (sort_by=created_at desc): Conv B first
+    resp_created = await client.get("/v1/conversations", params={"order": "desc"})
+    created_ids = [c["id"] for c in resp_created.json()["data"]]
+    assert created_ids[0] == conv_b_id, (
+        f"Expected Conv B first when sorting by created_at desc, got {created_ids}."
+    )
+
+    # sort_by=updated_at desc: Conv A first (most recently updated)
+    resp_updated = await client.get(
+        "/v1/conversations",
+        params={"sort_by": "updated_at", "order": "desc"},
+    )
+    updated_ids = [c["id"] for c in resp_updated.json()["data"]]
+    assert updated_ids[0] == conv_a_id, (
+        f"Expected Conv A first when sorting by updated_at desc "
+        f"(it received a second turn), got {updated_ids}."
+    )
+
+    # sort_by=updated_at asc: Conv B first (oldest update)
+    resp_asc = await client.get(
+        "/v1/conversations",
+        params={"sort_by": "updated_at", "order": "asc"},
+    )
+    asc_ids = [c["id"] for c in resp_asc.json()["data"]]
+    assert asc_ids[0] == conv_b_id, (
+        f"Expected Conv B first when sorting by updated_at asc, got {asc_ids}."
+    )
 
 
 async def test_list_conversation_items_pagination(
@@ -441,7 +562,7 @@ async def test_multi_turn_after_steering_sees_full_history(
     first_id = first.body["id"]
     conv_id = first.body["conversation"]["id"]
 
-    call_1.call_event.wait(timeout=10)
+    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
 
     # Steer while blocked
     await create_test_response(
@@ -524,11 +645,11 @@ async def test_steering_position_among_tool_items(
     conv_id = first.body["conversation"]["id"]
 
     # Release tool call so tool executes
-    call_1.call_event.wait(timeout=10)
+    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
     call_1.release()
 
     # Wait for second LLM call (post-tool)
-    call_2.call_event.wait(timeout=10)
+    await asyncio.wait_for(call_2.call_event.wait(), timeout=10)
 
     # Steer while blocked in second LLM call
     await create_test_response(
@@ -793,7 +914,7 @@ async def test_steering_during_llm_with_client_tool_persists_steered_message(
     conv_id = first.body["conversation"]["id"]
 
     # Wait for LLM to be called, then steer
-    call_1.call_event.wait(timeout=10)
+    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
     steer_resp = await create_test_response(
         client,
         input_text="Also check NYC",

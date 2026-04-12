@@ -72,6 +72,8 @@ class SqlConversation(Base):
         ``"conv_e4f5a6b7..."``.
     :param created_at: Unix epoch seconds when the conversation was
         created.
+    :param updated_at: Unix epoch seconds when the conversation was
+        last updated (item append, title change, etc.).
     :param title: Optional human-readable title for the conversation.
         ``None`` when not provided.
     :param kind: Conversation type. ``"default"`` for user-initiated,
@@ -82,12 +84,14 @@ class SqlConversation(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int] = mapped_column(Integer)
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
     kind: Mapped[str] = mapped_column(String(32), default="default")
 
     __table_args__ = (
         CheckConstraint("kind IN ('default', 'sub_agent')", name="ck_conversations_kind"),
         Index("ix_conversations_created_at", "created_at"),
+        Index("ix_conversations_updated_at", "updated_at"),
         Index("ix_conversations_kind", "kind"),
     )
 

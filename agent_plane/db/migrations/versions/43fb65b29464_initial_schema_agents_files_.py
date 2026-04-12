@@ -35,12 +35,14 @@ def upgrade() -> None:
         "conversations",
         sa.Column("id", sa.String(length=64), nullable=False),
         sa.Column("created_at", sa.Integer(), nullable=False),
+        sa.Column("updated_at", sa.Integer(), nullable=False),
         sa.Column("title", sa.Text(), nullable=True),
         sa.Column("kind", sa.String(length=32), nullable=False, server_default="default"),
         sa.CheckConstraint("kind IN ('default', 'sub_agent')", name="ck_conversations_kind"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_conversations_created_at", "conversations", ["created_at"], unique=False)
+    op.create_index("ix_conversations_updated_at", "conversations", ["updated_at"], unique=False)
     op.create_index("ix_conversations_kind", "conversations", ["kind"], unique=False)
     op.create_table(
         "files",
@@ -165,6 +167,7 @@ def downgrade() -> None:
     op.drop_index("ix_files_created_at", table_name="files")
     op.drop_table("files")
     op.drop_index("ix_conversations_kind", table_name="conversations")
+    op.drop_index("ix_conversations_updated_at", table_name="conversations")
     op.drop_index("ix_conversations_created_at", table_name="conversations")
     op.drop_table("conversations")
     op.drop_index("ix_agents_created_at", table_name="agents")

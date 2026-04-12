@@ -791,3 +791,193 @@ def test_subagent_conversations_are_isolated(
         f"{ids_a & ids_b}. Each conversation must have "
         "unique item IDs."
     )
+
+
+# ── updated_at ─────────────────────────────────────────
+
+
+def test_create_sets_updated_at_equal_to_created_at(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A newly created conversation has updated_at == created_at.
+    """
+    conv = conversation_store.create_conversation()
+    assert conv.updated_at == conv.created_at, (
+        f"Expected updated_at ({conv.updated_at}) to equal "
+        f"created_at ({conv.created_at}) on a brand-new conversation."
+    )
+
+
+def test_append_bumps_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Appending items to a conversation advances updated_at
+    to the current time.
+    """
+    import agent_plane.stores.conversation_store.sqlalchemy_store as store_mod
+
+    # Freeze time at creation
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    assert conv.updated_at == 1000
+
+    # Advance time, then append
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_bump",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "hi"}],
+                ),
+            ),
+        ],
+    )
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 2000, (
+        f"Expected updated_at to advance to 2000 after append, got {fetched.updated_at}."
+    )
+
+
+def test_update_title_bumps_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Updating the title of a conversation advances updated_at.
+    """
+    import agent_plane.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    assert conv.updated_at == 1000
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 3000)
+    updated = conversation_store.update_conversation(conv.id, title="New title")
+    assert updated is not None
+    assert updated.updated_at == 3000, (
+        f"Expected updated_at to advance to 3000 after title update, got {updated.updated_at}."
+    )
+
+
+# ── sort_by=updated_at ────────────────────────────────
+
+
+def test_list_conversations_sort_by_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Sorting by updated_at returns conversations in order of
+    last activity, not creation order.
+    """
+    import agent_plane.stores.conversation_store.sqlalchemy_store as store_mod
+
+    # Create conv_a at t=100, conv_b at t=200
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 100)
+    conv_a = conversation_store.create_conversation()
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 200)
+    conv_b = conversation_store.create_conversation()
+
+    # Append to conv_a at t=300, making it the most recently updated
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 300)
+    conversation_store.append(
+        conv_a.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_sort",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "hello"}],
+                ),
+            ),
+        ],
+    )
+
+    # sort_by=created_at desc → conv_b first (created later)
+    by_created = conversation_store.list_conversations(
+        sort_by="created_at",
+        order="desc",
+        kind=None,
+    )
+    assert by_created.data[0].id == conv_b.id, (
+        "Expected conv_b first when sorting by created_at desc."
+    )
+
+    # sort_by=updated_at desc → conv_a first (updated more recently)
+    by_updated = conversation_store.list_conversations(
+        sort_by="updated_at",
+        order="desc",
+        kind=None,
+    )
+    assert by_updated.data[0].id == conv_a.id, (
+        "Expected conv_a first when sorting by updated_at desc, "
+        "because it was updated at t=300 vs conv_b at t=200."
+    )
+
+
+def test_list_conversations_sort_by_updated_at_with_pagination(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Cursor-based pagination works correctly when sorting
+    by updated_at.
+    """
+    import agent_plane.stores.conversation_store.sqlalchemy_store as store_mod
+
+    # Create 3 conversations with distinct updated_at values
+    ids = []
+    for t in (100, 200, 300):
+        monkeypatch.setattr(store_mod, "now_epoch", lambda _t=t: _t)
+        conv = conversation_store.create_conversation()
+        ids.append(conv.id)
+
+    # Reverse the update order: bump the oldest conversation last
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 400)
+    conversation_store.append(
+        ids[0],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_pg",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "pg"}],
+                ),
+            ),
+        ],
+    )
+
+    # sort_by=updated_at desc: ids[0] (400), ids[2] (300), ids[1] (200)
+    page1 = conversation_store.list_conversations(
+        limit=2,
+        sort_by="updated_at",
+        order="desc",
+        kind=None,
+    )
+    # 2 results with has_more=True
+    assert len(page1.data) == 2
+    assert page1.has_more is True
+    assert page1.data[0].id == ids[0]
+    assert page1.data[1].id == ids[2]
+
+    page2 = conversation_store.list_conversations(
+        limit=2,
+        sort_by="updated_at",
+        order="desc",
+        after=page1.last_id,
+        kind=None,
+    )
+    # 1 result remaining
+    assert len(page2.data) == 1
+    assert page2.has_more is False
+    assert page2.data[0].id == ids[1]

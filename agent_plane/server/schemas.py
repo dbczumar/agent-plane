@@ -121,12 +121,15 @@ class ConversationObject(BaseModel):
         ``"conversation"``.
     :param title: Optional user-assigned conversation title.
     :param created_at: Unix epoch timestamp of creation.
+    :param updated_at: Unix epoch timestamp of the last
+        update, e.g. ``1774118400``.
     """
 
     id: str
     object: str = "conversation"
     title: str | None = None
     created_at: int
+    updated_at: int
 
 
 class ConversationDeleted(BaseModel):

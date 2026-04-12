@@ -40,6 +40,7 @@ def _to_conversation_object(conv: Conversation) -> ConversationObject:
         id=conv.id,
         title=conv.title,
         created_at=conv.created_at,
+        updated_at=conv.updated_at,
     )
 
 
@@ -96,6 +97,7 @@ def create_conversations_router(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
+        sort_by: str = Query(default="created_at", pattern="^(created_at|updated_at)$"),
     ) -> PaginatedList:
         """
         List conversations with cursor-based pagination.
@@ -106,6 +108,8 @@ def create_conversations_router(
         :param before: Cursor — return items before this
             conversation ID.
         :param order: Sort order, ``"asc"`` or ``"desc"``.
+        :param sort_by: Column to sort on,
+            ``"created_at"`` or ``"updated_at"``.
         :returns: A :class:`PaginatedList` of conversations.
         """
         page = conversation_store.list_conversations(
@@ -113,6 +117,7 @@ def create_conversations_router(
             after=after,
             before=before,
             order=order,
+            sort_by=sort_by,
         )
         data = [_to_conversation_object(s) for s in page.data]
         return PaginatedList(

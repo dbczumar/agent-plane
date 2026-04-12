@@ -240,14 +240,17 @@ Query parameters:
     Cursor for backward pagination. Pass the `first_id` from a previous response.
 
   order (string, optional, default: "desc")
-    Sort order by `created_at`. Either "asc" or "desc".
+    Sort order. Either "asc" or "desc".
+
+  sort_by (string, optional, default: "created_at")
+    Column to sort on. Either "created_at" or "updated_at".
 
 200 OK
 {
   "object": "list",
   "data": [
-    {"id": "conv_abc123", "object": "conversation", "title": null, "created_at": ...},
-    {"id": "conv_def456", "object": "conversation", "title": "Weather chat", "created_at": ...}
+    {"id": "conv_abc123", "object": "conversation", "title": null, "created_at": ..., "updated_at": ...},
+    {"id": "conv_def456", "object": "conversation", "title": "Weather chat", "created_at": ..., "updated_at": ...}
   ],
   "first_id": "conv_abc123",
   "last_id": "conv_def456",
@@ -255,7 +258,7 @@ Query parameters:
 }
 ```
 
-Results ordered by `created_at` descending (newest first).
+Results ordered by `sort_by` column descending (newest first) by default.
 
 ### Get Conversation
 
@@ -267,7 +270,8 @@ GET /v1/conversations/{id}
   "id": "conv_abc123",
   "object": "conversation",
   "title": null,
-  "created_at": 1774118382
+  "created_at": 1774118382,
+  "updated_at": 1774118400
 }
 
 404 Not Found
@@ -337,7 +341,8 @@ Content-Type: application/json
   "id": "conv_abc123",
   "object": "conversation",
   "title": "Weather chat",
-  "created_at": 1774118382
+  "created_at": 1774118382,
+  "updated_at": 1774118400
 }
 
 404 Not Found

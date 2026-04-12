@@ -2028,7 +2028,7 @@ async def test_spawn_recovery_across_client_tool_boundary(
     # then release it so it completes before response 2 starts.
     # This guarantees mock call ordering (call 3 goes to the
     # parent's second workflow, not the sub-agent).
-    call_2.call_event.wait(timeout=10)
+    await asyncio.wait_for(call_2.call_event.wait(), timeout=10)
     call_2.release()
 
     # Response 2: send tool results as a new request.
