@@ -29,4 +29,4 @@ if [[ "$AGENT" == *"/coder"* ]] && [[ "$AGENT" != *"claude-coder"* ]] && [[ "$AG
 fi
 
 cd "$REPO_ROOT/frontends/repl"
-PYTHONPATH="../clients/python:.:${PYTHONPATH:-}" exec python repl.py "$AGENT" $CLIENT_TOOLS_FLAG
+PYTHONPATH="../sdks/python:.:${PYTHONPATH:-}" exec python repl.py "$AGENT" $CLIENT_TOOLS_FLAG

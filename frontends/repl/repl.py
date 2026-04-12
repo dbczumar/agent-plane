@@ -30,12 +30,12 @@ from prompt_toolkit.styles import Style as PTStyle
 from rich.console import Console
 
 # Add the client library to the path.
-_CLIENT_LIB = str(pathlib.Path(__file__).resolve().parent.parent / "clients" / "python")
-if _CLIENT_LIB not in sys.path:
-    sys.path.insert(0, _CLIENT_LIB)
+_SDK_DIR = str(pathlib.Path(__file__).resolve().parent.parent / "sdks" / "python")
+if _SDK_DIR not in sys.path:
+    sys.path.insert(0, _SDK_DIR)
 
 import renderer  # noqa: E402
-from agent_plane_client import (  # noqa: E402
+from agent_plane_ui_sdk import (  # noqa: E402
     AgentPlaneClient,
     CompactionInProgress,
     ErrorEvent,

@@ -237,11 +237,12 @@ async def test_cancel_active_response(
     # Cancellation must append an interruption marker to the conversation
     items_resp = await client.get(f"/v1/conversations/{conv_id}/items")
     items = items_resp.json()["data"]
-    # Last item: user message indicating the interruption
+    # Last item: user message indicating the interruption.
+    # API items are flat — data fields are spread into the top level.
     last = items[-1]
     assert last["type"] == "message"
-    assert last["data"]["role"] == "user"
-    assert "interrupted" in last["data"]["content"][0]["text"]
+    assert last["role"] == "user"
+    assert "interrupted" in last["content"][0]["text"]
 
 
 async def test_cancel_response_not_found(client: httpx.AsyncClient) -> None:
