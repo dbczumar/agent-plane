@@ -139,9 +139,13 @@ class StreamRenderer:
                 # ResponseCompleted and this ResponseCreated.
                 for ex in list(pending_tools.values()):
                     if ex.output is not None:
-                        # Re-emit with output populated — formatter
-                        # renders the result panel.
-                        yield ToolGroup(executions=[ex], ctx=_ctx())
+                        yield ToolResultBlock(
+                            name=ex.name,
+                            call_id=ex.call_id,
+                            agent_name=ex.agent_name,
+                            output=ex.output,
+                            ctx=_ctx(),
+                        )
                 pending_tools.clear()
                 agent = event.response.model
                 if not started:
@@ -183,8 +187,10 @@ class StreamRenderer:
                 for ex in list(pending_tools.values()):
                     if ex.output is not None:
                         yield ToolResultBlock(
-                            name=ex.name, call_id=ex.call_id,
-                            agent_name=ex.agent_name, output=ex.output,
+                            name=ex.name,
+                            call_id=ex.call_id,
+                            agent_name=ex.agent_name,
+                            output=ex.output,
                             ctx=_ctx(),
                         )
                 pending_tools.clear()

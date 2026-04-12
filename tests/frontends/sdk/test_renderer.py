@@ -159,10 +159,16 @@ async def test_tool_group_with_results(renderer: StreamRenderer) -> None:
     blocks = [b async for b in renderer.stream(session, "test")]  # type: ignore[arg-type]
     tool_groups = [b for b in blocks if isinstance(b, ToolGroup)]
 
-    # ToolGroup emitted on ResponseCreated with results populated.
-    assert len(tool_groups) == 1
+    # First ToolGroup: emitted immediately with output=None (call line).
+    assert len(tool_groups) >= 1
     assert tool_groups[0].executions[0].name == "Read"
-    assert tool_groups[0].executions[0].output == "file content"
+
+    # ToolResultBlock: emitted when result arrives.
+    from agent_plane_ui_sdk._blocks import ToolResultBlock
+
+    results = [b for b in blocks if isinstance(b, ToolResultBlock)]
+    assert len(results) == 1
+    assert results[0].output == "file content"
 
 
 @pytest.mark.asyncio()
