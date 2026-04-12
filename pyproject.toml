@@ -57,6 +57,26 @@ ignore_missing_imports = true
 module = "httpx"
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = "boto3"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "botocore.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "google.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tool_sets.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "claude_agent_sdk.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
 addopts = "--ignore=tests/e2e"

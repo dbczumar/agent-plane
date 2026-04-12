@@ -36,7 +36,7 @@ def _boto_config(
         ``execute_with_retry`` handles retries instead).
     :returns: A ``botocore.config.Config`` instance.
     """
-    from botocore.config import Config  # type: ignore[import-untyped]
+    from botocore.config import Config
 
     retries = (
         {"max_attempts": max_retries, "mode": "adaptive"}
@@ -78,7 +78,7 @@ class BedrockAdapter(BaseAdapter):
             ``"aws_secret_access_key"``, ``"aws_session_token"``.
         :returns: A boto3 ``bedrock-runtime`` client.
         """
-        import boto3  # type: ignore[import-untyped]
+        import boto3
 
         boto_kwargs: dict[str, str] = {}
         if connection_params:

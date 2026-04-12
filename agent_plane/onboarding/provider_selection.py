@@ -130,8 +130,7 @@ def _prompt_provider() -> str:
     console.print(
         Panel(
             Columns(entries, column_first=True, padding=(0, 2)),
-            title="[bold]Select a provider for the onboarding assistant[/bold]",
-            subtitle=f"[dim]{len(providers)} providers available[/dim]",
+            title="[bold]Select a model provider for the onboarding assistant[/bold]",
             border_style="blue",
         )
     )
@@ -198,29 +197,51 @@ def _prompt_field(field: AuthField, provider: str) -> str:
     """
     env_val = _check_env_for_field(field.name, provider)
 
+    if env_val and field.secret:
+        return _prompt_secret_with_env(field, env_val)
+    return _prompt_value(field, env_val)
+
+
+def _prompt_secret_with_env(field: AuthField, env_val: str) -> str:
+    """
+    Confirm or replace a secret value found in the environment.
+
+    Shows the masked value and lets the user accept or override.
+
+    :param field: The auth field.
+    :param env_val: The value found in the environment.
+    :returns: The confirmed or replacement value.
+    """
+    masked = env_val[:8] + "..." if len(env_val) > 8 else env_val
+    console.print(
+        f"  [dim]{field.description}:[/dim] {masked}",
+        highlight=False,
+    )
+    override = str(
+        click.prompt(
+            "  Use this key? (Enter to accept, or paste a different one)",
+            default="",
+            show_default=False,
+        )
+    )
+    if not override.strip():
+        return env_val
+    return override.strip()
+
+
+def _prompt_value(field: AuthField, env_val: str | None) -> str:
+    """
+    Prompt for a field value, using env_val as default if available.
+
+    :param field: The auth field.
+    :param env_val: Optional default from the environment.
+    :returns: The user-supplied value.
+    """
     while True:
         if env_val:
-            masked = env_val[:8] + "..." if len(env_val) > 8 else env_val
-            console.print(
-                f"  [dim]Found in env:[/dim] {masked}",
-                highlight=False,
-            )
-            value = str(
-                click.prompt(
-                    field.description,
-                    default=env_val,
-                    hide_input=field.secret,
-                    show_default=False,
-                )
-            )
+            value = str(click.prompt(field.description, default=env_val))
         else:
-            value = str(
-                click.prompt(
-                    field.description,
-                    hide_input=field.secret,
-                )
-            )
-
+            value = str(click.prompt(field.description, hide_input=field.secret))
         if value.strip():
             return value.strip()
         console.print("  [red]Value cannot be empty.[/red]")
@@ -287,13 +308,12 @@ def _prompt_model(provider: str) -> str:
 
 def _display_model_list(models: list[ModelInfo]) -> None:
     """
-    Display models as a compact numbered list, newest first.
+    Display all models in columns, newest first.
 
     :param models: Sorted model list.
     """
-    display_limit = 15
     entries: list[Text] = []
-    for i, m in enumerate(models[:display_limit], 1):
+    for i, m in enumerate(models, 1):
         entry = Text()
         entry.append(f" {i:>3}. ", style="dim")
         entry.append(m.name, style="cyan")
@@ -304,30 +324,30 @@ def _display_model_list(models: list[ModelInfo]) -> None:
         Panel(
             Columns(entries, column_first=True, padding=(0, 2)),
             title="[bold]Select a model for the onboarding assistant[/bold]",
-            subtitle=f"[dim]{len(models)} models · newest first[/dim]",
+            subtitle="[dim]newest first[/dim]",
             border_style="blue",
         )
     )
 
-    if len(models) > display_limit:
-        console.print(
-            f"  [dim]{len(models) - display_limit} more available — "
-            f'type a name to search (e.g. "gpt-5")[/dim]'
-        )
-    console.print(f"  [dim]Default:[/dim] [bold]{models[0].name}[/bold]")
-
 
 def _collect_model_choice(models: list[ModelInfo]) -> str:
     """
-    Prompt the user to select a model by number or name search.
-
-    Defaults to 1 (the newest model).
+    Show the default model and let the user confirm or override.
 
     :param models: The full sorted list of available models.
     :returns: The chosen model name.
     """
+    console.print(f"\n  Model: [dim]\\[1][/dim] [bold]{models[0].name}[/bold]")
     while True:
-        raw = str(click.prompt("Model", default="1"))
+        raw = str(
+            click.prompt(
+                "  Enter to confirm, or pick a number/model name",
+                default="",
+                show_default=False,
+            )
+        )
+        if not raw.strip():
+            return models[0].name
         try:
             choice = int(raw)
             if 1 <= choice <= len(models):

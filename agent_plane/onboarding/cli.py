@@ -101,14 +101,14 @@ def _prompt_shell_access(console: Console) -> bool:
     """
     console.print()
     console.print(
-        "  [bold]Shell access[/bold] gives the assistant full access to "
-        "your filesystem, shell commands, and network. It can read your "
-        "existing code and write the generated agent directly to disk."
+        "  [bold]• Shell access[/bold] — full access to your filesystem, "
+        "shell commands, and network. Can read your existing code and "
+        "write the generated agent directly to disk.\n"
     )
     console.print(
-        "  [bold]Sandbox mode[/bold] (default) restricts the assistant "
-        "to an isolated workspace. It creates the agent in a sandbox, "
-        "then exports it to your chosen path."
+        "  [bold]• Sandbox mode[/bold] (default) — restricted to an "
+        "isolated workspace. Creates the agent in a sandbox, then "
+        "exports it to your chosen path."
     )
     answer = click.prompt(
         "\n  Allow shell access? (y/n)",

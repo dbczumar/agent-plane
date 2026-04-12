@@ -50,31 +50,129 @@ def _extract_text_from_response(body: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_non_interactive_creates_valid_agent(
+def _verify_agent_serves(
+    agent_dir: Path,
+    api_key: str,
+    expected_marker: str | None = None,
+) -> None:
+    """
+    Start ``ap server`` with the generated agent and verify it responds.
+
+    :param agent_dir: Path to the generated agent directory.
+    :param api_key: LLM API key.
+    :param expected_marker: Optional string the response must contain.
+    """
+    port = find_free_port()
+    server_proc = _start_agent_server(agent_dir, port, api_key)
+    try:
+        wait_for_server(f"http://127.0.0.1:{port}")
+        _send_and_check(f"http://127.0.0.1:{port}", expected_marker)
+    finally:
+        server_proc.send_signal(signal.SIGTERM)
+        try:
+            server_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+
+
+def _start_agent_server(
+    agent_dir: Path,
+    port: int,
+    api_key: str,
+) -> subprocess.Popen[bytes]:
+    """
+    Launch ``ap server`` with the given agent directory.
+
+    :param agent_dir: Path to the agent directory.
+    :param port: Port to listen on.
+    :param api_key: LLM API key.
+    :returns: The server subprocess.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="ap-e2e-serve-")
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "agent_plane.cli",
+            "server",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--database-uri",
+            f"sqlite:///{tmpdir}/test.db",
+            "--artifact-location",
+            f"{tmpdir}/artifacts",
+            "--agent",
+            str(agent_dir),
+        ],
+        env={**os.environ, "OPENAI_API_KEY": api_key},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+
+def _send_and_check(base_url: str, expected_marker: str | None) -> None:
+    """
+    Find the agent, send a message, and verify the response.
+
+    :param base_url: Server base URL.
+    :param expected_marker: Optional marker the response must contain.
+    """
+    agents_resp = httpx.get(f"{base_url}/api/agents", timeout=10.0)
+    agents_resp.raise_for_status()
+    agents = agents_resp.json()["data"]
+    assert len(agents) > 0, "No agents registered."
+
+    resp = httpx.post(
+        f"{base_url}/v1/responses",
+        json={"model": agents[0]["name"], "input": "Hello!", "stream": False},
+        timeout=120.0,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+
+    assert body["status"] == "completed", f"Status is {body['status']!r}. Full response: {body}"
+    text = _extract_text_from_response(body)
+    assert len(text) > 0, f"No text output. Full response: {body}"
+
+    if expected_marker is not None:
+        assert expected_marker.lower() in text.lower(), (
+            f"Missing marker {expected_marker!r}. Response: {text[:500]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive sandbox mode: create + export + serve
+# ---------------------------------------------------------------------------
+
+
+def test_sandbox_mode_creates_and_exports_agent(
     llm_api_key: str,
     tmp_path: Path,
 ) -> None:
     """
-    ``ap create`` non-interactively produces a valid agent directory
-    that can be served by ``ap server``.
+    ``ap create`` without ``--allow-shell-access`` uses sandbox mode:
+    the onboarding assistant creates the agent in its code_sandbox
+    workspace and exports it to the user's path via ``export_agent``.
 
     Flow:
-    1. Run ``ap create`` with a message and ``--model`` and
-       ``--allow-shell-access``, targeting a temp directory.
-    2. Verify the agent directory exists with a valid ``config.yaml``.
-    3. Boot the generated agent with ``ap server --agent``.
-    4. Send a request to the agent and verify it responds.
+    1. Run ``ap create`` WITHOUT ``--allow-shell-access``.
+    2. The prompt tells the agent to create an agent and export it
+       to a specific directory.
+    3. Verify the exported agent directory exists with valid config.
+    4. Boot the exported agent and verify it responds.
 
     **What breaks if this fails:**
-    - Onboarding agent can't generate valid config.yaml → parse error.
-    - Generated agent has wrong model format → server rejects it.
-    - Non-interactive tool loop is broken → no files written.
+    - code_sandbox not added to onboarding agent in sandbox mode →
+      agent can't create files at all.
+    - export_agent not added → agent creates files in workspace but
+      can't copy them to the target path.
+    - export_agent tool broken → files stay in sandbox, never exported.
+    - Server-side tool execution broken → tool calls not processed.
     """
-    agent_dir = tmp_path / "my-test-agent"
+    agent_dir = tmp_path / "sandbox-test-agent"
 
-    # Run ap create non-interactively.
-    # The prompt tells the onboarding agent exactly what to create
-    # and where, to keep the test deterministic.
     result = subprocess.run(
         [
             sys.executable,
@@ -82,15 +180,103 @@ def test_non_interactive_creates_valid_agent(
             "agent_plane.cli",
             "create",
             (
-                f"Create a minimal agent called 'test-greeter' in the directory "
-                f"{agent_dir}. It should use the model openai/gpt-5.4 with "
-                f"${{OPENAI_API_KEY}} for the api key. "
-                f"The agent's instructions should say: "
-                f"'You are a greeter. When someone says hello, respond with "
-                f"exactly: HELLO_E2E_SUCCESS'. "
-                f"Only create config.yaml with inline instructions. "
-                f"Do not create AGENTS.md or skills. "
-                f"Write the files now."
+                f"Create a minimal agent called 'sandbox-greeter' in your "
+                f"workspace. The config.yaml must have this exact structure:\n"
+                f"  spec_version: 1\n"
+                f"  name: sandbox-greeter\n"
+                f"  llm:\n"
+                f"    model: openai/gpt-5.4\n"
+                f"    connection:\n"
+                f"      api_key: ${{OPENAI_API_KEY}}\n"
+                f"  instructions: 'Reply with exactly: SANDBOX_SUCCESS'\n"
+                f"Write config.yaml in your workspace, then use export_agent "
+                f"to copy it to {agent_dir}."
+            ),
+            "--model",
+            "openai/gpt-5.4",
+            # No --allow-shell-access → sandbox mode
+        ],
+        env={**os.environ, "OPENAI_API_KEY": llm_api_key},
+        capture_output=True,
+        text=True,
+        timeout=240,
+    )
+
+    assert result.returncode == 0, (
+        f"ap create (sandbox mode) exited with code {result.returncode}.\n"
+        f"stdout: {result.stdout[-2000:]}\n"
+        f"stderr: {result.stderr[-2000:]}"
+    )
+
+    # ── Verify exported agent directory ────────────────
+    config_path = agent_dir / "config.yaml"
+    assert config_path.exists(), (
+        f"Expected config.yaml at {config_path}. "
+        f"The onboarding assistant did not export the agent. "
+        f"It should have used code_sandbox to create files in the "
+        f"workspace, then export_agent to copy them to {agent_dir}. "
+        f"stdout: {result.stdout[-2000:]}"
+    )
+
+    config = yaml.safe_load(config_path.read_text())
+    assert config.get("spec_version") == 1, (
+        f"Exported config.yaml has spec_version={config.get('spec_version')}, expected 1."
+    )
+    assert config.get("name"), "Exported config.yaml is missing 'name'."
+    llm_block = config.get("llm", {})
+    assert llm_block.get("model"), "Exported config.yaml is missing llm.model."
+
+    # ── Boot the exported agent and verify it responds ─
+    # The marker proves the instructions were set correctly, not
+    # just that some random agent was created.
+    _verify_agent_serves(agent_dir, llm_api_key, expected_marker="SANDBOX_SUCCESS")
+
+
+# ---------------------------------------------------------------------------
+# Shell access mode: create + serve
+# ---------------------------------------------------------------------------
+
+
+def test_shell_mode_creates_and_serves_agent(
+    llm_api_key: str,
+    tmp_path: Path,
+) -> None:
+    """
+    ``ap create --allow-shell-access`` gives the onboarding assistant
+    full shell tools (Read, Write, Bash, etc.) to create the agent
+    directly on the filesystem.
+
+    Flow:
+    1. Run ``ap create`` with ``--allow-shell-access``.
+    2. The prompt tells the agent to create an agent at a specific path.
+    3. Verify the agent directory exists with valid config.
+    4. Boot the generated agent and verify it responds.
+
+    **What breaks if this fails:**
+    - Client-side tool execution broken → Write/Bash not available.
+    - Non-interactive tool loop doesn't handle client tool calls.
+    - Generated config invalid → server rejects it.
+    """
+    agent_dir = tmp_path / "shell-test-agent"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "agent_plane.cli",
+            "create",
+            (
+                f"Create a minimal agent in the directory {agent_dir}. "
+                f"The config.yaml must have this exact structure:\n"
+                f"  spec_version: 1\n"
+                f"  name: shell-greeter\n"
+                f"  llm:\n"
+                f"    model: openai/gpt-5.4\n"
+                f"    connection:\n"
+                f"      api_key: ${{OPENAI_API_KEY}}\n"
+                f"  instructions: 'Reply with exactly: SHELL_SUCCESS'\n"
+                f"Create {agent_dir} and write config.yaml there. "
+                f"Do not create any other files."
             ),
             "--model",
             "openai/gpt-5.4",
@@ -102,121 +288,31 @@ def test_non_interactive_creates_valid_agent(
         timeout=180,
     )
 
-    # The process should complete (exit 0) even if the agent
-    # couldn't create files — we check file existence next.
-    # Non-zero exit means the CLI itself crashed.
     assert result.returncode == 0, (
-        f"ap create exited with code {result.returncode}.\n"
+        f"ap create (shell mode) exited with code {result.returncode}.\n"
         f"stdout: {result.stdout[-2000:]}\n"
         f"stderr: {result.stderr[-2000:]}"
     )
 
-    # ── Verify the generated agent directory ────────────
     config_path = agent_dir / "config.yaml"
     assert config_path.exists(), (
         f"Expected config.yaml at {config_path}. "
-        f"The onboarding agent did not write files. "
+        f"The onboarding assistant did not write files via shell tools. "
         f"stdout: {result.stdout[-2000:]}"
     )
 
     config = yaml.safe_load(config_path.read_text())
-    # spec_version is required and must be 1.
     assert config.get("spec_version") == 1, (
-        f"Generated config.yaml has spec_version={config.get('spec_version')}, "
-        f"expected 1. Full config: {config}"
+        f"spec_version is {config.get('spec_version')}, expected 1."
     )
-    # Must have a name.
-    assert config.get("name"), f"Generated config.yaml is missing 'name'. Full config: {config}"
-    # Must have an llm.model field.
-    llm_block = config.get("llm", {})
-    assert llm_block.get("model"), (
-        f"Generated config.yaml is missing llm.model. Full config: {config}"
-    )
+    assert config.get("name"), f"Config missing 'name'. Full config: {config}"
+    assert config.get("llm", {}).get("model"), f"Config missing llm.model. Full config: {config}"
 
-    # ── Boot the generated agent and verify it responds ─
-    _verify_agent_serves(agent_dir, llm_api_key)
-
-
-def _verify_agent_serves(agent_dir: Path, api_key: str) -> None:
-    """
-    Start ``ap server`` with the generated agent and send a test request.
-
-    Verifies the agent responds with text content (proving it's a
-    valid, runnable agent).
-
-    :param agent_dir: Path to the generated agent directory.
-    :param api_key: LLM API key.
-    """
-    port = find_free_port()
-    tmpdir = tempfile.mkdtemp(prefix="ap-e2e-serve-")
-    db_uri = f"sqlite:///{tmpdir}/test.db"
-    art_loc = f"{tmpdir}/artifacts"
-
-    server_proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "agent_plane.cli",
-            "server",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--database-uri",
-            db_uri,
-            "--artifact-location",
-            art_loc,
-            "--agent",
-            str(agent_dir),
-        ],
-        env={**os.environ, "OPENAI_API_KEY": api_key},
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-
-    base_url = f"http://127.0.0.1:{port}"
-    try:
-        wait_for_server(base_url)
-
-        # Find the agent.
-        agents_resp = httpx.get(f"{base_url}/api/agents", timeout=10.0)
-        agents_resp.raise_for_status()
-        agents = agents_resp.json()["data"]
-        assert len(agents) > 0, "No agents registered — the generated agent failed to load."
-        agent_name = agents[0]["name"]
-
-        # Send a test message.
-        resp = httpx.post(
-            f"{base_url}/v1/responses",
-            json={
-                "model": agent_name,
-                "input": "Hello!",
-                "stream": False,
-            },
-            timeout=120.0,
-        )
-        resp.raise_for_status()
-        body = resp.json()
-
-        # The agent should complete successfully.
-        assert body["status"] == "completed", (
-            f"Agent response status is {body['status']!r}, expected 'completed'. "
-            f"Full response: {body}"
-        )
-
-        # The agent should produce text output.
-        text = _extract_text_from_response(body)
-        assert len(text) > 0, f"Agent produced no text output. Full response: {body}"
-    finally:
-        server_proc.send_signal(signal.SIGTERM)
-        try:
-            server_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            server_proc.kill()
+    _verify_agent_serves(agent_dir, llm_api_key, expected_marker="SHELL_SUCCESS")
 
 
 # ---------------------------------------------------------------------------
-# Non-interactive e2e without filesystem: still produces output
+# Non-interactive without shell: still produces output
 # ---------------------------------------------------------------------------
 
 
