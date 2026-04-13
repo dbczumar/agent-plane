@@ -8,6 +8,7 @@ provider that speaks the OpenAI Chat Completions API format.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -31,6 +32,8 @@ from agent_plane.llms.types import (
     ResponseTextDeltaEvent,
     Usage,
 )
+
+_logger = logging.getLogger(__name__)
 
 # Timeout for non-streaming requests (seconds)
 _REQUEST_TIMEOUT = 120
@@ -535,6 +538,13 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
                 headers=headers,
                 json=payload,
             ) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    _logger.error(
+                        "OpenAI Responses API %s: %s",
+                        resp.status_code,
+                        body.decode("utf-8", errors="replace")[:2000],
+                    )
                 resp.raise_for_status()
                 async for chunk in resp.aiter_bytes():
                     buf += chunk.decode("utf-8", errors="replace")

@@ -20,6 +20,54 @@ from agent_plane.stores import ArtifactStore, FileStore
 
 _logger = logging.getLogger(__name__)
 
+# Extensions that Python's mimetypes module doesn't always know,
+# depending on the platform and Python version. Used as a fallback
+# when the stored content_type is missing or generic. LLM providers
+# (OpenAI) reject application/octet-stream for text files, so any
+# text-like format needs a proper MIME type.
+_EXTRA_MIME_TYPES: dict[str, str] = {
+    # Markup / config
+    ".md": "text/markdown",
+    ".markdown": "text/markdown",
+    ".yaml": "text/yaml",
+    ".yml": "text/yaml",
+    ".toml": "text/plain",
+    ".jsonl": "application/jsonl",
+    ".ndjson": "application/x-ndjson",
+    ".proto": "text/plain",
+    ".graphql": "text/plain",
+    ".gql": "text/plain",
+    # Languages mimetypes misses
+    ".rs": "text/x-rust",
+    ".go": "text/x-go",
+    ".ts": "text/typescript",
+    ".tsx": "text/typescript",
+    ".jsx": "text/javascript",
+    ".swift": "text/x-swift",
+    ".kt": "text/x-kotlin",
+    ".scala": "text/x-scala",
+    ".r": "text/x-r",
+    ".jl": "text/x-julia",
+    ".lua": "text/x-lua",
+    ".ex": "text/x-elixir",
+    ".exs": "text/x-elixir",
+    ".erl": "text/x-erlang",
+    ".hs": "text/x-haskell",
+    ".clj": "text/x-clojure",
+    ".dart": "text/x-dart",
+    ".vue": "text/plain",
+    ".svelte": "text/plain",
+    # Infra / build
+    ".tf": "text/plain",
+    ".hcl": "text/plain",
+    ".dockerfile": "text/plain",
+    ".gradle": "text/plain",
+    ".ipynb": "application/x-ipynb+json",
+    # Dotfiles
+    ".env": "text/plain",
+    ".lock": "text/plain",
+}
+
 
 def resolve_content_references(
     items: list[ConversationItem],
@@ -159,16 +207,60 @@ def _resolve_file_id_block(
     # Copy all fields except file_id.
     resolved: dict[str, Any] = {k: v for k, v in block.items() if k != "file_id"}
 
+    content_type = _resolve_content_type(file_meta.content_type, file_meta.filename)
+
     block_type = block.get("type")
     if block_type == "input_image":
-        # Image blocks use a data: URI in the image_url field.
-        content_type = file_meta.content_type or "application/octet-stream"
         resolved["image_url"] = f"data:{content_type};base64,{encoded}"
     else:
         # input_file and any future type: inline as file_data.
-        # Use a data: URI so providers (OpenAI, etc.) can parse
+        # Uses a data: URI so providers (OpenAI, etc.) can parse
         # the media type alongside the payload.
-        content_type = file_meta.content_type or "application/octet-stream"
         resolved["file_data"] = f"data:{content_type};base64,{encoded}"
 
     return resolved
+
+
+def _resolve_content_type(
+    stored_type: str | None,
+    filename: str | None,
+) -> str:
+    """
+    Determine the MIME type for a file, with fallbacks.
+
+    Priority: stored content_type (unless it's the generic
+    ``application/octet-stream``) → ``mimetypes.guess_type``
+    from filename → ``_EXTRA_MIME_TYPES`` lookup → ``text/plain``
+    for text-like extensions → ``application/octet-stream``.
+
+    Some LLM providers (OpenAI) reject ``application/octet-stream``
+    for text files, so we try hard to resolve a specific type.
+
+    :param stored_type: The content_type from file metadata, or
+        ``None``.
+    :param filename: The original filename, e.g. ``"report.md"``.
+    :returns: A MIME type string.
+    """
+    import mimetypes as _mt
+    from pathlib import PurePath
+
+    # Use stored type if it's specific (not the generic fallback).
+    if stored_type and stored_type != "application/octet-stream":
+        return stored_type
+
+    if filename:
+        suffix = PurePath(filename).suffix.lower()
+        # Our map takes priority over mimetypes — the stdlib has
+        # wrong mappings for some code extensions (e.g. .ts →
+        # video/mp2t, .rs → application/rls-services+xml).
+        if suffix in _EXTRA_MIME_TYPES:
+            return _EXTRA_MIME_TYPES[suffix]
+        guessed = _mt.guess_type(filename)[0]
+        if guessed and guessed != "application/octet-stream":
+            return guessed
+        # Text-like extensions default to text/plain rather than
+        # octet-stream, which providers are more likely to accept.
+        if suffix in {".txt", ".log", ".cfg", ".ini", ".env"}:
+            return "text/plain"
+
+    return stored_type or "application/octet-stream"

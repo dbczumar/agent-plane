@@ -97,6 +97,33 @@ def _extract_file_paths(text: str) -> list[PendingAttachment]:
     return attachments
 
 
+def _strip_file_paths(text: str, attachments: list[PendingAttachment]) -> str:
+    """
+    Remove detected file paths from the input text.
+
+    After extracting attachments, the raw pasted paths (possibly
+    shell-escaped) should not appear in the message sent to the LLM.
+    Returns the remaining text, stripped.
+
+    :param text: The raw input line.
+    :param attachments: Detected attachments with resolved paths.
+    :returns: The text with file path tokens removed.
+    """
+    resolved_paths = {a.path for a in attachments}
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        tokens = text.split()
+    remaining = []
+    for token in tokens:
+        cleaned = token.strip("'\"")
+        p = pathlib.Path(os.path.expanduser(cleaned)).resolve()
+        if str(p) in resolved_paths:
+            continue
+        remaining.append(token)
+    return " ".join(remaining).strip()
+
+
 def _display_width(text: str) -> int:
     """Visible width of text in terminal columns (handles CJK, emoji)."""
     w = wcswidth(text)
@@ -233,7 +260,7 @@ class TerminalHost:
                     except (EOFError, KeyboardInterrupt):
                         break
 
-                    if line is None or not line.strip():
+                    if line is None:
                         continue
 
                     line = line.strip()
@@ -242,6 +269,9 @@ class TerminalHost:
                     attachments = _extract_file_paths(line)
                     if attachments:
                         self._pending_attachments.extend(attachments)
+                        # Invalidate so the paperclip renders immediately.
+                        if self._prompt.app:
+                            self._prompt.app.invalidate()
                         # If ONLY file paths and no other text, queue
                         # and wait for a message.
                         att_paths = {a.path for a in attachments}
@@ -254,10 +284,12 @@ class TerminalHost:
                         if not non_file_tokens:
                             continue
 
+                    # Allow empty text when attachments are pending (the
+                    # user dropped a file then hit Enter without typing).
+                    if not line and not self._pending_attachments:
+                        continue
+
                     # Clear attachments before starting the handler.
-                    # Pass the original line (not stripped) — the handler
-                    # shows it as-is. File paths in the text are fine;
-                    # the SDK also uploads them via the files parameter.
                     files = self.take_attachments()
                     task = asyncio.create_task(handler(line, files))
                     self._tasks.append(task)

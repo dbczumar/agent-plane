@@ -177,17 +177,30 @@ def _normalize_input(
     """
     Normalize the request input into a list of content parts.
 
-    A plain string is converted into a single ``input_text``
-    content block.
+    Accepts three formats:
 
-    :param raw_input: Either a plain string (e.g. ``"Hello"``)
-        or a list of content-block dicts, e.g.
-        ``[{"type": "input_text", "text": "Hello"}]``.
-    :returns: A list of content-block dicts.
+    1. Plain string → ``[{"type": "input_text", "text": "..."}]``
+    2. List of content blocks → returned as-is.
+    3. List of message items (each with ``role`` + ``content``) →
+       content blocks are extracted and flattened. This handles
+       clients that send structured input items (e.g. the UI SDK's
+       ``_build_input_with_files``).
+
+    :param raw_input: Either a plain string, a list of content
+        blocks, or a list of message-item dicts.
+    :returns: A flat list of content-block dicts.
     """
     if isinstance(raw_input, str):
         return [{"type": "input_text", "text": raw_input}]
-    return raw_input
+    # If items have "role" + "content", they're message items —
+    # extract the content blocks.
+    blocks: list[dict[str, Any]] = []
+    for item in raw_input:
+        if "role" in item and "content" in item and isinstance(item["content"], list):
+            blocks.extend(item["content"])
+        else:
+            blocks.append(item)
+    return blocks
 
 
 def _validate_file_references(

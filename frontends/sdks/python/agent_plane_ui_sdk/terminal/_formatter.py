@@ -220,16 +220,31 @@ class RichBlockFormatter:
             padding=(0, 1),
         )
 
-    def user_message(self, text: str) -> FormattedItem:
-        """Format a user message with accent marker and gray background."""
+    def user_message(
+        self,
+        text: str,
+        attachments: list[str] | None = None,
+    ) -> FormattedItem:
+        """
+        Format a user message with accent marker and gray background.
+
+        :param text: The user's message text.
+        :param attachments: Optional list of attachment filenames to
+            display alongside the message.
+        """
         truncated = text
         lines = text.split("\n")
         if len(lines) > 4:
             truncated = "\n".join(lines[:4]) + f"\n… {len(lines) - 4} more lines"
         escaped = truncated.replace("[", "\\[").replace("]", "\\]")
-        return Text.from_markup(
-            f"\n [{self.accent}]❯[/{self.accent}] [on #1a1a1a]{escaped}[/on #1a1a1a]"
-        )
+        parts = f"\n [{self.accent}]❯[/{self.accent}]"
+        if escaped:
+            parts += f" [on #1a1a1a]{escaped}[/on #1a1a1a]"
+        if attachments:
+            for name in attachments:
+                safe = name.replace("[", "\\[").replace("]", "\\]")
+                parts += f" [{self.muted}]📎 {safe}[/{self.muted}]"
+        return Text.from_markup(parts)
 
     def goodbye(self) -> FormattedItem:
         """Goodbye message."""
