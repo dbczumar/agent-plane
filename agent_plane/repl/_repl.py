@@ -97,14 +97,24 @@ async def run_repl(
             )
             from agent_plane_ui_sdk import TextDone
 
+            got_blocks = False
             async for block in stream:
-                # If TextDone has code blocks, clear the raw streamed
-                # text before showing the rendered markdown.
+                got_blocks = True
                 if isinstance(block, TextDone) and block.has_code_blocks:
                     host.clear_streamed_text()
                 for item in fmt.format(block):
                     host.output(item)
                 await asyncio.sleep(0)
+
+            if not got_blocks:
+                # Steering — no blocks from our stream, but the agent
+                # will respond via the existing stream. Show the header
+                # so the user knows the agent is working.
+                from rich.text import Text as RText
+
+                host.output(
+                    RText.from_markup(f"\n [{fmt.assistant}]◆ {ui_name}[/{fmt.assistant}]")
+                )
         finally:
             host.stop_timer()
 
