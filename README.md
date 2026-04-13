@@ -199,9 +199,13 @@ agent-name/
   `tools/mcp/*.yaml` with URL, headers, and optional per-server
   timeout/retry config.
 
-- **Built-in tools** — web search via OpenAI (passthrough), Google Custom
-  Search, or Perplexity. Configured in `config.yaml` with API keys or
-  environment variable references.
+- **Built-in tools** — includes web search via OpenAI (passthrough), Google
+  Custom Search, or Perplexity, plus `web_fetch` for live page fetching
+  (available with any model, not just models with native web search),
+  `introspect` for inspecting the current agent/runtime configuration,
+  `search_conversations` for recalling prior work, and `export_agent` for
+  packaging an agent bundle. Search providers are configured in
+  `config.yaml` with API keys or environment variable references.
 
 - **Local Python tools** — auto-discovered from `tools/python/*.py`. Each
   file exports a `SCHEMA` dict (OpenAI function format) and a `run(arguments)
@@ -229,6 +233,10 @@ agent-name/
 
 - **File upload** — `POST /v1/files` for uploading files referenced in
   requests via `file_id`.
+
+- **Built-in coding sandbox and file return** — agents can write code and
+  files inside a sandboxed workspace, then return generated files to the user
+  as downloadable attachments via the files API / `file_citation` annotations.
 
 - **Agent management API** — CRUD for agent bundles (`/api/agents`). Upload
   validates the spec on the server side (structure, naming, constraints).
