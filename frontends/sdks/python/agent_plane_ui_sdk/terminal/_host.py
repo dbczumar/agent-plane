@@ -11,7 +11,6 @@ import asyncio
 import io
 import os
 import pathlib
-import shlex
 import textwrap
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -76,19 +75,21 @@ def _extract_file_paths(text: str) -> list[PendingAttachment]:
 
     Terminals like iTerm2 and Kitty convert drag-and-drop into
     pasted text with file paths (possibly shell-escaped).
+    Only checks whitespace-separated tokens — no shell parsing
+    that could concatenate long text with filenames.
     """
     attachments: list[PendingAttachment] = []
-    try:
-        tokens = shlex.split(text)
-    except ValueError:
-        tokens = text.split()
-
-    for token in tokens:
+    for token in text.split():
         token = token.strip("'\"")
-        p = pathlib.Path(os.path.expanduser(token)).resolve()
-        if not p.is_file():
+        if len(token) > 512:
             continue
-        if p.suffix.lower() not in _FILE_EXTENSIONS:
+        if not any(token.endswith(ext) for ext in _FILE_EXTENSIONS):
+            continue
+        try:
+            p = pathlib.Path(os.path.expanduser(token)).resolve()
+        except (OSError, ValueError):
+            continue
+        if not p.is_file():
             continue
         is_image = p.suffix.lower() in _IMAGE_EXTENSIONS
         attachments.append(PendingAttachment(path=str(p), is_image=is_image))
@@ -243,12 +244,14 @@ class TerminalHost:
                         self._pending_attachments.extend(attachments)
                         # If ONLY file paths and no other text, queue
                         # and wait for a message.
-                        try:
-                            tokens = shlex.split(line)
-                        except ValueError:
-                            tokens = line.split()
-                        has_text = any(not pathlib.Path(t.strip("'\"")).is_file() for t in tokens)
-                        if not has_text:
+                        att_paths = {a.path for a in attachments}
+                        non_file_tokens = [
+                            t
+                            for t in line.split()
+                            if str(pathlib.Path(os.path.expanduser(t.strip("'\""))).resolve())
+                            not in att_paths
+                        ]
+                        if not non_file_tokens:
                             continue
 
                     # Clear attachments before starting the handler.
