@@ -241,22 +241,20 @@ class TerminalHost:
                     attachments = _extract_file_paths(line)
                     if attachments:
                         self._pending_attachments.extend(attachments)
-                        # Strip file paths from text to get the message.
+                        # If ONLY file paths and no other text, queue
+                        # and wait for a message.
                         try:
                             tokens = shlex.split(line)
                         except ValueError:
                             tokens = line.split()
-                        remaining = [
-                            t for t in tokens if not pathlib.Path(t.strip("'\"")).is_file()
-                        ]
-                        line = " ".join(remaining).strip()
-                        if not line:
-                            # Only files pasted, no text. Prompt redraws
-                            # with attachments shown via build_prompt().
+                        has_text = any(not pathlib.Path(t.strip("'\"")).is_file() for t in tokens)
+                        if not has_text:
                             continue
 
-                    # Clear attachments before starting the handler so
-                    # the prompt redraws without them immediately.
+                    # Clear attachments before starting the handler.
+                    # Pass the original line (not stripped) — the handler
+                    # shows it as-is. File paths in the text are fine;
+                    # the SDK also uploads them via the files parameter.
                     files = self.take_attachments()
                     task = asyncio.create_task(handler(line, files))
                     self._tasks.append(task)
