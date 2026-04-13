@@ -232,7 +232,7 @@ class TerminalHost:
                     except (EOFError, KeyboardInterrupt):
                         break
 
-                    if line is None or not line.strip():
+                    if line is None:
                         continue
 
                     line = line.strip()
@@ -241,8 +241,12 @@ class TerminalHost:
                     attachments = _extract_file_paths(line)
                     if attachments:
                         self._pending_attachments.extend(attachments)
-                        # If ONLY file paths and no other text, queue
-                        # and wait for a message.
+                        # Invalidate so the paperclip renders immediately
+                        # instead of waiting for the toolbar ticker.
+                        if self._prompt.app:
+                            self._prompt.app.invalidate()
+                        # If ONLY file paths and no other text, wait for
+                        # the user to type a message (or just hit Enter).
                         try:
                             tokens = shlex.split(line)
                         except ValueError:
@@ -251,10 +255,12 @@ class TerminalHost:
                         if not has_text:
                             continue
 
+                    # Allow empty text when attachments are pending (the
+                    # user dropped a file then hit Enter without typing).
+                    if not line and not self._pending_attachments:
+                        continue
+
                     # Clear attachments before starting the handler.
-                    # Pass the original line (not stripped) — the handler
-                    # shows it as-is. File paths in the text are fine;
-                    # the SDK also uploads them via the files parameter.
                     files = self.take_attachments()
                     task = asyncio.create_task(handler(line, files))
                     self._tasks.append(task)

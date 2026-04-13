@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import pathlib
 from typing import Any
 
 from agent_plane_ui_sdk import (
@@ -84,11 +85,16 @@ async def run_repl(
     async def on_input(text: str, attachments: list[Any] | None = None) -> None:
         nonlocal is_streaming
 
-        if text.startswith("/"):
+        # Slash commands are short tokens like "/help", "/clear".
+        # File paths like "/Users/foo/bar.jpg" start with "/" but
+        # contain more path separators — don't treat those as commands.
+        first_token = text.split()[0] if text.split() else ""
+        if first_token.startswith("/") and "/" not in first_token[1:]:
             await handle_slash_command(text, session, client, host, fmt)
             return
 
         files = [a.path for a in attachments] if attachments else None
+        filenames = [pathlib.Path(a.path).name for a in attachments] if attachments else None
 
         if is_streaming:
             # Show the message immediately in dimmed style so the
@@ -100,7 +106,7 @@ async def run_repl(
                 pass  # Steer yields nothing if delivered.
             return
 
-        host.output(fmt.user_message(text))
+        host.output(fmt.user_message(text, attachments=filenames))
         host.start_timer()
         await asyncio.sleep(0)
         is_streaming = True
