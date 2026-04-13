@@ -248,9 +248,9 @@ agent-name/
   (`tools.timeout`, `tools.retry`) and per-tool (MCP server config,
   `tools.local` block). Exponential backoff with jitter.
 
-- **Executor support** — the default `llm` executor, Claude agents via
-  `executor.type: claude_sdk`, and OpenAI Agents SDK agents via
-  `executor.type: agents_sdk` are supported.
+- **Multiple agent harnesses** — supports the default `llm` executor,
+  Claude agents via `executor.type: claude_sdk`, and OpenAI Agents SDK
+  agents via `executor.type: agents_sdk`.
 
 - **Security sandboxing** — when `srt` (Anthropic's Sandbox Runtime) is on
   PATH, `code_sandbox` and local Python tools run inside an OS-level sandbox
