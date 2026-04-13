@@ -200,7 +200,7 @@ class TerminalHost:
         self._pending_attachments = []
         return attachments
 
-    async def run(self, handler: Callable[[str], Awaitable[None]]) -> None:
+    async def run(self, handler: Callable[..., Awaitable[None]]) -> None:
         """Run the input loop.
 
         Uses the alternate screen buffer so the prompt stays pinned
@@ -240,22 +240,8 @@ class TerminalHost:
                     # Detect file paths from drag-and-drop paste.
                     attachments = _extract_file_paths(line)
                     if attachments:
-                        # If the entire input is file paths, queue them
-                        # without sending. Otherwise, queue + send.
                         self._pending_attachments.extend(attachments)
-                        # Show what was attached.
-                        for att in attachments:
-                            if att.is_image:
-                                self.output(
-                                    StreamingText(
-                                        text=f"   📎 [Image] {pathlib.Path(att.path).name}\n"
-                                    )
-                                )
-                            else:
-                                self.output(
-                                    StreamingText(text=f"   📎 {pathlib.Path(att.path).name}\n")
-                                )
-                        # Strip file paths from text to get just the message.
+                        # Strip file paths from text to get the message.
                         try:
                             tokens = shlex.split(line)
                         except ValueError:
@@ -265,10 +251,14 @@ class TerminalHost:
                         ]
                         line = " ".join(remaining).strip()
                         if not line:
-                            # Only files pasted, no text — wait for a message.
+                            # Only files pasted, no text. Prompt redraws
+                            # with attachments shown via build_prompt().
                             continue
 
-                    task = asyncio.create_task(handler(line))
+                    # Clear attachments before starting the handler so
+                    # the prompt redraws without them immediately.
+                    files = self.take_attachments()
+                    task = asyncio.create_task(handler(line, files))
                     self._tasks.append(task)
                     task.add_done_callback(
                         lambda t: self._tasks.remove(t) if t in self._tasks else None

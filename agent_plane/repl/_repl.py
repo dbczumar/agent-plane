@@ -80,13 +80,11 @@ async def run_repl(
 
     host.on_help = show_help
 
-    async def on_input(text: str) -> None:
+    async def on_input(text: str, attachments: list[Any] | None = None) -> None:
         if text.startswith("/"):
             await handle_slash_command(text, session, client, host, fmt)
             return
 
-        # Collect any pending file attachments.
-        attachments = host.take_attachments()
         files = [a.path for a in attachments] if attachments else None
 
         host.output(fmt.user_message(text))
