@@ -221,6 +221,19 @@ class CodeSandboxTool(Tool):
         """
         return "code_sandbox"
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return (
+            "Execute a shell command in a persistent workspace. "
+            "Use for reading files (cat), writing files (echo >), "
+            "running scripts (python), installing packages (pip), "
+            "and any other shell operation. The workspace persists "
+            "across turns within the conversation."
+        )
+
     def get_schema(self) -> dict[str, Any]:
         """
         Return the OpenAI function schema.

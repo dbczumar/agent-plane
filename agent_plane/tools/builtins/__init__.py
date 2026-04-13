@@ -32,6 +32,7 @@ from agent_plane.tools.builtins.spawn import (
 from agent_plane.tools.builtins.web_search import WebSearchTool
 
 __all__ = [
+    "BUILTIN_NAMES",
     "CancelSubAgentTool",
     "CheckSubAgentsTool",
     "LoadSkillTool",
@@ -130,15 +131,28 @@ def _create_export_agent(config: dict[str, str]) -> Tool:
     return ExportAgentTool()
 
 
+# Canonical set of all builtin tool names that agents can enable
+# via ``tools.builtins`` in config.yaml. Used for discovery (e.g.
+# by the onboarding assistant's list_builtin_tools).
+BUILTIN_NAMES: frozenset[str] = frozenset(
+    {
+        "web_search",
+        "web_fetch",
+        "introspect",
+        "code_sandbox",
+        "upload_file",
+        "list_files",
+        "download_file",
+        "search_conversations",
+        "export_agent",
+    }
+)
+
 _BUILTIN_REGISTRY: dict[str, _BuiltinFactory] = {
-    # web_search and web_fetch are handled specially by
-    # ToolManager._create_builtin (they need extra context from
-    # the parent spec). Registered here so get_builtin_tool
-    # doesn't return None for them.
+    # web_fetch and introspect need runtime context (parent spec)
+    # to instantiate — ToolManager handles them before reaching
+    # this registry. They are listed in BUILTIN_NAMES above.
     "web_search": lambda config: WebSearchTool(config=config),
-    # web_fetch is handled by ToolManager._create_web_fetch (needs
-    # parent spec). Not registered here — ToolManager catches it
-    # before reaching the registry.
     "code_sandbox": _create_code_sandbox,
     "upload_file": _create_upload_file,
     "list_files": _create_list_files,

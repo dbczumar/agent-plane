@@ -37,6 +37,18 @@ class ReadSkillFileTool(Tool):
         """
         return "read_skill_file"
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return (
+            "Read a file from a skill's directory "
+            "(references/, scripts/, or assets/). "
+            "Requires the skill name and a relative "
+            "file path."
+        )
+
     def get_schema(self) -> dict[str, Any]:
         """
         Return the OpenAI-format schema for ``read_skill_file``.

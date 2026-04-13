@@ -78,6 +78,21 @@ class WebSearchTool(Tool):
         """
         return "web_search"
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return (
+            "Quick web search — returns a comprehensive "
+            "list of result links and snippets from a "
+            "search engine. Good for broad discovery and "
+            "finding URLs, but results may be slightly "
+            "delayed vs. live web. For reading full page "
+            "content or fetching the latest info from a "
+            "specific URL, use web_fetch instead."
+        )
+
     def get_schema(self) -> dict[str, Any]:
         """
         Return the tool schema, varying by provider.

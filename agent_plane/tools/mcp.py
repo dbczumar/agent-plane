@@ -833,6 +833,13 @@ class McpTool(Tool):
         """
         return self._tool_def.name
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return "Tool provided by an MCP server."
+
     # Returns dict[str, Any] — defined by the Tool ABC. OpenAI
     # tool schemas are inherently heterogeneous (nested dicts,
     # strings, lists) so Any is the narrowest safe value type.

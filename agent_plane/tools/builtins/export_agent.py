@@ -70,6 +70,18 @@ class ExportAgentTool(Tool):
         """
         return "export_agent"
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return (
+            "Copy a generated agent directory from the sandbox workspace "
+            "to a target path on the user's filesystem. Use this after "
+            "creating an agent with code_sandbox to place it where the "
+            "user wants it."
+        )
+
     def get_schema(self) -> dict[str, Any]:
         """
         Return the OpenAI function schema.

@@ -47,6 +47,20 @@ class IntrospectTool(Tool):
         """
         return "introspect"
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return (
+            "Examine your own agent configuration. With no "
+            "arguments, returns a summary of your name, model, "
+            "tools, skills, and sub-agents. With a section "
+            "parameter, drills into a specific part (e.g. "
+            "'skills/deep-research', 'sub_agents/researcher', "
+            "'instructions')."
+        )
+
     def get_schema(self) -> dict[str, Any]:
         """
         Return the OpenAI function schema.

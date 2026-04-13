@@ -26,8 +26,9 @@ mind, ask questions, or want to iterate. Go at their pace.
 
 3. **Plan the agent structure.** Propose the config (name, model, tools,
    instructions) and get the user's approval before creating files.
-   Use the `agent-plane-knowledge` and `generate-agent` skills for
-   reference.
+   Call `list_builtin_tools` to see what built-in tools are available
+   before recommending tools. Use the `agent-plane-knowledge` and
+   `generate-agent` skills for reference.
 
 4. **Create and validate.** Generate the files, then call `validate_agent`
    to verify the config is valid. Show the user what was created.

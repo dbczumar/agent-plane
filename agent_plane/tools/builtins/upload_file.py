@@ -78,6 +78,17 @@ class UploadFileTool(Tool):
         """
         return "upload_file"
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return (
+            "Upload a file from the workspace so the user can download it. "
+            "Takes a relative path within the workspace (e.g. 'output/chart.png'). "
+            "Returns a file_id that the user's client can use to download the file."
+        )
+
     def get_schema(self) -> dict[str, Any]:
         """
         Return the OpenAI function schema.
