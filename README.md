@@ -38,8 +38,9 @@ behind it is production-grade.
 
 ## Quick Start
 
-The `examples/` directory has ready-to-run agents. The `ap chat` command
-starts a server, uploads the agent, and opens an interactive chat.
+The fastest way to get started is: run an example, try client-side tools,
+then create your own. The `examples/` directory has ready-to-run agents, and
+`ap chat` starts a server, uploads the agent, and opens an interactive chat.
 
 https://github.com/user-attachments/assets/419c9951-c05b-451f-9914-892c156acba0
 
@@ -74,6 +75,35 @@ ap chat examples/agents/coder/ --tools coding
 The `--tools coding` flag loads client-side tool schemas (Read, Write,
 Edit, Glob, Grep, Bash) and their local execution logic from
 `agent_plane/client_tools/coding.py`.
+
+### Example 3: Create your own agent
+
+Once you've run the example agents, create your own with `ap create`.
+
+```bash
+ap create --allow-shell-access
+```
+
+This launches the onboarding assistant, which helps you create a new agent
+through an interactive conversation. It prompts you to choose a model
+provider and model, then scaffolds the agent for you.
+
+`--allow-shell-access` gives the onboarding assistant full access to read and
+write files, run commands, and inspect your environment. Without it, the
+assistant works in a sandbox and exports the finished agent to your chosen
+path.
+
+You can also run `ap create` non-interactively by giving it a prompt and a
+model:
+
+```bash
+ap create "create a research agent with web search" \
+  --model anthropic/claude-sonnet-4-20250514 \
+  --allow-shell-access
+```
+
+Interactive mode is the easiest way to get started. Non-interactive mode is
+useful for scripting or quick scaffolding.
 
 ### Using the API directly
 

@@ -132,6 +132,9 @@ async def run_repl(
                 await session.cancel()
             except Exception:
                 pass  # Best-effort — server may already have finished.
+            from rich.text import Text as RText
+
+            host.output(RText.from_markup(f"\n  [{fmt.muted}]cancelled[/{fmt.muted}]"))
             raise
         finally:
             is_streaming = False
