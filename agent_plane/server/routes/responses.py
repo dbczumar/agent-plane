@@ -16,6 +16,7 @@ from agent_plane.entities import (
     ACTIVE_STATUSES,
     TERMINAL_STATUSES,
     CompletePendingToolCallResult,
+    FunctionCallData,
     FunctionCallOutputData,
     MessageData,
     NewConversationItem,
@@ -89,36 +90,70 @@ def _append_cancellation_item(
     conversation_store: ConversationStore,
 ) -> None:
     """
-    Append a user-role message indicating the response was cancelled.
+    Clean up the conversation after cancellation.
 
-    Called after ``task_store.cancel()`` so the conversation history
-    records that the user interrupted the agent. Subsequent turns
-    (and the agent itself on replay) will see this marker and know
-    the preceding assistant output may be incomplete.
+    1. Inserts synthetic ``function_call_output`` items for any
+       dangling ``function_call`` items (tool calls that were
+       persisted before the cancellation but never received a
+       result). Without these, the OpenAI Responses API rejects
+       the next turn with ``"No tool output found for function
+       call"``.
+    2. Appends a user-role marker so the agent knows the preceding
+       output may be incomplete.
 
     :param task: The cancelled task entity. Uses ``task.id`` as the
         ``response_id`` and ``task.conversation_id`` to locate the
         conversation.
     :param conversation_store: Store for appending the item.
     """
-    item = NewConversationItem(
-        type="message",
-        response_id=task.id,
-        data=MessageData(
-            role="user",
-            content=[
-                {
-                    "type": "input_text",
-                    "text": (
-                        "[The user interrupted and halted the agent response. "
-                        "The preceding assistant message may be incomplete — "
-                        "the user may not have seen the full response.]"
+    items: list[NewConversationItem] = []
+
+    # Find dangling function_calls and insert synthetic outputs.
+    history = conversation_store.fetch_all(task.conversation_id)
+    call_ids_with_output: set[str] = set()
+    dangling_call_ids: list[str] = []
+    for ci in history:
+        if ci.type == "function_call":
+            assert isinstance(ci.data, FunctionCallData)
+            dangling_call_ids.append(ci.data.call_id)
+        elif ci.type == "function_call_output":
+            assert isinstance(ci.data, FunctionCallOutputData)
+            call_ids_with_output.add(ci.data.call_id)
+
+    for call_id in dangling_call_ids:
+        if call_id not in call_ids_with_output:
+            items.append(
+                NewConversationItem(
+                    type="function_call_output",
+                    response_id=task.id,
+                    data=FunctionCallOutputData(
+                        call_id=call_id,
+                        output="[Cancelled — tool execution was interrupted.]",
                     ),
-                }
-            ],
-        ),
+                )
+            )
+
+    # Cancellation marker.
+    items.append(
+        NewConversationItem(
+            type="message",
+            response_id=task.id,
+            data=MessageData(
+                role="user",
+                content=[
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "[The user interrupted and halted the agent response. "
+                            "The preceding assistant message may be incomplete — "
+                            "the user may not have seen the full response.]"
+                        ),
+                    }
+                ],
+            ),
+        )
     )
-    conversation_store.append(task.conversation_id, [item])
+    conversation_store.append(task.conversation_id, items)
 
 
 def _apply_tool_results(
