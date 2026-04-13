@@ -60,7 +60,10 @@ def create_files_router(
         if not file.filename:
             raise AgentPlaneError("filename is required", code=ErrorCode.INVALID_INPUT)
         content = await file.read()
-        content_type = mimetypes.guess_type(file.filename)[0]
+        # Prefer the content type from the multipart upload headers
+        # (set by the client). Fall back to mimetypes.guess_type,
+        # which may not know newer extensions like .md in all Pythons.
+        content_type = file.content_type or mimetypes.guess_type(file.filename)[0]
         stored = file_store.create(
             filename=file.filename,
             bytes=len(content),

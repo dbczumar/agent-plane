@@ -8,6 +8,7 @@ provider that speaks the OpenAI Chat Completions API format.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -31,6 +32,8 @@ from agent_plane.llms.types import (
     ResponseTextDeltaEvent,
     Usage,
 )
+
+_logger = logging.getLogger(__name__)
 
 # Timeout for non-streaming requests (seconds)
 _REQUEST_TIMEOUT = 120
@@ -266,47 +269,6 @@ def _resolve_base_url(
     )
 
 
-def _prepare_input_files(
-    input_items: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """
-    Convert internal ``file_data`` data URIs to plain base64 for
-    the OpenAI Responses API.
-
-    The content resolver produces ``file_data`` as a data URI
-    (``"data:text/markdown;base64,..."``). OpenAI's Responses API
-    expects plain base64 in ``file_data``. This strips the URI
-    prefix on ``input_file`` blocks inside message content arrays.
-
-    :param input_items: Responses API input items.
-    :returns: A new list with ``input_file`` blocks transformed.
-        Items without file blocks are returned as-is.
-    """
-    result: list[dict[str, Any]] = []
-    for item in input_items:
-        content = item.get("content")
-        if not isinstance(content, list):
-            result.append(item)
-            continue
-        new_content: list[dict[str, Any]] = []
-        changed = False
-        for block in content:
-            if block.get("type") == "input_file" and "file_data" in block:
-                fd = block["file_data"]
-                if isinstance(fd, str) and ";base64," in fd:
-                    # Strip data URI prefix → plain base64.
-                    new_block = {**block, "file_data": fd.split(";base64,", 1)[1]}
-                    new_content.append(new_block)
-                    changed = True
-                    continue
-            new_content.append(block)
-        if changed:
-            result.append({**item, "content": new_content})
-        else:
-            result.append(item)
-    return result
-
-
 def _to_responses_tools(
     tools: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -506,7 +468,7 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         params = connection_params or {}
         payload: dict[str, Any] = {
             "model": model,
-            "input": _prepare_input_files(input),
+            "input": input,
             **kwargs,
         }
         if instructions:
@@ -576,6 +538,13 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
                 headers=headers,
                 json=payload,
             ) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    _logger.error(
+                        "OpenAI Responses API %s: %s",
+                        resp.status_code,
+                        body.decode("utf-8", errors="replace")[:2000],
+                    )
                 resp.raise_for_status()
                 async for chunk in resp.aiter_bytes():
                     buf += chunk.decode("utf-8", errors="replace")
