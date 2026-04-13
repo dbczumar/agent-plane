@@ -3,6 +3,11 @@
 Returns the live registry of builtin tool names and their
 descriptions, so the onboarding assistant always recommends
 from the current set — not a stale hardcoded list.
+
+Each tool class is imported individually from its own module to
+avoid importing the ``agent_plane.tools.builtins`` package (which
+transitively pulls in modules that conflict with the ``mcp`` pip
+package in subprocess environments).
 """
 
 from typing import Any
@@ -24,8 +29,10 @@ SCHEMA: dict[str, Any] = {
     },
 }
 
-# Maps builtin names to their Tool class import paths so we can
-# call cls.description() without instantiation.
+# Maps every builtin tool name to (module_path, class_name).
+# This is the sole source of truth — when a new builtin is added,
+# add it here. Each module is imported individually to avoid the
+# transitive import chain from agent_plane.tools.builtins.__init__.
 _TOOL_CLASSES: dict[str, tuple[str, str]] = {
     "code_sandbox": ("agent_plane.tools.builtins.code_sandbox", "CodeSandboxTool"),
     "download_file": ("agent_plane.tools.builtins.download_file", "DownloadFileTool"),
@@ -44,24 +51,18 @@ _TOOL_CLASSES: dict[str, tuple[str, str]] = {
 
 async def run(arguments: dict[str, Any]) -> str:
     """
-    Query the builtin tool registry and return names + descriptions.
+    Import each builtin tool class and return names + descriptions.
 
     :param arguments: Unused (no parameters).
     :returns: Formatted list of available builtin tools.
     """
     import importlib
 
-    from agent_plane.tools.builtins import BUILTIN_NAMES
-
     lines: list[str] = []
-    for name in sorted(BUILTIN_NAMES):
-        class_info = _TOOL_CLASSES.get(name)
-        if class_info is not None:
-            module_path, class_name = class_info
-            module = importlib.import_module(module_path)
-            cls = getattr(module, class_name)
-            lines.append(f"- {name}: {cls.description()}")
-        else:
-            lines.append(f"- {name}: (no description)")
+    for name in sorted(_TOOL_CLASSES):
+        module_path, class_name = _TOOL_CLASSES[name]
+        module = importlib.import_module(module_path)
+        cls = getattr(module, class_name)
+        lines.append(f"- {name}: {cls.description()}")
 
     return "\n".join(lines)

@@ -157,6 +157,10 @@ class LocalPythonTool(Tool):
             }
         ).encode()
 
+        # Pass workspace to the subprocess so local tools can resolve
+        # relative paths (e.g. validate_agent resolving sandbox dirs).
+        self._workspace = ctx.workspace
+
         # srt and Docker both wrap the command in their own process
         # chain, so the fd 3 pipe doesn't survive to the inner
         # Python process. Use the stdout protocol instead.
@@ -176,6 +180,8 @@ class LocalPythonTool(Tool):
         read_fd, write_fd = os.pipe()
         try:
             env = {**os.environ, "_AP_RESPONSE_FD": str(write_fd)}
+            if self._workspace is not None:
+                env["_AP_WORKSPACE"] = str(self._workspace)
             self._proc = subprocess.Popen(
                 self._build_command(),
                 stdin=subprocess.PIPE,
@@ -213,6 +219,8 @@ class LocalPythonTool(Tool):
         """
         try:
             env = {**os.environ, "_AP_RESPONSE_MODE": "stdout"}
+            if self._workspace is not None:
+                env["_AP_WORKSPACE"] = str(self._workspace)
             self._proc = subprocess.Popen(
                 self._build_command(),
                 stdin=subprocess.PIPE,

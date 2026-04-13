@@ -39,6 +39,7 @@ async def run(arguments: dict[str, Any]) -> str:
         an agent directory with config.yaml.
     :returns: ``"Valid: <agent-name>"`` or error details.
     """
+    import os
     from pathlib import Path
 
     path_str = arguments.get("path", "")
@@ -46,6 +47,14 @@ async def run(arguments: dict[str, Any]) -> str:
         return "Error: 'path' parameter is required."
 
     agent_path = Path(path_str)
+    # Resolve relative paths against the conversation workspace so
+    # validate_agent("my-agent") works from sandbox mode without the
+    # LLM needing to know the absolute workspace path.
+    if not agent_path.is_absolute():
+        workspace = os.environ.get("_AP_WORKSPACE")
+        if workspace:
+            agent_path = Path(workspace) / agent_path
+
     if not agent_path.exists():
         return f"Error: directory '{agent_path}' does not exist."
 
