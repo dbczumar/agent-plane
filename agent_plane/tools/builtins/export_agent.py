@@ -120,10 +120,9 @@ class ExportAgentTool(Tool):
             return f"Error: source '{source_rel}' is not a directory."
 
         if target.exists():
-            return (
-                f"Error: target '{target}' already exists. "
-                f"Choose a different path to avoid overwriting."
-            )
+            # Replace previous export — the onboarding workflow
+            # iterates and re-exports as the user refines the agent.
+            shutil.rmtree(str(target))
 
         shutil.copytree(str(source), str(target))
         return f"Exported agent to {target}"
