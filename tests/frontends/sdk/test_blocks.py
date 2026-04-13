@@ -23,7 +23,7 @@ from agent_plane_ui_sdk._blocks import (
 def test_block_context_defaults() -> None:
     """BlockContext has sensible defaults."""
     ctx = BlockContext()
-    assert ctx.agent == ""
+    assert ctx.agent is None
     assert ctx.depth == 0
     assert ctx.turn == 0
     assert ctx.timestamp > 0

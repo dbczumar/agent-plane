@@ -15,15 +15,23 @@ from ._types import Response
 
 @dataclass
 class BlockContext:
-    """Metadata attached to every render block."""
+    """Metadata attached to every render block.
 
-    agent: str = ""
+    :param agent: Name of the agent that produced this block, e.g.
+        ``"coder.researcher"``. ``None`` for the root agent.
+    :param depth: Nesting depth of the agent in the sub-agent tree.
+        ``0`` for the root agent.
+    :param turn: Turn number within the current response.
+    :param timestamp: Monotonic timestamp when the block was created.
+    """
+
+    agent: str | None = None
     depth: int = 0
     turn: int = 0
     timestamp: float = field(default_factory=time.monotonic)
 
 
-@dataclass
+@dataclass(kw_only=True)
 class RenderBlock:
     """Base for all render blocks."""
 
@@ -33,134 +41,191 @@ class RenderBlock:
 # ── Response lifecycle ───────────────────────────────────
 
 
-@dataclass
+@dataclass(kw_only=True)
 class ResponseStartBlock(RenderBlock):
-    """The response has started."""
+    """The response has started.
 
-    model: str = ""
-    response_id: str = ""
+    :param model: Agent model name, e.g. ``"coder"``.
+    :param response_id: Server-assigned response ID.
+    """
+
+    model: str
+    response_id: str
 
 
 # ── Tool calls ───────────────────────────────────────────
 
 
-@dataclass
+@dataclass(kw_only=True)
 class ToolExecution:
-    """A single tool call paired with its result."""
+    """A single tool call paired with its result.
 
-    name: str = ""
+    :param name: Tool name, e.g. ``"Read"``.
+    :param arguments: Parsed arguments dict.
+    :param args_summary: One-line summary of the arguments, e.g. ``"test.py"``.
+    :param call_id: Server-assigned call ID.
+    :param agent_name: Name of the agent that invoked the tool.
+    :param executed_by: ``"server"`` or ``"client"``.
+    :param output: Tool output text, or ``None`` if not yet available.
+    """
+
+    name: str
     arguments: dict[str, object] = field(default_factory=dict)
-    args_summary: str = ""
-    call_id: str = ""
-    agent_name: str = ""
+    args_summary: str
+    call_id: str
+    agent_name: str
     executed_by: str = "server"
     output: str | None = None
 
 
-@dataclass
+@dataclass(kw_only=True)
 class ToolGroup(RenderBlock):
-    """A batch of tool calls from one iteration."""
+    """A batch of tool calls from one iteration.
+
+    :param executions: The tool calls in this group.
+    :param iteration: The iteration number within the response.
+    """
 
     executions: list[ToolExecution] = field(default_factory=list)
     iteration: int = 0
 
 
-@dataclass
+@dataclass(kw_only=True)
 class ToolResultBlock(RenderBlock):
-    """A tool result, emitted after the tool executes."""
+    """A tool result, emitted after the tool executes.
 
-    name: str = ""
-    call_id: str = ""
-    agent_name: str = ""
-    output: str = ""
+    :param name: Tool name, e.g. ``"Read"``.
+    :param call_id: Server-assigned call ID.
+    :param agent_name: Name of the agent that invoked the tool.
+    :param output: Tool output text.
+    """
+
+    name: str
+    call_id: str
+    agent_name: str
+    output: str
 
 
-@dataclass
+@dataclass(kw_only=True)
 class NativeToolBlock(RenderBlock):
-    """A provider-native tool output (web_search, mcp, etc.)."""
+    """A provider-native tool output (web_search, mcp, etc.).
 
-    tool_type: str = ""
-    label: str = ""
+    :param tool_type: Provider tool type, e.g. ``"web_search_call"``.
+    :param label: Human-readable label for display, e.g. ``"search"``.
+    :param data: Raw provider data dict.
+    """
+
+    tool_type: str
+    label: str
     data: dict[str, object] = field(default_factory=dict)
 
 
 # ── Text ─────────────────────────────────────────────────
 
 
-@dataclass
+@dataclass(kw_only=True)
 class TextChunk(RenderBlock):
-    """A flushed chunk of streamed text."""
+    """A flushed chunk of streamed text.
 
-    text: str = ""
+    :param text: The text content of this chunk.
+    """
+
+    text: str
 
 
-@dataclass
+@dataclass(kw_only=True)
 class TextDone(RenderBlock):
-    """Complete text from a text-streaming section."""
+    """Complete text from a text-streaming section.
 
-    full_text: str = ""
+    :param full_text: The complete accumulated text.
+    :param has_code_blocks: Whether the text contains fenced code blocks.
+    """
+
+    full_text: str
     has_code_blocks: bool = False
 
 
 # ── Reasoning ────────────────────────────────────────────
 
 
-@dataclass
+@dataclass(kw_only=True)
 class ReasoningStartBlock(RenderBlock):
     """Reasoning has started — show a thinking indicator."""
 
     pass
 
 
-@dataclass
+@dataclass(kw_only=True)
 class ReasoningBlock(RenderBlock):
-    """A completed reasoning/thinking block."""
+    """A completed reasoning/thinking block.
 
-    reasoning_text: str = ""
-    summary_text: str = ""
+    :param reasoning_text: The raw reasoning text.
+    :param summary_text: A summary of the reasoning.
+    """
+
+    reasoning_text: str
+    summary_text: str
 
 
 # ── Status ───────────────────────────────────────────────
 
 
-@dataclass
+@dataclass(kw_only=True)
 class ErrorBlock(RenderBlock):
-    """An error during the response."""
+    """An error during the response.
 
-    message: str = ""
-    source: str = ""
+    :param message: The error message.
+    :param source: Where the error originated, e.g. ``"llm"``.
+    """
+
+    message: str
+    source: str
 
 
-@dataclass
+@dataclass(kw_only=True)
 class RetryBlock(RenderBlock):
-    """The server is retrying."""
+    """The server is retrying.
 
-    source: str = ""
-    attempt: int = 0
-    max_attempts: int = 0
-    delay_seconds: float = 0.0
+    :param source: What is being retried, e.g. ``"tool"``.
+    :param attempt: Current attempt number.
+    :param max_attempts: Maximum retry attempts.
+    :param delay_seconds: Delay before the next attempt.
+    """
+
+    source: str
+    attempt: int
+    max_attempts: int
+    delay_seconds: float
 
 
-@dataclass
+@dataclass(kw_only=True)
 class CompactionBlock(RenderBlock):
     """Conversation is being compacted."""
 
     pass
 
 
-@dataclass
+@dataclass(kw_only=True)
 class FileBlock(RenderBlock):
-    """A file artifact produced by the agent."""
+    """A file artifact produced by the agent.
 
-    file_id: str = ""
+    :param file_id: Server-assigned file ID.
+    :param filename: Original filename, or ``None`` if unknown.
+    """
+
+    file_id: str
     filename: str | None = None
 
 
-@dataclass
+@dataclass(kw_only=True)
 class ResponseEndBlock(RenderBlock):
-    """The response reached a terminal state."""
+    """The response reached a terminal state.
 
-    status: str = ""
+    :param status: Terminal status, e.g. ``"completed"`` or ``"failed"``.
+    :param response: The full response object, or ``None``.
+    """
+
+    status: str
     response: Response | None = None
 
 
