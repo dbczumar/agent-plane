@@ -60,10 +60,13 @@ def create_files_router(
         if not file.filename:
             raise AgentPlaneError("filename is required", code=ErrorCode.INVALID_INPUT)
         content = await file.read()
-        # Prefer the content type from the multipart upload headers
-        # (set by the client). Fall back to mimetypes.guess_type,
-        # which may not know newer extensions like .md in all Pythons.
-        content_type = file.content_type or mimetypes.guess_type(file.filename)[0]
+        # Resolve MIME type from client header + filename. The client
+        # may send application/octet-stream when mimetypes doesn't
+        # know the extension (e.g. .md in Python 3.10), so we use the
+        # same resolver as content_resolver.py to get the right type.
+        from agent_plane.runtime.content_resolver import _resolve_content_type
+
+        content_type = _resolve_content_type(file.content_type, file.filename)
         stored = file_store.create(
             filename=file.filename,
             bytes=len(content),
