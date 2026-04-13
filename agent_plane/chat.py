@@ -32,6 +32,9 @@ def run_chat(target: str, client_tools: str | None) -> None:
     :param target: Path to an agent directory/bundle, or a server URL.
     :param client_tools: Optional client-side tool set name.
     """
+    # Client-side tools are a CLI/TUI convenience (e.g. shell access
+    # for coding agents). They don't affect agent behavior — the spec
+    # is self-contained.
     tool_handler = _load_tool_handler(client_tools) if client_tools else None
 
     if _is_url(target):
@@ -137,7 +140,7 @@ def _chat_local(agent_path: str, tool_handler: ToolHandler | None) -> None:
     server_proc = _start_local_server(path, port)
 
     try:
-        _wait_for_server(port)
+        _wait_for_server(port, server_proc)
         click.echo(f"  Agent: {agent_name}\n")
         _run_repl(f"http://127.0.0.1:{port}", agent_name, tool_handler)
     finally:
@@ -146,16 +149,25 @@ def _chat_local(agent_path: str, tool_handler: ToolHandler | None) -> None:
 
 def _extract_agent_name(agent_path: Path) -> str:
     """
-    Read the agent name from config.yaml.
+    Read the agent name from config.yaml for display in the REPL.
+
+    Falls back to the directory name when the spec omits ``name``
+    (which is optional per AGENTSPEC.md for root agents). This is
+    only used as a display label — the server performs full spec
+    validation independently.
 
     :param agent_path: Path to the agent directory.
-    :returns: The agent name.
+    :returns: The agent name for REPL display.
     """
     config_path = agent_path / "config.yaml"
     if not config_path.exists():
+        # No config yet — the server will fail with a clear error;
+        # use the directory name as a placeholder for the startup message.
         return agent_path.name
 
     config = yaml.safe_load(config_path.read_text())
+    # ``name`` is optional in AGENTSPEC.md — directory name is the
+    # standard fallback for display purposes.
     return config.get("name") or agent_path.name
 
 
@@ -200,23 +212,32 @@ def _start_local_server(agent_path: Path, port: int) -> subprocess.Popen[bytes]:
             "--agent",
             str(agent_path),
         ],
+        # Inherit env so the spec parser can expand ${VAR} references
+        # in connection blocks (e.g. ${OPENAI_API_KEY}). The subprocess
+        # resolves these at spec-parse time, not at runtime.
         env={**os.environ},
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
 
 
-def _wait_for_server(port: int, timeout: float = 15.0) -> None:
+def _wait_for_server(
+    port: int, server_proc: subprocess.Popen[bytes], timeout: float = 15.0
+) -> None:
     """
     Poll until the server responds.
 
     :param port: The server port.
+    :param server_proc: The server subprocess, used to detect early exit and
+        capture output on failure.
     :param timeout: Max seconds to wait.
     :raises click.ClickException: If the server doesn't start.
     """
     base_url = f"http://127.0.0.1:{port}"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if server_proc.poll() is not None:
+            _raise_server_failed(server_proc)
         try:
             resp = httpx.get(f"{base_url}/v1/conversations", timeout=2.0)
             if resp.status_code in (200, 404):
@@ -224,7 +245,25 @@ def _wait_for_server(port: int, timeout: float = 15.0) -> None:
         except httpx.ConnectError:
             pass
         time.sleep(0.5)
-    raise click.ClickException(f"Server did not start within {timeout}s")
+    _raise_server_failed(server_proc)
+
+
+def _raise_server_failed(server_proc: subprocess.Popen[bytes]) -> None:
+    """
+    Read server output and raise a descriptive error.
+
+    :param server_proc: The server subprocess.
+    :raises click.ClickException: Always.
+    """
+    output = ""
+    if server_proc.stdout:
+        raw = server_proc.stdout.read(8192)
+        if raw:
+            output = raw.decode("utf-8", errors="replace").strip()
+    msg = "Server failed to start."
+    if output:
+        msg += f"\n\nServer output:\n{output}"
+    raise click.ClickException(msg)
 
 
 def _stop_server(proc: subprocess.Popen[bytes]) -> None:

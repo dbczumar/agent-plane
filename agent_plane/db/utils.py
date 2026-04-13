@@ -42,6 +42,8 @@ def _create_engine(db_uri: str) -> Engine:
     """
     is_sqlite = db_uri.startswith("sqlite")
     if is_sqlite:
+        # SQLite uses a single file-level connection — pool_pre_ping
+        # and pool_recycle are not applicable.
         return create_engine(db_uri)
     return create_engine(
         db_uri,
@@ -89,10 +91,9 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
         ``sqlalchemy.url`` config option, e.g.
         ``"sqlite:///mydb.db"``.
     """
+    from agent_plane.db.db_models import Base
     from alembic import command
     from alembic.config import Config
-
-    from agent_plane.db.db_models import Base
 
     expected_tables = {table.name for table in Base.metadata.sorted_tables}
     actual_tables = set(inspect(engine).get_table_names())
@@ -103,6 +104,9 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
     alembic_ini = Path(__file__).parent / "alembic.ini"
     config = Config(str(alembic_ini))
     config.set_main_option("sqlalchemy.url", db_uri)
+    # script_location in alembic.ini is relative — resolve it against
+    # the ini file's parent so `ap chat` works from any working directory.
+    config.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
     # Pass a shared connection so Alembic operates within the same
     # engine (required for SQLite in-memory databases, and avoids
     # creating a second connection pool).

@@ -24,6 +24,18 @@ class ListFilesTool(Tool):
         """
         return "list_files"
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return (
+            "List files that have been uploaded or created. "
+            "Returns file metadata: ID, filename, size, and "
+            "creation time. Use the file_id to download content "
+            "with download_file."
+        )
+
     def get_schema(self) -> dict[str, Any]:
         """
         Return the OpenAI-format tool schema.

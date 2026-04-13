@@ -30,16 +30,21 @@ from agent_plane.spec.types import (
 _FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n(.*)", re.DOTALL)
 
 
-def parse(root: Path) -> AgentSpec:
+def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     """
     Parse an agent image directory into an :class:`AgentSpec`.
 
     :param root: Path to the agent image directory. Must contain
         ``config.yaml``.
+    :param expand_env: Whether to expand ``${VAR}`` references in
+        connection blocks and MCP headers. ``True`` (default) for
+        deploy/runtime — raises on unresolved vars. ``False`` for
+        scaffolding/validation where env vars may not yet be set.
     :returns: A fully populated :class:`AgentSpec` (not yet
         validated).
     :raises AgentPlaneError: If ``config.yaml`` is not valid YAML,
-        has structural issues, or contains unresolved env vars.
+        has structural issues, or (when *expand_env* is ``True``)
+        contains unresolved env vars.
     :raises FileNotFoundError: If ``config.yaml`` is missing.
     """
     config_path = root / "config.yaml"
@@ -60,7 +65,7 @@ def parse(root: Path) -> AgentSpec:
             code=ErrorCode.INVALID_INPUT,
         )
 
-    llm = _parse_llm(raw.get("llm"))
+    llm = _parse_llm(raw.get("llm"), expand_env=expand_env)
     interaction = _parse_interaction(raw.get("interaction"))
     tools_config = _parse_tools_config(raw.get("tools"))
     executor = _parse_executor(raw.get("executor"))
@@ -69,9 +74,9 @@ def parse(root: Path) -> AgentSpec:
 
     instructions = _resolve_instructions(root, raw.get("instructions"))
     skills = _discover_skills(root / "skills")
-    mcp_servers = _discover_mcp_servers(root / "tools" / "mcp")
+    mcp_servers = _discover_mcp_servers(root / "tools" / "mcp", expand_env=expand_env)
     local_tools = _discover_local_tools(root / "tools")
-    sub_agents = _discover_sub_agents(root / "agents")
+    sub_agents = _discover_sub_agents(root / "agents", expand_env=expand_env)
 
     return AgentSpec(
         spec_version=spec_version,
@@ -91,7 +96,11 @@ def parse(root: Path) -> AgentSpec:
     )
 
 
-def _parse_llm(raw: dict[str, Any] | None) -> LLMConfig | None:
+def _parse_llm(
+    raw: dict[str, Any] | None,
+    *,
+    expand_env: bool = True,
+) -> LLMConfig | None:
     """
     Parse the ``llm:`` block from config.yaml into an
     :class:`LLMConfig`.
@@ -99,6 +108,8 @@ def _parse_llm(raw: dict[str, Any] | None) -> LLMConfig | None:
     :param raw: The raw ``llm:`` mapping from config.yaml, or
         ``None`` if the block was absent. Example:
         ``{"model": "openai/gpt-4o", "temperature": 0.7}``.
+    :param expand_env: Whether to expand ``${VAR}`` references in
+        the connection block. ``False`` keeps literals as-is.
     :returns: A populated :class:`LLMConfig`, or ``None`` when
         the ``llm:`` block is absent.
     :raises AgentPlaneError: If the ``llm:`` block is present but
@@ -118,8 +129,10 @@ def _parse_llm(raw: dict[str, Any] | None) -> LLMConfig | None:
     connection_raw = raw.get("connection")
     connection: dict[str, str] | None = None
     if isinstance(connection_raw, dict):
+        raw_dict = {str(k): str(v) for k, v in connection_raw.items()}
         # Expand ${VAR} references so api_key: ${OPENAI_API_KEY} works.
-        connection = expand_env_vars({str(k): str(v) for k, v in connection_raw.items()})
+        # Skipped when expand_env is False (scaffolding/validation).
+        connection = expand_env_vars(raw_dict) if expand_env else raw_dict
     request_timeout = int(raw["request_timeout"]) if "request_timeout" in raw else 300
     retry = _parse_retry(raw.get("retry"))
     reserved = {"model", "connection", "request_timeout", "retry"}
@@ -515,6 +528,8 @@ def check_unresolved_env_vars(key: str, value: str) -> None:
 
 def _discover_mcp_servers(
     mcp_dir: Path,
+    *,
+    expand_env: bool = True,
 ) -> list[MCPServerConfig]:
     """
     Discover and parse all MCP server configs under
@@ -525,6 +540,8 @@ def _discover_mcp_servers(
 
     :param mcp_dir: Path to the ``tools/mcp/`` directory, e.g.
         ``root / "tools" / "mcp"``.
+    :param expand_env: Whether to expand ``${VAR}`` references in
+        headers. ``False`` keeps literals as-is.
     :returns: A sorted list of parsed :class:`MCPServerConfig`
         objects. Returns an empty list if *mcp_dir* does not
         exist.
@@ -570,7 +587,11 @@ def _discover_mcp_servers(
                 name=str(name),
                 description=raw.get("description"),
                 url=str(url),
-                headers=expand_env_vars(raw.get("headers", {})),
+                headers=(
+                    expand_env_vars(raw.get("headers", {}))
+                    if expand_env
+                    else raw.get("headers", {})
+                ),
                 timeout=int(raw["timeout"]) if "timeout" in raw else None,
                 retry=_parse_retry(raw["retry"]) if "retry" in raw else None,
             )
@@ -610,7 +631,11 @@ def _discover_local_tools(
     return tools
 
 
-def _discover_sub_agents(agents_dir: Path) -> list[AgentSpec]:
+def _discover_sub_agents(
+    agents_dir: Path,
+    *,
+    expand_env: bool = True,
+) -> list[AgentSpec]:
     """
     Recursively discover and parse sub-agents under ``agents/``.
 
@@ -619,6 +644,8 @@ def _discover_sub_agents(agents_dir: Path) -> list[AgentSpec]:
 
     :param agents_dir: Path to the ``agents/`` directory, e.g.
         ``root / "agents"``.
+    :param expand_env: Whether to expand ``${VAR}`` references.
+        Propagated to :func:`parse` for each sub-agent.
     :returns: A sorted list of recursively parsed
         :class:`AgentSpec` objects. Returns an empty list if
         *agents_dir* does not exist.
@@ -632,6 +659,5 @@ def _discover_sub_agents(agents_dir: Path) -> list[AgentSpec]:
         config_yaml = agent_dir / "config.yaml"
         if not config_yaml.exists():
             continue
-        # Recursive parse
-        sub_agents.append(parse(agent_dir))
+        sub_agents.append(parse(agent_dir, expand_env=expand_env))
     return sub_agents

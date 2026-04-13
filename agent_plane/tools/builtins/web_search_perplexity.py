@@ -63,6 +63,15 @@ class WebSearchPerplexityTool(Tool):
         """
         return "web_search_perplexity"
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return (
+            "Search the web using Perplexity AI. Returns a grounded answer with source citations."
+        )
+
     def get_schema(self) -> dict[str, Any]:
         """
         Return the OpenAI function schema for Perplexity search.

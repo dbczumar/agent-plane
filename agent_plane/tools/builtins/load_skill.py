@@ -36,6 +36,13 @@ class LoadSkillTool(Tool):
         """
         return "load_skill"
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return "Load a skill's full instructions by name."
+
     def get_schema(self) -> dict[str, Any]:
         """
         Return the OpenAI-format schema for ``load_skill``.

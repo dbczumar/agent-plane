@@ -71,6 +71,13 @@ class ClientSideTool(Tool):
         """
         return self._spec.name
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return "Client-side tool executed by the frontend."
+
     def get_schema(self) -> dict[str, Any]:
         """
         Return the OpenAI-format tool schema.

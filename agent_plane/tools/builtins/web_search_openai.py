@@ -42,6 +42,17 @@ class WebSearchOpenAITool(Tool):
         """
         return "web_search_openai"
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return (
+            "Search the web using OpenAI's built-in "
+            "web_search_preview tool. The LLM handles "
+            "search execution server-side."
+        )
+
     def get_schema(self) -> dict[str, Any]:
         """
         Return the OpenAI-native web search tool schema.

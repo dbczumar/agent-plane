@@ -58,6 +58,13 @@ class WebSearchGoogleTool(Tool):
         """
         return "web_search_google"
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return "Search the web using Google and return results with titles, URLs, and snippets."
+
     def get_schema(self) -> dict[str, Any]:
         """
         Return the OpenAI function schema for Google search.

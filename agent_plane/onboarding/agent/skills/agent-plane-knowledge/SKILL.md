@@ -145,18 +145,9 @@ Rules:
 
 ### Built-in tools
 
-Available built-in tools — recommend these based on what the user
-wants to build:
-
-| Tool | When to recommend | Config needed |
-|------|------------------|---------------|
-| `web_search` | Research, finding info, Q&A | OpenAI models: none. Others: `search_provider` + `api_key` |
-| `web_fetch` | Reading web pages, fetching live data | None (spawns a sub-agent with code_sandbox) |
-| `code_sandbox` | Writing/running code, data analysis, scripting | None |
-| `upload_file` | Agents that produce downloadable files | None |
-| `search_conversations` | Agents that reference prior conversations | None |
-| `list_files` | Agents that browse uploaded files | None |
-| `download_file` | Agents that read uploaded files | None |
+Call `list_builtin_tools` to get the current set of available
+built-in tools and their descriptions. Do not rely on a hardcoded
+list — new tools may be added at any time.
 
 **Tool recommendation guide:**
 

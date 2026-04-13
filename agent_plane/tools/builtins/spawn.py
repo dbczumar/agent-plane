@@ -85,6 +85,17 @@ class SpawnTool(Tool):
         """
         return "spawn_sub_agents"
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return (
+            "Launch one or more sub-agents as independent "
+            "parallel tasks. Returns response IDs immediately. "
+            "Use check_sub_agents() to retrieve results."
+        )
+
     def __init__(self, sub_specs: dict[str, AgentSpec]) -> None:
         """
         Initialize the spawn tool.
@@ -158,6 +169,21 @@ class CheckSubAgentsTool(Tool):
         """
         return "check_sub_agents"
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return (
+            "Check the current status of one or more spawned "
+            "sub-agent tasks. Pass only the response IDs you "
+            "want to check — you do not need to check all "
+            "spawned sub-agents at once. Returns immediately "
+            "with each specified sub-agent's current status, "
+            "output (if completed), and recent conversation "
+            "activity (if still running). Does not wait."
+        )
+
     def get_schema(self) -> dict[str, Any]:
         """
         Return the OpenAI-format tool schema.
@@ -228,6 +254,17 @@ class CancelSubAgentTool(Tool):
         :returns: ``"cancel_sub_agent"``.
         """
         return "cancel_sub_agent"
+
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return (
+            "Cancel a running sub-agent task. The sub-agent "
+            "will stop execution and its status will become "
+            "'cancelled'."
+        )
 
     def get_schema(self) -> dict[str, Any]:
         """

@@ -25,6 +25,19 @@ class SearchConversationsTool(Tool):
         """
         return "search_conversations"
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return (
+            "Search past conversations for relevant information. "
+            "Use this to recall details from prior interactions — "
+            "e.g. decisions made, code reviewed, files created, "
+            "or facts discussed. Returns matching messages ranked "
+            "by relevance with surrounding context."
+        )
+
     def get_schema(self) -> dict[str, Any]:
         """
         Return the OpenAI-format tool schema.

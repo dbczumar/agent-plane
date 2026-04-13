@@ -33,7 +33,7 @@ async def _aiter(*blocks):  # type: ignore[no-untyped-def]
 async def test_skip_blocks_removes_reasoning() -> None:
     """skip_blocks(ReasoningBlock) drops reasoning blocks."""
     stream = _aiter(
-        ResponseStartBlock(model="test"),
+        ResponseStartBlock(model="test", response_id="r1"),
         ReasoningBlock(reasoning_text="think", summary_text="sum"),
         TextChunk(text="hello"),
         TextDone(full_text="hello"),
@@ -52,7 +52,7 @@ async def test_skip_blocks_removes_reasoning() -> None:
 async def test_skip_blocks_multiple_types() -> None:
     """skip_blocks can drop multiple types at once."""
     stream = _aiter(
-        ResponseStartBlock(model="test"),
+        ResponseStartBlock(model="test", response_id="r1"),
         ReasoningBlock(reasoning_text="t", summary_text="s"),
         TextChunk(text="hi"),
         ResponseEndBlock(status="completed"),
@@ -68,7 +68,7 @@ async def test_skip_blocks_multiple_types() -> None:
 async def test_skip_intermediate_ends() -> None:
     """Only the final ResponseEndBlock survives."""
     stream = _aiter(
-        ResponseStartBlock(model="test"),
+        ResponseStartBlock(model="test", response_id="r1"),
         ResponseEndBlock(status="completed"),  # intermediate
         TextChunk(text="hi"),
         ResponseEndBlock(status="completed"),  # final
@@ -85,7 +85,7 @@ async def test_skip_intermediate_ends() -> None:
 async def test_skip_intermediate_ends_keeps_single() -> None:
     """A single ResponseEndBlock is kept."""
     stream = _aiter(
-        ResponseStartBlock(model="test"),
+        ResponseStartBlock(model="test", response_id="r1"),
         ResponseEndBlock(status="completed"),
     )
 
@@ -98,7 +98,7 @@ async def test_skip_intermediate_ends_keeps_single() -> None:
 async def test_merge_text_across_iterations() -> None:
     """Multiple TextDone blocks merge into one."""
     stream = _aiter(
-        ResponseStartBlock(model="test"),
+        ResponseStartBlock(model="test", response_id="r1"),
         TextDone(full_text="Part 1. "),
         TextDone(full_text="Part 2."),
         ResponseEndBlock(status="completed"),
@@ -148,7 +148,7 @@ async def test_only_agent_filters() -> None:
 async def test_pipe_composes_transforms() -> None:
     """pipe() chains transforms left-to-right."""
     stream = _aiter(
-        ResponseStartBlock(model="test"),
+        ResponseStartBlock(model="test", response_id="r1"),
         ReasoningBlock(reasoning_text="t", summary_text="s"),
         TextChunk(text="hi"),
         ResponseEndBlock(status="completed"),  # intermediate

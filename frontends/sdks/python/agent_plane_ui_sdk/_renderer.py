@@ -123,7 +123,7 @@ class StreamRenderer:
         accumulated = ""
         full_text = ""
         pending_tools: dict[str, ToolExecution] = {}
-        agent = ""
+        agent: str | None = None
         turn = 0
         started = False
 
@@ -158,7 +158,7 @@ class StreamRenderer:
                 else:
                     turn += 1
 
-            elif isinstance(event, (ResponseQueued, ResponseInProgress)):
+            elif isinstance(event, ResponseQueued | ResponseInProgress):
                 pass
 
             # ── Reasoning ────────────────────────────
@@ -301,7 +301,8 @@ class StreamRenderer:
 
             # ── Terminal events ──────────────────────
             elif isinstance(
-                event, (ResponseCompleted, ResponseFailed, ResponseIncomplete, ResponseCancelled)
+                event,
+                ResponseCompleted | ResponseFailed | ResponseIncomplete | ResponseCancelled,
             ):
                 if in_reasoning:
                     in_reasoning = False

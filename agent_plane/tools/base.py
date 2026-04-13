@@ -73,6 +73,20 @@ class Tool(abc.ABC):
         :returns: The tool name, e.g. ``"load_skill"``.
         """
 
+    @classmethod
+    @abc.abstractmethod
+    def description(cls) -> str:
+        """
+        Human-readable description of what the tool does.
+
+        Must be readable without instantiation — used for tool
+        discovery (e.g. the onboarding assistant's
+        ``list_builtin_tools``) and should match the description
+        in :meth:`get_schema`.
+
+        :returns: The tool's description string.
+        """
+
     @abc.abstractmethod
     def get_schema(self) -> dict[str, Any]:
         """

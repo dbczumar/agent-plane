@@ -171,6 +171,23 @@ class WebFetchTool(Tool):
         """
         return "web_fetch"
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return (
+            "Deep web research — fetches live web pages and "
+            "summarizes relevant content. Always gets the "
+            "latest version of a page. Use this when you "
+            "need to read what a page actually says or need "
+            "the most current info. Optionally provide a URL "
+            "as a starting point; if it doesn't answer the "
+            "query, other sources will be searched. Slower "
+            "and less comprehensive than web_search but "
+            "returns actual page content."
+        )
+
     def get_schema(self) -> dict[str, Any]:
         """
         Return the OpenAI function schema for web_fetch.

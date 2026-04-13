@@ -87,8 +87,13 @@ principles — they are the most important check.**
    invented defaults. Flag any violation as BLOCKING.
 
 1. EMPTY STRING DEFAULTS: No `field: str = ""` or `field: int = 0` as
-   placeholder/sentinel values. If a field is optional, use `Optional[str] = None`.
-   If it's required, make it required.
+   placeholder/sentinel values on dataclass or Pydantic fields. If a
+   field is optional, use `str | None = None`. If it's required, make
+   it required (no default). Use `kw_only=True` on dataclass
+   subclasses of a parent with defaulted fields to allow required
+   fields after inherited defaults. Empty strings as dataclass
+   defaults are a blatant antipattern — they silently accept
+   uninitialized objects and mask missing data.
 
 2. UNUSED PARAMETERS: No function parameters accepted and silently ignored.
    If a parameter isn't used, remove it from the signature.

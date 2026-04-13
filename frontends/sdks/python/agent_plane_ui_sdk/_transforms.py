@@ -115,18 +115,22 @@ def merge_text_across_iterations() -> object:
     return _transform
 
 
-def only_agent(agent_name: str) -> object:
+def only_agent(agent_name: str | None) -> object:
     """Filter to blocks from a specific agent.
+
+    Pass ``None`` to include all agents (no filtering).
 
     Usage::
 
         stream = only_agent("coder.researcher")(renderer.stream(...))
+
+    :param agent_name: Agent name to filter by, or ``None`` for all.
     """
 
     def _transform(stream: AsyncIterator[AnyBlock]) -> AsyncIterator[AnyBlock]:
         async def _inner() -> AsyncIterator[AnyBlock]:
             async for block in stream:
-                if block.ctx.agent == agent_name or agent_name == "":
+                if agent_name is None or block.ctx.agent == agent_name:
                     yield block
 
         return _inner()

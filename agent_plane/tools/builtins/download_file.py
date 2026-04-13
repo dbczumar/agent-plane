@@ -25,6 +25,17 @@ class DownloadFileTool(Tool):
         """
         return "download_file"
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return (
+            "Download a file by its file_id to the workspace. "
+            "Returns the local file path. Use list_files to "
+            "find available file IDs."
+        )
+
     def get_schema(self) -> dict[str, Any]:
         """
         Return the OpenAI-format tool schema.

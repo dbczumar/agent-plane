@@ -119,6 +119,13 @@ class LocalPythonTool(Tool):
         """
         return self._name
 
+    @classmethod
+    def description(cls) -> str:
+        """
+        :returns: Human-readable description of the tool.
+        """
+        return "Custom local Python tool."
+
     def get_schema(self) -> dict[str, Any]:
         """
         Return the OpenAI function schema from the module's ``SCHEMA``.
