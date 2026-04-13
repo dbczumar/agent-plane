@@ -96,6 +96,33 @@ def _extract_file_paths(text: str) -> list[PendingAttachment]:
     return attachments
 
 
+def _strip_file_paths(text: str, attachments: list[PendingAttachment]) -> str:
+    """
+    Remove detected file paths from the input text.
+
+    After extracting attachments, the raw pasted paths (possibly
+    shell-escaped) should not appear in the message sent to the LLM.
+    Returns the remaining text, stripped.
+
+    :param text: The raw input line.
+    :param attachments: Detected attachments with resolved paths.
+    :returns: The text with file path tokens removed.
+    """
+    resolved_paths = {a.path for a in attachments}
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        tokens = text.split()
+    remaining = []
+    for token in tokens:
+        cleaned = token.strip("'\"")
+        p = pathlib.Path(os.path.expanduser(cleaned)).resolve()
+        if str(p) in resolved_paths:
+            continue
+        remaining.append(token)
+    return " ".join(remaining).strip()
+
+
 def _display_width(text: str) -> int:
     """Visible width of text in terminal columns (handles CJK, emoji)."""
     w = wcswidth(text)
@@ -245,14 +272,11 @@ class TerminalHost:
                         # instead of waiting for the toolbar ticker.
                         if self._prompt.app:
                             self._prompt.app.invalidate()
-                        # If ONLY file paths and no other text, wait for
-                        # the user to type a message (or just hit Enter).
-                        try:
-                            tokens = shlex.split(line)
-                        except ValueError:
-                            tokens = line.split()
-                        has_text = any(not pathlib.Path(t.strip("'\"")).is_file() for t in tokens)
-                        if not has_text:
+                        # Strip detected file paths from the text so the
+                        # handler receives only the user's message, not
+                        # the raw dropped paths.
+                        line = _strip_file_paths(line, attachments)
+                        if not line:
                             continue
 
                     # Allow empty text when attachments are pending (the
