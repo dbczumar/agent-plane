@@ -43,7 +43,7 @@ a custom agent of your own. The `examples/` directory has ready-to-run
 agents, and `ap chat` starts a server, uploads the agent, and opens an
 interactive chat.
 
-https://github.com/user-attachments/assets/419c9951-c05b-451f-9914-892c156acba0
+https://github.com/user-attachments/assets/6dca96fb-6ee2-4e2d-afc4-6525ba1d5337
 
 
 ### Example 1: Archer — research assistant
