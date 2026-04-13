@@ -2854,3 +2854,52 @@ async def test_parallel_subagents_park_and_patch_independently(
             "expected 'completed'. Tool result may have been "
             "delivered to the wrong sub-agent."
         )
+
+
+def test_normalize_input_extracts_content_from_message_items() -> None:
+    """
+    When input is a list of message items ({role, content: [...]})
+    instead of flat content blocks, _normalize_input extracts and
+    flattens the content blocks.
+
+    This handles the SDK's _build_input_with_files format where
+    input is structured as message items.
+    """
+    from agent_plane.server.routes.responses import _normalize_input
+
+    # Message-item format from SDK.
+    raw = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Summarize this"},
+                {"type": "input_file", "file_id": "file_123", "filename": "test.md"},
+            ],
+        }
+    ]
+    result = _normalize_input(raw)
+    # Should extract the content blocks, not wrap the message item.
+    assert len(result) == 2
+    assert result[0] == {"type": "input_text", "text": "Summarize this"}
+    assert result[1]["type"] == "input_file"
+    assert result[1]["file_id"] == "file_123"
+
+
+def test_normalize_input_passes_flat_blocks() -> None:
+    """Flat content blocks pass through unchanged."""
+    from agent_plane.server.routes.responses import _normalize_input
+
+    raw = [
+        {"type": "input_text", "text": "Hello"},
+        {"type": "input_file", "file_id": "file_123"},
+    ]
+    result = _normalize_input(raw)
+    assert result == raw
+
+
+def test_normalize_input_string() -> None:
+    """Plain string input becomes an input_text block."""
+    from agent_plane.server.routes.responses import _normalize_input
+
+    result = _normalize_input("Hello")
+    assert result == [{"type": "input_text", "text": "Hello"}]

@@ -250,13 +250,14 @@ def _resolve_content_type(
 
     if filename:
         suffix = PurePath(filename).suffix.lower()
-        # Try stdlib first.
+        # Our map takes priority over mimetypes — the stdlib has
+        # wrong mappings for some code extensions (e.g. .ts →
+        # video/mp2t, .rs → application/rls-services+xml).
+        if suffix in _EXTRA_MIME_TYPES:
+            return _EXTRA_MIME_TYPES[suffix]
         guessed = _mt.guess_type(filename)[0]
         if guessed and guessed != "application/octet-stream":
             return guessed
-        # Fallback for extensions mimetypes doesn't know.
-        if suffix in _EXTRA_MIME_TYPES:
-            return _EXTRA_MIME_TYPES[suffix]
         # Text-like extensions default to text/plain rather than
         # octet-stream, which providers are more likely to accept.
         if suffix in {".txt", ".log", ".cfg", ".ini", ".env"}:

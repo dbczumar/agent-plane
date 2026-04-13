@@ -148,3 +148,59 @@ def test_download_file_retrieves_content(
     assert _has_tool_call(body2, "download_file"), "Agent didn't call download_file"
     text = _extract_all_text(body2)
     assert "hello_world" in text.lower(), f"Agent didn't show file contents: {text[:300]}"
+
+
+def test_markdown_file_attachment(
+    http_client: httpx.Client,
+    archer_agent: str,
+) -> None:
+    """
+    Uploading and attaching a .md file works end-to-end.
+
+    Verifies the full pipeline: file upload → input_file content
+    block → content resolution (MIME type from filename) → LLM
+    receives and understands the file content.
+
+    **What breaks if this fails:**
+    - File upload rejects .md files or stores wrong content_type.
+    - Content resolver falls back to application/octet-stream
+      (which OpenAI rejects for text files).
+    - _normalize_input double-wraps message items.
+    """
+    # Upload a markdown file.
+    md_content = (
+        b"# Project Plan\n\n## Goals\n\n- Ship the feature by Friday\n- Write tests\n- Update docs"
+    )
+    upload_resp = http_client.post(
+        "/v1/files",
+        files={"file": ("plan.md", md_content, "text/markdown")},
+    )
+    upload_resp.raise_for_status()
+    file_id = upload_resp.json()["id"]
+
+    # Send a message with the file attached.
+    resp = http_client.post(
+        "/v1/responses",
+        json={
+            "model": archer_agent,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Summarize this document in one sentence."},
+                        {"type": "input_file", "file_id": file_id, "filename": "plan.md"},
+                    ],
+                },
+            ],
+            "background": True,
+        },
+    )
+    resp.raise_for_status()
+    rid = resp.json()["id"]
+    body = poll_until_terminal(http_client, rid, timeout=60)
+
+    assert body["status"] == "completed", (
+        f"Status: {body['status']!r}. Error: {body.get('error')}. Output: {body.get('output', [])}"
+    )
+    text = _extract_all_text(body)
+    assert text.strip(), f"Agent produced no text. Output: {body.get('output', [])}"

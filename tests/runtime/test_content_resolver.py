@@ -665,3 +665,103 @@ def test_deleted_file_raises_clear_error(
             file_store,
             artifact_store,  # type: ignore[arg-type]
         )
+
+
+# ── _resolve_content_type tests ───────────────────────────────────────
+
+
+def test_resolve_content_type_uses_stored_type() -> None:
+    """Stored content_type is used when it's not the generic fallback."""
+    from agent_plane.runtime.content_resolver import _resolve_content_type
+
+    assert _resolve_content_type("text/markdown", "test.md") == "text/markdown"
+    assert _resolve_content_type("application/pdf", "report.pdf") == "application/pdf"
+
+
+def test_resolve_content_type_ignores_octet_stream() -> None:
+    """application/octet-stream is treated as unresolved — falls through to filename."""
+    from agent_plane.runtime.content_resolver import _resolve_content_type
+
+    result = _resolve_content_type("application/octet-stream", "readme.md")
+    assert result == "text/markdown", f"Expected text/markdown, got {result}"
+
+
+def test_resolve_content_type_falls_back_to_extra_map() -> None:
+    """Extensions missing from mimetypes use the _EXTRA_MIME_TYPES fallback."""
+    from agent_plane.runtime.content_resolver import _resolve_content_type
+
+    # These extensions are NOT in Python 3.10's mimetypes module
+    # (except .ts, which mimetypes maps to video/mp2t).
+    assert _resolve_content_type(None, "config.yaml") == "text/yaml"
+    assert _resolve_content_type(None, "config.yml") == "text/yaml"
+    assert _resolve_content_type(None, "main.go") == "text/x-go"
+    # .ts is mapped by mimetypes to video/mp2t (MPEG transport stream)
+    # and .rs to application/rls-services+xml — both wrong for source
+    # code. Our _EXTRA_MIME_TYPES map takes priority.
+    assert _resolve_content_type(None, "app.ts") == "text/typescript"
+    assert _resolve_content_type(None, "app.tsx") == "text/typescript"
+    assert _resolve_content_type(None, "lib.rs") == "text/x-rust"
+    assert _resolve_content_type(None, "main.swift") == "text/x-swift"
+    assert _resolve_content_type(None, "data.jsonl") == "application/jsonl"
+    assert _resolve_content_type(None, "notebook.ipynb") == "application/x-ipynb+json"
+
+
+def test_resolve_content_type_no_filename_uses_fallback() -> None:
+    """When neither stored type nor filename is available, falls back to octet-stream."""
+    from agent_plane.runtime.content_resolver import _resolve_content_type
+
+    assert _resolve_content_type(None, None) == "application/octet-stream"
+
+
+def test_resolve_content_type_known_extension_uses_mimetypes() -> None:
+    """Standard extensions (e.g. .pdf, .html) use mimetypes.guess_type."""
+    from agent_plane.runtime.content_resolver import _resolve_content_type
+
+    # .pdf and .html are universally known by mimetypes.
+    result = _resolve_content_type(None, "report.pdf")
+    assert result == "application/pdf"
+    result = _resolve_content_type(None, "page.html")
+    assert result == "text/html"
+
+
+def test_resolve_content_type_case_insensitive() -> None:
+    """Extension matching is case-insensitive."""
+    from agent_plane.runtime.content_resolver import _resolve_content_type
+
+    assert _resolve_content_type(None, "README.MD") == "text/markdown"
+    assert _resolve_content_type(None, "config.YAML") == "text/yaml"
+
+
+def test_content_resolver_uses_filename_for_mime(
+    file_store: FakeFileStore,
+    artifact_store: FakeArtifactStore,
+) -> None:
+    """
+    End-to-end: when stored content_type is octet-stream, the resolver
+    uses the filename to determine the correct MIME type in the data URI.
+    """
+    md_content = b"# Hello\n\nMarkdown file."
+    file_store.files["file_md"] = StoredFile(
+        id="file_md",
+        filename="readme.md",
+        bytes=len(md_content),
+        content_type="application/octet-stream",
+        created_at=1000,
+    )
+    artifact_store.blobs["file_md"] = md_content
+
+    item = _make_conversation_item(
+        [{"type": "input_file", "file_id": "file_md", "filename": "readme.md"}]
+    )
+    resolved = resolve_content_references(
+        [item],
+        file_store,
+        artifact_store,  # type: ignore[arg-type]
+    )
+    resolved_data = resolved[0].data
+    assert isinstance(resolved_data, MessageData)
+    file_block = resolved_data.content[0]
+    # Must be text/markdown, NOT application/octet-stream.
+    assert file_block["file_data"].startswith("data:text/markdown;base64,"), (
+        f"Expected text/markdown data URI, got: {file_block['file_data'][:60]}"
+    )
