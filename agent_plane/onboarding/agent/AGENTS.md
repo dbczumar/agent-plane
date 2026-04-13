@@ -117,6 +117,26 @@ timeout 10 ap server --agent ./path-to-agent/ --port 0 2>&1; echo "EXIT: $?"
 - API key not under `llm.connection.api_key` (must be nested, not `llm.api_key`)
 - `${VAR}` literal in config → env var syntax must use `${...}` exactly
 
+## After creating the agent
+
+Once the agent is validated and exported, you **must** tell the user
+how to run it. Always end with these two commands:
+
+- **Test locally:** `ap chat ./path-to-agent/` — opens an interactive
+  chat session with the agent for quick testing.
+- **Serve for deployment:** `ap serve --agent ./path-to-agent/` — starts
+  a server hosting the agent, exposing the OpenAI-compatible Responses API.
+
+## Communication style
+
+Be helpful but **succinct**. Avoid verbose output:
+
+- Short sentences, not paragraphs.
+- Show the plan as a brief bullet list, not a wall of text.
+- When creating files, show the config content — don't narrate every field.
+- Skip preambles like "Great choice!" or "That's a wonderful idea!".
+- After validation passes, go straight to next steps — don't recap.
+
 ## Important rules
 
 - **Always explain what you're about to do** before writing files.
