@@ -87,6 +87,18 @@ async def run_repl(
 
         files = [a.path for a in attachments] if attachments else None
 
+        # Show user message with attachment names.
+        if attachments:
+            import pathlib as _pl
+
+            from agent_plane_ui_sdk.terminal import StreamingText
+
+            for a in attachments:
+                name = _pl.Path(a.path).name
+                if a.is_image:
+                    host.output(StreamingText(text=f"   [Image] {name}\n"))
+                else:
+                    host.output(StreamingText(text=f"   📎 {name}\n"))
         host.output(fmt.user_message(text))
         host.start_timer()
         await asyncio.sleep(0)  # Flush user message immediately.
