@@ -8,6 +8,10 @@ SDK session (same code path as the terminal REPL). Verifies that:
 3. Multiple cancel → send cycles don't corrupt session state.
 4. The LLM actually reads the attached markdown content.
 
+The test simulates the REPL's Escape-cancel behavior by consuming
+a few streaming events then calling ``session.cancel()`` — the exact
+same sequence the REPL's ``on_input`` + ``asyncio.shield`` performs.
+
 Uses keyword assertions on the final response to confirm the file
 was read (the file contains distinctive fictional terms that can
 only appear if the LLM processed the content).
