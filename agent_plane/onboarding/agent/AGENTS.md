@@ -108,12 +108,19 @@ timeout 10 ap server --agent ./path-to-agent/ --port 0 2>&1; echo "EXIT: $?"
 ## After creating the agent
 
 Once the agent is validated and exported, you **must** tell the user
-how to run it. Always end with these two commands:
+how to run it. Look at the config.yaml you generated — if `connection`
+contains any `${ENV_VAR}` references, show the user which env vars
+they need to set before running. Then show the commands. Example:
 
-- **Test locally:** `ap chat ./path-to-agent/` — opens an interactive
-  chat session with the agent for quick testing.
-- **Serve for deployment:** `ap serve --agent ./path-to-agent/` — starts
-  a server hosting the agent, exposing the OpenAI-compatible Responses API.
+```
+export OPENAI_API_KEY="your-key-here"
+ap chat /tmp/my-agent/
+```
+
+Always include:
+- The env var exports needed (read them from the config you generated)
+- `ap chat ./path/` for testing
+- `ap serve --agent ./path/` for deployment
 
 ## Communication style
 
