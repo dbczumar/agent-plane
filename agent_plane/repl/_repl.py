@@ -87,28 +87,7 @@ async def run_repl(
 
         files = [a.path for a in attachments] if attachments else None
 
-        # Show user message with file paths replaced by 📎 labels
-        # in their original position.
-        if attachments:
-            import pathlib as _pl
-
-            att_paths = {_pl.Path(a.path).resolve(): a for a in attachments}
-            try:
-                tokens = shlex.split(text)
-            except ValueError:
-                tokens = text.split()
-            display_tokens = []
-            for t in tokens:
-                p = _pl.Path(t.strip("'\"")).resolve()
-                if p in att_paths:
-                    a = att_paths[p]
-                    name = p.name
-                    display_tokens.append(f"[Image] {name}" if a.is_image else f"📎 {name}")
-                else:
-                    display_tokens.append(t)
-            host.output(fmt.user_message(" ".join(display_tokens)))
-        else:
-            host.output(fmt.user_message(text))
+        host.output(fmt.user_message(text))
         host.start_timer()
         await asyncio.sleep(0)  # Flush user message immediately.
         try:
