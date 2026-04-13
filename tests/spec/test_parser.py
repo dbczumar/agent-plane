@@ -200,6 +200,30 @@ def test_parse_llm_connection_unresolved_var_raises(
         parse(tmp_path)
 
 
+def test_parse_expand_env_false_keeps_var_references(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``expand_env=False`` keeps ``${VAR}`` references as literal strings.
+
+    Used during scaffolding/validation (e.g. ``ap create``) where
+    env vars may not yet be set in the current process.
+    """
+    monkeypatch.delenv("MY_API_KEY", raising=False)
+    config = {
+        "spec_version": 1,
+        "llm": {
+            "model": "openai/gpt-4o",
+            "connection": {"api_key": "${MY_API_KEY}"},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path, expand_env=False)
+    assert spec.llm is not None
+    assert spec.llm.connection == {"api_key": "${MY_API_KEY}"}
+
+
 def test_parse_instructions_multiline_inline(tmp_path: Path) -> None:
     """Multiline inline instructions are not treated as file paths."""
     config = {

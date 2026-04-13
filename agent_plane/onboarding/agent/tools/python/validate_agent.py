@@ -57,7 +57,10 @@ async def run(arguments: dict[str, Any]) -> str:
         from agent_plane.spec.parser import parse
         from agent_plane.spec.validator import validate
 
-        spec = parse(agent_path)
+        # expand_env=False: the generated agent may reference env vars
+        # like ${OPENAI_API_KEY} that aren't set in the current process.
+        # These are resolved at deploy/run time, not at creation time.
+        spec = parse(agent_path, expand_env=False)
         result = validate(spec)
 
         if result.valid:
