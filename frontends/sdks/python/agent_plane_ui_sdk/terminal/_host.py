@@ -85,16 +85,6 @@ def _extract_file_paths(text: str) -> list[PendingAttachment]:
 
     for token in tokens:
         token = token.strip("'\"")
-        # Only detect explicit paths — absolute, relative with ./ or ~/,
-        # or containing /. Bare filenames like "README.md" are NOT
-        # treated as files — they stay as text so the agent can find them.
-        if not (
-            token.startswith("/")
-            or token.startswith("./")
-            or token.startswith("~/")
-            or "/" in token
-        ):
-            continue
         p = pathlib.Path(os.path.expanduser(token)).resolve()
         if not p.is_file():
             continue
