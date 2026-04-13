@@ -315,14 +315,14 @@ agent-name/
 Agent-plane isolates tool execution so agents can't access files or
 resources outside their workspace.
 
-### Default executor (LLM)
+### Default LLM harness
 
 Local Python tools run in subprocesses. When `srt` is on PATH and
 `RuntimeCaps.sandbox_enabled` is True (default), tools are wrapped
 with OS-level sandboxing. Docker containers are supported via
 `tools.sandbox.docker_image` in the agent spec.
 
-### Claude SDK executor
+### Claude SDK harness
 
 Three isolation layers protect the host filesystem:
 
