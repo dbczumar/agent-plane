@@ -217,7 +217,7 @@ agent-name/
 
 - **Sub-agents** — declare child agents under `agents/` and list them in
   `tools.agents`. The parent spawns sub-agents as independent workflows with
-  isolated conversations and tool registries. Depth limit of 5.
+  isolated conversations and tool registries.
 
 - **Subagent batch and parallel fan-out** — `agent.map` / `agent.spawn` for
   orchestrating sub-agents at scale.
