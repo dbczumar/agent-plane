@@ -188,6 +188,9 @@ agent-name/
   incorporates it at its next loop iteration. Useful for redirecting an agent
   that's going down the wrong path.
 
+- **Context management** — compaction support for long conversations that
+  exceed token limits. Configurable via `context_management` on the request.
+
 - **Skills** — named instruction chunks the agent loads on demand. Each skill
   is a markdown file with frontmatter (`name`, `description`) and content
   injected into the system prompt when the agent calls `load_skill`.
@@ -205,9 +208,19 @@ agent-name/
   -> str` function. Executed in a subprocess for fault isolation — a crashed
   tool doesn't crash the server.
 
+- **Dependency management for tools** — local tool dependencies can be
+  declared and installed per tool runtime instead of assuming they're already
+  present on the host.
+
+- **Local async tool execution** — local tools can implement `async def run()`
+  in addition to synchronous execution.
+
 - **Sub-agents** — declare child agents under `agents/` and list them in
   `tools.agents`. The parent spawns sub-agents as independent workflows with
   isolated conversations and tool registries. Depth limit of 5.
+
+- **Subagent batch and parallel fan-out** — `agent.map` / `agent.spawn` for
+  orchestrating sub-agents at scale.
 
 - **Client-side tools** — tools whose execution happens on the caller's side,
   not the server. The server returns function call items; the client executes
@@ -230,6 +243,13 @@ agent-name/
   (`tools.timeout`, `tools.retry`) and per-tool (MCP server config,
   `tools.local` block). Exponential backoff with jitter.
 
+- **Parallel tool calls** — multiple tool calls from a single model response
+  can be executed concurrently.
+
+- **Executor support** — the default `llm` executor, Claude agents via
+  `executor.type: claude_sdk`, and OpenAI Agents SDK agents via
+  `executor.type: agents_sdk` are supported.
+
 - **Security sandboxing** — when `srt` (Anthropic's Sandbox Runtime) is on
   PATH, `code_sandbox` and local Python tools run inside an OS-level sandbox
   with filesystem and network restrictions. Writes are restricted to the
@@ -251,9 +271,6 @@ agent-name/
   on agent-plane, and vice versa. Use agent-plane's durable execution and
   multi-provider support with existing agent definitions.
 
-- **Context management** — compaction support for long conversations that
-  exceed token limits. Configurable via `context_management` on the request.
-
 - **Memory** — persistent memory across conversations. Agents will be able to
   store and retrieve information that survives individual sessions. Memory
   policy declarations (`memory:` block in config.yaml) for consent hints and
@@ -262,19 +279,6 @@ agent-name/
 - **Structured I/O** — `interaction.schema` for declaring typed input/output
   contracts. The runtime would validate inputs and outputs against declared
   field types.
-
-- **Parallel tool calls** — currently, multiple tool calls from a single LLM
-  response are executed sequentially. Planned: concurrent execution via thread
-  pool.
-
-- **Subagent batch and parallel fan-out** — `agent.map` / `agent.spawn` for
-  orchestrating sub-agents at scale.
-
-- **Dependency management for tools** — `requirements.txt` for Python tools,
-  `package.json` for TypeScript. Currently assumes dependencies are
-  pre-installed.
-
-- **Local async tool execution** — supporting `async def run()` in local tools.
 
 - **Frontend library** — a reusable client library for building frontends
   against the agent-plane API. SSE streaming, conversation management,
