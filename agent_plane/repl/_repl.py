@@ -65,8 +65,6 @@ async def run_repl(
     renderer = StreamRenderer()
     fmt = TimedFormatter(show_agent_labels=True)
     host = TerminalHost(model_name=ui_name)
-    # Queued steering messages — displayed after current stream ends.
-    pending_steers: list[str] = []
     is_streaming = False
 
     def show_help() -> None:
@@ -93,10 +91,11 @@ async def run_repl(
         files = [a.path for a in attachments] if attachments else None
 
         if is_streaming:
-            # Another handler is actively streaming. Queue the display
-            # and send the steer, but don't print yet — it would
-            # interleave with the agent's output.
-            pending_steers.append(text)
+            # Show the message immediately in dimmed style so the
+            # user knows it sent, then steer the agent.
+            from rich.text import Text as RText
+
+            host.output(RText.from_markup(f" [{fmt.muted}]❯ {text}[/{fmt.muted}]"))
             async for _ in session.send(text, files=files):
                 pass  # Steer yields nothing if delivered.
             return
@@ -121,10 +120,6 @@ async def run_repl(
         finally:
             is_streaming = False
             host.stop_timer()
-            # Show queued steering messages now that the stream ended.
-            for steer_text in pending_steers:
-                host.output(fmt.user_message(steer_text))
-            pending_steers.clear()
 
     async with host:
         host.output(fmt.welcome(ui_name))
