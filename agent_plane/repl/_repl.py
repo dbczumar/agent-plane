@@ -123,6 +123,16 @@ async def run_repl(
                 for item in fmt.format(block):
                     host.output(item)
                 await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            # Escape key cancels this task. Tell the server to cancel
+            # the in-progress response so the session state stays in
+            # sync. Without this, _is_terminal stays False and the
+            # next send() tries to steer a dead response.
+            try:
+                await session.cancel()
+            except Exception:
+                pass  # Best-effort — server may already have finished.
+            raise
         finally:
             is_streaming = False
             host.stop_timer()
