@@ -145,6 +145,9 @@ class RichBlockFormatter:
         """Render a tool result panel (no call line — already displayed)."""
         ex = ToolExecution(
             name=block.name,
+            # args_summary is not displayed for result-only panels,
+            # but is required by ToolExecution.
+            args_summary="",
             call_id=block.call_id,
             agent_name=block.agent_name,
             output=block.output,
