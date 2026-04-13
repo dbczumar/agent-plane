@@ -167,3 +167,68 @@ def test_cancel_appends_history_marker_and_followup_sees_it(
     assert "YES" in text, (
         f"Expected the follow-up to acknowledge the cancellation with 'YES'. Got: {text[:500]}"
     )
+
+
+def test_cancel_mid_tool_call_followup_succeeds(
+    http_client: httpx.Client,
+    archer_agent: str,
+) -> None:
+    """
+    Cancel a response while tools are executing, then verify the
+    follow-up turn succeeds (doesn't fail with 400).
+
+    When a response is cancelled mid-tool-call, dangling
+    ``function_call`` items exist without matching
+    ``function_call_output``. The cancellation handler must inject
+    synthetic outputs for these, otherwise OpenAI rejects the next
+    turn with "No tool output found for function call".
+
+    **What breaks if wrong:**
+
+    - If synthetic function_call_output items are not inserted,
+      every subsequent message in the conversation fails with
+      ``[llm] failed``.
+    """
+    # Step 1: ask archer to use tools (web_search triggers tool calls).
+    resp = http_client.post(
+        "/v1/responses",
+        json={
+            "model": archer_agent,
+            "input": (
+                "Search the web for 'latest Python release date' "
+                "and then search for 'latest Rust release date'. "
+                "Report both results."
+            ),
+            "background": True,
+        },
+    )
+    resp.raise_for_status()
+    response_id = resp.json()["id"]
+
+    # Step 2: wait for in_progress (tools should be executing), cancel.
+    _wait_for_in_progress(http_client, response_id, timeout=60)
+    # Brief delay so tool calls are persisted.
+    time.sleep(2)
+    cancel_resp = http_client.post(f"/v1/responses/{response_id}/cancel")
+    cancel_resp.raise_for_status()
+
+    # Step 3: send a follow-up — this would fail with 400 before the fix.
+    followup_resp = http_client.post(
+        "/v1/responses",
+        json={
+            "model": archer_agent,
+            "input": "Never mind the search. Just say hello.",
+            "previous_response_id": response_id,
+            "background": True,
+        },
+    )
+    followup_resp.raise_for_status()
+    followup_id = followup_resp.json()["id"]
+
+    followup_body = poll_until_terminal(http_client, followup_id, timeout=120)
+    # The follow-up must complete, not fail with an LLM error.
+    assert followup_body["status"] == "completed", (
+        f"Follow-up after tool-call cancel failed: "
+        f"status={followup_body['status']!r}, "
+        f"error={followup_body.get('error')}"
+    )

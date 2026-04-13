@@ -109,16 +109,20 @@ def _append_cancellation_item(
     items: list[NewConversationItem] = []
 
     # Find dangling function_calls and insert synthetic outputs.
-    history = conversation_store.fetch_all(task.conversation_id)
+    # Fetch all function_call and function_call_output items to
+    # identify calls that never received a result.
+    fc_page = conversation_store.list_items(task.conversation_id, limit=1000, type="function_call")
+    fco_page = conversation_store.list_items(
+        task.conversation_id, limit=1000, type="function_call_output"
+    )
     call_ids_with_output: set[str] = set()
     dangling_call_ids: list[str] = []
-    for ci in history:
-        if ci.type == "function_call":
-            assert isinstance(ci.data, FunctionCallData)
-            dangling_call_ids.append(ci.data.call_id)
-        elif ci.type == "function_call_output":
-            assert isinstance(ci.data, FunctionCallOutputData)
-            call_ids_with_output.add(ci.data.call_id)
+    for ci in fc_page.data:
+        assert isinstance(ci.data, FunctionCallData)
+        dangling_call_ids.append(ci.data.call_id)
+    for ci in fco_page.data:
+        assert isinstance(ci.data, FunctionCallOutputData)
+        call_ids_with_output.add(ci.data.call_id)
 
     for call_id in dangling_call_ids:
         if call_id not in call_ids_with_output:

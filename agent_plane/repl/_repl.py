@@ -128,8 +128,10 @@ async def run_repl(
             # the in-progress response so the session state stays in
             # sync. Without this, _is_terminal stays False and the
             # next send() tries to steer a dead response.
+            # shield() prevents the cancel() coroutine from being
+            # re-cancelled by the propagating CancelledError.
             try:
-                await session.cancel()
+                await asyncio.shield(session.cancel())
             except Exception:
                 pass  # Best-effort — server may already have finished.
             from rich.text import Text as RText
