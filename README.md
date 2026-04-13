@@ -206,14 +206,11 @@ agent-name/
 - **Local Python tools** — auto-discovered from `tools/python/*.py`. Each
   file exports a `SCHEMA` dict (OpenAI function format) and a `run(arguments)
   -> str` function. Executed in a subprocess for fault isolation — a crashed
-  tool doesn't crash the server.
+  tool doesn't crash the server. Supports sandboxing.
 
 - **Dependency management for tools** — local tool dependencies can be
   declared and installed per tool runtime instead of assuming they're already
   present on the host.
-
-- **Local async tool execution** — local tools can implement `async def run()`
-  in addition to synchronous execution.
 
 - **Sub-agents** — declare child agents under `agents/` and list them in
   `tools.agents`. The parent spawns sub-agents as independent workflows with
@@ -242,9 +239,6 @@ agent-name/
 - **Per-tool timeout and retry** — configurable at the global level
   (`tools.timeout`, `tools.retry`) and per-tool (MCP server config,
   `tools.local` block). Exponential backoff with jitter.
-
-- **Parallel tool calls** — multiple tool calls from a single model response
-  can be executed concurrently.
 
 - **Executor support** — the default `llm` executor, Claude agents via
   `executor.type: claude_sdk`, and OpenAI Agents SDK agents via
