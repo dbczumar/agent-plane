@@ -46,7 +46,12 @@ def build_agent_bundle(
         # LLM config is required for the real workflow to execute.
         # The model value must match the agent name used in
         # create_test_response(model=...).
-        "llm": {"model": name},
+        "llm": {
+            "model": name,
+            # api_key is required by spec validation; the workflow
+            # uses the mock LLM client so it's never actually sent.
+            "connection": {"api_key": "test-key"},
+        },
     }
     if description is not None:
         config["description"] = description
@@ -66,7 +71,10 @@ def build_agent_bundle(
             sa_config: dict[str, Any] = {
                 "spec_version": 1,
                 "name": sa["name"],
-                "llm": {"model": sa["name"]},
+                "llm": {
+                    "model": sa["name"],
+                    "connection": {"api_key": "test-key"},
+                },
             }
             if "description" in sa:
                 sa_config["description"] = sa["description"]
@@ -90,7 +98,7 @@ async def create_test_agent(
         "/api/agents",
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
     )
-    assert resp.status_code == 201
+    assert resp.status_code == 201, f"create_test_agent failed: {resp.text}"
     return resp.json()
 
 

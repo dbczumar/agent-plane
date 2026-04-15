@@ -192,6 +192,7 @@ def build_server(
         task_store=task_store,
         conversation_store=conversation_store,
         artifact_store=artifact_store,
+        agent_cache=agent_cache,
     )
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(

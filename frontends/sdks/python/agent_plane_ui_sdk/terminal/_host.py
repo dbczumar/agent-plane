@@ -11,6 +11,7 @@ import asyncio
 import io
 import os
 import pathlib
+import shlex
 import textwrap
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass

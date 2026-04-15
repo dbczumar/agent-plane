@@ -430,7 +430,9 @@ def test_search_finds_try_deliver_messages(
     agent_store: SqlAlchemyAgentStore,
 ) -> None:
     """Messages inserted via try_deliver are indexed for FTS."""
-    agent = agent_store.create(name="search-agent")
+    agent = agent_store.create(
+        agent_id="ag_test_search", name="search-agent", bundle_location="ag_test_search/fakehash"
+    )
     conv = conversation_store.create_conversation()
     task = task_store.create(conversation_id=conv.id, agent_id=agent.id, agent_name=agent.name)
 
@@ -479,7 +481,9 @@ async def test_delete_conversation_with_tasks(
     task_store: SqlAlchemyTaskStore,
     agent_store: SqlAlchemyAgentStore,
 ) -> None:
-    agent = agent_store.create(name="a")
+    agent = agent_store.create(
+        agent_id="ag_test_a", name="a", bundle_location="ag_test_a/fakehash"
+    )
     conv = conversation_store.create_conversation()
     task_store.create(conversation_id=conv.id, agent_id=agent.id, agent_name=agent.name)
     task_store.create(conversation_id=conv.id, agent_id=agent.id, agent_name=agent.name)

@@ -6,7 +6,6 @@ from sqlalchemy import and_, asc, desc, or_, select
 
 from agent_plane.db.db_models import SqlAgent
 from agent_plane.db.utils import (
-    generate_agent_id,
     get_or_create_engine,
     make_managed_session_maker,
     now_epoch,
@@ -26,7 +25,10 @@ def _to_entity(row: SqlAgent) -> Agent:
         id=row.id,
         created_at=row.created_at,
         name=row.name,
+        bundle_location=row.bundle_location,
+        version=row.version,
         description=row.description,
+        updated_at=row.updated_at,
     )
 
 
@@ -54,21 +56,29 @@ class SqlAlchemyAgentStore(AgentStore):
 
     def create(
         self,
+        agent_id: str,
         name: str,
+        bundle_location: str,
         description: str | None = None,
     ) -> Agent:
         """
         Register a new agent in the database.
 
+        :param agent_id: Pre-generated unique agent identifier,
+            e.g. ``"ag_0f1a2b3c..."``.
         :param name: Human-readable agent name. Must be unique,
             e.g. ``"code-assistant"``.
+        :param bundle_location: Artifact store key for the bundle,
+            e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
         :param description: Optional free-text description.
         :returns: The newly created :class:`Agent`.
         """
         row = SqlAgent(
-            id=generate_agent_id(),
+            id=agent_id,
             created_at=now_epoch(),
             name=name,
+            bundle_location=bundle_location,
+            version=1,
             description=description,
         )
         with self._session() as session:
@@ -150,6 +160,31 @@ class SqlAlchemyAgentStore(AgentStore):
                 last_id=entities[-1].id if entities else None,
                 has_more=has_more,
             )
+
+    def update(
+        self,
+        agent_id: str,
+        bundle_location: str,
+    ) -> Agent | None:
+        """
+        Update an agent's bundle location, bump version, and set
+        ``updated_at``.
+
+        :param agent_id: Unique agent identifier,
+            e.g. ``"agent_abc123"``.
+        :param bundle_location: New artifact store key for the
+            bundle, e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
+        :returns: The updated :class:`Agent`, or ``None`` if not
+            found.
+        """
+        with self._session() as session:
+            row = session.get(SqlAgent, agent_id)
+            if not row:
+                return None
+            row.bundle_location = bundle_location
+            row.version = row.version + 1
+            row.updated_at = now_epoch()
+            return _to_entity(row)
 
     def delete(self, agent_id: str) -> bool:
         """

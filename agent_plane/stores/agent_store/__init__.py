@@ -27,15 +27,22 @@ class AgentStore(ABC):
     @abstractmethod
     def create(
         self,
+        agent_id: str,
         name: str,
+        bundle_location: str,
         description: str | None = None,
     ) -> Agent:
         """
-        Register a new agent. Generates a unique agent_id. Name must
-        be unique -- raises if an agent with that name already exists.
+        Register a new agent. Name must be unique — raises if an
+        agent with that name already exists.
 
+        :param agent_id: Pre-generated unique agent identifier,
+            e.g. ``"ag_0f1a2b3c..."``. Caller generates this so
+            the bundle location can be computed before persisting.
         :param name: Human-readable agent name. Must be unique
             across all agents, e.g. ``"code-assistant"``.
+        :param bundle_location: Artifact store key for the bundle,
+            e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
         :param description: Optional free-text description of the
             agent's purpose.
         :returns: The newly created :class:`Agent`.
@@ -86,6 +93,26 @@ class AgentStore(ABC):
             *before* this agent in the sort order.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :returns: A :class:`PagedList` of :class:`Agent` objects.
+        """
+        ...
+
+    @abstractmethod
+    def update(
+        self,
+        agent_id: str,
+        bundle_location: str,
+    ) -> Agent | None:
+        """
+        Update an agent's bundle location, bump its version, and
+        set ``updated_at``. Returns the updated agent, or ``None``
+        if no agent with the given ID exists.
+
+        :param agent_id: Unique agent identifier,
+            e.g. ``"agent_abc123"``.
+        :param bundle_location: New artifact store key for the
+            bundle, e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
+        :returns: The updated :class:`Agent`, or ``None`` if not
+            found.
         """
         ...
 

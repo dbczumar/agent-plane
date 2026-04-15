@@ -49,16 +49,19 @@ def agent_cache(artifact_store: LocalArtifactStore, cache_dir: Path) -> AgentCac
 
 def _store_bundle(
     artifact_store: LocalArtifactStore,
-    agent_id: str,
+    bundle_location: str,
     files: dict[str, str] | None = None,
-) -> None:
+) -> bytes:
     """
     Store a tarball bundle in the artifact store under the given
-    agent_id. Uses minimal valid config.yaml if no files provided.
+    bundle_location. Uses minimal valid config.yaml if no files
+    provided. Returns the bundle bytes.
     """
     if files is None:
         files = {"config.yaml": _MINIMAL_CONFIG}
-    artifact_store.put(agent_id, _make_bundle_bytes(files))
+    data = _make_bundle_bytes(files)
+    artifact_store.put(bundle_location, data)
+    return data
 
 
 def test_load_cache_miss_downloads_and_extracts(
@@ -70,9 +73,10 @@ def test_load_cache_miss_downloads_and_extracts(
     On a full cache miss, load() downloads from artifact store,
     extracts to disk, parses spec, and returns LoadedAgent.
     """
-    _store_bundle(artifact_store, "agent-1")
+    loc = "agent-1/abc123"
+    _store_bundle(artifact_store, loc)
 
-    loaded = agent_cache.load("agent-1")
+    loaded = agent_cache.load("agent-1", loc)
 
     assert loaded.spec.name == "test-agent"
     assert loaded.spec.spec_version == 1
@@ -89,10 +93,11 @@ def test_load_memory_cache_hit(
     Second call to load() returns from in-memory cache without
     re-parsing from disk.
     """
-    _store_bundle(artifact_store, "agent-2")
+    loc = "agent-2/abc123"
+    _store_bundle(artifact_store, loc)
 
-    first = agent_cache.load("agent-2")
-    second = agent_cache.load("agent-2")
+    first = agent_cache.load("agent-2", loc)
+    second = agent_cache.load("agent-2", loc)
 
     # Same spec object (identity check — memory cache returns same ref)
     assert first.spec is second.spec
@@ -108,19 +113,20 @@ def test_load_disk_cache_hit(
     after server restart), load() re-parses from disk without
     downloading.
     """
-    _store_bundle(artifact_store, "agent-3")
+    loc = "agent-3/abc123"
+    _store_bundle(artifact_store, loc)
 
     # First cache instance populates disk
     cache_1 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
-    first = cache_1.load("agent-3")
+    first = cache_1.load("agent-3", loc)
 
     # New cache instance simulates server restart — empty memory cache
     cache_2 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
 
     # Remove from artifact store to prove we don't re-download
-    artifact_store.delete("agent-3")
+    artifact_store.delete(loc)
 
-    second = cache_2.load("agent-3")
+    second = cache_2.load("agent-3", loc)
     assert second.spec.name == first.spec.name
     assert second.workdir == first.workdir
 
@@ -128,9 +134,9 @@ def test_load_disk_cache_hit(
 def test_load_missing_agent_raises_key_error(
     agent_cache: AgentCache,
 ) -> None:
-    """load() raises KeyError when the agent doesn't exist."""
+    """load() raises KeyError when the bundle doesn't exist."""
     with pytest.raises(KeyError):
-        agent_cache.load("nonexistent")
+        agent_cache.load("nonexistent", "nonexistent/abc123")
 
 
 def test_load_invalid_spec_raises_agent_plane_error(
@@ -146,10 +152,11 @@ def test_load_invalid_spec_raises_agent_plane_error(
     """
     # spec_version=99 is invalid (must be 1)
     bad_config = yaml.dump({"spec_version": 99, "name": "bad"})
-    _store_bundle(artifact_store, "bad-agent", {"config.yaml": bad_config})
+    loc = "bad-agent/abc123"
+    _store_bundle(artifact_store, loc, {"config.yaml": bad_config})
 
     with pytest.raises(AgentPlaneError, match="invalid agent spec"):
-        agent_cache.load("bad-agent")
+        agent_cache.load("bad-agent", loc)
 
 
 def test_evict_clears_both_tiers(
@@ -158,9 +165,10 @@ def test_evict_clears_both_tiers(
     cache_dir: Path,
 ) -> None:
     """evict() removes from memory and disk."""
-    _store_bundle(artifact_store, "agent-4")
+    loc = "agent-4/abc123"
+    _store_bundle(artifact_store, loc)
 
-    agent_cache.load("agent-4")
+    agent_cache.load("agent-4", loc)
     assert (cache_dir / "agent-4").is_dir()
 
     agent_cache.evict("agent-4")
@@ -170,9 +178,9 @@ def test_evict_clears_both_tiers(
 
     # Memory cache cleared — remove from artifact store to prove
     # load() can't fall back to a cached spec in memory
-    artifact_store.delete("agent-4")
+    artifact_store.delete(loc)
     with pytest.raises(KeyError):
-        agent_cache.load("agent-4")
+        agent_cache.load("agent-4", loc)
 
 
 def test_evict_noop_for_uncached_agent(
@@ -180,3 +188,42 @@ def test_evict_noop_for_uncached_agent(
 ) -> None:
     """evict() on a non-existent agent is a silent no-op."""
     agent_cache.evict("never-loaded")
+
+
+def test_replace_swaps_spec(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+) -> None:
+    """
+    replace() extracts new bundle, swaps the in-memory spec,
+    and replaces the disk directory.
+    """
+    # Load original bundle
+    loc_v1 = "agent-5/v1hash"
+    _store_bundle(artifact_store, loc_v1)
+    loaded_v1 = agent_cache.load("agent-5", loc_v1)
+    assert loaded_v1.spec.name == "test-agent"
+
+    # Build a new bundle with a different description
+    new_config = yaml.dump(
+        {
+            "spec_version": 1,
+            "name": "test-agent",
+            "description": "updated agent",
+        }
+    )
+    new_bytes = _make_bundle_bytes({"config.yaml": new_config})
+
+    # Warm-swap
+    loc_v2 = "agent-5/v2hash"
+    loaded_v2 = agent_cache.replace("agent-5", loc_v2, new_bytes)
+
+    # New spec is returned and cached
+    assert loaded_v2.spec.description == "updated agent"
+    assert loaded_v2.workdir == cache_dir / "agent-5"
+    assert loaded_v2.workdir.is_dir()
+
+    # Subsequent load() returns the new spec from memory cache
+    loaded_again = agent_cache.load("agent-5", loc_v2)
+    assert loaded_again.spec is loaded_v2.spec

@@ -413,12 +413,17 @@ def app(task_store: SqlAlchemyTaskStore, db_uri: str, tmp_path: Path) -> FastAPI
     Build the FastAPI app with real stores and real workflow
     execution (mock LLM is patched in via task_store fixture).
     """
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
         task_store=task_store,
         conversation_store=SqlAlchemyConversationStore(db_uri),
-        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
     )
 
 

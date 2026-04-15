@@ -46,16 +46,22 @@ class AgentObject(BaseModel):
     :param object: Fixed resource type, always ``"agent"``.
     :param name: Human-readable agent name,
         e.g. ``"research-agent"``.
+    :param version: Monotonic version counter. Starts at 1,
+        incremented on each update.
     :param description: Optional free-text description of the
         agent's purpose.
     :param created_at: Unix epoch timestamp of creation.
+    :param updated_at: Unix epoch timestamp of the last update,
+        or ``None`` if never updated.
     """
 
     id: str
     object: str = "agent"
     name: str
+    version: int = 1
     description: str | None = None
     created_at: int
+    updated_at: int | None = None
 
 
 class AgentDeleted(BaseModel):

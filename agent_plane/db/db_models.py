@@ -20,8 +20,15 @@ class SqlAgent(Base):
     :param created_at: Unix epoch seconds when the agent was created.
     :param name: Human-readable agent name. Must be unique across all
         agents, max 256 characters.
+    :param bundle_location: Artifact store key for the current bundle.
+        Content-addressed (SHA-256 hex), e.g.
+        ``"ag_abc123/a1b2c3d4e5f6..."``.
+    :param version: Monotonic version counter. Starts at 1, incremented
+        on each update via ``PUT /api/agents/{id}``.
     :param description: Optional free-text description of the agent's
         purpose. ``None`` when not provided.
+    :param updated_at: Unix epoch seconds of the last update, or
+        ``None`` if the agent has never been updated.
     """
 
     __tablename__ = "agents"
@@ -29,7 +36,10 @@ class SqlAgent(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     created_at: Mapped[int] = mapped_column(Integer)
     name: Mapped[str] = mapped_column(String(256), unique=True)
+    bundle_location: Mapped[str] = mapped_column(String(512))
+    version: Mapped[int] = mapped_column(Integer, default=1)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (Index("ix_agents_created_at", "created_at"),)
 

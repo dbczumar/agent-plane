@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from agent_plane.errors import AgentPlaneError, ErrorCode
+from agent_plane.runtime.agent_cache import AgentCache
 from agent_plane.server.routes.agents import create_agents_router
 from agent_plane.server.routes.conversations import create_conversations_router
 from agent_plane.server.routes.files import create_files_router
@@ -27,13 +28,14 @@ def create_app(
     task_store: TaskStore,
     conversation_store: ConversationStore,
     artifact_store: ArtifactStore,
+    agent_cache: AgentCache,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
 
-    Stores are injected here and passed to route factories. Each store
-    is forwarded to the router factories that need it; the app itself
-    only wires them together.
+    Stores and cache are injected here and passed to route factories.
+    Each dependency is forwarded to the router factories that need it;
+    the app itself only wires them together.
 
     :param agent_store: Store for agent CRUD operations.
     :param file_store: Store for uploaded-file metadata.
@@ -43,6 +45,8 @@ def create_app(
         conversation-item persistence.
     :param artifact_store: Store for binary blobs (agent bundles,
         file content).
+    :param agent_cache: Cache for loaded agent specs and working
+        directories.
     :returns: A fully configured :class:`FastAPI` application.
     """
     app = FastAPI(title="Agent Plane Server")
@@ -95,7 +99,7 @@ def create_app(
         return {"status": "ok"}
 
     app.include_router(
-        create_agents_router(agent_store, task_store, artifact_store),
+        create_agents_router(agent_store, task_store, artifact_store, agent_cache),
         prefix="/api",
         tags=["agents"],
     )

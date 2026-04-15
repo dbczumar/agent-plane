@@ -88,7 +88,8 @@ curl -sL "https://example.com" | head -200
 
 Fetch JSON API:
 ```
-curl -s "https://api.github.com/repos/owner/repo" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['stargazers_count'])"
+curl -s "https://api.github.com/repos/owner/repo" | \
+  python3 -c "import sys,json; d=json.load(sys.stdin); print(d['stargazers_count'])"
 ```
 
 Search the web:

@@ -16,13 +16,23 @@ class Agent:
     :param id: Unique agent identifier, e.g. ``"ag_abc123"``.
     :param created_at: Unix epoch timestamp of creation.
     :param name: Human-readable agent name, e.g. ``"research-agent"``.
+    :param bundle_location: Artifact store key for the current bundle,
+        e.g. ``"ag_abc123/a1b2c3d4e5f6..."``. Content-addressed
+        (SHA-256 hex of the bundle bytes).
+    :param version: Monotonic version counter. Starts at 1, incremented
+        on each update.
     :param description: Optional free-text description of the agent.
+    :param updated_at: Unix epoch timestamp of the last update, or
+        ``None`` if the agent has never been updated.
     """
 
     id: str
     created_at: int
     name: str
+    bundle_location: str
+    version: int = 1
     description: str | None = None
+    updated_at: int | None = None
 
 
 @dataclass

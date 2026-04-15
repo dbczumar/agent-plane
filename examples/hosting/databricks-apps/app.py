@@ -92,8 +92,10 @@ try:
     conversation_store = SqlAlchemyConversationStore(DB_URI)
     artifact_store = DatabricksVolumesArtifactStore(ARTIFACT_URI)
 
+    agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=CACHE_DIR)
+
     init_runtime(
-        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=CACHE_DIR),
+        agent_cache=agent_cache,
         caps=RuntimeCaps(),
         agent_store=agent_store,
         file_store=file_store,
@@ -108,6 +110,7 @@ try:
         task_store=task_store,
         conversation_store=conversation_store,
         artifact_store=artifact_store,
+        agent_cache=agent_cache,
     )
 
     if __name__ == "__main__":

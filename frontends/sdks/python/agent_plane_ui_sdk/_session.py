@@ -166,7 +166,7 @@ class Session:
                 self._current_response_id = event.response.id
 
             if isinstance(
-                event, (ResponseCompleted, ResponseFailed, ResponseIncomplete, ResponseCancelled)
+                event, ResponseCompleted | ResponseFailed | ResponseIncomplete | ResponseCancelled
             ):
                 self._is_terminal = True
                 self._previous_response_id = event.response.id

@@ -51,6 +51,7 @@ from agent_plane.llms.types import (
 )
 from agent_plane.runtime import (
     get_agent_cache,
+    get_agent_store,
     get_artifact_store,
     get_caps,
     get_conversation_store,
@@ -4232,7 +4233,10 @@ async def agent_execution_workflow(
     tool_mgr: ToolManager | None = None
 
     try:
-        loaded = get_agent_cache().load(agent_id)
+        agent_record = get_agent_store().get(agent_id)
+        if agent_record is None:
+            raise ValueError(f"agent {agent_id} not found")
+        loaded = get_agent_cache().load(agent_id, agent_record.bundle_location)
         root_spec = loaded.spec
 
         # Resolve spec for sub-agents: if root_task_id is set,

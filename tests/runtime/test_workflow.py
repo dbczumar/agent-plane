@@ -1726,7 +1726,9 @@ def _create_task_pair(
         the conversation.
     :returns: ``(root_task_id, sub_task_id)`` tuple.
     """
-    agent = agent_store.create(name="test-agent")
+    agent = agent_store.create(
+        agent_id="ag_test_workflow", name="test-agent", bundle_location="ag_test_workflow/fakehash"
+    )
     conv = conversation_store.create_conversation()
     root = task_store.create(
         conversation_id=conv.id,

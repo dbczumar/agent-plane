@@ -320,7 +320,10 @@ class ResponsesNamespace:
 
                     elif isinstance(
                         event,
-                        (ResponseCompleted, ResponseFailed, ResponseIncomplete, ResponseCancelled),
+                        ResponseCompleted
+                        | ResponseFailed
+                        | ResponseIncomplete
+                        | ResponseCancelled,
                     ):
                         if in_reasoning:
                             in_reasoning = False

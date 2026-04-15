@@ -65,6 +65,7 @@ __all__ = [
     "ToolExecution",
     "ToolGroup",
     "ToolHandler",
+    "ToolResultBlock",
     "merge_text_across_iterations",
     "only_agent",
     "pipe",

@@ -106,9 +106,10 @@ def _make_agent(
     agent_store: SqlAlchemyAgentStore,
     artifact_store: LocalArtifactStore | None = None,
 ) -> str:
-    agent = agent_store.create(name=_AGENT_NAME)
+    loc = "ag_test_agent/fakehash"
+    agent = agent_store.create(agent_id="ag_test_agent", name=_AGENT_NAME, bundle_location=loc)
     if artifact_store is not None:
-        artifact_store.put(agent.id, _make_agent_bundle())
+        artifact_store.put(loc, _make_agent_bundle())
     return agent.id
 
 
@@ -179,8 +180,12 @@ async def test_list_tasks_by_agent(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     agent_store = SqlAlchemyAgentStore(db_uri)
-    a1 = agent_store.create(name="agent-a").id
-    a2 = agent_store.create(name="agent-b").id
+    a1 = agent_store.create(
+        agent_id="ag_test_a", name="agent-a", bundle_location="ag_test_a/fakehash"
+    ).id
+    a2 = agent_store.create(
+        agent_id="ag_test_b", name="agent-b", bundle_location="ag_test_b/fakehash"
+    ).id
     conv = _make_conversation(conversation_store)
 
     task_store.create(conversation_id=conv, agent_id=a1, agent_name="agent-a")
@@ -210,8 +215,12 @@ async def test_delete_all_by_agent(
     agent_store: SqlAlchemyAgentStore,
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    a1 = agent_store.create(name="agent-a").id
-    a2 = agent_store.create(name="agent-b").id
+    a1 = agent_store.create(
+        agent_id="ag_test_a", name="agent-a", bundle_location="ag_test_a/fakehash"
+    ).id
+    a2 = agent_store.create(
+        agent_id="ag_test_b", name="agent-b", bundle_location="ag_test_b/fakehash"
+    ).id
     conv = _make_conversation(conversation_store)
 
     task_store.create(conversation_id=conv, agent_id=a1, agent_name="agent-a")

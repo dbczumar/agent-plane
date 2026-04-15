@@ -70,9 +70,11 @@ def _preregister_agent(
     :param agent_store: The AgentStore for agent metadata.
     :param artifact_store: The ArtifactStore for bundle storage.
     """
+    import hashlib
     import io
     import tarfile
 
+    from agent_plane.db.utils import generate_agent_id
     from agent_plane.spec import load
 
     # Build tarball in memory.
@@ -95,14 +97,18 @@ def _preregister_agent(
     # replaces it — avoids stale config when iterating locally.
     existing = agent_store.get_by_name(spec.name)
     if existing is not None:
-        artifact_store.delete(existing.id)
+        artifact_store.delete(existing.bundle_location)
         agent_store.delete(existing.id)
 
-    agent = agent_store.create(
+    agent_id = generate_agent_id()
+    loc = f"{agent_id}/{hashlib.sha256(bundle_bytes).hexdigest()}"
+    artifact_store.put(loc, bundle_bytes)
+    agent_store.create(
+        agent_id=agent_id,
         name=spec.name,
+        bundle_location=loc,
         description=spec.description,
     )
-    artifact_store.put(agent.id, bundle_bytes)
     click.echo(f"  agent: {spec.name} (from {agent_dir})")
 
 
@@ -229,6 +235,7 @@ def server(
         task_store=task_store,
         conversation_store=conversation_store,
         artifact_store=artifact_store,
+        agent_cache=agent_cache,
     )
 
     # Pre-register agents from --agent directories.
@@ -521,7 +528,8 @@ def _expand_builtin_env_vars(
 @click.option(
     "--model",
     default=None,
-    help="Model in litellm format (provider/model_name), e.g. 'anthropic/claude-sonnet-4-20250514'.",
+    help="Model in litellm format (provider/model_name), "
+    "e.g. 'anthropic/claude-sonnet-4-20250514'.",
 )
 @click.option(
     "--allow-shell-access",

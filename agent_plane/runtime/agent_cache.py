@@ -39,7 +39,7 @@ class AgentCache:
         self._cache_dir = cache_dir
         self._specs: dict[str, AgentSpec] = {}
 
-    def load(self, agent_id: str) -> LoadedAgent:
+    def load(self, agent_id: str, bundle_location: str) -> LoadedAgent:
         """
         Load an agent, populating caches on miss.
 
@@ -48,6 +48,8 @@ class AgentCache:
 
         :param agent_id: Unique agent identifier,
             e.g. ``"ag_abc123"``.
+        :param bundle_location: Artifact store key for the bundle,
+            e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
         :returns: A LoadedAgent with the parsed spec and the
             on-disk working directory.
         """
@@ -64,17 +66,54 @@ class AgentCache:
             return LoadedAgent(spec=spec, workdir=workdir)
 
         # Cache miss — download bundle, write to temp file, extract
-        bundle_bytes = self._artifact_store.get(agent_id)
+        bundle_bytes = self._artifact_store.get(bundle_location)
+        return self._extract_and_cache(agent_id, bundle_bytes, workdir)
+
+    def replace(
+        self,
+        agent_id: str,
+        bundle_location: str,
+        bundle_bytes: bytes,
+    ) -> LoadedAgent:
+        """
+        Warm-swap an agent's cached spec and disk directory.
+
+        Extracts the new bundle to a temp directory, swaps the
+        in-memory spec entry, renames into the cache location, and
+        cleans up the old directory. Concurrent readers see either
+        the old spec or the new spec, never an empty cache.
+
+        :param agent_id: Unique agent identifier,
+            e.g. ``"ag_abc123"``.
+        :param bundle_location: New artifact store key (unused
+            during extraction but passed for consistency),
+            e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
+        :param bundle_bytes: Raw bytes of the new ``.tar.gz``
+            bundle.
+        :returns: A LoadedAgent with the new spec and working
+            directory.
+        """
+        workdir = self._cache_dir / agent_id
+        staging_dir = self._cache_dir / f"{agent_id}_staging"
+
+        # Extract new bundle to staging directory
         tmp_fd, tmp_name = tempfile.mkstemp(suffix=".tar.gz")
-        os.close(tmp_fd)  # close immediately; we re-open via Path.write_bytes
+        os.close(tmp_fd)
         tmp_path = Path(tmp_name)
         try:
             tmp_path.write_bytes(bundle_bytes)
-            spec = load_spec(tmp_path, dest=workdir)
+            spec = load_spec(tmp_path, dest=staging_dir)
         finally:
             tmp_path.unlink()
 
+        # Swap in-memory entry (atomic dict assignment)
         self._specs[agent_id] = spec
+
+        # Replace disk directory: remove old, rename staging into place
+        if workdir.is_dir():
+            shutil.rmtree(workdir)
+        staging_dir.rename(workdir)
+
         return LoadedAgent(spec=spec, workdir=workdir)
 
     def evict(self, agent_id: str) -> None:
@@ -89,3 +128,29 @@ class AgentCache:
         workdir = self._cache_dir / agent_id
         if workdir.is_dir():
             shutil.rmtree(workdir)
+
+    def _extract_and_cache(
+        self,
+        agent_id: str,
+        bundle_bytes: bytes,
+        workdir: Path,
+    ) -> LoadedAgent:
+        """
+        Extract bundle bytes to disk and populate both cache tiers.
+
+        :param agent_id: Unique agent identifier.
+        :param bundle_bytes: Raw bytes of the ``.tar.gz`` bundle.
+        :param workdir: Target directory for extraction.
+        :returns: A LoadedAgent with the parsed spec and workdir.
+        """
+        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".tar.gz")
+        os.close(tmp_fd)
+        tmp_path = Path(tmp_name)
+        try:
+            tmp_path.write_bytes(bundle_bytes)
+            spec = load_spec(tmp_path, dest=workdir)
+        finally:
+            tmp_path.unlink()
+
+        self._specs[agent_id] = spec
+        return LoadedAgent(spec=spec, workdir=workdir)

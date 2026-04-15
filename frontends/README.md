@@ -12,8 +12,10 @@ frontends/
       agent_plane_ui_sdk/       import agent_plane_ui_sdk
         terminal/               Rich + prompt_toolkit components
   repl/                         Standalone REPL (uses the SDK)
-  skills/                       Claude Code skills for frontend development
 ```
+
+Claude Code skills for frontend development live in the top-level
+`skills/` directory (e.g. `skills/repl-sdk/`).
 
 ## Python UI SDK
 
