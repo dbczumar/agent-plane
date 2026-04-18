@@ -36,9 +36,7 @@ def upgrade() -> None:
 
     # Backfill bundle_location for existing agents: the old artifact
     # key format was just the agent id.
-    op.execute(
-        sa.text("UPDATE agents SET bundle_location = id WHERE bundle_location IS NULL")
-    )
+    op.execute(sa.text("UPDATE agents SET bundle_location = id WHERE bundle_location IS NULL"))
 
     # Now make bundle_location NOT NULL.
     with op.batch_alter_table("agents") as batch_op:

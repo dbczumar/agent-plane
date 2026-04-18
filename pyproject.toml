@@ -20,6 +20,16 @@ dependencies = [
     "sqlalchemy>=2.0,<3",
     "tiktoken>=0.7,<1",
     "uvicorn[standard]>=0.30,<1",
+    # Observability. mlflow-tracing is a standalone package (see
+    # https://github.com/mlflow/mlflow/tree/master/libs/tracing)
+    # that bundles opentelemetry-api/sdk/proto and provides the
+    # GenAI semconv translation, attachment API, and distributed
+    # tracing helpers we use. See designs/OBSERVABILITY.md.
+    "mlflow-tracing>=3.0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.20",
+    "opentelemetry-exporter-otlp-proto-http>=1.20",
+    "opentelemetry-instrumentation-fastapi",
+    "opentelemetry-instrumentation-httpx",
 ]
 
 [project.optional-dependencies]
@@ -29,7 +39,14 @@ vertex = ["google-auth>=2.0,<3"]
 litellm = ["litellm>=1.0,<2"]
 # Executor backends
 claude-sdk = ["claude-agent-sdk>=1.0,<2"]
-agents-sdk = ["openai-agents>=0.1,<1"]
+# The OTel instrumentation package pulls the OpenAI Agents SDK
+# into its own dep chain, so we gate it behind the same extra as
+# the executor itself to avoid installing both on deployments that
+# don't use this executor type.
+agents-sdk = [
+    "openai-agents>=0.1,<1",
+    "opentelemetry-instrumentation-openai-agents-v2>=0.1",
+]
 # Storage backends
 databricks = ["databricks-sdk>=0.40,<1", "psycopg[binary]>=3.1,<4"]
 
@@ -77,6 +94,14 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "claude_agent_sdk.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "mlflow.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "opentelemetry.instrumentation.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

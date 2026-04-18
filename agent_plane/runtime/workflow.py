@@ -59,6 +59,7 @@ from agent_plane.runtime import (
     get_task_store,
     get_tool_manager,
     set_tool_manager,
+    telemetry,
 )
 from agent_plane.runtime.compaction import (
     SummaryMetadata,
@@ -213,6 +214,41 @@ def _create_executor(spec: AgentSpec) -> Executor:
     from agent_plane.runtime.executors import DefaultExecutor
 
     return DefaultExecutor.from_spec(spec)
+
+
+def _history_has_modality(
+    history: list[ConversationItem],
+    modality: str,
+) -> bool:
+    """
+    Return whether any message in *history* contains a content part
+    of the given modality.
+
+    Used to populate ``agent.iteration.has_images`` /
+    ``agent.iteration.has_files`` span attributes so operators can
+    quickly find multimodal requests in their trace backend.
+
+    :param history: The conversation history list.
+    :param modality: ``"image"`` or ``"file"``. Matches content
+        blocks whose ``type`` is ``"input_image"`` / ``"input_file"``
+        (OpenAI Responses API convention).
+    :returns: ``True`` if any message has a matching content part.
+    """
+    target_type = f"input_{modality}"
+    for item in history:
+        if item.type != "message":
+            continue
+        data = item.data
+        # The item validator guarantees data is MessageData when
+        # type == "message", so a ``content`` attribute is always
+        # present. Each content part is a dict with a ``type`` key.
+        content = getattr(data, "content", None)
+        if not content:
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == target_type:
+                return True
+    return False
 
 
 def _write_output(task_id: str, event: dict[str, Any]) -> None:
@@ -1338,6 +1374,7 @@ async def _call_tool(
     timeout: int,
     retry_config: RetryConfig,
     workspace_path: str | None = None,
+    call_id: str | None = None,
 ) -> str:
     """
     Route a tool call to the current workflow's ToolManager
@@ -1353,6 +1390,14 @@ async def _call_tool(
     an error string is returned (not raised) so the LLM can
     decide how to proceed.
 
+    An MLflow ``TOOL`` span covers the tool invocation. Inputs
+    (``tool_name``, ``arguments``) and outputs (the tool result
+    string) are recorded via ``set_inputs`` / ``set_outputs``
+    when content capture is enabled. The span lives inside the
+    ``@step`` body so it does not emit on DBOS crash recovery
+    replay (the cached result is returned without re-executing
+    the function body).
+
     :param task_id: The task identifier for SSE event emission,
         e.g. ``"task_abc123"``.
     :param agent_id: The registered agent ID,
@@ -1363,9 +1408,17 @@ async def _call_tool(
         LLM, e.g. ``'{"name": "summarize"}'``.
     :param timeout: Per-call timeout in seconds, e.g. ``60``.
     :param retry_config: Retry policy for this tool.
+    :param workspace_path: The per-task workspace directory. If
+        ``None``, tools run without a workspace reference.
+    :param call_id: The LLM-assigned call identifier for this
+        invocation, recorded on the span as ``tool.call_id``.
+        ``None`` when called from code paths that don't track
+        call IDs (legacy callers).
     :returns: The tool's string result, or an error string
         if all retries are exhausted.
     """
+    import mlflow
+    from mlflow.entities import SpanType
 
     def _blocking_call() -> str:
         """Execute the tool call in a thread."""
@@ -1394,7 +1447,54 @@ async def _call_tool(
             cancel_fn=tool.cancel if tool is not None else None,
         )
 
-    return await _to_thread(_blocking_call)
+    span_name = f"execute_tool {tool_name}"
+    with mlflow.start_span(span_name, span_type=SpanType.TOOL) as span:
+        span.set_attribute("tool.name", tool_name)
+        if call_id is not None:
+            span.set_attribute("tool.call_id", call_id)
+        mgr = get_tool_manager()
+        tool = mgr.get_tool(tool_name) if mgr is not None else None
+        if tool is not None:
+            span.set_attribute("tool.type", _classify_tool_type(tool))
+        if telemetry.should_capture_content():
+            span.set_inputs({"tool_name": tool_name, "arguments": arguments})
+        try:
+            result = await _to_thread(_blocking_call)
+            span.set_attribute("tool.status", "success")
+            if telemetry.should_capture_content():
+                span.set_outputs({"result": result})
+            return result
+        except Exception as exc:
+            span.set_attribute("tool.status", "error")
+            telemetry.record_error(span, exc)
+            raise
+
+
+def _classify_tool_type(tool: Any) -> str:
+    """
+    Classify a Tool instance by its source module.
+
+    Agent-plane has four tool families: ``builtins`` (baked into
+    the runtime), ``local`` (agent-provided Python scripts),
+    ``mcp`` (external MCP servers), and ``client_specified``
+    (tunneled to the calling client). The ``Tool`` base class
+    doesn't expose a type discriminator, so we infer from the
+    class's module path.
+
+    :param tool: A Tool subclass instance.
+    :returns: One of ``"builtin"``, ``"local"``, ``"mcp"``,
+        ``"client"``, or ``"unknown"``.
+    """
+    module = type(tool).__module__
+    if ".builtins." in module or module.endswith(".builtins"):
+        return "builtin"
+    if ".local" in module:
+        return "local"
+    if ".mcp" in module:
+        return "mcp"
+    if "client_specified" in module:
+        return "client"
+    return "unknown"
 
 
 def _inject_client_tools(
@@ -3905,185 +4005,204 @@ async def _run_agent_loop(
             pre_llm_last_seen = last_seen
             history_len_before_llm = len(history)
 
-            llm_resp = await _executor_turn_with_compaction(
-                task_id,
-                executor,
-                spec,
-                llm_config,
-                history,
-                instructions,
-                tool_schemas,
-                compaction_state,
-                executor_context,
-                content_cache,
-            )
+            # agent_iteration span: scoped to a single LLM turn +
+            # tool dispatch. Opens a new span per iteration so
+            # operators can correlate tool calls back to the
+            # iteration that produced them. Python's ``with``
+            # correctly closes the span on every exit path
+            # (return, continue, exception), so the entire
+            # iteration body lives inside this block.
+            import mlflow as _mlflow
 
-            # Persist and emit provider-native tool items (e.g.
-            # web_search_call) so the LLM sees its own tool
-            # results on subsequent iterations.
-            native_cursor = _emit_and_persist_native_tool_items(
-                task_id,
-                conversation_id,
-                agent_name,
-                llm_resp,
-                history,
-                output_items,
-                conv_store,
-            )
-            if native_cursor is not None:
-                last_seen = native_cursor
+            with _mlflow.start_span(
+                "agent_iteration",
+                attributes={
+                    "agent.iteration.number": iteration,
+                    "agent.iteration.input_message_count": len(history),
+                    "agent.iteration.tool_count": len(tool_schemas),
+                    "agent.iteration.has_images": _history_has_modality(history, "image"),
+                    "agent.iteration.has_files": _history_has_modality(history, "file"),
+                },
+            ):
+                llm_resp = await _executor_turn_with_compaction(
+                    task_id,
+                    executor,
+                    spec,
+                    llm_config,
+                    history,
+                    instructions,
+                    tool_schemas,
+                    compaction_state,
+                    executor_context,
+                    content_cache,
+                )
 
-            # Persist executor-observed tool calls (e.g. Claude SDK
-            # running tools internally). SSE was already emitted
-            # during the turn; this only persists to the store.
-            # Advance last_seen past the persisted items so
-            # _check_steering_inbox (inside _handle_final_response)
-            # doesn't treat them as late steered messages.
-            obs_cursor = _persist_observed_tool_calls(
-                task_id,
-                conversation_id,
-                agent_name,
-                llm_resp,
-                history,
-                output_items,
-                conv_store,
-            )
-            if obs_cursor is not None:
-                last_seen = obs_cursor
+                # Persist and emit provider-native tool items (e.g.
+                # web_search_call) so the LLM sees its own tool
+                # results on subsequent iterations.
+                native_cursor = _emit_and_persist_native_tool_items(
+                    task_id,
+                    conversation_id,
+                    agent_name,
+                    llm_resp,
+                    history,
+                    output_items,
+                    conv_store,
+                )
+                if native_cursor is not None:
+                    last_seen = native_cursor
 
-            # Collect IDs of items persisted during this iteration
-            # (native tools + observed tools). These must be
-            # excluded from the steering inbox check — they're our
-            # own items, not steered user messages.
-            iteration_item_ids = frozenset(ci.id for ci in history[history_len_before_llm:])
+                # Persist executor-observed tool calls (e.g. Claude SDK
+                # running tools internally). SSE was already emitted
+                # during the turn; this only persists to the store.
+                # Advance last_seen past the persisted items so
+                # _check_steering_inbox (inside _handle_final_response)
+                # doesn't treat them as late steered messages.
+                obs_cursor = _persist_observed_tool_calls(
+                    task_id,
+                    conversation_id,
+                    agent_name,
+                    llm_resp,
+                    history,
+                    output_items,
+                    conv_store,
+                )
+                if obs_cursor is not None:
+                    last_seen = obs_cursor
 
-            # Discover sub-agents by querying the task store — the
-            # single source of truth regardless of executor type.
-            # Terminal children go into both sets so auto-collect
-            # doesn't re-process them.
-            child_tasks = await task_store.list_tasks(
-                root_task_id=task_id,
-            )
-            for ct in child_tasks:
-                spawned_ids.add(ct.id)
-                if ct.status in TERMINAL_STATUSES:
-                    collected_ids.add(ct.id)
+                # Collect IDs of items persisted during this iteration
+                # (native tools + observed tools). These must be
+                # excluded from the steering inbox check — they're our
+                # own items, not steered user messages.
+                iteration_item_ids = frozenset(ci.id for ci in history[history_len_before_llm:])
 
-            if not _has_tool_calls(llm_resp):
-                # Auto-collect outstanding sub-agents before completing.
-                uncollected = spawned_ids - collected_ids
-                if uncollected:
-                    # last_seen is always set after the first
-                    # iteration (spawn persisted items).
-                    assert last_seen is not None
-                    # Persist the LLM text BEFORE auto-collect.
-                    # Without this, text is streamed to SSE but
-                    # never committed — ghost tokens that break
-                    # steering (the LLM's steering response is
-                    # lost and subsequent calls ignore the steer).
-                    collect_result = await _persist_text_before_auto_collect(
+                # Discover sub-agents by querying the task store — the
+                # single source of truth regardless of executor type.
+                # Terminal children go into both sets so auto-collect
+                # doesn't re-process them.
+                child_tasks = await task_store.list_tasks(
+                    root_task_id=task_id,
+                )
+                for ct in child_tasks:
+                    spawned_ids.add(ct.id)
+                    if ct.status in TERMINAL_STATUSES:
+                        collected_ids.add(ct.id)
+
+                if not _has_tool_calls(llm_resp):
+                    # Auto-collect outstanding sub-agents before completing.
+                    uncollected = spawned_ids - collected_ids
+                    if uncollected:
+                        # last_seen is always set after the first
+                        # iteration (spawn persisted items).
+                        assert last_seen is not None
+                        # Persist the LLM text BEFORE auto-collect.
+                        # Without this, text is streamed to SSE but
+                        # never committed — ghost tokens that break
+                        # steering (the LLM's steering response is
+                        # lost and subsequent calls ignore the steer).
+                        collect_result = await _persist_text_before_auto_collect(
+                            task_id,
+                            conversation_id,
+                            llm_resp,
+                            agent_name,
+                            list(uncollected),
+                            history,
+                            output_items,
+                            conv_store,
+                        )
+                        last_seen = collect_result.last_seen
+                        # Only mark actually-collected IDs — partial
+                        # collection (steering interrupt) leaves the
+                        # rest for the next auto-collect cycle.
+                        collected_ids.update(
+                            collect_result.collected_ids,
+                        )
+                        # Re-run the LLM so it can see collected
+                        # results and any steered messages.
+                        continue
+                    result = await _handle_final_response(
                         task_id,
                         conversation_id,
                         llm_resp,
                         agent_name,
-                        list(uncollected),
-                        history,
-                        output_items,
-                        conv_store,
-                    )
-                    last_seen = collect_result.last_seen
-                    # Only mark actually-collected IDs — partial
-                    # collection (steering interrupt) leaves the
-                    # rest for the next auto-collect cycle.
-                    collected_ids.update(
-                        collect_result.collected_ids,
-                    )
-                    # Re-run the LLM so it can see collected
-                    # results and any steered messages.
-                    continue
-                result = await _handle_final_response(
-                    task_id,
-                    conversation_id,
-                    llm_resp,
-                    agent_name,
-                    pre_llm_last_seen,
-                    history,
-                    output_items,
-                    task_store,
-                    conv_store,
-                    iteration_item_ids=iteration_item_ids,
-                )
-                if isinstance(result, _SteeringRetry):
-                    # Late steered messages arrived during streaming.
-                    # _handle_final_response persisted the assistant
-                    # response and appended both it and the steered
-                    # messages to history. Use the cursor from the
-                    # retry (the assistant message's ID, which has
-                    # the highest store position) so _sync_history
-                    # doesn't re-fetch already-processed items.
-                    last_seen = result.last_seen
-                    continue
-                return result
-
-            # Save the pre-tool last_seen so we can detect steered
-            # messages that arrived during tool execution. Tool
-            # outputs get positions after the steered message, so
-            # using the post-tool last_seen would skip it.
-            # Use the pre-LLM cursor so steered messages delivered
-            # during the LLM call (before native tools were persisted)
-            # are picked up by _sync_steered_after_tools.
-            pre_tool_last_seen = pre_llm_last_seen
-            handle_result = await _handle_tool_calls(
-                task_id,
-                conversation_id,
-                llm_resp,
-                agent_name,
-                agent_id,
-                tools_config,
-                history,
-                output_items,
-                conv_store,
-                tool_mgr,
-                workspace_path=workspace_path,
-            )
-            if isinstance(handle_result, _ClientToolCallsPending):
-                if root_task_id is not None:
-                    # Sub-agent: park and wait for client to deliver
-                    # tool results via PATCH on the root response.
-                    last_seen = await _park_for_client_tools(
-                        task_id,
-                        conversation_id,
-                        root_task_id,
-                        handle_result.client_call_ids,
-                        handle_result.last_seen,
+                        pre_llm_last_seen,
                         history,
                         output_items,
                         task_store,
                         conv_store,
+                        iteration_item_ids=iteration_item_ids,
                     )
-                    continue
-                # Top-level task: return function_call items to the
-                # caller and complete without server-side execution.
-                return await _complete_for_client_tools(
+                    if isinstance(result, _SteeringRetry):
+                        # Late steered messages arrived during streaming.
+                        # _handle_final_response persisted the assistant
+                        # response and appended both it and the steered
+                        # messages to history. Use the cursor from the
+                        # retry (the assistant message's ID, which has
+                        # the highest store position) so _sync_history
+                        # doesn't re-fetch already-processed items.
+                        last_seen = result.last_seen
+                        continue
+                    return result
+
+                # Save the pre-tool last_seen so we can detect steered
+                # messages that arrived during tool execution. Tool
+                # outputs get positions after the steered message, so
+                # using the post-tool last_seen would skip it.
+                # Use the pre-LLM cursor so steered messages delivered
+                # during the LLM call (before native tools were persisted)
+                # are picked up by _sync_steered_after_tools.
+                pre_tool_last_seen = pre_llm_last_seen
+                handle_result = await _handle_tool_calls(
                     task_id,
                     conversation_id,
-                    handle_result.last_seen,
+                    llm_resp,
+                    agent_name,
+                    agent_id,
+                    tools_config,
+                    history,
                     output_items,
-                    task_store,
+                    conv_store,
+                    tool_mgr,
+                    workspace_path=workspace_path,
                 )
-            last_seen = handle_result
-            # Track spawned/collected sub-agent IDs for auto-collect.
-            # Check for steered messages that arrived between the
-            # LLM call and tool completion. Use the pre-tool cursor
-            # to catch messages with positions interleaved among
-            # tool call items.
-            last_seen = _sync_steered_after_tools(
-                conv_store,
-                conversation_id,
-                pre_tool_last_seen,
-                last_seen,
-                history,
-            )
+                if isinstance(handle_result, _ClientToolCallsPending):
+                    if root_task_id is not None:
+                        # Sub-agent: park and wait for client to deliver
+                        # tool results via PATCH on the root response.
+                        last_seen = await _park_for_client_tools(
+                            task_id,
+                            conversation_id,
+                            root_task_id,
+                            handle_result.client_call_ids,
+                            handle_result.last_seen,
+                            history,
+                            output_items,
+                            task_store,
+                            conv_store,
+                        )
+                        continue
+                    # Top-level task: return function_call items to the
+                    # caller and complete without server-side execution.
+                    return await _complete_for_client_tools(
+                        task_id,
+                        conversation_id,
+                        handle_result.last_seen,
+                        output_items,
+                        task_store,
+                    )
+                last_seen = handle_result
+                # Track spawned/collected sub-agent IDs for auto-collect.
+                # Check for steered messages that arrived between the
+                # LLM call and tool completion. Use the pre-tool cursor
+                # to catch messages with positions interleaved among
+                # tool call items.
+                last_seen = _sync_steered_after_tools(
+                    conv_store,
+                    conversation_id,
+                    pre_tool_last_seen,
+                    last_seen,
+                    history,
+                )
 
         # Hit max iterations without a final response
         return _AgentLoopResult(
@@ -4229,6 +4348,10 @@ async def agent_execution_workflow(
     :returns: A result dict with ``"task_id"``,
         ``"status"``, and ``"output"`` keys.
     """
+    import mlflow
+    from mlflow.entities import SpanType
+    from mlflow.tracing.constant import SpanAttributeKey
+
     task_id = get_workflow_id()
     tool_mgr: ToolManager | None = None
 
@@ -4256,45 +4379,109 @@ async def agent_execution_workflow(
                 },
             ).to_dict(task_id)
 
-        client_tool_specs: list[ClientSideToolSpec] = parse_client_side_tool_specs(tools or [])
-        caps = get_caps()
-        tool_mgr = ToolManager(
-            spec,
-            client_tool_specs=client_tool_specs,
-            workdir=loaded.workdir,
-            sandbox_enabled=caps.sandbox_enabled,
-        )
-        set_tool_manager(tool_mgr)
-        executor = _create_executor(spec)
+        # Fetch the task row once to determine background flag, root
+        # vs sub-agent status, and (for sub-agents) the root task ID
+        # that anchors the shared trace.
+        task_row = await _to_thread(lambda: get_task_store().get_sync(task_id))
+        background = bool(task_row.background) if task_row is not None else False
+        root_task_id = task_row.root_task_id if task_row is not None else None
+        conversation_kind = "sub_agent" if root_task_id is not None else "default"
 
-        result = await _run_agent_loop(
-            task_id,
-            conversation_id,
-            spec,
-            agent_name,
-            agent_id,
-            instructions,
-            tool_mgr,
-            executor,
-            reasoning=reasoning,
-        )
-        return result.to_dict(task_id)
-    except Exception as exc:
-        _logger.exception(
-            "agent loop failed for task %s",
-            task_id,
-        )
-        # Emit a terminal error event so live-stream subscribers
-        # see the failure before the stream closes.
-        _write_output(
-            task_id,
-            {
-                "type": "response.error",
-                "source": "llm",
-                "message": str(exc),
-            },
-        )
-        raise
+        caps = get_caps()
+        effective_timeout = min(spec.executor.timeout, caps.execution_timeout)
+
+        # Open a trace context scoped to this response. For root
+        # invocations the trace ID is derived from ``task_id``; for
+        # sub-agents it's derived from ``root_task_id`` so the whole
+        # spawn tree shares one trace. Then create an ``invoke_agent``
+        # span per the GenAI agent spans semconv.
+        span_name = f"invoke_agent {spec.name}" if spec.name else "invoke_agent"
+        with (
+            telemetry.trace_context_for_response(
+                response_id=task_id,
+                root_response_id=root_task_id,
+            ),
+            mlflow.start_span(span_name, span_type=SpanType.AGENT) as span,
+        ):
+            # Record the response ID as the trace's client_request_id
+            # so MLflow-backend operators can look up the trace via
+            # mlflow.search_traces(filter_string='client_request_id =
+            # ...'). Complementary to the response-ID-derived trace ID.
+            mlflow.update_current_trace(client_request_id=task_id)
+            span.set_attribute("task.id", task_id)
+            span.set_attribute("agent.id", agent_id)
+            span.set_attribute("agent.conversation.kind", conversation_kind)
+            span.set_attribute("agent.background", background)
+            span.set_attribute("agent.executor.type", spec.executor.type)
+            span.set_attribute("agent.executor.max_iterations", spec.executor.max_iterations)
+            span.set_attribute("agent.executor.timeout_seconds", effective_timeout)
+            span.set_attribute(
+                "agent.modalities.input",
+                list(spec.interaction.modalities.input),
+            )
+            span.set_attribute(
+                "agent.modalities.output",
+                list(spec.interaction.modalities.output),
+            )
+            if previous_response_id is not None:
+                span.set_attribute("agent.previous_response_id", previous_response_id)
+            if spec.description is not None:
+                span.set_attribute("gen_ai.agent.description", spec.description)
+            if spec.llm is not None:
+                provider, request_model = telemetry.parse_provider_name(spec.llm.model)
+                span.set_attribute(SpanAttributeKey.MODEL, request_model)
+                span.set_attribute(SpanAttributeKey.MODEL_PROVIDER, provider)
+
+            client_tool_specs: list[ClientSideToolSpec] = parse_client_side_tool_specs(tools or [])
+            tool_mgr = ToolManager(
+                spec,
+                client_tool_specs=client_tool_specs,
+                workdir=loaded.workdir,
+                sandbox_enabled=caps.sandbox_enabled,
+            )
+            set_tool_manager(tool_mgr)
+            executor = _create_executor(spec)
+
+            try:
+                result = await _run_agent_loop(
+                    task_id,
+                    conversation_id,
+                    spec,
+                    agent_name,
+                    agent_id,
+                    instructions,
+                    tool_mgr,
+                    executor,
+                    reasoning=reasoning,
+                )
+                span.set_outputs({"status": result.status})
+                return result.to_dict(task_id)
+            except asyncio.CancelledError:
+                # Cancellation arrives as CancelledError at any await
+                # point. Emit a response.cancelled SSE event so clients
+                # see the cancellation in real-time, then propagate —
+                # DBOS translates this into a CANCELLED workflow status.
+                _write_output(
+                    task_id,
+                    {
+                        "type": "response.cancelled",
+                        "reason": "user_cancelled",
+                    },
+                )
+                telemetry.record_cancellation(span)
+                raise
+            except Exception as exc:
+                _logger.exception("agent loop failed for task %s", task_id)
+                _write_output(
+                    task_id,
+                    {
+                        "type": "response.error",
+                        "source": "llm",
+                        "message": str(exc),
+                    },
+                )
+                telemetry.record_error(span, exc)
+                raise
     finally:
         await _close_output(task_id)
         if tool_mgr is not None:

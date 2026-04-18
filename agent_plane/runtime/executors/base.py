@@ -114,9 +114,29 @@ class TurnComplete:
 
     :param text: The assistant's text response, or ``None`` if the turn
         ended with tool calls only.
+    :param usage: Token usage for this turn, e.g.
+        ``{"input_tokens": 1523, "output_tokens": 847}``. ``None``
+        when the executor does not report usage. Known keys:
+        ``"input_tokens"``, ``"output_tokens"``,
+        ``"cache_read_input_tokens"``,
+        ``"cache_creation_input_tokens"``.
+    :param response_model: The actual model identifier reported by
+        the provider (may differ from the requested model), or
+        ``None`` if unavailable.
+    :param response_id: The provider-assigned response/completion
+        identifier, or ``None`` if unavailable.
+    :param finish_reasons: Finish reasons from the response, e.g.
+        ``["stop"]`` or ``["tool_calls"]``. ``None`` when the
+        executor cannot derive a reason (e.g. empty response
+        output). Never an empty list — callers should treat
+        absence as "unknown", not "zero reasons".
     """
 
     text: str | None
+    usage: dict[str, Any] | None = None
+    response_model: str | None = None
+    response_id: str | None = None
+    finish_reasons: list[str] | None = None
 
 
 @dataclass
@@ -133,6 +153,25 @@ class ContextWindowExceeded:
 
     max_tokens: int
     actual_tokens: int
+
+
+@dataclass
+class TurnCancelled:
+    """
+    The executor's turn was cancelled before completing.
+
+    Yielded when an ``asyncio.CancelledError`` interrupts ``run_turn()``
+    mid-stream, or when the workflow detects cancellation between
+    executor events. Carries partial output so the workflow can persist
+    what was generated before the interruption.
+
+    :param reason: Why the turn was cancelled, e.g. ``"user_cancelled"``.
+    :param partial_text: Any text the model had streamed before the
+        cancellation, or ``None`` if no text was emitted yet.
+    """
+
+    reason: str
+    partial_text: str | None = None
 
 
 @dataclass
@@ -168,6 +207,7 @@ ExecutorEvent = (
     | ToolCallRequested
     | ToolCallObserved
     | TurnComplete
+    | TurnCancelled
     | ContextWindowExceeded
     | ExecutorError
 )
@@ -216,7 +256,26 @@ def event_to_dict(event: ExecutorEvent) -> dict[str, Any]:
             "duration_ms": event.duration_ms,
         }
     if isinstance(event, TurnComplete):
-        return {"type": "TurnComplete", "text": event.text}
+        return {
+            "type": "TurnComplete",
+            "text": event.text,
+            # Usage/metadata fields are included unconditionally
+            # (even when None). dict_to_event uses **fields so the
+            # keyword args pass through cleanly; None matches the
+            # dataclass defaults. Old cached events that predate
+            # these fields still deserialize because dict_to_event
+            # only passes keys that exist in the payload.
+            "usage": event.usage,
+            "response_model": event.response_model,
+            "response_id": event.response_id,
+            "finish_reasons": event.finish_reasons,
+        }
+    if isinstance(event, TurnCancelled):
+        return {
+            "type": "TurnCancelled",
+            "reason": event.reason,
+            "partial_text": event.partial_text,
+        }
     if isinstance(event, ContextWindowExceeded):
         return {
             "type": "ContextWindowExceeded",
@@ -239,6 +298,7 @@ _EVENT_CONSTRUCTORS: dict[str, type[ExecutorEvent]] = {
     "ToolCallRequested": ToolCallRequested,
     "ToolCallObserved": ToolCallObserved,
     "TurnComplete": TurnComplete,
+    "TurnCancelled": TurnCancelled,
     "ContextWindowExceeded": ContextWindowExceeded,
     "ExecutorError": ExecutorError,
 }

@@ -77,6 +77,65 @@ def _ensure_sdk() -> Any:
         ) from exc
 
 
+_otel_instrumentor_initialized = False
+
+
+def _ensure_otel_instrumentor() -> None:
+    """
+    Install the OTel instrumentation for the OpenAI Agents SDK.
+
+    The SDK has its own proprietary tracing system; this bridge
+    converts those traces into OTel spans that nest under the
+    agent-plane ``invoke_agent`` span. Called once per process at
+    executor creation.
+
+    No-op when ``OTEL_EXPORTER_OTLP_ENDPOINT`` is unset (telemetry
+    disabled) or when the optional
+    ``opentelemetry-instrumentation-openai-agents-v2`` package is
+    not installed.
+    """
+    global _otel_instrumentor_initialized
+    if _otel_instrumentor_initialized:
+        return
+    _otel_instrumentor_initialized = True
+
+    if not os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        return
+
+    # Content capture forwards through to the instrumentor's own
+    # env var so message bodies end up in gen_ai.input.messages /
+    # gen_ai.output.messages span attributes.
+    if os.environ.get("AGENT_PLANE_OTEL_CAPTURE_CONTENT", "").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+    ):
+        os.environ.setdefault(
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
+            "span_and_event",
+        )
+
+    try:
+        from opentelemetry.instrumentation.openai_agents import (
+            OpenAIAgentsInstrumentor,
+        )
+    except ImportError:
+        _logger.info(
+            "OpenAIAgentsInstrumentor not installed; "
+            "install 'agent-plane[agents-sdk]' to enable "
+            "OTel tracing for the OpenAI Agents SDK executor."
+        )
+        return
+
+    try:
+        OpenAIAgentsInstrumentor().instrument()
+    except Exception:
+        _logger.exception(
+            "failed to install OpenAIAgentsInstrumentor; "
+            "OpenAI Agents SDK spans will not appear in traces"
+        )
+
+
 def _extract_codex_tools(spec: AgentSpec) -> list[str]:
     """
     Extract ``codex:``-prefixed tool names from the agent spec.
@@ -742,6 +801,7 @@ class AgentsSdkExecutor(Executor):
         :returns: Configured AgentsSdkExecutor.
         """
         _ensure_sdk()
+        _ensure_otel_instrumentor()
         assert spec.llm is not None
         codex_tools = _extract_codex_tools(spec)
         return cls(

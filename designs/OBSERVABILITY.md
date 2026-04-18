@@ -604,9 +604,20 @@ instrumentation libraries for LLM calls. Reasons:
 3. Manual spans give us full control over attribute population and
    content capture gating.
 
-The one exception is **FastAPI auto-instrumentation** — the
-`opentelemetry-instrumentation-fastapi` package instruments HTTP
-request/response spans automatically. This is standard and low-risk.
+**FastAPI auto-instrumentation is deferred** — integrating the
+``opentelemetry-instrumentation-fastapi`` package would be ideal
+for HTTP SERVER spans, but MLflow's span processor (as of
+``mlflow-tracing`` 3.x) has a bug where raw OTel spans created by
+auto-instrumentors are wrapped via ``create_mlflow_span`` with a
+default ``span_type=None``, leaving ``mlflow.spanType`` serialized
+as the JSON literal ``null``. When MLflow's metrics mixin reads
+the attribute back, it resolves to a Python ``None``, and the
+OTLP exporter then crashes trying to encode the ``span_type``
+attribute on the duration histogram metric. Until MLflow fixes
+this upstream, we rely on uvicorn access logs for HTTP-level
+observability instead. The workflow / LLM / tool spans emitted by
+this module are independent of the HTTP span and cover the
+diagnostic value the HTTP span would have added.
 
 ### Tracer Module
 
@@ -1092,7 +1103,8 @@ package must be >= v0.50b0 to include the v1.37.0+ attributes
 1. Implement `telemetry.init()` — reads standard OTel env vars,
    creates providers and exporters, NoOp fallback when endpoint unset.
 2. Wire `telemetry.init()` into server startup (before `create_app()`).
-3. Add FastAPI auto-instrumentation.
+3. FastAPI auto-instrumentation is deferred pending an upstream
+   MLflow fix — see "How We Capture" for details.
 
 ### Phase 2: Core Spans
 

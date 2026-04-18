@@ -264,8 +264,7 @@ def test_update_agent_zero_downtime(
         f"Output: {body1.get('output', [])}"
     )
     assert body2["status"] == "completed", (
-        f"V2 request failed with status {body2['status']!r}. "
-        f"Output: {body2.get('output', [])}"
+        f"V2 request failed with status {body2['status']!r}. Output: {body2.get('output', [])}"
     )
 
     # Step 6: V1 response should NOT contain the marker —

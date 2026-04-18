@@ -47,6 +47,7 @@ from agent_plane.runtime.executors import (
     TextChunk,
     ToolCallRequested,
     ToolResult,
+    TurnCancelled,
     TurnComplete,
     _build_responses_args,
     _consume_stream,
@@ -183,6 +184,8 @@ async def _aiter(
         ),
         TurnComplete(text="Done."),
         TurnComplete(text=None),
+        TurnCancelled(reason="user_cancelled", partial_text="I was saying"),
+        TurnCancelled(reason="user_cancelled", partial_text=None),
         ContextWindowExceeded(max_tokens=128000, actual_tokens=142000),
         ExecutorError(message="auth failed", code="401"),
         ExecutorError(message="unknown error", code=None),
@@ -194,6 +197,8 @@ async def _aiter(
         "tool_call_requested",
         "turn_complete_with_text",
         "turn_complete_no_text",
+        "turn_cancelled_with_partial_text",
+        "turn_cancelled_no_partial_text",
         "context_window_exceeded",
         "executor_error_with_code",
         "executor_error_no_code",
@@ -205,6 +210,7 @@ def test_event_serialization_roundtrip(
     | NativeToolOutput
     | ToolCallRequested
     | TurnComplete
+    | TurnCancelled
     | ContextWindowExceeded
     | ExecutorError,
 ) -> None:
@@ -547,20 +553,28 @@ async def test_consume_stream_no_completed_event() -> None:
 
 def test_yield_final_events_text_only() -> None:
     """
-    Text-only response must yield TurnComplete with the text.
+    Text-only response must yield TurnComplete with the text and
+    a ``"stop"`` finish reason (so operators can distinguish from
+    truncation / tool calls in trace backends).
     """
     response = _make_text_response("Hello!")
 
     events = list(_yield_final_events(response))
 
     # Final event must be TurnComplete with the text.
-    assert events[-1] == TurnComplete(text="Hello!")
+    final = events[-1]
+    assert isinstance(final, TurnComplete)
+    assert final.text == "Hello!"
+    # Text-only responses get finish_reasons = ["stop"] so backends
+    # can render the termination cause.
+    assert final.finish_reasons == ["stop"]
 
 
 def test_yield_final_events_with_tool_calls() -> None:
     """
     Response with tool calls must yield ToolCallRequested events
-    and TurnComplete(text=None).
+    and a TurnComplete with ``text=None`` and
+    ``finish_reasons=["tool_calls"]``.
     """
     response = _make_tool_call_response("call_1", "search", {"q": "x"})
 
@@ -570,7 +584,11 @@ def test_yield_final_events_with_tool_calls() -> None:
     assert len(tool_events) == 1
     assert tool_events[0].name == "search"
     # TurnComplete.text must be None when tool calls are present.
-    assert events[-1] == TurnComplete(text=None)
+    final = events[-1]
+    assert isinstance(final, TurnComplete)
+    assert final.text is None
+    # Tool-call responses get finish_reasons = ["tool_calls"].
+    assert final.finish_reasons == ["tool_calls"]
 
 
 def test_yield_final_events_with_native_tools() -> None:
@@ -892,8 +910,14 @@ async def test_run_streaming_turn_yields_events_on_success(
     assert len(text_chunks) == 1
     assert text_chunks[0].text == "Hi!"
 
-    # Must end with TurnComplete carrying the full text.
-    assert events[-1] == TurnComplete(text="Hi!")
+    # Must end with TurnComplete carrying the full text. Other
+    # TurnComplete fields (usage, response_model, finish_reasons)
+    # are populated by _yield_final_events from the completed
+    # response — we check the text here; field-level tests for
+    # the derived metadata live in test_yield_final_events_*.
+    final = events[-1]
+    assert isinstance(final, TurnComplete)
+    assert final.text == "Hi!"
 
 
 @pytest.mark.asyncio

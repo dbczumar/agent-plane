@@ -229,6 +229,13 @@ def server(
         caps=caps,
     )
 
+    # Initialize OpenTelemetry observability. No-op when
+    # OTEL_EXPORTER_OTLP_ENDPOINT is unset; see
+    # designs/OBSERVABILITY.md for the env var reference.
+    from agent_plane.runtime import telemetry
+
+    telemetry.init()
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,

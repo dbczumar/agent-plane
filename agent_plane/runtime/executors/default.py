@@ -266,6 +266,14 @@ class DefaultExecutor(Executor):
         ``ContextWindowExceeded`` instead (no ``TurnComplete``).
         On permanent/exhausted errors, yields ``ExecutorError``.
 
+        An MLflow ``LLM`` span covers the full LLM call. Inputs
+        (messages, model config) and outputs (text, tool calls)
+        are recorded when content capture is enabled — MLflow
+        translates them to ``gen_ai.input.messages`` /
+        ``gen_ai.output.messages`` on OTLP export. Usage and
+        response metadata are recorded from the terminal
+        ``TurnComplete`` event.
+
         :param messages: Pre-compacted conversation history.
         :param tools: OpenAI-format tool schemas.
         :param system_prompt: System instructions.
@@ -273,21 +281,87 @@ class DefaultExecutor(Executor):
             per-request reasoning overrides applied).
         :param context: Agent-plane capabilities and identifiers.
         """
+        import mlflow
+        from mlflow.entities import SpanType
+
+        from agent_plane.runtime import telemetry
+
         args = _build_responses_args(
             llm_config.model,
             tools,
             llm_config.extra,
         )
-        async for event in _run_streaming_turn(
-            task_id=context.task_id,
-            input_items=messages,
-            instructions=system_prompt,
-            args=args,
-            connection=llm_config.connection,
-            timeout=llm_config.request_timeout,
-            retry_config=llm_config.retry,
-        ):
-            yield event
+        provider, model_name = telemetry.parse_provider_name(llm_config.model)
+        span_name = f"chat {model_name}" if model_name else "chat"
+        with mlflow.start_span(span_name, span_type=SpanType.CHAT_MODEL) as span:
+            # MLflow stores these as mlflow.llm.* and translates
+            # to gen_ai.request.* / gen_ai.provider.name on OTLP export.
+            from mlflow.tracing.constant import SpanAttributeKey
+
+            span.set_attribute(SpanAttributeKey.MODEL, model_name)
+            span.set_attribute(SpanAttributeKey.MODEL_PROVIDER, provider)
+            span.set_attribute("gen_ai.conversation.id", context.conversation_id)
+            # Common request params — only record when present to
+            # avoid invented defaults. ``extra`` is heterogeneous.
+            if (max_tokens := llm_config.extra.get("max_completion_tokens")) is not None:
+                span.set_attribute("gen_ai.request.max_tokens", max_tokens)
+            elif (max_tokens := llm_config.extra.get("max_tokens")) is not None:
+                span.set_attribute("gen_ai.request.max_tokens", max_tokens)
+            if (temperature := llm_config.extra.get("temperature")) is not None:
+                span.set_attribute("gen_ai.request.temperature", temperature)
+            if (top_p := llm_config.extra.get("top_p")) is not None:
+                span.set_attribute("gen_ai.request.top_p", top_p)
+            if (reasoning_effort := llm_config.extra.get("reasoning_effort")) is not None:
+                span.set_attribute("openai.request.reasoning_effort", reasoning_effort)
+
+            if telemetry.should_capture_content():
+                # MLflow auto-translates span.inputs containing a
+                # "messages" field to gen_ai.input.messages on OTLP
+                # export, so no hand-rolled format conversion needed.
+                span.set_inputs(
+                    {
+                        "messages": messages,
+                        "model": llm_config.model,
+                        "system": system_prompt,
+                        "tools": tools,
+                    }
+                )
+
+            output_texts: list[str] = []
+            async for event in _run_streaming_turn(
+                task_id=context.task_id,
+                input_items=messages,
+                instructions=system_prompt,
+                args=args,
+                connection=llm_config.connection,
+                timeout=llm_config.request_timeout,
+                retry_config=llm_config.retry,
+                chat_span=span,
+            ):
+                if isinstance(event, TextChunk):
+                    output_texts.append(event.text)
+                if isinstance(event, TurnComplete):
+                    if event.usage is not None:
+                        telemetry.record_llm_usage(span, event.usage)
+                    if event.response_model is not None:
+                        span.set_attribute("gen_ai.response.model", event.response_model)
+                    if event.response_id is not None:
+                        span.set_attribute("gen_ai.response.id", event.response_id)
+                    if event.finish_reasons:
+                        span.set_attribute(
+                            "gen_ai.response.finish_reasons",
+                            event.finish_reasons,
+                        )
+                    if telemetry.should_capture_content():
+                        # Let MLflow translate the output payload
+                        # to gen_ai.output.messages on export.
+                        span.set_outputs(
+                            {
+                                "text": "".join(output_texts) or event.text,
+                                "finish_reasons": event.finish_reasons or [],
+                            }
+                        )
+                yield event
 
 
 async def _create_stream(
@@ -335,6 +409,7 @@ async def _run_streaming_turn(
     connection: dict[str, str] | None,
     timeout: int,
     retry_config: RetryConfig,
+    chat_span: Any | None = None,
 ) -> AsyncIterator[ExecutorEvent]:
     """
     Execute the async streaming LLM call with retry and yield
@@ -346,7 +421,10 @@ async def _run_streaming_turn(
 
     Catches ``ContextWindowExceededError``,
     ``PermanentLLMError``, and ``RetryableLLMError`` from stream
-    creation and converts them to executor event types.
+    creation and converts them to executor event types. When a
+    ``chat_span`` is provided and an exception is raised, we add
+    a ``gen_ai.retry`` event for retries and mark the span as
+    failed for terminal errors.
 
     :param task_id: Task identifier for logging.
     :param input_items: Responses API input items.
@@ -356,7 +434,12 @@ async def _run_streaming_turn(
     :param connection: Provider connection overrides.
     :param timeout: Request timeout in seconds.
     :param retry_config: Retry policy.
+    :param chat_span: Optional chat span to annotate with retry
+        events and error status. ``None`` skips annotation (the
+        no-op tracer path).
     """
+    from agent_plane.runtime import telemetry
+
     try:
         stream = await _open_stream_with_retry(
             input_items,
@@ -365,8 +448,11 @@ async def _run_streaming_turn(
             connection,
             timeout,
             retry_config,
+            chat_span=chat_span,
         )
     except ContextWindowExceededError as exc:
+        if chat_span is not None:
+            telemetry.record_error(chat_span, exc)
         yield ContextWindowExceeded(
             max_tokens=exc.max_context_tokens,
             actual_tokens=exc.actual_tokens,
@@ -378,6 +464,8 @@ async def _run_streaming_turn(
             task_id,
             exc,
         )
+        if chat_span is not None:
+            telemetry.record_error(chat_span, exc)
         yield ExecutorError(message=str(exc), code=exc.code)
         return
 
@@ -392,6 +480,7 @@ async def _open_stream_with_retry(
     connection: dict[str, str] | None,
     timeout: int,
     retry_config: RetryConfig,
+    chat_span: Any | None = None,
 ) -> AsyncIterator[ResponseStreamEvent]:
     """
     Open an async LLM stream with retry on transient failures.
@@ -406,6 +495,7 @@ async def _open_stream_with_retry(
     :param connection: Provider connection overrides.
     :param timeout: Request timeout in seconds.
     :param retry_config: Retry policy.
+    :param chat_span: Optional chat span to record retry events on.
     :returns: Open async stream iterator.
     :raises ContextWindowExceededError: On context overflow.
     :raises PermanentLLMError: On non-retryable errors.
@@ -449,6 +539,17 @@ async def _open_stream_with_retry(
                     delay,
                     classified,
                 )
+                if chat_span is not None:
+                    chat_span.add_event(
+                        "gen_ai.retry",
+                        attributes={
+                            "attempt": attempt + 1,
+                            "max_attempts": retry_config.max_attempts,
+                            "error.type": type(exc).__name__,
+                            "error.message": str(exc),
+                            "backoff_seconds": delay,
+                        },
+                    )
                 await asyncio.sleep(delay)
 
     assert last_error is not None
@@ -513,7 +614,10 @@ def _yield_final_events(
     response.
 
     Native tool outputs from the completed response are also
-    yielded (they may not all appear during streaming).
+    yielded (they may not all appear during streaming). The
+    terminal ``TurnComplete`` carries usage, response metadata,
+    and finish reasons so the workflow instrumentation layer can
+    annotate the chat span without re-parsing the response.
 
     :param response: The completed LLM response.
     """
@@ -523,4 +627,43 @@ def _yield_final_events(
     yield from tool_calls
 
     text = _extract_text(response)
-    yield TurnComplete(text=text if not tool_calls else None)
+    usage_dict: dict[str, Any] | None = None
+    if response.usage is not None:
+        usage_dict = {}
+        if response.usage.input_tokens is not None:
+            usage_dict["input_tokens"] = response.usage.input_tokens
+        if response.usage.output_tokens is not None:
+            usage_dict["output_tokens"] = response.usage.output_tokens
+    finish_reasons = _extract_finish_reasons(response)
+    yield TurnComplete(
+        text=text if not tool_calls else None,
+        usage=usage_dict,
+        response_model=response.model,
+        # LLMResponse does not expose a response-level ID field
+        # yet; when adapters start surfacing it, add it here.
+        response_id=None,
+        finish_reasons=finish_reasons,
+    )
+
+
+def _extract_finish_reasons(response: LLMResponse) -> list[str] | None:
+    """
+    Extract finish reasons from a completed LLM response.
+
+    The Responses API uses ``stop`` for natural completion and
+    ``tool_calls`` when the turn ended in tool dispatch. We derive
+    the reason from response content rather than a dedicated field
+    because :class:`LLMResponse` does not expose one — tool-call
+    presence is the authoritative signal.
+
+    :param response: The completed LLM response.
+    :returns: A single-element list with the finish reason, or
+        ``None`` when the reason cannot be inferred.
+    """
+    has_tool_calls = any(isinstance(item, FunctionCallOutput) for item in response.output)
+    if has_tool_calls:
+        return ["tool_calls"]
+    has_text = any(isinstance(item, MessageOutput) for item in response.output)
+    if has_text:
+        return ["stop"]
+    return None

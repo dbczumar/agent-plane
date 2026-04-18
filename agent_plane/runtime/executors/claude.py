@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import queue
 import shutil
 import threading
@@ -134,10 +135,10 @@ class _ClientRegistry:
     the dict while another conversation registers a new entry.
 
     :param ttl_seconds: Idle time after which a client is disconnected
-        and evicted, e.g. ``3600.0``.
+        and evicted, e.g. ``21600.0``.
     """
 
-    def __init__(self, ttl_seconds: float = 3600.0) -> None:
+    def __init__(self, ttl_seconds: float = 21600.0) -> None:
         self._lock = threading.Lock()
         self._ttl = ttl_seconds
         # Per-conversation event loops. Created by get_or_create_loop
@@ -786,6 +787,38 @@ def _build_sdk_options(
 
     # Unset CLAUDECODE to prevent "nested session" error from the SDK.
     env = {"CLAUDECODE": ""}
+
+    # When agent-plane telemetry is configured, forward the OTel
+    # env vars and the current trace context to the SDK subprocess
+    # so its native OTel spans nest under our invoke_agent span.
+    # The Claude Agent SDK has built-in OTel support — it reads
+    # CLAUDE_CODE_ENABLE_TELEMETRY and the standard OTEL_* env vars.
+    if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        from agent_plane.runtime import telemetry as _telemetry
+
+        env["CLAUDE_CODE_ENABLE_TELEMETRY"] = "1"
+        env["CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"] = "1"
+        env["OTEL_TRACES_EXPORTER"] = "otlp"
+        env["OTEL_METRICS_EXPORTER"] = "otlp"
+        env["OTEL_LOGS_EXPORTER"] = "otlp"
+        env["OTEL_EXPORTER_OTLP_ENDPOINT"] = os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"]
+        if protocol := os.environ.get("OTEL_EXPORTER_OTLP_PROTOCOL"):
+            env["OTEL_EXPORTER_OTLP_PROTOCOL"] = protocol
+        if headers := os.environ.get("OTEL_EXPORTER_OTLP_HEADERS"):
+            env["OTEL_EXPORTER_OTLP_HEADERS"] = headers
+        if service_name := os.environ.get("OTEL_SERVICE_NAME"):
+            env["OTEL_SERVICE_NAME"] = service_name
+        if os.environ.get("AGENT_PLANE_OTEL_CAPTURE_CONTENT", "").strip().lower() in (
+            "true",
+            "1",
+            "yes",
+        ):
+            env["OTEL_LOG_USER_PROMPTS"] = "1"
+            env["OTEL_LOG_TOOL_DETAILS"] = "1"
+            env["OTEL_LOG_TOOL_CONTENT"] = "1"
+        # Inject the W3C traceparent so the child process's root
+        # span parents under the current agent-plane span.
+        env.update(_telemetry.get_traceparent_env())
 
     model = executor._model or llm_config.model
 

@@ -103,7 +103,7 @@ abstraction.
 Key files: `omniagents/os_env.py`, `omniagents/sandbox.py`,
 `omniagents/landlock_sandbox.py`, `DESIGN_OS_ENV_ACCESS.md`.
 
-#### G3: Terminal Environment (tmux)
+#### G3: Terminal Environment
 
 OmniAgents provides agents with interactive terminal sessions:
 - `TerminalInstance`: per-instance tmux server with isolated socket
@@ -392,9 +392,9 @@ with signal-based wake to avoid wasted LLM calls.
 Each `run_in_background("tool_name", {...})` spawns a minimal DBOS
 child workflow that runs the tool as a single `@step` (no agent loop,
 no LLM call). When the child completes, it signals the parent via
-`DBOS.send(parent_workflow_id, result, topic="bg_tool_complete")`.
+`DBOS.send(parent_workflow_id, result, topic="async_work_complete")`.
 
-The parent workflow uses `dbos_recv_async(topic="bg_tool_complete")`
+The parent workflow uses `dbos_recv_async(topic="async_work_complete")`
 to sleep until a result arrives -- the same mechanism client-side tool
 parking already uses. No polling loop, no wasted LLM calls.
 
@@ -477,16 +477,17 @@ sub-agent patterns (send-peek-send loops, collaborative workflows).
 Agent-plane's spawn-poll-collect is more batch-oriented.
 
 **Recommendation**: Named sessions are a significant enhancement to
-agent-plane's sub-agent model. They should be implemented as a new
-concept in the sub-agent system:
-- A `NamedSession` store tracks persistent sub-agent conversations
-- `session_send` reuses an existing conversation (no new workflow if
-  agent is idle, else steers the running workflow)
-- `session_peek` reads recent conversation items
-- `session_close` marks the session as closed
-
-This builds on the existing steering infrastructure rather than
-replacing it.
+agent-plane's sub-agent model. Implementation is lightweight -- one
+new nullable column (`parent_conversation_id`) on the existing
+`conversations` table. A named session is just a conversation whose
+`parent_conversation_id` points to the parent's conversation, with
+`title` as the human-readable key (e.g. `"coder:auth"`). No new
+store, no new entity type. Closing a session sets
+`parent_conversation_id = NULL` (history preserved, lookup broken).
+Tools (`session_send/peek/list/cancel_turn/close`) are workflow-level
+dispatched and use existing `conv_store` + `task_store` methods.
+Completion delivery reuses the same `dbos_recv_async` signal
+mechanism as background tools. See Phase 3 for full design.
 
 ### Rift 6: Spec Self-Containment vs Runtime Detection
 
@@ -644,10 +645,11 @@ Returns immediately. The tool executes in a child DBOS workflow.
 async def background_tool_workflow(parent_task_id, tool_name, arguments):
     result = await _call_tool(...)    # existing @step
     DBOS.send(parent_task_id, {       # signal parent
+        "kind": "background_tool",
         "handle_id": handle_id,
         "tool_name": tool_name,
         "result": result,
-    }, topic="bg_tool_complete")
+    }, topic="async_work_complete")   # unified topic, shared with named sessions
     return result
 ```
 
@@ -661,7 +663,7 @@ After LLM produces a response with no tool calls:
   1. Persist the LLM's text response as an assistant message (stream
      it to the user -- they see intermediate output).
   2. Wait for the next completion:
-     `result = await dbos_recv_async(topic="bg_tool_complete")`.
+     `result = await dbos_recv_async(topic="async_work_complete")`.
      This is zero-cost (no LLM calls, no polling).
   3. Remove from `pending_bg_tools`. Inject result as a system
      message: `"[Background tool completed: {tool_name}]\n{result}"`.
@@ -888,11 +890,11 @@ time rather than silently falling back to a weaker mode.
     used when sandbox is enabled)
 
 **Server-side tools** (workflow-level dispatch):
-- `terminal_launch(name, command, args)`: start a tmux session
+- `terminal_launch(name, command, args)`: start a PTY session
 - `terminal_send(name, text, keys)`: send keystrokes
-- `terminal_read(name, scrollback)`: capture screen (ANSI-stripped)
-- `terminal_list()`: list active terminal instances
-- `terminal_close(name)`: kill tmux session, clean up
+- `terminal_read(name, scrollback)`: read output (ANSI-stripped)
+- `terminal_list()`: list active terminal sessions
+- `terminal_close(name)`: kill session, clean up
 
 **Spec changes:**
 ```yaml
@@ -922,7 +924,7 @@ long-running processes, or persistent shell state. Adding client-side
 terminal support fills these gaps.
 
 **New client-side tools** (tunneled like existing Read/Write/Edit/Bash):
-- `terminal_launch(command, args)`: client starts a tmux session
+- `terminal_launch(command, args)`: client starts a PTY session
   locally, returns `{session_id}`
 - `terminal_send(session_id, text, keys)`: client sends keystrokes
 - `terminal_read(session_id, scrollback)`: client captures screen
@@ -1053,11 +1055,11 @@ Phase 2: OS Environment (G2)                     [HIGH priority, MEDIUM effort]
   ├── Landlock/seccomp backend
   └── System tools (os_read/write/edit/shell)
 
-Phase 3: Async Tools + Named Sessions (G4, G5)   [MEDIUM priority, MEDIUM effort]
-  ├── Background tool execution via child workflows
-  ├── Inbox as store query
-  ├── NamedSessionStore
-  └── session_send/peek/list/close tools
+Phase 3: Background Tools + Named Sessions (G4, G5) [MEDIUM priority, MEDIUM effort]
+  ├── Background tool execution via child workflows + signal-based wake
+  ├── Unified async_work_complete wake mechanism (shared by both)
+  ├── Named sessions: one column (parent_conversation_id) on conversations
+  └── session_send/peek/list/cancel_turn/close tools
 
 Phase 4: Terminal Environment (G3, G20)           [MEDIUM priority, MEDIUM effort]
   ├── Server-side: TerminalSession (pexpect + pyte), sandbox launcher
@@ -1161,7 +1163,7 @@ agents** -- what each system can do that the other cannot.
 |---|---------|------------------------|
 | 1 | **Guardrails (policies + labels)** | Agent authors can declare input/output/tool-call/tool-result policies that ALLOW, DENY, or ASK for approval. Rate limits, LLM-evaluated content filters, label-based information flow control. Users see "[DENIED by policy]" when guardrails trigger. Agent-plane has zero guardrails. |
 | 2 | **OS environment per agent** | Each agent gets its own sandboxed filesystem and shell (read/write/edit/shell). Landlock+seccomp kernel sandbox on Linux. Fork mode copies the working directory for safe mutation. Agent-plane has `code_sandbox` but not per-agent filesystem isolation. |
-| 3 | **Terminal sessions (tmux)** | Agents can launch, interact with, and read from interactive terminal processes. An agent can start a `claude` CLI in a tmux pane, send it commands, read its screen output. Each terminal has its own isolated tmux server. Terminals are strictly more capable than agent-plane's `code_sandbox` -- proposed to replace it server-side and extend client-side tools with interactive process support (see Phase 4). |
+| 3 | **Terminal sessions (persistent PTY)** | Agents can launch, interact with, and read from interactive terminal processes. An agent can start a CLI process, send it commands, read its output. Terminals are strictly more capable than agent-plane's `code_sandbox` -- proposed to replace it server-side (using pexpect+pyte, matching Gemini CLI's pattern) and extend client-side tools with interactive process support (see Phase 4). |
 | 4 | **Background tool execution** | Agents can fire a tool in the background (`sys_call_async`), continue working, and collect results later (`sys_read_inbox`). The session sleeps between completions (no wasted LLM calls). Useful for parallel research tasks. Agent-plane has parallel tool calls within a turn but no fire-and-forget across turns. Proposed design: DBOS child workflows with `dbos_recv_async` signal-based wake (see Rift 3 and Phase 3). |
 | 5 | **Named persistent child sessions** | Parent agents can maintain long-lived named sessions with child agents (`sys_session_send/peek/list/close`). A "coding supervisor" can send work to a "coder" session, peek at progress, send more instructions. Sessions persist across parent turns. Agent-plane's sub-agents are one-shot (spawn, collect, done). |
 | 6 | **Interactive approval (ASK)** | Policies can require user approval before proceeding. The agent pauses, shows the user what's being attempted, waits for yes/no. Configurable timeout with auto-deny. |
