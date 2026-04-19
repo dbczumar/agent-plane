@@ -33,6 +33,12 @@ from agent_plane.errors import AgentPlaneError, ErrorCode
 # the unit the parent loop separates from the polling-based
 # sub-agent path so each kind uses the right collection mechanism.
 _TOOL_KIND = "tool"
+
+# G20: cadence for `response.heartbeat` SSE events emitted while
+# the parent loop is blocked on the async-tool drain. 15 s keeps
+# proxies that close idle connections at 30 s safely under their
+# threshold without flooding the channel with pings.
+_HEARTBEAT_INTERVAL_S = 15.0
 from agent_plane.llms import Client as LLMClient
 from agent_plane.llms.errors import (
     ContextWindowExceededError,
@@ -3169,11 +3175,24 @@ async def _drain_async_completions(
 
     drained: list[dict[str, Any]] = []
     if block_for_one:
-        # No timeout — block until at least one payload arrives.
-        # Caller must verify pending_tasks is non-empty first.
-        first = await dbos_recv_async(topic=ASYNC_WORK_COMPLETE_TOPIC)
-        if first is not None:
-            drained.append(first)
+        # Loop with the documented heartbeat cadence (G20: 15s).
+        # Each timeout slice emits a `response.heartbeat` so SSE
+        # proxies that close idle connections see traffic. The
+        # parent workflow_id is the heartbeat target — it's
+        # always available in this DBOS workflow context.
+        parent_id = get_workflow_id()
+        first: dict[str, Any] | None = None
+        while first is None:
+            first = await dbos_recv_async(
+                topic=ASYNC_WORK_COMPLETE_TOPIC,
+                timeout_seconds=_HEARTBEAT_INTERVAL_S,
+            )
+            if first is None:
+                _write_output(
+                    parent_id,
+                    {"type": "response.heartbeat"},
+                )
+        drained.append(first)
     while True:
         # timeout_seconds=0 is the documented "non-blocking poll"
         # form (see the design doc's drain protocol, G19).
