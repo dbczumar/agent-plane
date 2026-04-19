@@ -237,22 +237,65 @@ class PolicyEngine:
         """
         Validate and persist label writes.
 
-        Phase 2 behavior: writes pass through to the store
-        unchanged. Schema validation (``values`` /
-        ``monotonic`` per :class:`LabelDef`) is enforced in
-        Phase 3 when ``LabelPolicy`` lands — the separate path
-        keeps Phase 2 shippable on its own.
+        Per POLICIES.md §10, writes are silently dropped when:
 
-        :param set_labels: Mapping of label key to value. No-op
-            on empty dict. Writes update both the hot cache on
-            this engine and the persistent row in
-            ``conversation_labels`` in a single UPSERT
-            transaction (POLICIES.md §6.3).
+        - The key has a declared ``LabelDef.values`` list and
+          the new value is not in it.
+        - The key has a declared ``LabelDef.monotonic`` and
+          the new position (relative to the current cache
+          value) violates the direction.
+
+        Keys with no ``LabelDef`` are set freely (omniagents
+        parity — "unschema'd labels set freely"). The engine
+        applies the filtered dict in a single UPSERT through
+        the store so either every surviving write lands or
+        none do.
+
+        :param set_labels: Mapping of label key to new value.
+            No-op on empty dict. Writes update both the hot
+            cache on this engine and the persistent row in
+            ``conversation_labels`` in one UPSERT transaction.
         """
         if not set_labels:
             return
-        self._store.set_labels(self._conversation_id, set_labels)
-        self._labels.update(set_labels)
+        filtered = self._filter_schema_valid(set_labels)
+        if not filtered:
+            return
+        self._store.set_labels(self._conversation_id, filtered)
+        self._labels.update(filtered)
+
+    def _filter_schema_valid(
+        self,
+        set_labels: dict[str, str],
+    ) -> dict[str, str]:
+        """
+        Drop writes that violate a declared :class:`LabelDef`.
+
+        Called before persistence. Silent-drop semantics match
+        POLICIES.md §10 / §13 — runtime label failures don't
+        nuke the whole evaluation; they just fail to land.
+
+        :param set_labels: Caller's requested writes.
+        :returns: Subset of *set_labels* that pass every
+            applicable schema check. Keys with no LabelDef
+            pass through unchanged.
+        """
+        result: dict[str, str] = {}
+        for key, value in set_labels.items():
+            ldef = self.label_defs.get(key)
+            if ldef is None:
+                result[key] = value
+                continue
+            if ldef.values is not None and value not in ldef.values:
+                continue
+            if ldef.monotonic is not None and not _monotonic_ok(
+                ldef,
+                self._labels.get(key),
+                value,
+            ):
+                continue
+            result[key] = value
+        return result
 
     def spec_for(self, policy_name: str | None) -> PolicySpec | None:
         """
@@ -420,6 +463,53 @@ def _filter_writable_labels(
     if not isinstance(whitelist, list):
         return dict(set_labels)
     return {k: v for k, v in set_labels.items() if k in whitelist}
+
+
+def _monotonic_ok(
+    ldef: LabelDef,
+    current: str | None,
+    new_value: str,
+) -> bool:
+    """
+    Check whether a monotonic label write is permitted.
+
+    Direction semantics (POLICIES.md §10):
+
+    - ``"increasing"``: new_value's index in
+      ``ldef.values`` must be ``>=`` current's index.
+    - ``"decreasing"``: new_value's index must be ``<=``
+      current's index.
+    - Seeding an unset label (``current is None``) is
+      always permitted — nothing to compare against yet.
+
+    Values outside ``ldef.values`` never reach this helper
+    (the values-check runs first in
+    :meth:`PolicyEngine._filter_schema_valid`).
+
+    :param ldef: The label's schema declaration.
+    :param current: Current value in the hot cache, or
+        ``None`` when the label is unset.
+    :param new_value: The value the caller wants to write.
+    :returns: ``True`` when the write is permitted.
+    """
+    if current is None:
+        return True
+    # ldef.values is guaranteed non-None here because the
+    # caller only invokes this helper when monotonic is set,
+    # and the parser rejects monotonic-without-values at
+    # spec load (POLICIES.md §13). Assert rather than branch
+    # so any regression fails loud.
+    assert ldef.values is not None, "monotonic without values reached runtime — parser regression?"
+    current_idx = ldef.values.index(current) if current in ldef.values else -1
+    new_idx = ldef.values.index(new_value)
+    if ldef.monotonic == "increasing":
+        return new_idx >= current_idx
+    if ldef.monotonic == "decreasing":
+        return new_idx <= current_idx
+    # Unknown direction — fall through to reject. Parser
+    # rejects unknown values at spec load so this is
+    # defensive.
+    return False
 
 
 def _condition_matches(
