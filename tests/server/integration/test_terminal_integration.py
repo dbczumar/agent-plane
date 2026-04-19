@@ -447,11 +447,16 @@ async def test_idle_reaper_collects_managers_through_registry(
     from agent_plane.terminals import TerminalManagerRegistry
 
     # Replace the autouse-fixture's registry with one whose idle
-    # threshold is 50 ms. Directly assigning to the module global
-    # overrides the earlier monkeypatch.
+    # threshold is NEGATIVE. Makes the sweep's ``last_activity <
+    # now - idle_timeout_s`` check always true (deadline becomes
+    # ``now + 1``, which any real monotonic timestamp is less
+    # than), so the test is independent of how fast the
+    # preceding HTTP + DBOS roundtrip was. A positive threshold
+    # like 0.05s would in theory fail on a very fast machine
+    # that completes the roundtrip under the threshold.
     reg = TerminalManagerRegistry(
         sandbox_enabled=False,
-        idle_timeout_s=0.05,
+        idle_timeout_s=-1.0,
     )
     monkeypatch.setattr(_globals, "_terminal_registry", reg)
 
