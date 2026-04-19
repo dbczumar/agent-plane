@@ -15,12 +15,18 @@ internal and may change between phases.
 
 from __future__ import annotations
 
+from agent_plane.runtime.policies.approval import (
+    ApprovalRequest,
+    _await_policy_approval,
+)
 from agent_plane.runtime.policies.builder import build_policy_engine
 from agent_plane.runtime.policies.enforcement import _enforce_policy
 from agent_plane.runtime.policies.engine import PolicyEngine
 
 __all__ = [
+    "ApprovalRequest",
     "PolicyEngine",
+    "_await_policy_approval",
     "_enforce_policy",
     "build_policy_engine",
 ]
