@@ -127,7 +127,16 @@ def test_build_tool_handler_mixes_sync_and_async() -> None:
 
 
 async def _bytes(*frames: bytes) -> AsyncIterator[bytes]:
-    """Yield each frame as a discrete chunk (mimics httpx streaming)."""
+    """
+    Yield each frame as a discrete chunk (mimics httpx streaming).
+
+    :param frames: One or more raw SSE byte frames to feed into
+        :func:`parse_sse_stream`. Each frame is yielded as its
+        own chunk so the parser sees realistic
+        ``aiter_bytes()`` boundaries instead of one giant
+        concatenated buffer.
+    :yields: Each frame's bytes verbatim, in argument order.
+    """
     for frame in frames:
         yield frame
 
