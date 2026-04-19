@@ -94,6 +94,10 @@ get_workflow_status = DBOS.get_workflow_status
 cancel_workflow = DBOS.cancel_workflow
 dbos_sleep = DBOS.sleep
 dbos_recv = DBOS.recv
+# Used by background workflows to wake the parent's async_work_complete
+# drain (G19/G86); call from within a workflow context, not from HTTP
+# handlers (use send_direct for those).
+dbos_send = DBOS.send
 read_stream = DBOS.read_stream
 
 
@@ -160,6 +164,7 @@ __all__ = [
     "asyncio_wait",
     "dbos_recv",
     "dbos_recv_async",
+    "dbos_send",
     "dbos_sleep",
     "dbos_sleep_async",
     "send_direct",
