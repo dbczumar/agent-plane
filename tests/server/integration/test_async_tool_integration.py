@@ -43,7 +43,7 @@ _AGENT_NAME = "async-tool-test-agent"
 # body. Returning a fixed string makes the assertion at the end
 # unambiguous.
 _ASYNC_TOOL_SOURCE = '''\
-"""Test async tool — returns a fixed marker so assertions are deterministic."""
+"""Test async tools — fixed markers so assertions are deterministic."""
 from agent_plane.tools import tool
 
 
@@ -55,6 +55,26 @@ def slow_compute() -> str:
         (no arguments)
     """
     return "ASYNC_TOOL_DONE_MARKER"
+
+
+@tool(synchronous=False)
+def slow_echo(label: str) -> str:
+    """Echo the label so parallel-spawn tests can prove ordering.
+
+    Args:
+        label: Text to echo back.
+    """
+    return f"ECHO[{label}]"
+
+
+@tool(synchronous=False)
+def boom() -> str:
+    """Always raises so the failure path is exercised.
+
+    Args:
+        (no arguments)
+    """
+    raise RuntimeError("intentional boom from async tool")
 '''
 
 
@@ -63,7 +83,9 @@ def _build_async_tool_agent_bundle() -> bytes:
     Build an agent bundle exporting one ``synchronous=False`` tool.
 
     :returns: tar.gz bytes containing config.yaml plus
-        ``tools/python/slow_compute.py``.
+        ``tools/python/async_tools.py``. The single file exports
+        every async tool the test suite uses (slow_compute,
+        slow_echo, boom) so the bundle stays small.
     """
     config: dict[str, Any] = {
         "spec_version": 1,
@@ -81,7 +103,7 @@ def _build_async_tool_agent_bundle() -> bytes:
         tf.addfile(cfg_info, io.BytesIO(cfg_bytes))
 
         src_bytes = _ASYNC_TOOL_SOURCE.encode()
-        src_info = tarfile.TarInfo(name="tools/python/slow_compute.py")
+        src_info = tarfile.TarInfo(name="tools/python/async_tools.py")
         src_info.size = len(src_bytes)
         tf.addfile(src_info, io.BytesIO(src_bytes))
     return buf.getvalue()
@@ -292,3 +314,177 @@ async def test_async_tool_dispatch_returns_handle_and_auto_delivers_result(
         "the auto-delivered system message was persisted but not "
         "synced into the in-memory history."
     )
+
+
+async def test_async_tool_failure_surfaces_truncated_traceback(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    A raising ``@tool(synchronous=False)`` must:
+    * surface ``status="failed"`` in the auto-delivered message;
+    * include the exception class + message so the LLM can adjust
+      its plan;
+    * NOT cause the parent response to fail (the failure is the
+      *tool's*, not the agent's).
+
+    Without this coverage, an exception in a background tool
+    could vanish silently — the parent's drain might never wake
+    if the failure path skipped ``_send_payload`` (it mustn't,
+    per G86).
+    """
+    await _create_async_tool_agent(client)
+
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_boom_1",
+                "name": "boom",
+                "arguments": "{}",
+            },
+        ],
+    )
+    mock_llm.add_call(text="Working on it…")
+    call_3 = mock_llm.add_call(text="Got the failure.")
+
+    result = await create_test_response(
+        client,
+        model=_AGENT_NAME,
+        input_text="Run the boom tool, please.",
+    )
+    response_id = result.body["id"]
+    conv_id = result.body["conversation"]["id"]
+
+    completed = await _wait_for_completion(client, response_id)
+    # The PARENT response completes successfully — only the tool
+    # task itself is "failed". A wrong implementation would
+    # propagate the tool exception to the agent loop and fail
+    # the whole turn.
+    assert completed["status"] == "completed", (
+        f"Parent must complete even when an async tool fails. "
+        f"Got {completed['status']}; error={completed.get('error')}"
+    )
+
+    items = await _get_items(client, conv_id)
+    user_texts = [
+        i["content"][0]["text"]
+        for i in items
+        if i.get("role") == "user" and i["content"][0].get("type") == "input_text"
+    ]
+    failure_messages = [t for t in user_texts if "[System: task " in t and "failed" in t]
+    assert len(failure_messages) == 1, (
+        f"Expected one [System: ... failed] message; got {failure_messages}. "
+        f"If empty, the failure path skipped _send_payload — "
+        f"the parent's drain has nothing to wake on (G86 violated)."
+    )
+    failure_text = failure_messages[0]
+    # The exception class and message must both appear so the LLM
+    # can decide whether to retry, change strategy, or apologize
+    # to the user.
+    assert "RuntimeError" in failure_text
+    assert "intentional boom from async tool" in failure_text
+
+    # The follow-up LLM call also sees the failure in its prompt
+    # — proves the system message wasn't lost between persist and
+    # _sync_history.
+    assert call_3.received_kwargs is not None
+    llm_input_text = json.dumps(call_3.received_kwargs["input"])
+    assert "RuntimeError" in llm_input_text
+
+
+async def test_parallel_async_tool_spawns_all_auto_deliver(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Three parallel ``@tool(synchronous=False)`` calls in a single
+    LLM turn must all dispatch, all run, and all auto-deliver
+    distinct results.
+
+    What this guards against:
+    * Dispatch serializing async calls (would still pass but be
+      pointlessly slow — covered by the next-iteration count).
+    * Drain only consuming the first signal (would surface as
+      missing markers in the conversation).
+    * Handle collisions (same task_id reused for multiple
+      dispatches — would surface as identical task_ids in the
+      function_call_outputs).
+    """
+    await _create_async_tool_agent(client)
+
+    labels = ["alpha", "beta", "gamma"]
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": f"call_par_{i}",
+                "name": "slow_echo",
+                "arguments": json.dumps({"label": label}),
+            }
+            for i, label in enumerate(labels)
+        ],
+    )
+    # Placeholder turn — pending_tool_tasks non-empty triggers
+    # end-of-turn wait.
+    mock_llm.add_call(text="Working…")
+    # Final response — by now all three signals have drained.
+    call_final = mock_llm.add_call(text="All three done.")
+
+    result = await create_test_response(
+        client,
+        model=_AGENT_NAME,
+        input_text="Echo three labels in parallel.",
+    )
+    response_id = result.body["id"]
+    conv_id = result.body["conversation"]["id"]
+
+    completed = await _wait_for_completion(client, response_id)
+    assert completed["status"] == "completed", (
+        f"Got {completed['status']}; error={completed.get('error')}"
+    )
+
+    items = await _get_items(client, conv_id)
+    # Three distinct function_call_outputs (one per dispatched
+    # async call) — confirms each got its own handle.
+    fco_items = [i for i in items if i.get("type") == "function_call_output"]
+    assert len(fco_items) == 3, (
+        f"Expected 3 function_call_outputs (one per parallel "
+        f"dispatch); got {len(fco_items)}. items="
+        f"{[i['type'] for i in items]}"
+    )
+    handle_task_ids = {json.loads(i["output"])["task_id"] for i in fco_items}
+    # Set length 3 proves task_ids are unique — a regression
+    # where _dispatch_async_tool reused IDs would collapse this.
+    assert len(handle_task_ids) == 3, (
+        f"Handle task_ids must be unique across dispatches; "
+        f"got {handle_task_ids}"
+    )
+
+    # Three distinct system messages — one per completion.
+    user_texts = [
+        i["content"][0]["text"]
+        for i in items
+        if i.get("role") == "user" and i["content"][0].get("type") == "input_text"
+    ]
+    completion_messages = [t for t in user_texts if t.startswith("[System: task ")]
+    assert len(completion_messages) == 3, (
+        f"Expected 3 auto-delivered completion messages; "
+        f"got {len(completion_messages)}. user_texts={user_texts}"
+    )
+    completion_blob = "\n".join(completion_messages)
+    for label in labels:
+        # Each label's marker must appear somewhere — proves the
+        # drain delivered every payload, not just the first.
+        assert f"ECHO[{label}]" in completion_blob, (
+            f"Marker for label {label!r} missing from auto-delivered "
+            f"messages — drain may have stopped after the first signal."
+        )
+
+    # The final LLM call must see all three markers in its
+    # prompt — proves _sync_history pulled in the system messages
+    # before the next LLM call.
+    assert call_final.received_kwargs is not None
+    final_input = json.dumps(call_final.received_kwargs["input"])
+    for label in labels:
+        assert f"ECHO[{label}]" in final_input, (
+            f"Marker for label {label!r} missing from final LLM input."
+        )
