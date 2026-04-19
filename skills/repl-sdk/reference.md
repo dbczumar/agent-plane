@@ -2,7 +2,7 @@
 
 ## Block Types
 
-Every block inherits from `RenderBlock` with `ctx: BlockContext`.
+Every block inherits from `StreamBlock` with `ctx: BlockContext`.
 
 ### BlockContext
 
@@ -46,12 +46,12 @@ class ToolExecution:
     output: str | None
 ```
 
-## StreamRenderer
+## BlockStream
 
 ```python
-renderer = StreamRenderer(text_flush_threshold=30)
+block_stream = BlockStream(text_flush_threshold=30)
 
-async for block in renderer.stream(session, input, *, files=None):
+async for block in block_stream.stream(session, input, *, files=None):
     ...  # AnyBlock instances
 ```
 
@@ -63,7 +63,7 @@ async for block in renderer.stream(session, input, *, files=None):
 ## Transforms
 
 ```python
-from agent_plane_ui_sdk import pipe, skip_blocks, skip_intermediate_ends, merge_text_across_iterations, only_agent
+from agent_plane_client import pipe, skip_blocks, skip_intermediate_ends, merge_text_across_iterations, only_agent
 
 # Compose:
 stream = pipe(source, transform1, transform2, ...)

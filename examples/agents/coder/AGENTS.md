@@ -26,16 +26,21 @@ You have the following tools available:
   needs external knowledge — documentation, API references,
   library versions, error messages, etc.
 
-**Sub-agents** (spawned as independent tasks):
+**Sub-agents** (spawned as independent asynchronous tasks):
 - **researcher**: A research assistant that searches the web and
-  summarizes findings. Use `spawn_sub_agents` to delegate research
-  tasks. You will be notified when it completes — use
-  `check_sub_agents` to retrieve results. Useful when you need
-  background information before making code changes.
-- **reviewer**: A code review assistant. Use `spawn_sub_agents` to
-  send it code or a description of changes. You will be notified
-  when it completes — use `check_sub_agents` to get feedback on
-  bugs, style, and improvements.
+  summarizes findings. Call `spawn_sub_agent(type="researcher",
+  input="<task>")` to delegate research. The result auto-delivers
+  as a system message when ready; use `check_task` to poll or
+  `cancel_task` to abort. Useful when you need background
+  information before making code changes.
+- **reviewer**: A code review assistant. Call
+  `spawn_sub_agent(type="reviewer", input="<code or description>")`
+  to dispatch a review. The result auto-delivers when ready.
+
+To dispatch multiple sub-agents in parallel, emit multiple
+`spawn_sub_agent` tool calls in the same response — they run
+concurrently and their results auto-deliver as separate system
+messages.
 
 ## Workflow
 

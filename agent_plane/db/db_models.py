@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -88,6 +97,10 @@ class SqlConversation(Base):
         ``None`` when not provided.
     :param kind: Conversation type. ``"default"`` for user-initiated,
         ``"sub_agent"`` for sub-agent execution conversations.
+    :param parent_conversation_id: For Phase 4 named sub-agents,
+        points at the parent conversation. ``None`` for top-level
+        conversations. ``ON DELETE CASCADE`` so removing a parent
+        cleans up the entire sub-tree.
     """
 
     __tablename__ = "conversations"
@@ -97,12 +110,31 @@ class SqlConversation(Base):
     updated_at: Mapped[int] = mapped_column(Integer)
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
     kind: Mapped[str] = mapped_column(String(32), default="default")
+    parent_conversation_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=True,
+    )
 
     __table_args__ = (
         CheckConstraint("kind IN ('default', 'sub_agent')", name="ck_conversations_kind"),
         Index("ix_conversations_created_at", "created_at"),
         Index("ix_conversations_updated_at", "updated_at"),
         Index("ix_conversations_kind", "kind"),
+        # Phase 4: partial unique index on (parent_conversation_id,
+        # title) prevents two same-named children under the same
+        # parent (G36 race protection at the DB layer). The
+        # ``sqlite_where`` / ``postgresql_where`` clauses scope the
+        # index so multiple top-level conversations (NULL parent)
+        # remain valid.
+        Index(
+            "ix_conversations_parent_title_unique",
+            "parent_conversation_id",
+            "title",
+            unique=True,
+            sqlite_where=text("parent_conversation_id IS NOT NULL"),
+            postgresql_where=text("parent_conversation_id IS NOT NULL"),
+        ),
     )
 
 
@@ -130,6 +162,15 @@ class SqlTask(Base):
     :param root_task_id: ID of the top-level task that initiated
         this sub-agent's spawn tree, or ``None`` for top-level
         tasks.
+    :param kind: Task kind discriminator. ``"agent_task"`` for
+        user-initiated turns; ``"tool"`` for background custom-tool
+        invocations spawned via ``@tool(synchronous=False)``;
+        ``"sub_agent"`` for sub-agent workflows (Phase 3);
+        ``"client_tool"`` for async client-side tools (Phase 5).
+        The unified task lifecycle (`check_task` / `cancel_task` /
+        `list_tasks`) uses this to classify and filter rows so the
+        LLM only sees the background work it spawned, not its own
+        parent turn.
     """
 
     __tablename__ = "tasks"
@@ -147,12 +188,22 @@ class SqlTask(Base):
     root_task_id: Mapped[str | None] = mapped_column(
         String(64), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=True
     )
+    # Server-side default backfills pre-existing rows to "agent_task";
+    # all new task creation paths set kind explicitly per G74.
+    kind: Mapped[str] = mapped_column(
+        String(32), default="agent_task", server_default="agent_task"
+    )
 
     __table_args__ = (
         Index("ix_tasks_conversation_id", "conversation_id"),
         Index("ix_tasks_agent_id", "agent_id"),
         Index("ix_tasks_created_at", "created_at"),
         Index("ix_tasks_root_task_id", "root_task_id"),
+        Index("ix_tasks_kind", "kind"),
+        CheckConstraint(
+            "kind IN ('agent_task', 'tool', 'sub_agent', 'client_tool')",
+            name="ck_tasks_kind",
+        ),
     )
 
 

@@ -1,0 +1,14 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-plane-ui-sdk"
+version = "0.1.0"
+description = "Terminal UI components (Rich + prompt_toolkit) for building agent-plane frontends"
+requires-python = ">=3.10"
+dependencies = [
+    "agent-plane-client>=0.1.0",
+    "rich>=13",
+    "prompt_toolkit>=3",
+]

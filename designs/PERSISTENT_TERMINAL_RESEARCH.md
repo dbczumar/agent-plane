@@ -796,10 +796,20 @@ Two separate enums live on different axes.
 |---|---|
 | `"completed"` | Synchronous `terminal_run` finished cleanly (OSC 633 `D` marker seen). `exit_code` present. |
 | `"killed"` | Synchronous `terminal_run` killed by `timeout_ms`. `exit_code` reflects signal (negative). |
-| `"shell_busy"` | The target shell already has a command running. Response also includes `running_command` + `running_since_ms`. |
-| `"shell_not_found"` | No shell with that name. Possible causes: typo, lost to 24h idle timeout, lost on server restart, previously closed. |
-| `"shell_crashed"` | The bash process itself died (segfault, OOM-kill). Shell removed from registry; agent can retry with a new shell. |
+| `"shell_busy"` | The target shell already has a command running. No queueing — the call fails fast so the agent can decide how to react. |
+| `"shell_crashed"` | The bash process itself died (segfault, OOM-kill, or unrecoverable timeout SIGKILL). Shell removed from registry; the next call auto-spawns a fresh shell. |
+| `"shell_name_invalid"` | The supplied `shell` arg fails the `^[a-zA-Z][a-zA-Z0-9_-]{0,63}$` regex, or starts with an underscore (reserved). Error message names the rule violated. |
+| `"shell_cap_exceeded"` | The per-conversation 10-shell cap (§6.4) would be exceeded by creating this shell. Agent must `terminal_close` another shell first. |
+| `"error"` | Validation failure unrelated to the shell itself — e.g. missing `conversation_id` or `workspace` on the tool context (setup bug, not an agent-recoverable condition). |
 | `"idle"` / `"busy"` | Only used in `terminal_list` per-shell entries, not as a top-level response status. |
+
+Note: there is **no** `"shell_not_found"` status. If an agent calls
+`terminal_run(shell="dev")` and "dev" doesn't exist, we transparently
+spawn it — agents address shells by name, and the first call to a
+name creates it. This is why §6.4 idle-reaping is safe: agents can't
+tell a reaped shell from a never-created one, and they don't need to
+(their persistent state was in the reaped shell and is gone, but
+that's acceptable given the 24h idle threshold).
 
 **Task `status`** (returned by `check_task` for tasks of
 `kind: "terminal"`). Reuses the unified enum from
@@ -1292,9 +1302,12 @@ requires closing and re-launching the shell.
 
 **Launch failures**: if step 5 or 6 fails (bash not installed, srt
 launcher broken, snippet bug that prevents the initial prompt),
-`terminal_run` returns `status: "shell_not_found"` with an error
-message explaining the failure. The shell is not registered; the
-agent sees a clear, loud error rather than a subtly-broken shell.
+`Shell.spawn` raises `RuntimeError` synchronously (fail-loud per
+Principle #3). The `TerminalManager._get_or_create_shell` lets the
+exception propagate; the tool sees it as an unhandled exception and
+the request surfaces as a task failure. Launch-failure bugs never
+produce a silently-broken shell — they always surface as loud
+server errors.
 
 ### 6.9 Threading model and registry integration
 
@@ -1521,47 +1534,40 @@ No module-level `threading.Lock` anywhere. No functions that take a
 lock as an argument. No "lock the registry before calling this" notes
 in docstrings — the methods handle their own coordination.
 
-### 6.10 Removal plan
+### 6.10 Removal plan — *completed*
 
-In a single change:
+Completed as part of Slice 5:
 
-1. Add the new `terminal` builtin package.
-2. Migrate every in-tree consumer of `code_sandbox`. Based on the
-   initial grep, the consumers are:
-   - `agent_plane/tools/builtins/code_sandbox.py` (delete)
-   - `agent_plane/tools/builtins/__init__.py` (unregister)
-   - `agent_plane/tools/base.py` (any baseclass hooks specific to it)
-   - `agent_plane/tools/builtins/web_fetch.py` (reference — update)
-   - `agent_plane/tools/builtins/export_agent.py` (reference — update)
-   - `agent_plane/onboarding/agent/AGENTS.md`,
-     `agent_plane/onboarding/agent/tools/python/list_builtin_tools.py`,
-     `agent_plane/onboarding/cli.py`,
-     `agent_plane/onboarding/agent/skills/agent-plane-knowledge/SKILL.md`
-     (all mention code_sandbox — update)
-   - `README.md` (docs — update)
-   - `tests/runtime/test_workflow.py` (rewrite to use terminal)
-   - `tests/e2e/test_file_tools.py`,
-     `tests/e2e/test_sandbox_dependencies.py`,
-     `tests/e2e/test_archer_code_sandbox.py`,
-     `tests/e2e/test_native_tool_persistence.py`,
-     `tests/e2e/test_web_fetch_e2e.py`,
-     `tests/e2e/test_openai_coder_codex_tools.py`,
-     `tests/e2e/test_archer_introspect.py`,
-     `tests/e2e/test_onboarding_e2e.py` (rewrite to use terminal —
-     these exercise behavior that the terminal tool must preserve)
-   - `designs/PORTING_FROM_OMNIAGENTS.md` (already discusses this;
-     its Phase 4 section is the authoritative design input for the
-     implementation)
-3. Delete `code_sandbox.py` and `_srt_wrap.mjs` is reused by the
-   terminal launch path (keep).
-4. Run the full E2E suite (mandatory per CLAUDE.md — these tests touch
-   agent execution, and the tool-set change is material).
-5. Run the post-change review agent, the test-authoring review agent,
-   and verify the terminal works in the TUI (the mandatory pre-commit
-   TUI check).
+1. `agent_plane/tools/builtins/code_sandbox.py` — deleted.
+2. `agent_plane/tools/builtins/_srt_wrap.mjs` — deleted (the
+   terminal's launch path uses its own PTY-compatible
+   `_srt_shell.mjs` that uses `spawn(..., stdio: 'inherit')`
+   rather than `execSync`).
+3. `agent_plane/tools/builtins/__init__.py` — `code_sandbox`
+   unregistered from `BUILTIN_NAMES` and `_BUILTIN_REGISTRY`;
+   `_create_code_sandbox` factory deleted.
+4. `agent_plane/tools/manager.py` — `_create_code_sandbox` method
+   deleted; `_register_builtin_tools` no longer dispatches to it.
+5. `agent_plane/tools/base.py`, `agent_plane/tools/builtins/web_fetch.py`,
+   `agent_plane/tools/builtins/export_agent.py` — docstring references
+   updated to point at `terminal_run`.
+6. `agent_plane/onboarding/*` — onboarding assistant now installs
+   `terminal_run` + `export_agent` (not `code_sandbox` + `export_agent`)
+   when shell access is disabled.
+7. `tests/tools/builtins/test_code_sandbox.py` — deleted.
+8. E2E tests rewritten to use `terminal_run`:
+   `test_archer_terminal.py` (renamed from `test_archer_code_sandbox.py`),
+   `test_sandbox_dependencies.py`, `test_archer_output_files.py`,
+   `test_file_tools.py`, `test_steering.py`, `test_web_fetch_e2e.py`,
+   `test_onboarding_e2e.py`, `test_archer_introspect.py`.
+9. `examples/agents/archer/config.yaml` — `code_sandbox` replaced with
+   `terminal_run` + `terminal_list` + `terminal_close`.
+10. README.md, AGENTSPEC.md, and onboarding SKILL.md updated to
+    document `terminal_run` as the shell tool.
 
-No `# removed` comments, no aliases, no `warnings.warn` shim. The old
-tool ceases to exist.
+Principle #33 honored: no `# removed` comments, no aliases, no
+`warnings.warn` shim, no dual-register period surviving past Slice 5.
+The old tool ceases to exist.
 
 **Harness-based agents are unaffected.** Agents whose executor is
 `ClaudeAgentsExecutor` or `AgentsSdkExecutor` don't use `code_sandbox`

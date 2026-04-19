@@ -10,6 +10,20 @@ from agent_plane.entities import (
 )
 
 
+class NameAlreadyExistsError(Exception):
+    """
+    Raised by ``create_conversation`` when the requested
+    ``(parent_conversation_id, title)`` pair already exists.
+
+    Phase 4: the conversations table has a partial unique index
+    that enforces sub-agent name uniqueness within a parent.
+    SqlAlchemy's ``IntegrityError`` is translated to this exception
+    so callers (the ``spawn_sub_agent`` and ``send_to_sub_agent``
+    builtins) can surface a clean ``name_already_exists`` tool
+    error to the LLM.
+    """
+
+
 class ConversationStore(ABC):
     """
     Abstract base for conversation persistence.
@@ -32,6 +46,8 @@ class ConversationStore(ABC):
     def create_conversation(
         self,
         kind: str = "default",
+        title: str | None = None,
+        parent_conversation_id: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -40,7 +56,18 @@ class ConversationStore(ABC):
         :param kind: Conversation type. ``"default"`` for
             user-initiated, ``"sub_agent"`` for sub-agent
             execution conversations.
+        :param title: Optional title. Phase 4 named sub-agents
+            store ``"<type>:<name>"`` so the partial unique index
+            can enforce ``(parent_conversation_id, title)``
+            uniqueness within a parent.
+        :param parent_conversation_id: Phase 4 — for child
+            sub-agent conversations, the owning parent's id.
+            ``None`` for top-level conversations.
         :returns: The newly created :class:`Conversation`.
+        :raises NameAlreadyExistsError: If
+            ``parent_conversation_id`` is not ``None`` and a
+            sibling with the same ``title`` already exists
+            (Phase 4 partial unique index violation).
         """
         ...
 
@@ -152,6 +179,7 @@ class ConversationStore(ABC):
         order: str = "desc",
         kind: str | None = "default",
         sort_by: str = "created_at",
+        parent_conversation_id: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -173,6 +201,14 @@ class ConversationStore(ABC):
             ``None`` disables the filter and returns all.
         :param sort_by: Column to sort on, ``"created_at"`` or
             ``"updated_at"``.
+        :param parent_conversation_id: Phase 4 — when set, only
+            return conversations whose
+            ``parent_conversation_id == parent_conversation_id``
+            (named sub-agents under the given parent). When
+            ``None`` (default), the filter is disabled and all
+            parent pointers are accepted. Powers the
+            ``list_sub_agents`` builtin and the ambient-hint
+            injection.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """

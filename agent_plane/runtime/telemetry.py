@@ -36,8 +36,9 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from mlflow.entities.span import LiveSpan
@@ -120,21 +121,16 @@ def trace_id_from_response_id(response_id: str) -> str:
         ``"resp_"`` or the hex suffix is not exactly 32 chars.
     """
     if not response_id.startswith(_RESP_PREFIX):
-        raise ValueError(
-            f"Expected {_RESP_PREFIX!r} prefix, got {response_id!r}"
-        )
+        raise ValueError(f"Expected {_RESP_PREFIX!r} prefix, got {response_id!r}")
     hex_part = response_id[len(_RESP_PREFIX) :]
     if len(hex_part) != _HEX_LEN:
         raise ValueError(
-            f"Expected {_HEX_LEN} hex chars after prefix, "
-            f"got {len(hex_part)} in {response_id!r}"
+            f"Expected {_HEX_LEN} hex chars after prefix, got {len(hex_part)} in {response_id!r}"
         )
     try:
         int(hex_part, 16)
     except ValueError as exc:
-        raise ValueError(
-            f"Invalid hex suffix in {response_id!r}: {exc}"
-        ) from exc
+        raise ValueError(f"Invalid hex suffix in {response_id!r}: {exc}") from exc
     return hex_part
 
 
@@ -172,17 +168,12 @@ def trace_context_for_response(
 
     effective = root_response_id or response_id
     trace_id_hex = trace_id_from_response_id(effective)
-    traceparent = (
-        f"{_W3C_VERSION}-{trace_id_hex}-"
-        f"{_DUMMY_PARENT_SPAN_ID}-{_W3C_FLAGS_SAMPLED}"
-    )
-    with set_tracing_context_from_http_request_headers(
-        {"traceparent": traceparent}
-    ):
+    traceparent = f"{_W3C_VERSION}-{trace_id_hex}-{_DUMMY_PARENT_SPAN_ID}-{_W3C_FLAGS_SAMPLED}"
+    with set_tracing_context_from_http_request_headers({"traceparent": traceparent}):
         yield
 
 
-def record_llm_usage(span: "LiveSpan", usage: dict[str, Any]) -> None:
+def record_llm_usage(span: LiveSpan, usage: dict[str, Any]) -> None:
     """
     Record token usage on an LLM span.
 
@@ -210,15 +201,10 @@ def record_llm_usage(span: "LiveSpan", usage: dict[str, Any]) -> None:
     }
     total = usage.get("total_tokens")
     if total is None:
-        total = (
-            payload[TokenUsageKey.INPUT_TOKENS]
-            + payload[TokenUsageKey.OUTPUT_TOKENS]
-        )
+        total = payload[TokenUsageKey.INPUT_TOKENS] + payload[TokenUsageKey.OUTPUT_TOKENS]
     payload[TokenUsageKey.TOTAL_TOKENS] = int(total)
     if "cache_read_input_tokens" in usage:
-        payload[TokenUsageKey.CACHE_READ_INPUT_TOKENS] = int(
-            usage["cache_read_input_tokens"]
-        )
+        payload[TokenUsageKey.CACHE_READ_INPUT_TOKENS] = int(usage["cache_read_input_tokens"])
     if "cache_creation_input_tokens" in usage:
         payload[TokenUsageKey.CACHE_CREATION_INPUT_TOKENS] = int(
             usage["cache_creation_input_tokens"]
@@ -226,7 +212,7 @@ def record_llm_usage(span: "LiveSpan", usage: dict[str, Any]) -> None:
     span.set_attribute(SpanAttributeKey.CHAT_USAGE, payload)
 
 
-def record_error(span: "LiveSpan", exc: BaseException) -> None:
+def record_error(span: LiveSpan, exc: Exception) -> None:
     """
     Mark a span as failed with an ``error.type`` attribute.
 
@@ -234,6 +220,11 @@ def record_error(span: "LiveSpan", exc: BaseException) -> None:
     trace and message; this helper adds the ``error.type``
     attribute (exception class name) so operators can filter by
     class in the trace backend without reading the exception event.
+
+    ``exc`` is typed ``Exception`` (not ``BaseException``) to match
+    MLflow's ``record_exception`` signature and because every
+    in-tree caller catches ``Exception`` or a subclass; we don't
+    report telemetry for ``KeyboardInterrupt`` / ``SystemExit``.
 
     :param span: The span to mark as failed.
     :param exc: The exception that caused the failure.
@@ -246,7 +237,7 @@ def record_error(span: "LiveSpan", exc: BaseException) -> None:
     span.record_exception(exc)
 
 
-def record_cancellation(span: "LiveSpan") -> None:
+def record_cancellation(span: LiveSpan) -> None:
     """
     Mark a span as cancelled.
 

@@ -5,48 +5,28 @@ validator that ``ap server`` uses. A passing validation means
 the agent will load and serve correctly.
 """
 
-from typing import Any
-
-SCHEMA: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "validate_agent",
-        "description": (
-            "Validate an agent directory's config.yaml. Returns "
-            "'valid' with the agent name if the spec is correct, "
-            "or a list of errors if something is wrong. Use this "
-            "after creating an agent to verify it will work."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": ("Path to the agent directory containing config.yaml."),
-                },
-            },
-            "required": ["path"],
-        },
-    },
-}
+from agent_plane_client import tool
 
 
-async def run(arguments: dict[str, Any]) -> str:
+@tool
+def validate_agent(path: str) -> str:
     """
-    Parse and validate an agent spec.
+    Validate an agent directory's config.yaml.
 
-    :param arguments: Must contain ``"path"`` (str) pointing to
-        an agent directory with config.yaml.
-    :returns: ``"Valid: <agent-name>"`` or error details.
+    Returns ``"Valid: <agent-name>"`` if the spec is correct, or
+    a list of errors if something is wrong. Use this after
+    creating an agent to verify it will work.
+
+    Args:
+        path: Path to the agent directory containing config.yaml.
     """
     import os
     from pathlib import Path
 
-    path_str = arguments.get("path", "")
-    if not path_str:
+    if not path:
         return "Error: 'path' parameter is required."
 
-    agent_path = Path(path_str)
+    agent_path = Path(path)
     # Resolve relative paths against the conversation workspace so
     # validate_agent("my-agent") works from sandbox mode without the
     # LLM needing to know the absolute workspace path.

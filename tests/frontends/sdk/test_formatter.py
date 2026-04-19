@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from agent_plane_ui_sdk._blocks import (
+from agent_plane_client._blocks import (
     CompactionBlock,
     ErrorBlock,
     FileBlock,
@@ -186,7 +186,7 @@ def test_format_response_end_failed() -> None:
 
 def test_show_agent_labels_for_sub_agents() -> None:
     """show_agent_labels=True adds agent name for sub-agent blocks."""
-    from agent_plane_ui_sdk._blocks import BlockContext
+    from agent_plane_client._blocks import BlockContext
 
     fmt = RichBlockFormatter(show_agent_labels=True)
     block = TextChunk(
@@ -203,7 +203,7 @@ def test_show_agent_labels_for_sub_agents() -> None:
 
 def test_show_agent_labels_not_for_root() -> None:
     """show_agent_labels=True doesn't add label for root agent."""
-    from agent_plane_ui_sdk._blocks import BlockContext
+    from agent_plane_client._blocks import BlockContext
 
     fmt = RichBlockFormatter(show_agent_labels=True)
     block = TextChunk(

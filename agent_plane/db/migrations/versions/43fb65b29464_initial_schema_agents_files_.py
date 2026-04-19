@@ -41,12 +41,36 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.Integer(), nullable=False),
         sa.Column("title", sa.Text(), nullable=True),
         sa.Column("kind", sa.String(length=32), nullable=False, server_default="default"),
+        # Phase 4: pointer from a sub-agent's child conversation to
+        # its parent conversation. NULL for top-level conversations.
+        # ON DELETE CASCADE so removing a parent recursively cleans
+        # up all descendants (and via the items/tasks FK cascades,
+        # everything they own).
+        sa.Column(
+            "parent_conversation_id",
+            sa.String(length=64),
+            sa.ForeignKey("conversations.id", ondelete="CASCADE"),
+            nullable=True,
+        ),
         sa.CheckConstraint("kind IN ('default', 'sub_agent')", name="ck_conversations_kind"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_conversations_created_at", "conversations", ["created_at"], unique=False)
     op.create_index("ix_conversations_updated_at", "conversations", ["updated_at"], unique=False)
     op.create_index("ix_conversations_kind", "conversations", ["kind"], unique=False)
+    # Phase 4: partial unique index on (parent_conversation_id, title)
+    # prevents two same-named children under the same parent at the
+    # DB layer (G36 race protection). The WHERE clause excludes top-
+    # level conversations (parent_conversation_id IS NULL) so multiple
+    # untitled top-level conversations remain valid.
+    op.create_index(
+        "ix_conversations_parent_title_unique",
+        "conversations",
+        ["parent_conversation_id", "title"],
+        unique=True,
+        sqlite_where=sa.text("parent_conversation_id IS NOT NULL"),
+        postgresql_where=sa.text("parent_conversation_id IS NOT NULL"),
+    )
     op.create_table(
         "files",
         sa.Column("id", sa.String(length=64), nullable=False),
@@ -95,6 +119,21 @@ def upgrade() -> None:
         sa.Column("agent_name", sa.String(length=256), nullable=False),
         sa.Column("background", sa.Boolean(), nullable=False),
         sa.Column("root_task_id", sa.String(length=64), nullable=True),
+        # G74: kind discriminator for the unified task lifecycle.
+        # "agent_task" = user-initiated turn (default for fresh DBs);
+        # "tool" = @tool(synchronous=False) background invocation;
+        # "sub_agent" = sub-agent workflow (Phase 3);
+        # "client_tool" = async client-side tool (Phase 5).
+        sa.Column(
+            "kind",
+            sa.String(length=32),
+            nullable=False,
+            server_default="agent_task",
+        ),
+        sa.CheckConstraint(
+            "kind IN ('agent_task', 'tool', 'sub_agent', 'client_tool')",
+            name="ck_tasks_kind",
+        ),
         sa.ForeignKeyConstraint(
             ["agent_id"],
             ["agents.id"],
@@ -116,6 +155,7 @@ def upgrade() -> None:
     op.create_index("ix_tasks_conversation_id", "tasks", ["conversation_id"], unique=False)
     op.create_index("ix_tasks_created_at", "tasks", ["created_at"], unique=False)
     op.create_index("ix_tasks_root_task_id", "tasks", ["root_task_id"], unique=False)
+    op.create_index("ix_tasks_kind", "tasks", ["kind"], unique=False)
     op.create_table(
         "pending_tool_calls",
         sa.Column("call_id", sa.String(length=64), nullable=False),
@@ -157,6 +197,7 @@ def downgrade() -> None:
     op.drop_index("ix_pending_tool_calls_task_id", table_name="pending_tool_calls")
     op.drop_index("ix_pending_tool_calls_root_task_id", table_name="pending_tool_calls")
     op.drop_table("pending_tool_calls")
+    op.drop_index("ix_tasks_kind", table_name="tasks")
     op.drop_index("ix_tasks_root_task_id", table_name="tasks")
     op.drop_index("ix_tasks_created_at", table_name="tasks")
     op.drop_index("ix_tasks_conversation_id", table_name="tasks")
@@ -169,6 +210,7 @@ def downgrade() -> None:
     op.drop_table("conversation_items")
     op.drop_index("ix_files_created_at", table_name="files")
     op.drop_table("files")
+    op.drop_index("ix_conversations_parent_title_unique", table_name="conversations")
     op.drop_index("ix_conversations_kind", table_name="conversations")
     op.drop_index("ix_conversations_updated_at", table_name="conversations")
     op.drop_index("ix_conversations_created_at", table_name="conversations")

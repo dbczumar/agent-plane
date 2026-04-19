@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from agent_plane.spec.types import (
     AgentSpec,
     ExecutorSpec,
@@ -172,16 +174,22 @@ def test_non_llm_executor_returns_error() -> None:
     assert "agents_sdk" in result
 
 
-def test_llm_executor_does_not_error_guard() -> None:
+def test_llm_executor_does_not_error_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     web_fetch with default llm executor should NOT trigger the
     executor guard. It will raise RuntimeError (no runtime
     initialized) when it tries to spawn — but that's past the
     guard, proving it wasn't blocked.
     """
-    import pytest
-
+    from agent_plane.runtime import _globals
     from agent_plane.tools.base import ToolContext
+
+    # Other tests (e.g. tests/stores/test_task_store.py) initialize
+    # the global task_store and leave it set, which causes this
+    # test's `runtime not initialized` assertion to fail when run
+    # after them. Force the globals to None for this test so the
+    # uninitialized-runtime branch is reachable regardless of order.
+    monkeypatch.setattr(_globals, "_task_store", None)
 
     parent = _make_parent_spec(executor_type="llm")
     tool = WebFetchTool(parent_spec=parent)

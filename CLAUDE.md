@@ -368,6 +368,18 @@ principles — they are the most important check.**
     change and delete the old path. No "will be removed once all
     consumers are updated" — update them NOW.
 
+34. CONSTANTS LIVE AT THE TOP OF THE MODULE: Module-level
+    constants (UPPER_CASE names, frozen sets, sentinel values,
+    config tunables) MUST be declared in a single block near the
+    top of the file — after imports, before the first class /
+    function definition. Never interleave a constant between two
+    function definitions later in the file just because the
+    nearest user happens to live there. Mid-file constants hide
+    from grep, surprise readers scrolling top-down, and silently
+    duplicate when two functions independently "need" the same
+    value. The single top block is the file's parameter surface;
+    code below it is implementation.
+
 Report each finding as:
   [FILE:LINE] ISSUE — description of the problem and suggested fix
 

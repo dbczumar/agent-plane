@@ -20,10 +20,16 @@ class Conversation:
     :param created_at: Unix epoch timestamp of creation.
     :param updated_at: Unix epoch timestamp of the last
         update (item append, title change, etc.).
-    :param title: Optional user-assigned title.
+    :param title: Optional user-assigned title. Phase 4 named
+        sub-agents store ``"<type>:<name>"`` here so the partial
+        unique index on ``(parent_conversation_id, title)`` can
+        enforce uniqueness within a parent.
     :param kind: Conversation type. ``"default"`` for
         user-initiated, ``"sub_agent"`` for sub-agent
         execution conversations.
+    :param parent_conversation_id: Phase 4 — for child
+        sub-agent conversations, points at the owning parent
+        conversation. ``None`` for top-level conversations.
     """
 
     id: str
@@ -31,6 +37,7 @@ class Conversation:
     updated_at: int
     title: str | None = None
     kind: str = "default"
+    parent_conversation_id: str | None = None
 
 
 # ── Conversation item data types ───────────────────────

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 import httpx
@@ -562,7 +561,7 @@ async def test_multi_turn_after_steering_sees_full_history(
     first_id = first.body["id"]
     conv_id = first.body["conversation"]["id"]
 
-    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
+    await call_1.wait_called(timeout=10)
 
     # Steer while blocked
     await create_test_response(
@@ -645,11 +644,11 @@ async def test_steering_position_among_tool_items(
     conv_id = first.body["conversation"]["id"]
 
     # Release tool call so tool executes
-    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
+    await call_1.wait_called(timeout=10)
     call_1.release()
 
     # Wait for second LLM call (post-tool)
-    await asyncio.wait_for(call_2.call_event.wait(), timeout=10)
+    await call_2.wait_called(timeout=10)
 
     # Steer while blocked in second LLM call
     await create_test_response(
@@ -914,7 +913,7 @@ async def test_steering_during_llm_with_client_tool_persists_steered_message(
     conv_id = first.body["conversation"]["id"]
 
     # Wait for LLM to be called, then steer
-    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
+    await call_1.wait_called(timeout=10)
     steer_resp = await create_test_response(
         client,
         input_text="Also check NYC",

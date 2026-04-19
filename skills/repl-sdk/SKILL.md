@@ -8,12 +8,14 @@ user-invocable: false
 
 ## Architecture
 
-A REPL has three layers. See `reference.md` for the full API.
+A REPL has three layers. The first two come from `agent_plane_client`;
+the last two come from `agent_plane_ui_sdk`. See `reference.md` for the
+full API.
 
 ```
-StreamRenderer      events → blocks        (state machine, no I/O)
-RichBlockFormatter   blocks → Rich output   (panels, colors, markdown)
-TerminalHost         prompt_toolkit I/O      (pinned input, background tasks)
+BlockStream         events → blocks        (state machine, no I/O)    [agent_plane_client]
+RichBlockFormatter   blocks → Rich output   (panels, colors, markdown) [agent_plane_ui_sdk]
+TerminalHost         prompt_toolkit I/O      (pinned input, tasks)     [agent_plane_ui_sdk]
 ```
 
 ## Minimal Working REPL
@@ -22,24 +24,24 @@ This is a complete, working REPL. Start here and customize.
 
 ```python
 import asyncio
-from agent_plane_ui_sdk import (
-    AgentPlaneClient, LocalServer, StreamRenderer,
+from agent_plane_client import (
+    AgentPlaneClient, LocalServer, BlockStream,
     pipe, skip_intermediate_ends,
 )
-from agent_plane_ui_sdk.terminal import RichBlockFormatter, TerminalHost
+from agent_plane_ui_sdk import RichBlockFormatter, TerminalHost
 
 async def main():
     async with LocalServer(agent_path="./my-agent/") as server:
         client = server.client
         session = client.session(model="my-agent")
-        renderer = StreamRenderer()
+        block_stream = BlockStream()
         fmt = RichBlockFormatter()
         host = TerminalHost(model_name="my agent")
 
         async def on_input(text: str) -> None:
             host.output(fmt.user_message(text))
             async for block in pipe(
-                renderer.stream(session, text),
+                block_stream.stream(session, text),
                 skip_intermediate_ends(),
             ):
                 for item in fmt.format(block):
@@ -90,7 +92,7 @@ async def on_input(text):
 ## Adding Client-Side Tools
 
 ```python
-from agent_plane_ui_sdk import ToolHandler, ToolCallInfo
+from agent_plane_client import ToolHandler, ToolCallInfo
 
 handler = ToolHandler(
     schemas=[
@@ -115,7 +117,7 @@ block stream.
 ## Adding an Elapsed Timer
 
 ```python
-from agent_plane_ui_sdk import ResponseStartBlock, ResponseEndBlock
+from agent_plane_client import ResponseStartBlock, ResponseEndBlock
 
 class TimedFormatter(RichBlockFormatter):
     def __init__(self, **kwargs):
@@ -196,10 +198,10 @@ fmt = MyFormatter(accent_color="#00aaff", code_theme="dracula")
 ## Hiding Block Types with Transforms
 
 ```python
-from agent_plane_ui_sdk import pipe, skip_blocks, ReasoningBlock
+from agent_plane_client import pipe, skip_blocks, ReasoningBlock
 
 stream = pipe(
-    renderer.stream(session, text),
+    block_stream.stream(session, text),
     skip_blocks(ReasoningBlock),         # No thinking panels
     skip_intermediate_ends(),            # Clean end events
 )
@@ -256,17 +258,17 @@ by calling `run_repl` internals directly (no prompt_toolkit):
 
 ```python
 import asyncio
-from agent_plane_ui_sdk import *
+from agent_plane_client import *
 
 async def test_scenario(agent_path, prompt, expect_blocks):
     """Run one scenario and verify expected block types appear."""
     async with LocalServer(agent_path=agent_path) as server:
         client = server.client
         session = client.session(model=server_agent_name)
-        renderer = StreamRenderer()
+        block_stream = BlockStream()
         blocks = []
         async for block in pipe(
-            renderer.stream(session, prompt),
+            block_stream.stream(session, prompt),
             skip_intermediate_ends(),
         ):
             blocks.append(block)

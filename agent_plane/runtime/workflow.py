@@ -26,8 +26,58 @@ from agent_plane.entities import (
     NativeToolData,
     NewConversationItem,
 )
-from agent_plane.entities.task import TERMINAL_STATUSES
+from agent_plane.entities.task import TERMINAL_STATUSES, Task
 from agent_plane.errors import AgentPlaneError, ErrorCode
+
+# Task kind for background `@tool(synchronous=False)` work items —
+# the unit the parent loop separates from the polling-based
+# sub-agent path so each kind uses the right collection mechanism.
+_TOOL_KIND = "tool"
+_SUB_AGENT_KIND = "sub_agent"
+# Kinds whose completion arrives via the async_work_complete drain
+# (Phase 2: tools; Phase 3: sub-agents). The legacy "agent_task"
+# kind is the top-level user turn — always tracked separately.
+_DRAIN_KINDS = frozenset({_TOOL_KIND, _SUB_AGENT_KIND})
+
+# Per-payload character cap for sub-agent output piggy-backed on
+# the async_work_complete signal (matches the @tool path's
+# ``truncate_for_llm`` budget — keeps the LLM-facing system
+# message under control regardless of which kind produced it).
+_SUB_AGENT_OUTPUT_BUDGET = 10_000
+
+# G20: cadence for `response.heartbeat` SSE events emitted while
+# the parent loop is blocked on the async-tool drain. 15 s keeps
+# proxies that close idle connections at 30 s safely under their
+# threshold without flooding the channel with pings.
+_HEARTBEAT_INTERVAL_S = 15.0
+
+# Generic type variable used by ``_to_thread`` (pure helper).
+_T = TypeVar("_T")
+
+# Hard upper bound on LLM turns per execution. Prevents runaway
+# loops. See designs/AGENTLOOP.md "Not Yet" for making this
+# configurable.
+_MAX_ITERATIONS = 1000
+
+# SSE event types emitted for reasoning content (set by the
+# streaming accumulator and consumed by the terminal frontend).
+_REASONING_TEXT_EVENT = "response.reasoning_text.delta"
+_REASONING_SUMMARY_EVENT = "response.reasoning_summary_text.delta"
+_REASONING_STARTED_EVENT = "response.reasoning.started"
+
+# Executor storage layout — each (conversation, agent) gets a
+# stable subdir under ``_EXECUTOR_STORAGE_BASE`` that persists
+# across tasks. The artifact-store key prefix mirrors the disk
+# layout so snapshots round-trip cleanly.
+_EXECUTOR_STORAGE_KEY_PREFIX = "executor_storage"
+_EXECUTOR_STORAGE_BASE = Path.home() / ".agent-plane" / "executor_storage"
+
+# Client-side tool result polling — used by
+# ``_build_await_tool_output`` while waiting for a PATCH'd
+# function_call_output to arrive.
+_TOOL_POLL_INTERVAL_SECONDS = 0.5
+_TOOL_POLL_TIMEOUT_SECONDS = 600
+
 from agent_plane.llms import Client as LLMClient
 from agent_plane.llms.errors import (
     ContextWindowExceededError,
@@ -110,7 +160,7 @@ from agent_plane.spec.types import LLMConfig, RetryConfig, ToolsConfig
 from agent_plane.stores import ConversationStore, TaskStore
 from agent_plane.tools import ToolManager
 from agent_plane.tools.base import ToolContext
-from agent_plane.tools.builtins import SpawnTool
+from agent_plane.tools.builtins import SpawnSubAgentTool
 from agent_plane.tools.client_specified import (
     ClientSideToolSpec,
     parse_client_side_tool_specs,
@@ -132,9 +182,6 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
-_T = TypeVar("_T")
-
-
 async def _to_thread(fn: Callable[[], _T]) -> _T:
     """
     Run a sync callable in the thread pool, propagating ``ContextVar`` values.
@@ -151,10 +198,6 @@ async def _to_thread(fn: Callable[[], _T]) -> _T:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, ctx.run, fn)
 
-
-# Hard upper bound on LLM turns per execution. Prevents runaway loops.
-# See designs/AGENTLOOP.md "Not Yet" for making this configurable.
-_MAX_ITERATIONS = 1000
 
 # Lazy singleton — created on first LLM call so import doesn't
 # fail when provider API keys are not yet set.
@@ -686,12 +729,6 @@ async def _call_llm_streaming(
         effective_retry,
         on_retry=lambda event: _write_output(task_id, event),
     )
-
-
-# SSE event types emitted for reasoning content
-_REASONING_TEXT_EVENT = "response.reasoning_text.delta"
-_REASONING_SUMMARY_EVENT = "response.reasoning_summary_text.delta"
-_REASONING_STARTED_EVENT = "response.reasoning.started"
 
 
 def _accumulate_stream(
@@ -1442,7 +1479,7 @@ async def _call_tool(
         # Inject client-side tool schemas into spawn arguments so
         # sub-agents know which client tools are available.
         effective_args = arguments
-        if tool_name == SpawnTool.name():
+        if tool_name == SpawnSubAgentTool.name():
             effective_args = _inject_client_tools(
                 arguments,
                 mgr.get_client_tool_schemas(),
@@ -2216,8 +2253,31 @@ async def _execute_tools(
         to :class:`ToolContext`, e.g. ``"ag_abc123"``.
     :returns: The ID of the last persisted tool output item.
     """
-    # Launch all tool calls concurrently as async tasks.
-    tasks: list[asyncio.Task[str]] = [
+    # Separate async @tool(synchronous=False) calls from sync
+    # ones. Async calls dispatch directly here (workflow body,
+    # NOT a @step) because DBOS forbids start_workflow from
+    # inside a step. Sync calls still go through the @step
+    # `_call_tool` so DBOS checkpoints their results for replay.
+    mgr = get_tool_manager()
+    results: dict[str, str] = {}
+    sync_calls: list[_ToolCall] = []
+    for tc in tool_calls:
+        tool = mgr.get_tool(tc.name) if mgr is not None else None
+        if tool is not None and tool.is_async():
+            handle = await _dispatch_async_tool(
+                parent_task_id=task_id,
+                conversation_id_for_handle=None,
+                agent_id=agent_id,
+                agent_name=tc.name,
+                tool=tool,
+                arguments=tc.arguments,
+            )
+            results[tc.call_id] = handle.to_handle_json()
+            continue
+        sync_calls.append(tc)
+
+    # Launch sync tool calls concurrently as async tasks.
+    sync_tasks: list[asyncio.Task[str]] = [
         asyncio.ensure_future(
             _call_tool(
                 task_id,
@@ -2230,21 +2290,19 @@ async def _execute_tools(
                 conversation_id=conversation_id,
             )
         )
-        for tc in tool_calls
+        for tc in sync_calls
     ]
-    # DBOS.asyncio_wait checkpoints task completion state for
-    # deterministic recovery on replay. Cast needed because list
-    # is invariant and asyncio_wait expects list[Awaitable[Any]].
-    await asyncio_wait(
-        cast(list[Any], tasks),
-        return_when=asyncio.ALL_COMPLETED,
-    )
-
-    # Map results back by position (tasks and tool_calls share
-    # the same order).
-    results: dict[str, str] = {
-        tool_calls[i].call_id: tasks[i].result() for i in range(len(tool_calls))
-    }
+    if sync_tasks:
+        # DBOS.asyncio_wait checkpoints task completion state for
+        # deterministic recovery on replay. Cast needed because
+        # list is invariant and asyncio_wait expects
+        # list[Awaitable[Any]].
+        await asyncio_wait(
+            cast(list[Any], sync_tasks),
+            return_when=asyncio.ALL_COMPLETED,
+        )
+        for i, tc in enumerate(sync_calls):
+            results[tc.call_id] = sync_tasks[i].result()
 
     # Persist in original call order so the LLM sees outputs
     # matching the function_call item sequence.
@@ -2431,72 +2489,6 @@ async def _handle_tool_calls(
     return last_seen
 
 
-def _recover_spawn_ids_from_history(
-    history: list[ConversationItem],
-) -> tuple[set[str], set[str]]:
-    """
-    Recover spawned and collected sub-agent IDs from conversation history.
-
-    When a client-tool round-trip creates a new response (workflow),
-    sub-agents spawned in the previous response need to be recovered
-    so auto-collect runs. The task store query (``list_tasks`` with
-    ``root_task_id``) only finds children of the CURRENT task. This
-    function scans history for ``spawn_sub_agents`` results from
-    ANY prior response in the conversation.
-
-    :param history: The loaded conversation history.
-    :returns: ``(spawned_ids, collected_ids)`` — spawned IDs from
-        ``spawn_sub_agents`` results, collected IDs from
-        auto-collected system messages.
-    """
-    call_names: dict[str, str] = {}
-    for item in history:
-        if item.type == "function_call" and isinstance(item.data, FunctionCallData):
-            call_names[item.data.call_id] = _strip_mcp_tool_prefix(item.data.name)
-
-    spawned: set[str] = set()
-    collected: set[str] = set()
-
-    for item in history:
-        if item.type == "function_call_output" and isinstance(item.data, FunctionCallOutputData):
-            name = call_names.get(item.data.call_id, "")
-            if name != SpawnTool.name():
-                continue
-            try:
-                parsed = json.loads(item.data.output)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            for rid in parsed.get("response_ids", []):
-                spawned.add(rid)
-
-        # Auto-collected results are persisted as user messages
-        # with "[System: auto-collected sub-agent results]".
-        if item.type == "message" and isinstance(item.data, MessageData):
-            for block in item.data.content:
-                if not isinstance(block, dict):
-                    continue
-                # `.get("text", "")` returns None (not "") if the key
-                # is present but null — common when the LLM produces a
-                # pure tool-call response with no accompanying text. The
-                # `or ""` coerces None to "" for the startswith check.
-                text = block.get("text") or ""
-                if not text.startswith("[System: auto-collected"):
-                    continue
-                json_part = text.split("\n", 1)
-                if len(json_part) < 2:
-                    continue
-                try:
-                    payload = json.loads(json_part[1])
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                for r in payload.get("results", []):
-                    rid = r.get("response_id", "")
-                    if rid:
-                        collected.add(rid)
-
-    return spawned, collected
-
-
 def _strip_mcp_tool_prefix(name: str) -> str:
     """
     Strip the Claude SDK MCP tool prefix from a tool name.
@@ -2516,307 +2508,502 @@ def _strip_mcp_tool_prefix(name: str) -> str:
     return name
 
 
+# ─── Async tool dispatch ───────────────────────────────────
+
+
 @dataclass
-class _AutoCollectResult:
+class _AsyncToolHandle:
     """
-    Result of :func:`_auto_collect_sub_agents`.
+    Handle returned to the LLM when an async tool is dispatched.
 
-    :param last_seen: The **original** store cursor (unchanged
-        from the input). Not advanced past the injected system
-        message so that ``_sync_history`` on the next loop
-        iteration picks up both the message and any steering
-        that arrived during the poll, e.g. ``"msg_abc123"``.
-    :param collected_ids: The set of sub-agent response IDs
-        that actually reached a terminal status and were
-        collected. May be a subset of the requested IDs if
-        a steering message interrupted the wait.
+    Replaces the inline tool result string from a sync invocation.
+    The LLM gets back a structured task handle so it can call
+    ``check_task`` later or wait for auto-delivery (D7/G12).
+
+    :param task_id: The newly created task's ID, e.g.
+        ``"tsk_async_xyz"``. Identical to the
+        ``background_tool_workflow``'s DBOS workflow_id (G56).
+    :param tool_name: The dispatched tool's name, included in the
+        handle so the LLM can correlate the handle to its own
+        tool_calls field.
+    :param status: Always ``"in_progress"`` at handle-creation
+        time — terminal status arrives via the
+        ``async_work_complete`` signal.
+    :param message: A self-explanatory instruction for the LLM
+        (G12). Names the task_id explicitly so the LLM can
+        copy-paste it into ``check_task`` / ``cancel_task``.
     """
 
-    last_seen: str
-    collected_ids: set[str]
+    task_id: str
+    tool_name: str
+    status: str
+    message: str
+
+    def to_handle_json(self) -> str:
+        """
+        Serialize the handle as JSON for the tool-call return path.
+
+        The runner contract returns strings, so the handle ships
+        as a JSON-encoded dict. The LLM treats the result like
+        any other tool output.
+
+        :returns: JSON string with ``task_id``, ``tool_name``,
+            ``status``, and ``message`` keys.
+        """
+        return json.dumps(
+            {
+                "task_id": self.task_id,
+                "tool_name": self.tool_name,
+                "status": self.status,
+                "message": self.message,
+            }
+        )
 
 
-# Interval between polls when waiting for sub-agents during
-# auto-collect. Short enough to detect steering promptly.
-_COLLECT_POLL_S = 0.5
+def _async_handle_message(task_id: str, tool_name: str) -> str:
+    """
+    Build the LLM-facing instruction text on a fresh async handle.
+
+    Every word here is load-bearing — the message is the LLM's
+    only signal that the result is NOT in this string. Without
+    "asynchronous" + "auto-deliver" + the literal task_id, the
+    LLM tends to either treat the handle as the result and
+    hallucinate completion, or repeatedly call ``check_task``
+    in a polling loop.
+
+    :param task_id: The async task's ID, included verbatim so
+        the LLM can pass it to ``check_task`` / ``cancel_task``.
+    :param tool_name: The dispatched tool's name.
+    :returns: A compact instruction string.
+    """
+    return (
+        f"Tool {tool_name!r} dispatched asynchronously. "
+        f"The result will be auto-delivered as a system message "
+        f"when ready. To poll proactively call check_task with "
+        f"task_id={task_id!r}; to abort call cancel_task."
+    )
 
 
-async def _persist_text_before_auto_collect(
-    task_id: str,
-    conversation_id: str,
-    llm_resp: dict[str, Any],
+async def _dispatch_async_tool(
+    *,
+    parent_task_id: str,
+    conversation_id_for_handle: str | None,
+    agent_id: str,
     agent_name: str,
-    uncollected_ids: list[str],
-    history: list[ConversationItem],
-    output_items: list[dict[str, Any]],
-    conv_store: ConversationStore,
-) -> _AutoCollectResult:
+    tool: Any,
+    arguments: str,
+) -> _AsyncToolHandle:
     """
-    Persist the LLM text then run auto-collect.
+    Create a child task row and start its background workflow.
 
-    Without this, the LLM's text is streamed to SSE but never
-    persisted (ghost tokens). Subsequent LLM calls do not see
-    the text in the conversation, causing the LLM to re-generate
-    or ignore it. This is especially damaging for steering:
-    the LLM's response to a steering message is lost, so
-    the next LLM call sees only the auto-collect results and
-    ignores the steering instruction.
+    Implements D2/D3 dispatch: pins the new DBOS workflow_uuid to
+    the freshly minted task_id (G56) so callers can later look up
+    workflow state by task_id, then returns the handle to the
+    parent ``_call_tool`` for serialization back to the LLM.
 
-    :param task_id: The parent task ID, e.g. ``"task_abc123"``.
-    :param conversation_id: The conversation ID.
-    :param llm_resp: The LLM response dict with text content.
-    :param agent_name: The agent's registered name, e.g.
-        ``"research-agent"``.
-    :param uncollected_ids: Sub-agent response IDs to collect.
-    :param history: Mutable conversation history list.
-    :param output_items: Mutable output items list.
-    :param conv_store: ConversationStore for persistence.
-    :returns: An :class:`_AutoCollectResult` from auto-collect.
+    The created task row carries ``kind="tool"`` so the parent's
+    end-of-turn auto-collect (D5) groups it correctly with other
+    async work. ``root_task_id`` is set to the parent so
+    ``task_store.list_tasks(root_task_id=...)`` finds it.
+
+    :param parent_task_id: The currently-executing parent
+        workflow's task_id. The new task points at it via
+        ``root_task_id``; the background workflow signals it via
+        the ``async_work_complete`` topic.
+    :param conversation_id_for_handle: Optional conversation_id
+        override for the new task row. Defaults to the parent
+        task's conversation_id (looked up from task_store).
+    :param agent_id: The owning agent's ID.
+    :param agent_name: The tool's name (recorded as ``agent_name``
+        on the task so ``list_tasks`` results show what produced
+        the work).
+    :param tool: The :class:`Tool` instance to dispatch — must be
+        a :class:`~agent_plane.tools.local.LocalPythonTool`. The
+        function pulls ``module_path`` and ``name()`` off the
+        instance.
+    :param arguments: JSON-encoded arguments string from the LLM.
+    :returns: An :class:`_AsyncToolHandle` ready to be serialized
+        back to the LLM as a tool-call result.
+    :raises RuntimeError: If the parent task row cannot be found
+        (this would mean the framework's invariants are broken
+        and the parent isn't a real workflow execution).
     """
-    text = _get_text_content(llm_resp)
-    file_annotations = _collect_file_annotations(output_items)
-    _emit_file_annotations(task_id, file_annotations)
-    item = _build_assistant_item(
-        task_id,
-        agent_name,
-        text,
-        annotations=file_annotations or None,
+    from agent_plane.runtime.background_tool_workflow import (
+        background_tool_workflow,
     )
-    persisted = _persist_and_stream(
-        task_id,
-        conv_store,
-        conversation_id,
-        [item],
-        output_items,
+    from agent_plane.runtime.durability import (
+        SetWorkflowID,
+        start_workflow,
     )
-    history.extend(persisted)
-    return await _auto_collect_sub_agents(
-        task_id,
-        conversation_id,
-        uncollected_ids,
-        # Cursor after the persisted text — steering detection
-        # starts here so only messages arriving DURING
-        # auto-collect are detected.
-        persisted[-1].id,
-        output_items,
-        conv_store,
-    )
+    from agent_plane.tools.local import LocalPythonTool
 
-
-async def _auto_collect_sub_agents(
-    task_id: str,
-    conversation_id: str,
-    response_ids: list[str],
-    last_seen: str,
-    output_items: list[dict[str, Any]],
-    conv_store: ConversationStore,
-) -> _AutoCollectResult:
-    """
-    Auto-collect outstanding sub-agents before turn completion.
-
-    Polls sub-agents with short timeouts, checking for steering
-    messages between each poll. If all sub-agents finish, injects
-    their results as a synthetic message. If a steering message
-    arrives first, injects partial results (for any sub-agents
-    that completed so far) and returns early so the agent loop
-    can process the steering.
-
-    Does NOT modify ``history`` — the caller re-enters the loop
-    with ``continue``, and ``_sync_history`` picks up both the
-    injected results and any steering messages from the store.
-
-    :param task_id: The parent task ID.
-    :param conversation_id: The parent's conversation ID.
-    :param response_ids: Sub-agent response IDs to collect.
-    :param last_seen: The current store cursor for detecting
-        new items (steering), e.g. ``"msg_abc123"``.
-    :param output_items: Mutable output items list.
-    :param conv_store: ConversationStore for persistence.
-    :returns: An :class:`_AutoCollectResult` with the
-        **original** cursor and the set of actually-collected
-        IDs.
-    """
-    results, collected = await _poll_subagents_with_steering_check(
-        response_ids,
-        conversation_id,
-        last_seen,
-        conv_store,
-    )
-    return _inject_collect_results(
-        task_id,
-        conversation_id,
-        last_seen,
-        results,
-        collected,
-        output_items,
-        conv_store,
-    )
-
-
-async def _poll_subagents_with_steering_check(
-    response_ids: list[str],
-    conversation_id: str,
-    last_seen: str,
-    conv_store: ConversationStore,
-) -> tuple[list[dict[str, str]], set[str]]:
-    """
-    Poll sub-agents for terminal status, checking for steering
-    between each poll cycle.
-
-    :param response_ids: Sub-agent response IDs to wait for.
-    :param conversation_id: Parent's conversation ID for
-        steering detection.
-    :param last_seen: Store cursor for detecting new items.
-    :param conv_store: ConversationStore for steering checks.
-    :returns: ``(results, collected_ids)`` — results dicts for
-        sub-agents that finished, and their IDs.
-    """
+    if not isinstance(tool, LocalPythonTool):
+        raise RuntimeError(
+            f"async dispatch only supported for LocalPythonTool, got {type(tool).__name__}"
+        )
 
     task_store = get_task_store()
-    pending = set(response_ids)
-    results: list[dict[str, str]] = []
-    collected: set[str] = set()
-
-    poll_count = 0
-    while pending:
-        newly_done = await _check_terminal(
-            pending,
-            task_store,
-            results,
+    parent_row = await _to_thread(lambda: task_store.get_sync(parent_task_id))
+    if parent_row is None:
+        raise RuntimeError(
+            f"parent task {parent_task_id!r} not found — async dispatch invariant broken"
         )
-        collected.update(newly_done)
-        pending -= newly_done
+    conv_id = conversation_id_for_handle or parent_row.conversation_id
 
-        if not pending:
-            _logger.debug(
-                "auto-collect: all sub-agents terminal after %d polls",
-                poll_count,
+    def _create_row() -> Any:
+        return task_store.create(
+            conversation_id=conv_id,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            root_task_id=parent_task_id,
+            kind=_TOOL_KIND,
+        )
+
+    new_task = await _to_thread(_create_row)
+
+    parsed_args: dict[str, Any] = json.loads(arguments) if arguments else {}
+
+    def _start() -> None:
+        # Pin the DBOS workflow_uuid to the new task_id (G56) so
+        # check_task / cancel_task can look up the workflow by
+        # task_id later.
+        with SetWorkflowID(new_task.id):
+            start_workflow(
+                background_tool_workflow,
+                parent_task_id,
+                tool.module_path(),
+                tool.name(),
+                parsed_args,
             )
-            break
 
-        # Check for steering messages before sleeping.
-        new_items = fetch_all_items(
-            conv_store,
-            conversation_id,
-            after=last_seen,
-        )
-        _logger.debug(
-            "auto-collect poll %d: pending=%s, new_items=%d, last_seen=%s",
-            poll_count,
-            pending,
-            len(new_items),
-            last_seen,
-        )
-        if new_items:
-            _logger.debug(
-                "steering detected during auto-collect, returning %d partial results",
-                len(results),
+    await _to_thread(_start)
+
+    return _AsyncToolHandle(
+        task_id=new_task.id,
+        tool_name=tool.name(),
+        status="in_progress",
+        message=_async_handle_message(new_task.id, tool.name()),
+    )
+
+
+async def _signal_sub_agent_terminal(
+    *,
+    parent_task_id: str,
+    sub_agent_task_id: str,
+    status: str,
+    output: str,
+    error: dict[str, str] | None,
+) -> None:
+    """
+    Send an ``async_work_complete`` payload from a sub-agent's terminal exit.
+
+    Phase 3 D2: sub-agents reuse Phase 2's drain channel. The
+    payload shape is identical to
+    :class:`~agent_plane.runtime.background_tool_workflow.AsyncWorkCompletePayload`
+    except ``kind="sub_agent"`` so the parent's drain renders
+    the system message correctly.
+
+    :param parent_task_id: The parent agent's task_id (the
+        original ``root_task_id`` set at sub-agent spawn).
+    :param sub_agent_task_id: This sub-agent's own task_id.
+        Embedded in the payload so the parent can correlate
+        with the handle the LLM holds.
+    :param status: Terminal status — one of ``"completed"``,
+        ``"failed"``, or ``"cancelled"``.
+    :param output: The sub-agent's output string. For
+        ``"completed"`` this is the final assistant text; for
+        ``"failed"`` it's the exception class + message; for
+        ``"cancelled"`` it's empty.
+    :param error: For ``"failed"`` only — dict with
+        ``"message"`` + ``"traceback"`` keys (the same shape
+        :func:`~agent_plane.runtime.background_tool_workflow.format_failure_payload`
+        returns). ``None`` for non-failed.
+    """
+    from agent_plane.runtime.background_tool_workflow import (
+        ASYNC_WORK_COMPLETE_TOPIC,
+    )
+    from agent_plane.runtime.durability import dbos_send_async
+
+    truncated = (
+        output
+        if len(output) <= _SUB_AGENT_OUTPUT_BUDGET
+        else output[:_SUB_AGENT_OUTPUT_BUDGET]
+        + f"\n[... {len(output) - _SUB_AGENT_OUTPUT_BUDGET} more chars truncated]"
+    )
+    await dbos_send_async(
+        parent_task_id,
+        {
+            "task_id": sub_agent_task_id,
+            "kind": "sub_agent",
+            "status": status,
+            "output": truncated,
+            "error": error,
+        },
+        topic=ASYNC_WORK_COMPLETE_TOPIC,
+    )
+
+
+def _extract_sub_agent_output_text(output: list[dict[str, Any]]) -> str:
+    """
+    Pull the assistant's final text out of a sub-agent's output items.
+
+    The sub-agent's ``_AgentLoopResult.output`` is the same
+    list of API-format items that the parent's
+    ``response.output`` carries — walk it for assistant message
+    blocks and concatenate their ``output_text``. Returns the
+    empty string when no text exists (e.g. the sub-agent
+    completed with only tool calls, which is an edge case).
+
+    :param output: API-format output items from
+        :class:`_AgentLoopResult`.
+    :returns: Concatenated assistant text, possibly empty.
+    """
+    parts: list[str] = []
+    for item in output:
+        if item.get("type") != "message":
+            continue
+        if item.get("role") != "assistant":
+            continue
+        for block in item.get("content") or []:
+            if block.get("type") == "output_text":
+                text = block.get("text")
+                if text:
+                    parts.append(text)
+    return "\n\n".join(parts)
+
+
+async def cancel_pending_child_tools(parent_task_id: str) -> None:
+    """
+    Cancel every non-terminal ``kind="tool"`` child of the parent.
+
+    Implements D9 (parent cancel propagates non-blocking). Invoked
+    by the route-level cancel handler BEFORE the parent itself is
+    cancelled — once a workflow is marked CANCELLED in DBOS, no
+    further ``@step`` calls (including ``list_tasks``) can run
+    inside it, so the propagation must be issued from outside the
+    parent's workflow context.
+
+    The cancelled child's ``background_tool_workflow`` enters its
+    ``except BaseException`` block, sends an
+    ``async_work_complete`` payload with ``status="cancelled"``
+    (G86), and re-raises so DBOS records the workflow as
+    CANCELLED. The parent's drain on the next iteration picks up
+    the cancellation message; if the parent is itself being
+    cancelled the message is harmless (it's just a database row).
+
+    Per-child failures are swallowed so one cancel error does
+    not block the others.
+
+    :param parent_task_id: The parent
+        ``agent_execution_workflow`` task_id whose tool children
+        should be cancelled.
+    """
+    from agent_plane.runtime.durability import cancel_workflow_async
+
+    task_store = get_task_store()
+    children = await task_store.list_tasks(root_task_id=parent_task_id)
+    iter_children = children.data if hasattr(children, "data") else children
+    for child in iter_children:
+        if child.kind != _TOOL_KIND:
+            continue
+        if child.status in TERMINAL_STATUSES:
+            continue
+        try:
+            await cancel_workflow_async(child.id)
+        except Exception:
+            _logger.exception(
+                "failed to cancel child tool task %s during parent cancel",
+                child.id,
             )
+
+
+# ─── Async work drain ──────────────────────────────────────
+#
+# The ``async_work_complete`` topic is the unified channel for any
+# child workflow (currently ``background_tool_workflow``; future:
+# sub-agents) to notify its parent of terminal completion. The
+# parent drains queued signals at the top of every loop iteration
+# (D4) and converts each into a ``[System: task ... <status>]``
+# user message so the LLM sees the completion on the next turn.
+#
+# See ``agent_plane/runtime/background_tool_workflow.py`` for the
+# sender side and ``tests/_adherence/phase2.md`` (D4/G18/G19) for
+# the contract.
+
+
+def _format_async_completion_text(payload: dict[str, Any]) -> str:
+    """
+    Render an ``async_work_complete`` payload as a system message body.
+
+    The text follows the existing ``[System: ...]`` convention used
+    elsewhere in the workflow (steering markers, sub-agent
+    auto-collect). Includes the task_id verbatim so the LLM can
+    cross-reference the original handle it received from the
+    asynchronous tool call.
+
+    :param payload: Drained dict with ``task_id``, ``kind``,
+        ``status``, ``output``, and ``error`` keys (the shape
+        produced by
+        :class:`~agent_plane.runtime.background_tool_workflow.AsyncWorkCompletePayload`).
+    :returns: Rendered system-message text. Always non-empty.
+    """
+    task_id = payload["task_id"]
+    kind = payload["kind"]
+    status = payload["status"]
+    if status == "completed":
+        body = payload.get("output") or ""
+        return f"[System: task {task_id} ({kind}) completed]\n{body}"
+    if status == "failed":
+        err = payload.get("error") or {}
+        message = err.get("message", "(no message)")
+        traceback_text = err.get("traceback", "")
+        return f"[System: task {task_id} ({kind}) failed]\n{message}\n{traceback_text}".rstrip()
+    # Cancelled (G86) or any other terminal status — surface the
+    # status verbatim so the LLM can adjust its plan rather than
+    # silently re-trying.
+    return f"[System: task {task_id} ({kind}) {status}]"
+
+
+def _build_async_completion_item(
+    task_id: str,
+    payload: dict[str, Any],
+) -> NewConversationItem:
+    """
+    Build the ``user``-role conversation item for one drained payload.
+
+    The LLM receives these as user messages because OpenAI-style
+    chat formats don't have a first-class "system event" role for
+    mid-conversation notifications. The leading ``[System: task ...]``
+    marker is the convention every drain-based completion uses
+    (matches the @tool path in this same module).
+
+    :param task_id: The PARENT task_id (the conversation owner),
+        not the completed child's task_id.
+    :param payload: Drained signal dict.
+    :returns: A :class:`NewConversationItem` ready to persist via
+        ``_persist_and_stream``.
+    """
+    return NewConversationItem(
+        type="message",
+        response_id=task_id,
+        data=MessageData(
+            role="user",
+            content=[
+                {
+                    "type": "input_text",
+                    "text": _format_async_completion_text(payload),
+                },
+            ],
+        ),
+    )
+
+
+async def _drain_async_completions(
+    *,
+    block_for_one: bool,
+) -> list[dict[str, Any]]:
+    """
+    Drain queued ``async_work_complete`` signals for the current workflow.
+
+    Two modes:
+
+    * ``block_for_one=False`` (between-iteration drain, D4): pulls
+      every payload available *right now* via repeated
+      ``timeout_seconds=0`` reads and returns. Returns an empty
+      list if the queue is empty — the caller proceeds straight to
+      the LLM call.
+    * ``block_for_one=True`` (end-of-turn auto-collect, D5): the
+      first ``recv_async`` call blocks until at least one payload
+      arrives (no timeout). Subsequent reads use ``timeout=0`` to
+      drain anything that piled up while the first one was
+      waiting. Caller must check ``pending_tasks`` independently
+      before deciding to call this — calling with no pending work
+      will deadlock.
+
+    Both modes filter against nothing: the topic itself is the
+    filter and the sender side (background workflows + future
+    sub-agent terminal hook) is the contract for what arrives.
+
+    :param block_for_one: When ``True``, block on the first read
+        until a payload arrives. When ``False``, return
+        immediately if the queue is empty.
+    :returns: List of payload dicts in arrival order. Each dict has
+        the
+        :class:`~agent_plane.runtime.background_tool_workflow.AsyncWorkCompletePayload`
+        shape: ``task_id``, ``kind``, ``status``, ``output``,
+        ``error``.
+    """
+    from agent_plane.runtime.background_tool_workflow import (
+        ASYNC_WORK_COMPLETE_TOPIC,
+    )
+
+    drained: list[dict[str, Any]] = []
+    if block_for_one:
+        # Loop with the documented heartbeat cadence (G20: 15s).
+        # Each timeout slice emits a `response.heartbeat` so SSE
+        # proxies that close idle connections see traffic. The
+        # parent workflow_id is the heartbeat target — it's
+        # always available in this DBOS workflow context.
+        parent_id = get_workflow_id()
+        first: dict[str, Any] | None = None
+        while first is None:
+            first = await dbos_recv_async(
+                topic=ASYNC_WORK_COMPLETE_TOPIC,
+                timeout_seconds=_HEARTBEAT_INTERVAL_S,
+            )
+            if first is None:
+                _write_output(
+                    parent_id,
+                    {"type": "response.heartbeat"},
+                )
+        drained.append(first)
+    while True:
+        # timeout_seconds=0 is the documented "non-blocking poll"
+        # form (see the design doc's drain protocol, G19).
+        payload = await dbos_recv_async(
+            topic=ASYNC_WORK_COMPLETE_TOPIC,
+            timeout_seconds=0,
+        )
+        if payload is None:
             break
-
-        poll_count += 1
-        await asyncio.sleep(_COLLECT_POLL_S)
-
-    return results, collected
+        drained.append(payload)
+    return drained
 
 
-async def _check_terminal(
-    pending: set[str],
-    task_store: TaskStore,
-    results: list[dict[str, str]],
-) -> set[str]:
-    """
-    Check for sub-agents that reached terminal status.
-
-    :param pending: Set of sub-agent IDs still being waited on.
-    :param task_store: For fetching current task status.
-    :param results: Mutable list — appends a result dict for
-        each newly-terminal sub-agent.
-    :returns: Set of IDs that became terminal this poll cycle.
-    """
-    from agent_plane.tools.builtins.spawn import _task_to_result
-
-    newly_done: set[str] = set()
-    for rid in list(pending):
-
-        def _get(task_id: str = rid) -> Any:
-            return task_store.get_sync(task_id)
-
-        task = await _to_thread(_get)
-        if task is not None and task.status in TERMINAL_STATUSES:
-            results.append(_task_to_result(task))
-            newly_done.add(rid)
-    return newly_done
-
-
-def _inject_collect_results(
+def _persist_async_completions(
     task_id: str,
     conversation_id: str,
-    last_seen: str,
-    results: list[dict[str, str]],
-    collected: set[str],
+    payloads: list[dict[str, Any]],
     output_items: list[dict[str, Any]],
     conv_store: ConversationStore,
-) -> _AutoCollectResult:
+) -> list[ConversationItem]:
     """
-    Persist collected sub-agent results as a system message.
+    Persist drained ``async_work_complete`` payloads as user messages.
 
-    If no sub-agents completed, returns the original cursor
-    without persisting anything.
+    No-op (returns empty list) when ``payloads`` is empty so callers
+    can unconditionally call this after a drain. The persisted
+    items are NOT added to ``history`` here — the iteration loop's
+    next ``_sync_history`` call picks them up alongside any
+    steering messages whose positions interleave (G33).
 
-    Returns the **original** ``last_seen`` (not the newly
-    persisted item's ID) so that ``_sync_history`` on the next
-    loop iteration picks up both the collected-results message
-    AND any steering messages that arrived during the poll.
-    Advancing the cursor here would skip steering messages
-    whose positions fall between the original cursor and the
-    injected system message.
-
-    :param task_id: The parent task ID.
-    :param conversation_id: The parent's conversation ID.
-    :param last_seen: Current store cursor — returned as-is.
-    :param results: Result dicts from completed sub-agents.
-    :param collected: IDs of completed sub-agents.
-    :param output_items: Mutable output items list.
+    :param task_id: The parent task_id (response_id for the new items).
+    :param conversation_id: The owning conversation.
+    :param payloads: Drained payloads from :func:`_drain_async_completions`.
+    :param output_items: Mutable output items list — appended to
+        for SSE delivery via ``_persist_and_stream``.
     :param conv_store: ConversationStore for persistence.
-    :returns: An :class:`_AutoCollectResult` with the
-        **original** cursor.
+    :returns: The list of persisted :class:`ConversationItem`
+        instances in store order. Empty when ``payloads`` is empty.
     """
-    if not results:
-        return _AutoCollectResult(
-            last_seen=last_seen,
-            collected_ids=collected,
-        )
-
-    result_json = json.dumps({"results": results})
-    new_items = [
-        NewConversationItem(
-            type="message",
-            response_id=task_id,
-            data=MessageData(
-                role="user",
-                content=[
-                    {
-                        "type": "input_text",
-                        "text": ("[System: auto-collected sub-agent results]\n" + result_json),
-                    },
-                ],
-            ),
-        ),
-    ]
-    # Persist and stream to SSE/output_items, but do NOT add
-    # to history — _sync_history handles that on the next
-    # iteration, which also picks up any steering messages.
-    _persist_and_stream(
+    if not payloads:
+        return []
+    new_items = [_build_async_completion_item(task_id, p) for p in payloads]
+    return _persist_and_stream(
         task_id,
         conv_store,
         conversation_id,
         new_items,
         output_items,
-    )
-    return _AutoCollectResult(
-        last_seen=last_seen,
-        collected_ids=collected,
     )
 
 
@@ -3484,13 +3671,6 @@ def _handle_execution_timeout(
     )
 
 
-_EXECUTOR_STORAGE_KEY_PREFIX = "executor_storage"
-
-# Base directory for executor storage on disk. Each (conversation, agent)
-# pair gets a stable subdirectory that persists across tasks.
-_EXECUTOR_STORAGE_BASE = Path.home() / ".agent-plane" / "executor_storage"
-
-
 def _storage_artifact_key(
     conversation_id: str,
     agent_name: str,
@@ -3686,12 +3866,6 @@ def _build_executor_context(
 
 
 # ── await_tool_output implementation ───────────────────────
-
-
-# Polling interval for client tool result delivery.
-_TOOL_POLL_INTERVAL_SECONDS = 0.5
-# Maximum time to wait for a client tool result.
-_TOOL_POLL_TIMEOUT_SECONDS = 600
 
 
 def _build_await_tool_output(
@@ -3960,14 +4134,6 @@ async def _run_agent_loop(
     execution_timeout = min(spec.executor.timeout, caps.execution_timeout)
     max_iterations = spec.executor.max_iterations
     start_time = _monotonic()
-    # Track spawned sub-agent response IDs for auto-collect.
-    # When the LLM produces a final response without collecting,
-    # the loop auto-collects outstanding sub-agents before
-    # completing the turn.
-    # Recover state from history so sub-agents spawned in
-    # previous responses (before a client-tool round-trip) are
-    # still tracked for auto-collect.
-    spawned_ids, collected_ids = _recover_spawn_ids_from_history(history)
     # Per-execution compaction state. context_window is seeded from
     # the executor's known limit (if any) so proactive compaction
     # can fire from the first iteration. Falls back to None when the
@@ -4020,6 +4186,27 @@ async def _run_agent_loop(
                 last_seen,
                 history,
             )
+            # Drain any async-work signals that piled up since the
+            # last iteration (D4). Each completion is persisted as a
+            # `[System: task ... <status>]` user message; the next
+            # _sync_history call below picks them up alongside any
+            # interleaved steering messages (G33), so we deliberately
+            # do NOT advance last_seen past the persisted items here.
+            drained = await _drain_async_completions(block_for_one=False)
+            if drained:
+                _persist_async_completions(
+                    task_id,
+                    conversation_id,
+                    drained,
+                    output_items,
+                    conv_store,
+                )
+                last_seen = _sync_history(
+                    conv_store,
+                    conversation_id,
+                    last_seen,
+                    history,
+                )
             # Save the pre-LLM cursor and history length. Used by
             # _handle_final_response to check for steered messages
             # that arrived during the LLM call — their positions
@@ -4099,49 +4286,93 @@ async def _run_agent_loop(
                 # own items, not steered user messages.
                 iteration_item_ids = frozenset(ci.id for ci in history[history_len_before_llm:])
 
-                # Discover sub-agents by querying the task store — the
+                # Discover children by querying the task store — the
                 # single source of truth regardless of executor type.
-                # Terminal children go into both sets so auto-collect
-                # doesn't re-process them.
+                # Phase 3: both async @tool tasks and sub-agent
+                # tasks signal completion via the unified
+                # async_work_complete topic. The end-of-turn block
+                # waits on either kind via the drain — the
+                # polling-based sub-agent collection from Phase 2
+                # was deleted because every sub-agent workflow
+                # now signals on terminal exit (see
+                # _signal_sub_agent_terminal in
+                # agent_execution_workflow).
                 child_tasks = await task_store.list_tasks(
                     root_task_id=task_id,
                 )
-                for ct in child_tasks:
-                    spawned_ids.add(ct.id)
-                    if ct.status in TERMINAL_STATUSES:
-                        collected_ids.add(ct.id)
+                pending_tool_tasks: list[Task] = [
+                    ct
+                    for ct in child_tasks
+                    if ct.kind in _DRAIN_KINDS and ct.status not in TERMINAL_STATUSES
+                ]
 
                 if not _has_tool_calls(llm_resp):
-                    # Auto-collect outstanding sub-agents before completing.
-                    uncollected = spawned_ids - collected_ids
-                    if uncollected:
-                        # last_seen is always set after the first
-                        # iteration (spawn persisted items).
-                        assert last_seen is not None
-                        # Persist the LLM text BEFORE auto-collect.
-                        # Without this, text is streamed to SSE but
-                        # never committed — ghost tokens that break
-                        # steering (the LLM's steering response is
-                        # lost and subsequent calls ignore the steer).
-                        collect_result = await _persist_text_before_auto_collect(
+                    # End-of-turn async-tool auto-collect (D5).
+                    # Two race cases combined into one branch:
+                    # * pending_tool_tasks non-empty: a child is
+                    #   still running — we MUST wait so the LLM
+                    #   doesn't return without it.
+                    # * pending_tool_tasks empty BUT non-blocking
+                    #   drain returns payloads: a child terminated
+                    #   AFTER iteration-top drain but BEFORE this
+                    #   point. The signal sits in the DBOS queue
+                    #   and would be lost if we fell through to
+                    #   _handle_final_response. Drain + continue.
+                    late_drained: list[dict[str, Any]] = []
+                    if not pending_tool_tasks:
+                        late_drained = await _drain_async_completions(
+                            block_for_one=False,
+                        )
+                    if pending_tool_tasks or late_drained:
+                        # Persist the LLM text first so it isn't
+                        # lost — without this, the streamed
+                        # tokens would be ghost text (visible in
+                        # SSE but never committed), and the next
+                        # LLM call wouldn't see what the model
+                        # said in this turn.
+                        text = _get_text_content(llm_resp)
+                        file_annotations = _collect_file_annotations(output_items)
+                        _emit_file_annotations(task_id, file_annotations)
+                        item = _build_assistant_item(
                             task_id,
-                            conversation_id,
-                            llm_resp,
                             agent_name,
-                            list(uncollected),
-                            history,
-                            output_items,
+                            text,
+                            annotations=file_annotations or None,
+                        )
+                        persisted = _persist_and_stream(
+                            task_id,
                             conv_store,
+                            conversation_id,
+                            [item],
+                            output_items,
                         )
-                        last_seen = collect_result.last_seen
-                        # Only mark actually-collected IDs — partial
-                        # collection (steering interrupt) leaves the
-                        # rest for the next auto-collect cycle.
-                        collected_ids.update(
-                            collect_result.collected_ids,
-                        )
-                        # Re-run the LLM so it can see collected
-                        # results and any steered messages.
+                        history.extend(persisted)
+                        if late_drained:
+                            # Already-drained payloads need
+                            # persisting; pending case will block
+                            # for at least one more.
+                            _persist_async_completions(
+                                task_id,
+                                conversation_id,
+                                late_drained,
+                                output_items,
+                                conv_store,
+                            )
+                        if pending_tool_tasks:
+                            # Block on the topic until at least
+                            # one signal arrives. The next
+                            # iteration's drain picks up
+                            # remaining completions.
+                            blocking = await _drain_async_completions(
+                                block_for_one=True,
+                            )
+                            _persist_async_completions(
+                                task_id,
+                                conversation_id,
+                                blocking,
+                                output_items,
+                                conv_store,
+                            )
                         continue
                     result = await _handle_final_response(
                         task_id,
@@ -4478,12 +4709,29 @@ async def agent_execution_workflow(
                     reasoning=reasoning,
                 )
                 span.set_outputs({"status": result.status})
+                # Phase 3: if this workflow is a sub-agent, signal
+                # the parent on the unified async_work_complete topic
+                # so the parent's drain auto-delivers the result
+                # (D2). Mirrors background_tool_workflow's send.
+                if root_task_id is not None:
+                    await _signal_sub_agent_terminal(
+                        parent_task_id=root_task_id,
+                        sub_agent_task_id=task_id,
+                        status=result.status,
+                        output=_extract_sub_agent_output_text(result.output),
+                        error=None,
+                    )
                 return result.to_dict(task_id)
             except asyncio.CancelledError:
                 # Cancellation arrives as CancelledError at any await
                 # point. Emit a response.cancelled SSE event so clients
                 # see the cancellation in real-time, then propagate —
                 # DBOS translates this into a CANCELLED workflow status.
+                # NOTE: Cancel propagation to child @tool(synchronous=False)
+                # workflows happens at the ROUTE level (D9) — once the
+                # parent workflow is marked cancelled, DBOS rejects further
+                # @step calls (which list_tasks needs), so the propagation
+                # would fail mid-loop if attempted here.
                 _write_output(
                     task_id,
                     {
@@ -4491,6 +4739,18 @@ async def agent_execution_workflow(
                         "reason": "user_cancelled",
                     },
                 )
+                # Phase 3 / G86: a cancelled sub-agent must still
+                # signal its parent so the drain wakes and removes
+                # it from pending_tasks. Send BEFORE re-raising so
+                # the signal lands.
+                if root_task_id is not None:
+                    await _signal_sub_agent_terminal(
+                        parent_task_id=root_task_id,
+                        sub_agent_task_id=task_id,
+                        status="cancelled",
+                        output="",
+                        error=None,
+                    )
                 telemetry.record_cancellation(span)
                 raise
             except Exception as exc:
@@ -4503,6 +4763,22 @@ async def agent_execution_workflow(
                         "message": str(exc),
                     },
                 )
+                # Phase 3: signal failure with a truncated traceback
+                # so the parent's drain surfaces the error to the
+                # next LLM iteration rather than orphaning the task.
+                if root_task_id is not None:
+                    from agent_plane.runtime.background_tool_workflow import (
+                        format_failure_payload,
+                    )
+
+                    err_payload = format_failure_payload(exc)
+                    await _signal_sub_agent_terminal(
+                        parent_task_id=root_task_id,
+                        sub_agent_task_id=task_id,
+                        status="failed",
+                        output=err_payload["message"],
+                        error=err_payload,
+                    )
                 telemetry.record_error(span, exc)
                 raise
     finally:

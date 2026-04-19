@@ -678,25 +678,21 @@ def _write_local_tool(
 
     :param workdir: Agent image root directory.
     :param filename: File name, e.g. ``"web_fetch.py"``.
-    :param schema_name: The ``name`` field in SCHEMA.
+    :param schema_name: The ``@tool``-decorated function's name —
+        becomes the LLM-facing tool name.
     """
     py_dir = workdir / "tools" / "python"
     py_dir.mkdir(parents=True, exist_ok=True)
-    code = f'''
-"""Test tool."""
-from typing import Any
-SCHEMA: dict[str, Any] = {{
-    "type": "function",
-    "function": {{
-        "name": "{schema_name}",
-        "description": "A test tool.",
-        "parameters": {{"type": "object", "properties": {{}}}},
-    }},
-}}
-async def run(arguments: dict[str, Any]) -> str:
-    """Execute."""
-    return "local_tool_result"
-'''
+    code = (
+        '"""Test tool."""\n'
+        "from agent_plane_client import tool\n"
+        "\n"
+        "\n"
+        "@tool\n"
+        f"def {schema_name}() -> str:\n"
+        '    """Execute."""\n'
+        '    return "local_tool_result"\n'
+    )
     (py_dir / filename).write_text(code)
 
 

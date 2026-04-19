@@ -18,11 +18,11 @@ from agent_plane.errors import AgentPlaneError, ErrorCode
 from agent_plane.spec import AgentSpec
 from agent_plane.tools.base import Tool, ToolContext, is_valid_tool_name
 from agent_plane.tools.builtins import (
-    CancelSubAgentTool,
-    CheckSubAgentsTool,
+    ListSubAgentsTool,
     LoadSkillTool,
     ReadSkillFileTool,
-    SpawnTool,
+    SendToSubAgentTool,
+    SpawnSubAgentTool,
     any_skill_has_resources,
     get_builtin_tool,
 )
@@ -220,20 +220,37 @@ class ToolManager:
             return
 
         sub_specs = {sa.name: sa for sa in self._spec.sub_agents if sa.name is not None}
-        spawn = SpawnTool(sub_specs=sub_specs)
-        self._tools[SpawnTool.name()] = spawn
-        self._tools[CheckSubAgentsTool.name()] = CheckSubAgentsTool()
-        self._tools[CancelSubAgentTool.name()] = CancelSubAgentTool()
+        # Phase 3: only the singular spawn_sub_agent is registered.
+        # Inspection / cancellation use the unified check_task /
+        # cancel_task builtins (Phase 2) since sub-agent and async
+        # @tool tasks share the kind discriminator.
+        self._tools[SpawnSubAgentTool.name()] = SpawnSubAgentTool(
+            sub_specs=sub_specs,
+        )
+        # Phase 4: send_to_sub_agent reuses the same sub_specs for
+        # type validation; persistence is via the conversation
+        # title="<type>:<name>" partial unique index.
+        self._tools[SendToSubAgentTool.name()] = SendToSubAgentTool(
+            sub_specs=sub_specs,
+        )
+        # Phase 4: list_sub_agents needs no spec — it scans the
+        # caller's child conversations regardless of which types
+        # the parent declared.
+        self._tools[ListSubAgentsTool.name()] = ListSubAgentsTool()
 
     def _register_local_tools(self, workdir: Path | None) -> None:
         """
         Load and register local Python tools from the agent image.
 
-        Tools with invalid names are skipped with a warning.
-        If ``workdir`` is ``None`` or the spec has no local tools,
-        this is a no-op.
+        Each ``@tool``-decorated function in ``tools/python/*.py``
+        becomes one tool. Name collisions with already-registered
+        tools (built-ins or earlier local tools) fail loud at load
+        time per G27. If ``workdir`` is ``None`` or the spec has
+        no local tools, this is a no-op.
 
         :param workdir: The agent image directory, or ``None``.
+        :raises LocalToolLoadError: If any tool file fails to load
+            or any name collides with a built-in.
         """
         if workdir is None or not self._spec.local_tools:
             return
@@ -244,6 +261,11 @@ class ToolManager:
             srt_available=self._srt_available,
             uv_available=self._uv_available,
             sandbox_enabled=self._sandbox_enabled,
+            agent_name=self._spec.name,
+            # Pass the names of already-registered tools (builtins
+            # at this point) so the loader can detect collisions
+            # at G27 strictness — fail loud, not silent shadowing.
+            builtin_tool_names=frozenset(self._tools.keys()),
         ):
             if not is_valid_tool_name(tool.name()):
                 _logger.warning(
@@ -251,11 +273,6 @@ class ToolManager:
                     tool.name(),
                 )
                 continue
-            if tool.name() in self._tools:
-                _logger.warning(
-                    "Local tool %r shadows existing tool — overwriting",
-                    tool.name(),
-                )
             self._tools[tool.name()] = tool
 
     def _register_client_tools(

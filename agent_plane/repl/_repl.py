@@ -10,16 +10,16 @@ import os
 import pathlib
 from typing import Any
 
-from agent_plane_ui_sdk import (
+from agent_plane_client import (
     AgentPlaneClient,
+    BlockStream,
     ResponseEndBlock,
     ResponseStartBlock,
-    StreamRenderer,
     ToolHandler,
     pipe,
     skip_intermediate_ends,
 )
-from agent_plane_ui_sdk.terminal import (
+from agent_plane_ui_sdk import (
     RichBlockFormatter,
     TerminalHost,
 )
@@ -63,7 +63,7 @@ async def run_repl(
     """
     ui_name = agent_name.replace("-", " ").replace("_", " ")
     session = client.session(model=agent_name, tool_handler=tool_handler)
-    renderer = StreamRenderer()
+    block_stream = BlockStream()
     fmt = TimedFormatter(show_agent_labels=True)
     host = TerminalHost(model_name=ui_name)
     is_streaming = False
@@ -112,10 +112,10 @@ async def run_repl(
         is_streaming = True
         try:
             stream = pipe(
-                renderer.stream(session, text, files=files),
+                block_stream.stream(session, text, files=files),
                 skip_intermediate_ends(),
             )
-            from agent_plane_ui_sdk import TextDone
+            from agent_plane_client import TextDone
 
             async for block in stream:
                 if isinstance(block, TextDone) and block.has_code_blocks:
@@ -145,7 +145,7 @@ async def run_repl(
     async with host:
         host.output(fmt.welcome(ui_name))
 
-        from agent_plane_ui_sdk.terminal import StreamingText
+        from agent_plane_ui_sdk import StreamingText
 
         host.output(StreamingText(text="\n\n\n"))
         if initial_message:

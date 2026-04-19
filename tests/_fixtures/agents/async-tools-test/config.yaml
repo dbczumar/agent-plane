@@ -1,0 +1,24 @@
+spec_version: 1
+
+name: async-tools-test
+description: |
+  Test-only agent that exercises @tool(synchronous=False) end-to-end
+  against a real LLM. Has one async tool that returns an unambiguous
+  marker, one async tool that always fails, and one sync tool — so
+  the same agent can drive the dispatch, drain, failure, and mixed
+  scenarios.
+
+llm:
+  model: gpt-5.4
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  timeout: 60
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

@@ -10,24 +10,7 @@ transitively pulls in modules that conflict with the ``mcp`` pip
 package in subprocess environments).
 """
 
-from typing import Any
-
-SCHEMA: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "list_builtin_tools",
-        "description": (
-            "List all built-in tools available in agent plane. "
-            "Returns tool names and descriptions. Call this before "
-            "recommending tools for a new agent."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
-    },
-}
+from agent_plane_client import tool
 
 # Maps every builtin tool name to (module_path, class_name).
 # This is the sole source of truth — when a new builtin is added,
@@ -51,12 +34,13 @@ _TOOL_CLASSES: dict[str, tuple[str, str]] = {
 }
 
 
-async def run(arguments: dict[str, Any]) -> str:
+@tool
+def list_builtin_tools() -> str:
     """
-    Import each builtin tool class and return names + descriptions.
+    List all built-in tools available in agent plane.
 
-    :param arguments: Unused (no parameters).
-    :returns: Formatted list of available builtin tools.
+    Returns tool names and descriptions. Call this before
+    recommending tools for a new agent.
     """
     import importlib
 

@@ -25,19 +25,19 @@ from agent_plane.tools.builtins.read_skill_file import (
     ReadSkillFileTool,
 )
 from agent_plane.tools.builtins.spawn import (
-    CancelSubAgentTool,
-    CheckSubAgentsTool,
-    SpawnTool,
+    ListSubAgentsTool,
+    SendToSubAgentTool,
+    SpawnSubAgentTool,
 )
 from agent_plane.tools.builtins.web_search import WebSearchTool
 
 __all__ = [
     "BUILTIN_NAMES",
-    "CancelSubAgentTool",
-    "CheckSubAgentsTool",
+    "ListSubAgentsTool",
     "LoadSkillTool",
     "ReadSkillFileTool",
-    "SpawnTool",
+    "SendToSubAgentTool",
+    "SpawnSubAgentTool",
     "WebSearchTool",
     "any_skill_has_resources",
     "get_builtin_tool",

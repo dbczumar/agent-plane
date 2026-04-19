@@ -37,7 +37,6 @@ from agent_plane.runtime.workflow import (
     _proactive_compact_if_needed,
     _publish_client_tool_call,
     _reactive_compact,
-    _recover_spawn_ids_from_history,
     _register_client_tool_call,
     _run_agent_loop,
     _split_tool_calls,
@@ -344,6 +343,18 @@ def _patch_agent_loop_deps(
     monkeypatch.setattr(
         "agent_plane.runtime.workflow._load_initial_history",
         lambda store, conv_id: [],
+    )
+
+    # Stub the async-work drain — calling DBOS.recv_async outside a
+    # workflow context raises. The drain returning [] keeps
+    # _run_agent_loop's iteration path identical to pre-Phase-2
+    # for these isolated unit tests.
+    async def _no_drain(*, block_for_one: bool) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._drain_async_completions",
+        _no_drain,
     )
 
     return emitted_events
@@ -2204,90 +2215,6 @@ def test_build_assistant_item_coerces_none_text_to_empty_string() -> None:
     # it must NOT be the None singleton (could happen if someone
     # replaced "" with NaN or similar truthiness-matching sentinel).
     assert block["text"] is not None
-
-
-# ── _recover_spawn_ids_from_history ─────────────────────────────
-
-
-def test_recover_spawn_ids_tolerates_null_text_blocks() -> None:
-    """
-    ``_recover_spawn_ids_from_history`` must survive assistant
-    messages whose ``output_text`` block has ``text: null``.
-
-    **Why this matters**: LLMs can produce pure tool-call responses
-    with no accompanying text. The persisted message then has
-    ``{"type": "output_text", "text": null}``. If the recovery
-    scanner does ``block.get("text", "").startswith(...)``, the
-    ``.get`` returns ``None`` (not ``""``) because the key IS
-    present, and ``None.startswith`` raises ``AttributeError``.
-
-    This was a latent bug that only surfaced once the terminal tool
-    started producing tool-call-only assistant turns at scale.
-
-    **If this regresses** (e.g. someone reverts the ``or ""``
-    guard in ``_recover_spawn_ids_from_history``), this test
-    raises ``AttributeError`` from inside the scanner. A null-text
-    history should be scanned cleanly — the two returned sets are
-    empty because there are no spawn/collect markers in null text.
-    """
-    history = [
-        ConversationItem(
-            id="msg_null_text",
-            type="message",
-            status="completed",
-            response_id="resp_null",
-            created_at=0,
-            data=MessageData(
-                role="assistant",
-                agent="test-agent",
-                # The key fixture: text is explicitly None, not
-                # missing and not empty.
-                content=[{"type": "output_text", "text": None}],
-            ),
-        ),
-    ]
-
-    spawned, collected = _recover_spawn_ids_from_history(history)
-
-    # No spawn/collect markers in null text → both sets empty.
-    assert spawned == set()
-    assert collected == set()
-
-
-def test_recover_spawn_ids_still_finds_auto_collected_markers() -> None:
-    """
-    The null-text guard doesn't break the happy path: auto-collected
-    sub-agent results are still detected.
-
-    **Why this matters alongside the null-text test**: a naive fix
-    that replaced ``text.startswith(...)`` with something like
-    ``(text or "") == ""`` could silently drop real markers. This
-    test ensures the guard only neutralizes null, not actual content.
-    """
-    auto_collected_text = (
-        "[System: auto-collected sub-agent results]\n"
-        '{"results": [{"response_id": "resp_child_123"}]}'
-    )
-    history = [
-        ConversationItem(
-            id="msg_collected",
-            type="message",
-            status="completed",
-            response_id="resp_parent",
-            created_at=0,
-            data=MessageData(
-                role="user",
-                content=[{"type": "input_text", "text": auto_collected_text}],
-            ),
-        ),
-    ]
-
-    _spawned, collected = _recover_spawn_ids_from_history(history)
-
-    # The marker's response_id was found even through the null-text
-    # guard — proves the guard's ``or ""`` only affects None, not
-    # legitimate strings.
-    assert "resp_child_123" in collected
 
 
 # ── conversation_id propagation into ToolContext ─────────────────

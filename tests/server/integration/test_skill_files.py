@@ -41,7 +41,10 @@ def _build_agent_with_skill_files() -> bytes:
     config: dict[str, Any] = {
         "spec_version": 1,
         "name": "skill-test-agent",
-        "llm": {"model": "skill-test-agent"},
+        "llm": {
+            "model": "skill-test-agent",
+            "connection": {"api_key": "test-key"},
+        },
     }
     config_bytes = yaml.dump(config).encode()
 

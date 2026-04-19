@@ -68,13 +68,17 @@ _logger = logging.getLogger(__name__)
 
 # ── DBOS → Task status mapping ───────────────────────────
 
+# Stores the underlying str values (not TaskStatus enum members) so
+# downstream f-string formatting and equality checks see the
+# documented status strings ("completed", etc.) rather than the
+# repr ("TaskStatus.COMPLETED").
 _DBOS_TO_TASK_STATUS: dict[str, str] = {
-    WorkflowStatusString.ENQUEUED.value: TaskStatus.QUEUED,
-    WorkflowStatusString.PENDING.value: TaskStatus.IN_PROGRESS,
-    WorkflowStatusString.SUCCESS.value: TaskStatus.COMPLETED,
-    WorkflowStatusString.ERROR.value: TaskStatus.FAILED,
-    WorkflowStatusString.CANCELLED.value: TaskStatus.CANCELLED,
-    WorkflowStatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED.value: TaskStatus.FAILED,
+    WorkflowStatusString.ENQUEUED.value: TaskStatus.QUEUED.value,
+    WorkflowStatusString.PENDING.value: TaskStatus.IN_PROGRESS.value,
+    WorkflowStatusString.SUCCESS.value: TaskStatus.COMPLETED.value,
+    WorkflowStatusString.ERROR.value: TaskStatus.FAILED.value,
+    WorkflowStatusString.CANCELLED.value: TaskStatus.CANCELLED.value,
+    WorkflowStatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED.value: TaskStatus.FAILED.value,
 }
 
 # DBOS statuses that mean the workflow is still running.
@@ -101,7 +105,7 @@ def _map_dbos_status(dbos_status_value: str) -> str:
     # Fallback to FAILED: if DBOS introduces a status we haven't mapped,
     # treating it as failed is the safest option — it surfaces the gap
     # via the API rather than silently misclassifying the task.
-    return _DBOS_TO_TASK_STATUS.get(dbos_status_value, TaskStatus.FAILED)
+    return _DBOS_TO_TASK_STATUS.get(dbos_status_value, TaskStatus.FAILED.value)
 
 
 # ── Row → entity helpers ─────────────────────────────────
@@ -129,7 +133,10 @@ def _to_entity(row: SqlTask) -> Task:
         previous_response_id=row.previous_response_id,
         background=row.background,
         root_task_id=row.root_task_id,
-        status=TaskStatus.QUEUED,
+        kind=row.kind,
+        # task.status is typed str; store the enum's .value so f-string
+        # formatting produces "queued" not "TaskStatus.QUEUED".
+        status=TaskStatus.QUEUED.value,
         # instructions and reasoning are populated by _apply_workflow_status
         # from DBOS workflow inputs, not from the DB row.
     )
@@ -186,6 +193,23 @@ async def _enrich_from_dbos(task: Task) -> Task:
     :returns: The enriched :class:`Task`.
     """
     wf_status: WorkflowStatus | None = await get_workflow_status_async(task.id)
+    if wf_status is None:
+        return task
+    return _apply_workflow_status(task, wf_status)
+
+
+def _enrich_from_dbos_sync(task: Task) -> Task:
+    """
+    Synchronous variant of :func:`_enrich_from_dbos`.
+
+    Used by ``list_tasks_sync`` so callers in sync tool bodies
+    (which the workflow's thread executor runs) can enumerate
+    tasks without crossing back into the async runtime.
+
+    :param task: The :class:`Task` to enrich.
+    :returns: The enriched :class:`Task`.
+    """
+    wf_status: WorkflowStatus | None = get_workflow_status(task.id)
     if wf_status is None:
         return task
     return _apply_workflow_status(task, wf_status)
@@ -251,6 +275,7 @@ class SqlAlchemyTaskStore(TaskStore):
         previous_response_id: str | None = None,
         background: bool = False,
         root_task_id: str | None = None,
+        kind: str = "agent_task",
     ) -> Task:
         """
         Create a new task in the database.
@@ -266,6 +291,13 @@ class SqlAlchemyTaskStore(TaskStore):
         :param background: Whether this is a background task.
         :param root_task_id: ID of the top-level task for
             sub-agent spawns. ``None`` for top-level tasks.
+        :param kind: Task kind discriminator, one of
+            ``"agent_task"`` (default — user-initiated turn),
+            ``"tool"`` (background ``@tool(synchronous=False)``),
+            ``"sub_agent"`` (sub-agent workflow, Phase 3), or
+            ``"client_tool"`` (async client-side tool, Phase 5).
+            Set explicitly per G74 — every spawn site picks the
+            right value rather than relying on the default.
         :returns: The newly created :class:`Task` with status
             ``"queued"``.
         """
@@ -279,6 +311,7 @@ class SqlAlchemyTaskStore(TaskStore):
             inbox_closed=False,
             background=background,
             root_task_id=root_task_id,
+            kind=kind,
         )
         with self._session() as session:
             session.add(row)
@@ -704,6 +737,40 @@ class SqlAlchemyTaskStore(TaskStore):
         for t in tasks:
             enriched.append(await _enrich_from_dbos(t))
         return enriched
+
+    def list_tasks_sync(
+        self,
+        conversation_id: str | None = None,
+        agent_id: str | None = None,
+        root_task_id: str | None = None,
+    ) -> list[Task]:
+        """
+        Synchronous variant of :meth:`list_tasks`.
+
+        Used by the Phase 4 ``send_to_sub_agent`` builtin (which
+        runs inside the workflow's thread executor) to detect
+        whether a child conversation already has a non-terminal
+        task in flight.
+
+        :param conversation_id: Optional conversation ID filter.
+        :param agent_id: Optional agent ID filter.
+        :param root_task_id: Optional root task ID filter.
+        :returns: A list of matching :class:`Task` objects,
+            ordered by ``created_at`` descending.
+        """
+        with self._session() as session:
+            stmt = select(SqlTask)
+            if conversation_id:
+                stmt = stmt.where(SqlTask.conversation_id == conversation_id)
+            if agent_id:
+                stmt = stmt.where(SqlTask.agent_id == agent_id)
+            if root_task_id:
+                stmt = stmt.where(SqlTask.root_task_id == root_task_id)
+            stmt = stmt.order_by(SqlTask.created_at.desc())
+            rows = list(session.execute(stmt).scalars().all())
+            tasks = [_to_entity(r) for r in rows]
+
+        return [_enrich_from_dbos_sync(t) for t in tasks]
 
     # ── Pending tool call helpers ─────────────────────────
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from agent_plane_ui_sdk._blocks import (
+from agent_plane_client._blocks import (
     BlockContext,
     CompactionBlock,
     ErrorBlock,

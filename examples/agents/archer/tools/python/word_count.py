@@ -9,50 +9,22 @@ Demonstrates PEP 723 inline dependencies — ``uv`` auto-installs
 ``ftfy`` on first invocation.
 """
 
-from typing import Any
-
-SCHEMA: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "word_count",
-        "description": (
-            "Count words, characters, and lines in a block of text. "
-            "Fixes encoding issues (mojibake) before counting. "
-            "Useful for analyzing document length or meeting word limits."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "The text to analyze.",
-                },
-            },
-            "required": ["text"],
-        },
-    },
-}
+from agent_plane_client import tool
 
 
-async def run(arguments: dict[str, Any]) -> str:
+@tool
+def word_count(text: str) -> dict[str, int]:
     """
     Fix text encoding then count words, characters, and lines.
 
-    :param arguments: Must contain ``"text"`` (str).
-    :returns: JSON string with word_count, char_count, line_count.
+    Args:
+        text: The text to analyze.
     """
-    import json
-
     import ftfy
 
-    text = ftfy.fix_text(arguments.get("text", ""))
-    words = len(text.split())
-    chars = len(text)
-    lines = text.count("\n") + (1 if text else 0)
-    return json.dumps(
-        {
-            "word_count": words,
-            "char_count": chars,
-            "line_count": lines,
-        }
-    )
+    fixed = ftfy.fix_text(text)
+    return {
+        "word_count": len(fixed.split()),
+        "char_count": len(fixed),
+        "line_count": fixed.count("\n") + (1 if fixed else 0),
+    }

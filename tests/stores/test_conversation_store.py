@@ -985,3 +985,149 @@ def test_list_conversations_sort_by_updated_at_with_pagination(
     assert len(page2.data) == 1
     assert page2.has_more is False
     assert page2.data[0].id == ids[1]
+
+
+# ─── Phase 4: parent_conversation_id + name uniqueness ──────
+
+
+def test_create_conversation_with_parent_pointer_and_title(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Setting ``parent_conversation_id`` + ``title`` round-trips through the row."""
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent",
+        title="coder:auth",
+        parent_conversation_id=parent.id,
+    )
+    # Both fields surface on the entity — proves the row was
+    # populated AND the converter pulls the column. Without the
+    # converter update, parent_conversation_id would always be
+    # None on the returned entity even after the row stores it.
+    fetched = conversation_store.get_conversation(child.id)
+    assert fetched is not None
+    assert fetched.title == "coder:auth"
+    assert fetched.parent_conversation_id == parent.id
+    assert fetched.kind == "sub_agent"
+
+
+def test_create_duplicate_title_under_same_parent_raises(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """G36: partial unique index rejects ``(parent_id, title)`` duplicates."""
+    from agent_plane.stores.conversation_store import NameAlreadyExistsError
+
+    parent = conversation_store.create_conversation()
+    conversation_store.create_conversation(
+        kind="sub_agent",
+        title="coder:auth",
+        parent_conversation_id=parent.id,
+    )
+    # Without the partial unique index + IntegrityError-to-
+    # NameAlreadyExistsError translation, the second create
+    # would either succeed silently (creating a duplicate row)
+    # or raise a raw sqlalchemy IntegrityError that would leak
+    # through to the LLM as an opaque error.
+    with pytest.raises(NameAlreadyExistsError):
+        conversation_store.create_conversation(
+            kind="sub_agent",
+            title="coder:auth",
+            parent_conversation_id=parent.id,
+        )
+
+
+def test_create_same_title_under_different_parents_succeeds(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The unique constraint is per-parent — ``(p1, "auth")`` and ``(p2, "auth")`` coexist."""
+    p1 = conversation_store.create_conversation()
+    p2 = conversation_store.create_conversation()
+    conversation_store.create_conversation(
+        kind="sub_agent", title="coder:auth", parent_conversation_id=p1.id
+    )
+    # Same title, different parent — no conflict.
+    conversation_store.create_conversation(
+        kind="sub_agent", title="coder:auth", parent_conversation_id=p2.id
+    )
+    # Both children must exist; if the unique constraint were
+    # global (not partial-by-parent), the second create would
+    # raise.
+    p1_children = conversation_store.list_conversations(
+        kind="sub_agent",
+        parent_conversation_id=p1.id,
+    )
+    p2_children = conversation_store.list_conversations(
+        kind="sub_agent",
+        parent_conversation_id=p2.id,
+    )
+    assert len(p1_children.data) == 1
+    assert len(p2_children.data) == 1
+    assert p1_children.data[0].title == "coder:auth"
+    assert p2_children.data[0].title == "coder:auth"
+
+
+def test_create_null_parent_allows_duplicate_titles(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Top-level conversations (NULL parent) are NOT subject to the unique constraint."""
+    # Both conversations share title=None and parent=None.
+    # The partial index excludes NULL parents, so two NULL-NULL
+    # rows are valid. Without the WHERE clause on the index,
+    # this would raise.
+    a = conversation_store.create_conversation()
+    b = conversation_store.create_conversation()
+    assert a.id != b.id
+    assert a.parent_conversation_id is None
+    assert b.parent_conversation_id is None
+
+
+def test_list_conversations_filtered_by_parent_returns_children_only(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``parent_conversation_id`` filter scopes results to one parent's sub-tree."""
+    parent_a = conversation_store.create_conversation()
+    parent_b = conversation_store.create_conversation()
+    conversation_store.create_conversation(
+        kind="sub_agent", title="coder:auth", parent_conversation_id=parent_a.id
+    )
+    conversation_store.create_conversation(
+        kind="sub_agent", title="coder:payments", parent_conversation_id=parent_a.id
+    )
+    conversation_store.create_conversation(
+        kind="sub_agent", title="coder:other", parent_conversation_id=parent_b.id
+    )
+
+    page = conversation_store.list_conversations(
+        kind="sub_agent",
+        parent_conversation_id=parent_a.id,
+    )
+    # Exactly 2 children for parent_a — proves the WHERE clause
+    # excludes parent_b's child. If the filter were a no-op,
+    # all 3 sub-agent rows would appear.
+    titles = sorted(c.title for c in page.data if c.title)
+    assert titles == ["coder:auth", "coder:payments"]
+
+
+def test_cascade_delete_removes_descendants(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Deleting a parent recursively removes children + grandchildren (FK CASCADE)."""
+    import asyncio
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", title="coder:auth", parent_conversation_id=parent.id
+    )
+    grandchild = conversation_store.create_conversation(
+        kind="sub_agent", title="reviewer:nested", parent_conversation_id=child.id
+    )
+    # Delete the root — both descendants must vanish via the
+    # ON DELETE CASCADE on parent_conversation_id.
+    asyncio.run(conversation_store.delete_conversation(parent.id))
+    assert conversation_store.get_conversation(parent.id) is None
+    assert conversation_store.get_conversation(child.id) is None, (
+        "Child not cascaded — FK ondelete=CASCADE missing or migration didn't apply it"
+    )
+    assert conversation_store.get_conversation(grandchild.id) is None, (
+        "Grandchild not cascaded — recursive FK cascade missing"
+    )

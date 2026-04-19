@@ -1469,6 +1469,16 @@ def _handle_sse(
     elif event_type == "response.output_item.done":
         live = _handle_item_done(app, scroll, live, data, acc)
 
+    elif event_type == "response.heartbeat":
+        # G20: server-emitted keepalive during long auto-collect
+        # waits. Intentionally no rendering — the heartbeat's
+        # job is to keep SSE proxies (which close idle
+        # connections) from killing the stream while the agent
+        # blocks on a background tool. Subscribing here makes
+        # the contract explicit; without the branch the
+        # "unknown event" log noise becomes a paper cut.
+        pass
+
     elif event_type in ("response.completed", "response.failed"):
         _extract_response_id(data, app)
         # Mark the response as terminal. This is the authoritative
@@ -1555,6 +1565,16 @@ def _handle_item_done(
 
     item_type = item.get("type")
     if item_type == "message":
+        # Auto-delivered async-tool completions arrive as
+        # role=user messages whose first text block starts with
+        # "[System: task ...]" (D10/G18). Render them as a
+        # SystemInfo line with a ⤵ prefix so the user can tell
+        # them apart from their own typed input. Without this
+        # branch they'd hit the assistant-finalize path and be
+        # silently dropped (live is None for non-streamed items).
+        if item.get("role") == "user" and _is_system_notification(item):
+            _mount_system_notification(scroll, item)
+            return live
         if live is not None:
             _finalize_message(scroll, live, item, acc)
         # Download files referenced by file_citation annotations.
@@ -1802,6 +1822,66 @@ def _reset_accumulator(acc: _StreamAccumulator) -> None:
     acc.in_summary = False
     acc.had_text = False
     acc.text_widget = None
+
+
+def _is_system_notification(item: dict[str, object]) -> bool:
+    """
+    Return ``True`` if a message item is an auto-delivered async notification.
+
+    The runtime persists ``[System: task ... <status>]``-prefixed
+    user-role messages when async-tool completions drain (D4/G18).
+    Detecting them lets the UI render them distinctly from the
+    user's typed input.
+
+    :param item: The output_item.done payload's ``item`` dict.
+    :returns: ``True`` if the first text content block starts
+        with the documented system-notification marker.
+    """
+    content = item.get("content")
+    if not isinstance(content, list) or not content:
+        return False
+    first = content[0]
+    if not isinstance(first, dict) or first.get("type") != "input_text":
+        return False
+    text = first.get("text", "")
+    return isinstance(text, str) and text.startswith("[System: task ")
+
+
+def _mount_system_notification(
+    scroll: VerticalScroll,
+    item: dict[str, object],
+) -> None:
+    """
+    Mount a SystemInfo widget for an auto-delivered async notification.
+
+    Uses a ⤵ prefix and dim styling so the message is visibly
+    distinct from the user's typed input (which uses ``user>``)
+    and from inline tool calls (which use ▸).
+
+    :param scroll: The scrollable container.
+    :param item: The user-role message item with the
+        ``[System: task ...]`` content.
+    """
+    content = item.get("content")
+    text = ""
+    if isinstance(content, list) and content:
+        first = content[0]
+        if isinstance(first, dict):
+            raw = first.get("text", "")
+            if isinstance(raw, str):
+                text = raw
+    # Compact a multi-line body into a single line for the header,
+    # then keep the rest as a dimmer continuation. The user can
+    # always inspect the conversation store for full content; the
+    # in-stream view is for at-a-glance awareness.
+    header, _, body = text.partition("\n")
+    label = f"⤵ {header}"
+    if body:
+        label = f"{label}\n{body[:200]}"
+    widget = SystemInfo(Text.from_markup(f"[dim]{escape(label)}[/dim]"))
+    scroll.mount(widget)
+    _wlog("MOUNT", "SystemInfo", f"async_completion: {header[:80]}")
+    scroll.scroll_end()
 
 
 def _mount_tool_call(
