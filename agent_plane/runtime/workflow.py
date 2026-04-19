@@ -34,10 +34,12 @@ from agent_plane.errors import AgentPlaneError, ErrorCode
 # sub-agent path so each kind uses the right collection mechanism.
 _TOOL_KIND = "tool"
 _SUB_AGENT_KIND = "sub_agent"
+_CLIENT_TOOL_KIND = "client_tool"
 # Kinds whose completion arrives via the async_work_complete drain
-# (Phase 2: tools; Phase 3: sub-agents). The legacy "agent_task"
-# kind is the top-level user turn — always tracked separately.
-_DRAIN_KINDS = frozenset({_TOOL_KIND, _SUB_AGENT_KIND})
+# (Phase 2: tools; Phase 3: sub-agents; Phase 5: client tools).
+# The legacy "agent_task" kind is the top-level user turn —
+# always tracked separately.
+_DRAIN_KINDS = frozenset({_TOOL_KIND, _SUB_AGENT_KIND, _CLIENT_TOOL_KIND})
 
 # Per-payload character cap for sub-agent output piggy-backed on
 # the async_work_complete signal (matches the @tool path's
@@ -2498,6 +2500,21 @@ async def _handle_tool_calls(
 
     split = _split_tool_calls(tool_calls, tool_mgr)
 
+    # Phase 5: split client tools again by ``is_async()``.
+    # Async client tools take the unified async_work_complete
+    # path — we register a kind="client_tool" task, persist a
+    # handle JSON as their function_call_output, and let the
+    # drain auto-deliver the eventual result from the client's
+    # PATCH. Sync client tools keep the legacy parking model.
+    client_async: list[_ToolCall] = []
+    client_sync: list[_ToolCall] = []
+    for tc in split.client:
+        client_tool = tool_mgr.get_tool(tc.name)
+        if client_tool is not None and client_tool.is_async():
+            client_async.append(tc)
+        else:
+            client_sync.append(tc)
+
     # Always execute server-side tools — even in mixed batches
     last_seen = fc_items[-1].id
     if split.server:
@@ -2513,14 +2530,34 @@ async def _handle_tool_calls(
             workspace_path=workspace_path,
         )
 
-    if split.has_client:
-        # Client-side function_call items are already persisted
-        # and streamed. Server-side tool outputs (if any) are
-        # also persisted. Complete the response so the caller
-        # can handle the client-side calls externally.
+    if client_async:
+        # For each async client tool: create a kind=client_tool
+        # task row in task_store, persist a function_call_output
+        # carrying the handle JSON. The LLM sees the handle on
+        # the next iteration; the client receives the
+        # function_call SSE event (with task_id embedded in the
+        # already-streamed function_call item via the persisted
+        # FunctionCallData) and is expected to PATCH back via
+        # ``async_tool_results: [{task_id, ...}]``.
+        last_seen = await _dispatch_async_client_tools(
+            parent_task_id=task_id,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            tool_calls=client_async,
+            conversation_id=conversation_id,
+            history=history,
+            output_items=output_items,
+            conv_store=conv_store,
+        )
+
+    if client_sync:
+        # Sync client-side function_call items are already
+        # persisted and streamed. Complete the response so the
+        # caller can handle them via the legacy
+        # ``tool_results`` PATCH path.
         return _ClientToolCallsPending(
             last_seen=last_seen,
-            client_call_ids=[tc.call_id for tc in split.client],
+            client_call_ids=[tc.call_id for tc in client_sync],
         )
 
     return last_seen
@@ -2807,6 +2844,110 @@ def _extract_sub_agent_output_text(output: list[dict[str, Any]]) -> str:
                 if text:
                     parts.append(text)
     return "\n\n".join(parts)
+
+
+async def _dispatch_async_client_tools(
+    *,
+    parent_task_id: str,
+    agent_id: str,
+    agent_name: str,
+    tool_calls: list[_ToolCall],
+    conversation_id: str,
+    history: list[ConversationItem],
+    output_items: list[dict[str, Any]],
+    conv_store: ConversationStore,
+) -> str:
+    """
+    Dispatch async client-side tool calls per Phase 5.
+
+    For each call:
+    1. Create a ``kind="client_tool"`` task row anchored to the
+       parent's conversation. The row carries no DBOS workflow
+       (the client owns execution); ``task_store.start`` is NOT
+       called. The row is created in the ``"in_progress"``
+       initial state and finalized by the route's PATCH handler.
+    2. Persist a ``function_call_output`` whose ``output`` is
+       the handle JSON ``{task_id, kind: "client_tool", ...}``.
+       The LLM sees this on the next iteration.
+
+    The actual result arrives later via
+    ``PATCH /v1/responses/{root}`` ``async_tool_results``,
+    which signals ``async_work_complete`` so the parent's drain
+    auto-delivers a ``[System: task ... <status>]`` user message.
+
+    :param parent_task_id: The currently-executing parent task.
+        Receives the eventual ``async_work_complete`` signal.
+    :param agent_id: The owning agent's id.
+    :param agent_name: The agent's registered name (kept on the
+        task row for display).
+    :param tool_calls: The async client tool calls to dispatch.
+    :param conversation_id: The current conversation.
+    :param history: Mutable conversation history.
+    :param output_items: Mutable API output list (FCO items
+        appended).
+    :param conv_store: The conversation store.
+    :returns: The id of the last persisted item (the most
+        recent function_call_output).
+    """
+    task_store = get_task_store()
+    parent_row = await _to_thread(lambda: task_store.get_sync(parent_task_id))
+    if parent_row is None:
+        raise RuntimeError(
+            f"parent task {parent_task_id!r} not found — async client tool dispatch invariant broken"
+        )
+    # Resolve root_task_id so signals route to the original
+    # top-level task even for nested sub-agents calling client
+    # tools.
+    root_task_id = parent_row.root_task_id or parent_task_id
+
+    fco_items: list[NewConversationItem] = []
+    for tc in tool_calls:
+        # Create the client_tool task row. ``start`` is NOT
+        # called — the client owns execution. The PATCH handler
+        # will later cancel the (non-existent) workflow but
+        # still mark the row terminal in task_store.
+        def _create_row() -> Any:
+            return task_store.create(
+                conversation_id=conversation_id,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                root_task_id=root_task_id,
+                kind=_CLIENT_TOOL_KIND,
+            )
+
+        new_task = await _to_thread(_create_row)
+        handle = {
+            "task_id": new_task.id,
+            "kind": _CLIENT_TOOL_KIND,
+            "tool_name": tc.name,
+            "status": "in_progress",
+            "message": (
+                f"Client-side tool {tc.name!r} dispatched as task "
+                f"{new_task.id!r}. Result will auto-deliver as a "
+                f"system message when the client PATCHes back. To "
+                f"poll call check_task; to abort call cancel_task."
+            ),
+        }
+        fco_items.append(
+            NewConversationItem(
+                type="function_call_output",
+                response_id=parent_task_id,
+                data=FunctionCallOutputData(
+                    call_id=tc.call_id,
+                    output=json.dumps(handle),
+                ),
+            )
+        )
+
+    persisted = _persist_and_stream(
+        parent_task_id,
+        conv_store,
+        conversation_id,
+        fco_items,
+        output_items,
+    )
+    history.extend(persisted)
+    return persisted[-1].id
 
 
 async def cancel_pending_child_tools(parent_task_id: str) -> None:

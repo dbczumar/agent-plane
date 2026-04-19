@@ -38,10 +38,19 @@ class ClientSideToolSpec:
     :param schema: Standard OpenAI-format function tool object, e.g.
         ``{"type": "function", "function": {"name": "get_weather",
         "description": "...", "parameters": {...}}}``.
+    :param synchronous: Phase 5 — when ``True`` (default), the
+        runtime parks the workflow until the client PATCHes
+        ``tool_results`` (the legacy single-PATCH pattern). When
+        ``False``, the runtime instead creates a kind="client_tool"
+        task, returns a ``{task_id, kind: "client_tool"}`` handle
+        to the LLM inline, and the parent loop's
+        ``async_work_complete`` drain delivers the eventual result
+        from the client's ``async_tool_results`` PATCH.
     """
 
     name: str
     schema: dict[str, Any]
+    synchronous: bool = True
 
 
 class ClientSideTool(Tool):
@@ -86,6 +95,23 @@ class ClientSideTool(Tool):
         """
         return self._spec.schema
 
+    def is_async(self) -> bool:
+        """
+        Return ``True`` for client tools the caller marked
+        ``"synchronous": false`` in their POST body.
+
+        Phase 5 — async client tools take the
+        ``async_work_complete`` drain path instead of the
+        legacy parking + ``tool_results`` PATCH path. The
+        runtime checks this in ``_handle_tool_calls`` to route
+        between the two execution models.
+
+        :returns: ``True`` for ``synchronous=False`` client
+            tools, ``False`` (default) for the legacy
+            parking model.
+        """
+        return not self._spec.synchronous
+
     def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
         Raise ``RuntimeError`` — client-side tools must never be executed
@@ -111,8 +137,9 @@ def parse_client_side_tool_spec(raw: dict[str, Any]) -> ClientSideToolSpec:
     Parse a raw OpenAI tool dict into a :class:`ClientSideToolSpec`.
 
     Validates that the dict is a well-formed OpenAI function tool schema
-    with a ``function.name``. No ``agent_plane`` extension key is required
-    or expected — client-side tools use standard OpenAI format.
+    with a ``function.name``. Recognizes the optional Phase 5
+    ``"synchronous": false`` field; default ``True`` preserves the
+    legacy parking behavior.
 
     :param raw: A dict in standard OpenAI function tool format, e.g.::
 
@@ -122,12 +149,15 @@ def parse_client_side_tool_spec(raw: dict[str, Any]) -> ClientSideToolSpec:
                     "name": "get_weather",
                     "description": "Get current weather",
                     "parameters": {"type": "object", "properties": {...}}
-                }
+                },
+                "synchronous": true   // Phase 5; defaults to true
             }
 
-    :returns: A :class:`ClientSideToolSpec` with the name and schema.
-    :raises ValueError: If ``type`` is not ``"function"`` or
-        ``function.name`` is missing.
+    :returns: A :class:`ClientSideToolSpec` with the name, schema,
+        and synchronous flag.
+    :raises ValueError: If ``type`` is not ``"function"``,
+        ``function.name`` is missing, or ``synchronous`` is not a
+        bool.
     """
     if raw.get("type") != "function":
         raise ValueError(
@@ -145,7 +175,14 @@ def parse_client_side_tool_spec(raw: dict[str, Any]) -> ClientSideToolSpec:
     if not is_valid_tool_name(name):
         raise ValueError(f"Invalid tool name {name!r}: must match [a-zA-Z0-9_-]{{1,256}}")
 
-    return ClientSideToolSpec(name=name, schema=raw)
+    synchronous_raw = raw.get("synchronous", True)
+    if not isinstance(synchronous_raw, bool):
+        raise ValueError(
+            f"client-specified tool {name!r}: 'synchronous' must be a bool, "
+            f"got {type(synchronous_raw).__name__}"
+        )
+
+    return ClientSideToolSpec(name=name, schema=raw, synchronous=synchronous_raw)
 
 
 def parse_client_side_tool_specs(
