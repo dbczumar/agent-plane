@@ -48,6 +48,12 @@ _STDOUT_PREFIX = "__AP_RESPONSE__:"
 # in heavy deps); the constant is a string literal anyway.
 _TOOL_MARKER_ATTR = "_ap_tool_metadata"
 
+# Reserved parameter name — kept in sync with
+# ``agent_plane_client.tools._schema.STATE_PARAM_NAME``. We hardcode
+# it here instead of importing to keep the subprocess runner's
+# import surface minimal on the hot path.
+_STATE_PARAM_NAME = "tool_state"
+
 
 def main() -> None:
     """
@@ -67,6 +73,11 @@ def main() -> None:
     module_path: str = request.get("module_path", "")
     tool_name: str = request.get("tool_name", "")
     arguments: dict[str, Any] = request.get("arguments", {})
+    # Per-agent tool-state directory (see designs/TOOL_STATE.md).
+    # ``None`` when no workspace is available (e.g. ad-hoc tests);
+    # _maybe_inject_tool_state handles that by raising if the tool
+    # actually asked for tool_state in that case.
+    state_root: str | None = request.get("state_root")
 
     if not tool_name:
         _write_error("Request missing 'tool_name' field — runner cannot dispatch.")
@@ -81,6 +92,7 @@ def main() -> None:
         return
 
     try:
+        _maybe_inject_tool_state(target, arguments, state_root)
         result = _invoke_tool(target, arguments)
     except Exception as exc:
         traceback.print_exc()
@@ -141,6 +153,68 @@ def _resolve_tool_function(module: ModuleType, tool_name: str) -> Any:
         _write_error(f"Function '{tool_name}' is not decorated with @tool.")
         return None
     return target
+
+
+def _maybe_inject_tool_state(
+    target: Any,
+    arguments: dict[str, Any],
+    state_root: str | None,
+) -> None:
+    """Inject a ``ToolState`` kwarg into ``arguments`` if the tool asks for it.
+
+    Inspects the tool function's signature; if it declares a
+    parameter named :data:`_STATE_PARAM_NAME`, constructs a live
+    ``ToolState`` rooted at ``state_root`` and adds it to
+    ``arguments`` in place.
+
+    :param target: The ``@tool`` callable to be invoked.
+    :param arguments: Kwargs dict splatted into the call. Mutated
+        in place when state is injected.
+    :param state_root: Parent-provided directory for this agent's
+        state, or ``None`` when no workspace is available.
+    :raises RuntimeError: If the tool declares ``tool_state`` but
+        the parent didn't provide a ``state_root``.
+    """
+    import inspect as _inspect
+
+    try:
+        sig = _inspect.signature(target)
+    except (TypeError, ValueError):
+        # Non-introspectable (builtin, C-extension). Not an @tool,
+        # but defense-in-depth.
+        return
+    if _STATE_PARAM_NAME not in sig.parameters:
+        return
+    arguments[_STATE_PARAM_NAME] = _construct_tool_state(state_root)
+
+
+def _construct_tool_state(state_root: str | None) -> Any:
+    """Build a :class:`ToolState` for the given root.
+
+    Split out of :func:`_maybe_inject_tool_state` so the injector
+    stays under the 40-line limit and so the lazy imports happen
+    on the one path that needs them.
+
+    :param state_root: Directory provided by the parent.
+    :returns: A new ``ToolState`` instance.
+    :raises RuntimeError: If ``state_root`` is ``None``. Silently
+        falling back to a temp dir would crash the tool deep
+        inside its body with a less helpful error.
+    """
+    if state_root is None:
+        raise RuntimeError(
+            f"Tool declares a '{_STATE_PARAM_NAME}' parameter but no "
+            f"state_root was provided by the parent. This usually means "
+            f"the invocation has no workspace (e.g. an ad-hoc test). "
+            f"ToolState is only available inside a conversation."
+        )
+    # Lazy imports so stateless tools don't pay the cost. ToolState's
+    # own deps are stdlib-only (fcntl, json, pathlib).
+    from pathlib import Path as _Path
+
+    from agent_plane_client.tools import ToolState as _ToolState
+
+    return _ToolState(_Path(state_root))
 
 
 def _invoke_tool(target: Any, arguments: dict[str, Any]) -> Any:

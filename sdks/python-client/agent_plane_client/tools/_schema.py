@@ -31,9 +31,18 @@ from pydantic import Field, create_model
 from pydantic.fields import FieldInfo
 
 from ._docstring import parse_google_docstring
+from ._state import ToolState
 from ._strict import ensure_strict_schema
 
 _logger = logging.getLogger(__name__)
+
+# Reserved parameter name for framework-injected per-conversation
+# per-agent tool state. A ``@tool`` function that declares a
+# parameter with this name receives a live :class:`ToolState` at
+# call time; the parameter is stripped from the LLM-facing JSON
+# schema. Convention over configuration — every stateful tool uses
+# the same identifier.
+STATE_PARAM_NAME = "tool_state"
 
 
 @dataclass(frozen=True)
@@ -82,6 +91,31 @@ def build_function_schema(
     fields: dict[str, tuple[Any, FieldInfo]] = {}
     for name, param in sig.parameters.items():
         ann = type_hints.get(name, Any)
+
+        # Framework-injected parameter — reserved by convention:
+        # any parameter named exactly ``tool_state`` is filled by
+        # the runtime with a :class:`ToolState`. Skipped from the
+        # LLM-facing schema; the LLM has no way to supply it.
+        # Enforce the convention: if someone types a param as
+        # ToolState but names it something else, fail loud so they
+        # know the right contract.
+        if name == STATE_PARAM_NAME:
+            if ann is not ToolState and ann is not Any:
+                raise TypeError(
+                    f"@tool function {fn.__name__!r} declares parameter "
+                    f"'{STATE_PARAM_NAME}' with unexpected type "
+                    f"{ann!r}. It must be typed as ToolState "
+                    f"(or left unannotated); any other type is a bug."
+                )
+            continue
+        if ann is ToolState:
+            raise TypeError(
+                f"@tool function {fn.__name__!r} types parameter "
+                f"{name!r} as ToolState but the parameter must be named "
+                f"{STATE_PARAM_NAME!r}. Rename it and the framework "
+                f"will inject a live ToolState at call time."
+            )
+
         _warn_if_permissive(fn.__name__, name, ann)
 
         doc_desc = parsed_doc.param_descriptions.get(name)

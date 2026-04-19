@@ -22,10 +22,12 @@ images, so the same decorator powers both authoring and runtime.
 
 from ._decorator import TOOL_MARKER_ATTR, ToolMetadata, get_tool_metadata, tool
 from ._handler import build_tool_handler
+from ._state import ToolState
 
 __all__ = [
     "TOOL_MARKER_ATTR",
     "ToolMetadata",
+    "ToolState",
     "build_tool_handler",
     "get_tool_metadata",
     "tool",

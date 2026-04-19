@@ -60,7 +60,7 @@ from ._transforms import (
     skip_intermediate_ends,
 )
 from ._types import File
-from .tools import ToolMetadata, tool
+from .tools import ToolMetadata, ToolState, tool
 
 __all__ = [
     "AgentPlaneClient",
@@ -93,6 +93,7 @@ __all__ = [
     "ToolHandler",
     "ToolMetadata",
     "ToolResultBlock",
+    "ToolState",
     "merge_text_across_iterations",
     "only_agent",
     "pipe",

@@ -126,6 +126,11 @@ class LocalPythonTool(Tool):
         self._uv_available = uv_available
         self._proc: subprocess.Popen[bytes] | None = None
         self._workspace: Path | None = None
+        # Set on each invoke() to the per-conversation, per-agent
+        # tool-state dir (or ``None`` for stateless tools / tools
+        # invoked without a workspace). Read by ``_prepend_srt`` to
+        # whitelist the dir for writes inside the srt sandbox.
+        self._state_root: str | None = None
 
     def name(self) -> str:  # type: ignore[override]
         """
@@ -211,11 +216,26 @@ class LocalPythonTool(Tool):
             if the subprocess fails.
         """
         parsed: dict[str, Any] = json.loads(arguments) if arguments else {}
+
+        # Per-agent ToolState directory. Only available when the
+        # workspace is present (tests without a workspace get None;
+        # the runner then refuses to inject and raises a clear error
+        # if the tool asked for tool_state). See designs/TOOL_STATE.md.
+        state_root: str | None = None
+        if ctx.workspace is not None:
+            state_dir = ctx.workspace / ".tool_state" / ctx.agent_id
+            state_dir.mkdir(parents=True, exist_ok=True)
+            state_root = str(state_dir)
+        # Stash on ``self`` so ``_prepend_srt`` / the settings
+        # writer can whitelist this path inside the sandbox.
+        self._state_root = state_root
+
         request = json.dumps(
             {
                 "module_path": str(self._module_path),
                 "tool_name": self._metadata.name,
                 "arguments": parsed,
+                "state_root": state_root,
             }
         ).encode()
 
@@ -353,21 +373,68 @@ class LocalPythonTool(Tool):
         """
         Prepend ``srt`` if sandbox is enabled and available.
 
-        Uses ``srt -c '<command>'`` instead of ``srt arg1 arg2``
-        because srt's default mode joins args into ``bash -c``
-        without proper quoting, which misinterprets PEP 508
-        specifiers like ``>=6.0`` as shell redirects.
+        Stateless tools use plain ``srt -c`` — srt's default
+        bubblewrap sandbox is permissive enough for pure reads
+        (the venv python remains executable, $PATH resolves,
+        etc.).
+
+        Stateful tools (those with a ``tool_state`` parameter)
+        additionally need one writable path: ``{workspace}/.tool_state/
+        {agent_id}/``. We achieve that with an ``-s`` settings
+        file that keeps srt's permissive defaults for reads but
+        whitelists exactly that directory for writes. This is
+        NOT the same ``_srt_wrap.mjs``-based setup
+        ``code_sandbox`` uses — that config restricts reads too,
+        which would hide the venv python from the runner.
 
         :param cmd: The base command to wrap.
-        :returns: The wrapped command, or ``cmd`` unchanged.
+        :returns: The wrapped command.
         """
         if not (self._srt_available and self._sandbox_enabled):
             return cmd
-        # Use srt -c with a properly quoted command string so
-        # shell metacharacters in args (e.g. ">=6.0") are preserved.
         import shlex
 
-        return ["srt", "-c", shlex.join(cmd)]
+        base = ["srt"]
+        if self._state_root is not None:
+            base += ["-s", self._write_srt_settings_file()]
+        return [*base, "-c", shlex.join(cmd)]
+
+    def _write_srt_settings_file(self) -> str:
+        """Write a per-invocation srt settings file for stateful tools.
+
+        The file whitelists ``self._state_root`` as writable while
+        leaving reads unrestricted (empty ``denyRead``), so the
+        subprocess can still resolve the venv python and its
+        imports. The settings shape matches srt's JSON schema —
+        ``network.{allowedDomains,deniedDomains}`` + ``filesystem.
+        {denyRead,allowRead,allowWrite,denyWrite}`` (see srt's
+        ``SandboxManager`` reference).
+
+        Temp files are intentionally not cleaned up: the payload
+        is trivial (~100 bytes), each invocation writes a fresh
+        one, and the OS tmpwatch handles eventual garbage
+        collection. Cleaning up per-invocation would require
+        another try/finally around the subprocess call, which
+        isn't worth it.
+
+        :returns: Absolute path to the written settings JSON.
+        """
+        import json as _json
+        import tempfile as _tempfile
+
+        settings = {
+            "network": {"allowedDomains": [], "deniedDomains": []},
+            "filesystem": {
+                "denyRead": [],
+                "allowRead": [],
+                "allowWrite": [self._state_root],
+                "denyWrite": [],
+            },
+        }
+        fd, path = _tempfile.mkstemp(suffix=".srt.json")
+        with os.fdopen(fd, "w") as f:
+            _json.dump(settings, f)
+        return path
 
     def _build_docker_command(self) -> list[str]:
         """
