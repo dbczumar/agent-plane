@@ -3002,6 +3002,51 @@ async def _dispatch_async_tool(
     )
 
 
+async def cancel_pending_child_tools(parent_task_id: str) -> None:
+    """
+    Cancel every non-terminal ``kind="tool"`` child of the parent.
+
+    Implements D9 (parent cancel propagates non-blocking). Invoked
+    by the route-level cancel handler BEFORE the parent itself is
+    cancelled — once a workflow is marked CANCELLED in DBOS, no
+    further ``@step`` calls (including ``list_tasks``) can run
+    inside it, so the propagation must be issued from outside the
+    parent's workflow context.
+
+    The cancelled child's ``background_tool_workflow`` enters its
+    ``except BaseException`` block, sends an
+    ``async_work_complete`` payload with ``status="cancelled"``
+    (G86), and re-raises so DBOS records the workflow as
+    CANCELLED. The parent's drain on the next iteration picks up
+    the cancellation message; if the parent is itself being
+    cancelled the message is harmless (it's just a database row).
+
+    Per-child failures are swallowed so one cancel error does
+    not block the others.
+
+    :param parent_task_id: The parent
+        ``agent_execution_workflow`` task_id whose tool children
+        should be cancelled.
+    """
+    from agent_plane.runtime.durability import cancel_workflow_async
+
+    task_store = get_task_store()
+    children = await task_store.list_tasks(root_task_id=parent_task_id)
+    iter_children = children.data if hasattr(children, "data") else children
+    for child in iter_children:
+        if child.kind != _TOOL_KIND:
+            continue
+        if child.status in TERMINAL_STATUSES:
+            continue
+        try:
+            await cancel_workflow_async(child.id)
+        except Exception:
+            _logger.exception(
+                "failed to cancel child tool task %s during parent cancel",
+                child.id,
+            )
+
+
 # ─── Async work drain ──────────────────────────────────────
 #
 # The ``async_work_complete`` topic is the unified channel for any
@@ -4908,6 +4953,11 @@ async def agent_execution_workflow(
                 # point. Emit a response.cancelled SSE event so clients
                 # see the cancellation in real-time, then propagate —
                 # DBOS translates this into a CANCELLED workflow status.
+                # NOTE: Cancel propagation to child @tool(synchronous=False)
+                # workflows happens at the ROUTE level (D9) — once the
+                # parent workflow is marked cancelled, DBOS rejects further
+                # @step calls (which list_tasks needs), so the propagation
+                # would fail mid-loop if attempted here.
                 _write_output(
                     task_id,
                     {

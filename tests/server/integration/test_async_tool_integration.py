@@ -44,7 +44,7 @@ _AGENT_NAME = "async-tool-test-agent"
 # unambiguous.
 _ASYNC_TOOL_SOURCE = '''\
 """Test async tools — fixed markers so assertions are deterministic."""
-from agent_plane.tools import tool
+from agent_plane_client import tool
 
 
 @tool(synchronous=False)
@@ -75,6 +75,23 @@ def boom() -> str:
         (no arguments)
     """
     raise RuntimeError("intentional boom from async tool")
+
+
+@tool(synchronous=False)
+def long_sleep() -> str:
+    """Block long enough that tests can cancel mid-execution.
+
+    The test cancels the parent response within a couple of
+    seconds; this 60s sleep guarantees the tool is still
+    running when the cancel arrives.
+
+    Args:
+        (no arguments)
+    """
+    import time
+
+    time.sleep(60)
+    return "should-never-return"
 '''
 
 
@@ -488,3 +505,114 @@ async def test_parallel_async_tool_spawns_all_auto_deliver(
         assert f"ECHO[{label}]" in final_input, (
             f"Marker for label {label!r} missing from final LLM input."
         )
+
+
+async def test_parent_cancel_propagates_to_async_tool_task(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Cancelling the parent response while an async tool task is
+    still running must:
+
+    * Reach a terminal state for the parent (cancelled).
+    * Cause the child tool task row to also reach a terminal
+      status (cancelled or failed) — not stay in_progress
+      forever (D9 / G86).
+
+    Without DBOS workflow-tree cancellation propagating, the
+    background_tool_workflow would keep its 60s sleep going and
+    the child task row would be stuck in ``in_progress`` for
+    a minute past the cancel.
+    """
+    from agent_plane.runtime.durability import get_workflow_status_async
+
+    _ = get_workflow_status_async  # may use later; primary check is via task_store
+
+    await _create_async_tool_agent(client)
+
+    # Tool 1: long-running async tool.
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_long_1",
+                "name": "long_sleep",
+                "arguments": "{}",
+            },
+        ],
+    )
+    # The runtime won't actually call the LLM again before the
+    # cancel arrives — but queue a dummy response in case timing
+    # races and the loop gets to the next iteration first.
+    mock_llm.add_call(text="should not appear")
+
+    result = await create_test_response(
+        client,
+        model=_AGENT_NAME,
+        input_text="Run long_sleep",
+    )
+    response_id = result.body["id"]
+
+    # Wait until the child tool task row exists — proves dispatch
+    # ran and the background workflow has started. Without this
+    # the cancel might race ahead of dispatch and miss the
+    # propagation entirely.
+    child_task_id: str | None = None
+    for _ in range(60):
+        items_resp = await client.get(
+            f"/v1/conversations/{result.body['conversation']['id']}/items",
+            params={"limit": 100},
+        )
+        items = items_resp.json()["data"]
+        fcos = [i for i in items if i.get("type") == "function_call_output"]
+        if fcos:
+            handle = json.loads(fcos[0]["output"])
+            child_task_id = handle["task_id"]
+            break
+        await asyncio.sleep(0.1)
+    assert child_task_id is not None, (
+        "Async dispatch never produced a function_call_output — "
+        "the runtime didn't reach _dispatch_async_tool."
+    )
+
+    # Cancel the parent. The route returns 200 + the cancelled
+    # response body once the task row is marked.
+    cancel_resp = await client.post(f"/v1/responses/{response_id}/cancel")
+    assert cancel_resp.status_code == 200, (
+        f"Cancel failed: {cancel_resp.status_code} {cancel_resp.text}"
+    )
+
+    # Parent must reach terminal — without proper propagation it
+    # would sit in_progress while the LLM call blocks.
+    completed = await _wait_for_completion(client, response_id)
+    assert completed["status"] == "cancelled", (
+        f"Parent must be cancelled; got {completed['status']}"
+    )
+
+    # The child task row must transition to a terminal status —
+    # cancel_workflow_async marks the DBOS row CANCELLED, and our
+    # store mapper translates that to a terminal status string.
+    # Poll up to 5 s.
+    final_dbos_status: str | None = None
+    last_seen_status: str | None = None
+    for _ in range(50):
+        status = await get_workflow_status_async(child_task_id)
+        last_seen_status = status.status if status is not None else "NULL"
+        if status is not None and status.status in {
+            "CANCELLED",
+            "ERROR",
+            "SUCCESS",
+        }:
+            final_dbos_status = status.status
+            break
+        await asyncio.sleep(0.1)
+    # Without _cancel_pending_child_tools wiring, this assertion
+    # times out: the child workflow stays in PENDING/ENQUEUED
+    # forever (the time.sleep(60) in the subprocess keeps the
+    # worker thread busy, but DBOS still marks the row on cancel).
+    assert final_dbos_status == "CANCELLED", (
+        f"Child workflow {child_task_id} did not transition to "
+        f"CANCELLED after parent cancellation; "
+        f"final_dbos_status={final_dbos_status!r}, "
+        f"last_seen_status={last_seen_status!r}"
+    )

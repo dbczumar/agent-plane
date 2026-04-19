@@ -1062,6 +1062,14 @@ def create_responses_router(
             raise AgentPlaneError("Response not found", code=ErrorCode.NOT_FOUND)
         if task.status in TERMINAL_STATUSES:
             return _build_response_object(task)
+        # D9: propagate cancel to non-terminal @tool(synchronous=False)
+        # children FIRST. Once the parent is marked CANCELLED, DBOS
+        # rejects further @step calls inside the parent's context
+        # (including the list_tasks the propagation would need), so
+        # the propagation must run before task_store.cancel.
+        from agent_plane.runtime.workflow import cancel_pending_child_tools
+
+        await cancel_pending_child_tools(response_id)
         # cancel() is sync (DBOS cancel_workflow) — offload to
         # avoid "called while event loop is running" error.
         cancelled_task = await asyncio.to_thread(
