@@ -1,0 +1,25 @@
+spec_version: 1
+
+name: sub-agent-test
+
+description: |
+  Test-only parent agent for the Phase 3 E2E sub-agent suite.
+  Has two named sub-agents (researcher, summarizer) so a real
+  LLM can dispatch them — singularly or in parallel — via
+  spawn_sub_agent.
+
+llm:
+  model: gpt-5.4
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  agents: [researcher, summarizer]
+  timeout: 60
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

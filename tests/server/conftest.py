@@ -89,6 +89,12 @@ class MockCall:
     # Callable[[dict[str, Any]], list[dict[str, str]]] — generates
     # tool_calls dynamically from create() kwargs.
     tool_calls_fn: Any = None
+    # Callable[[dict[str, Any]], Exception | None] — predicate
+    # that conditionally raises based on inspecting the call's
+    # kwargs. Returning None means "do not raise". Useful when
+    # parent and sub-agent share the FIFO mock queue and only
+    # one of them should fail (route by an input substring).
+    exception_fn: Any = None
     # Populated by the mock when this call is consumed. Contains
     # the kwargs passed to responses.create() so tests can inspect
     # what the LLM received (e.g. the input/history).
@@ -176,6 +182,7 @@ class ControllableMockClient:
         tool_calls: list[dict[str, str]] | None = None,
         tool_calls_fn: Any = None,
         exception: Exception | None = None,
+        exception_fn: Any = None,
     ) -> MockCall:
         """
         Enqueue a configured call.
@@ -205,6 +212,7 @@ class ControllableMockClient:
             block_before_response=asyncio.Event() if block else None,
             stream_tokens=stream_tokens,
             exception=exception,
+            exception_fn=exception_fn,
         )
         self._calls.append(call)
         return call
@@ -303,7 +311,15 @@ class _MockResponsesNamespace:
         # other tasks (e.g. the test) can proceed.
         if call.block_before_response is not None:
             await call.block_before_response.wait()
-        # Raise configured exception (simulates retryable errors)
+        # Raise configured exception (simulates retryable errors).
+        # exception_fn fires only if its predicate decides this
+        # specific kwargs payload should fail; useful for FIFO-
+        # shared mocks where only one consumer (parent vs sub-
+        # agent) should hit the failure path.
+        if call.exception_fn is not None:
+            dynamic_exc = call.exception_fn(kwargs)
+            if dynamic_exc is not None:
+                raise dynamic_exc
         if call.exception is not None:
             raise call.exception
 
