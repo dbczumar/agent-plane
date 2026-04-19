@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent_plane.runtime.durability import (
-    dbos_send,
+    dbos_send_async,
     get_workflow_id,
     step,
     workflow,
@@ -260,21 +260,25 @@ async def background_tool_workflow(
             output=error["message"],
             error=error,
         )
-        _send_payload(parent_task_id, payload)
+        await _send_payload(parent_task_id, payload)
         raise
 
-    _send_payload(parent_task_id, payload)
+    await _send_payload(parent_task_id, payload)
     return _payload_to_dict(payload)
 
 
-def _send_payload(parent_task_id: str, payload: AsyncWorkCompletePayload) -> None:
+async def _send_payload(parent_task_id: str, payload: AsyncWorkCompletePayload) -> None:
     """
-    Wrap the ``DBOS.send`` call so the workflow body stays readable.
+    Wrap the ``DBOS.send_async`` call so the workflow body stays readable.
+
+    Uses the async variant because the surrounding workflow body
+    runs inside the asyncio event loop — the sync ``DBOS.send``
+    raises ``RuntimeError`` when called with an event loop active.
 
     :param parent_task_id: The parent workflow's task_id.
     :param payload: The completion payload to deliver.
     """
-    dbos_send(
+    await dbos_send_async(
         parent_task_id,
         _payload_to_dict(payload),
         topic=ASYNC_WORK_COMPLETE_TOPIC,

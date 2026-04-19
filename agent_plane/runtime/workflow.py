@@ -1463,22 +1463,6 @@ async def _call_tool(
             span.set_attribute("tool.type", _classify_tool_type(tool))
         if telemetry.should_capture_content():
             span.set_inputs({"tool_name": tool_name, "arguments": arguments})
-        # @tool(synchronous=False) dispatches to a background DBOS
-        # workflow and returns a handle immediately (D2/D3). The
-        # parent loop later auto-delivers the result via the
-        # async_work_complete drain. Sync tools fall through.
-        if tool is not None and tool.is_async():
-            handle = await _dispatch_async_tool(
-                parent_task_id=task_id,
-                conversation_id_for_handle=None,
-                agent_id=agent_id,
-                agent_name=tool_name,
-                tool=tool,
-                arguments=arguments,
-            )
-            span.set_attribute("tool.status", "dispatched_async")
-            span.set_attribute("tool.async_task_id", handle.task_id)
-            return handle.to_handle_json()
         try:
             result = await _to_thread(_blocking_call)
             span.set_attribute("tool.status", "success")
@@ -2220,8 +2204,31 @@ async def _execute_tools(
         to :class:`ToolContext`, e.g. ``"ag_abc123"``.
     :returns: The ID of the last persisted tool output item.
     """
-    # Launch all tool calls concurrently as async tasks.
-    tasks: list[asyncio.Task[str]] = [
+    # Separate async @tool(synchronous=False) calls from sync
+    # ones. Async calls dispatch directly here (workflow body,
+    # NOT a @step) because DBOS forbids start_workflow from
+    # inside a step. Sync calls still go through the @step
+    # `_call_tool` so DBOS checkpoints their results for replay.
+    mgr = get_tool_manager()
+    results: dict[str, str] = {}
+    sync_calls: list[_ToolCall] = []
+    for tc in tool_calls:
+        tool = mgr.get_tool(tc.name) if mgr is not None else None
+        if tool is not None and tool.is_async():
+            handle = await _dispatch_async_tool(
+                parent_task_id=task_id,
+                conversation_id_for_handle=None,
+                agent_id=agent_id,
+                agent_name=tc.name,
+                tool=tool,
+                arguments=tc.arguments,
+            )
+            results[tc.call_id] = handle.to_handle_json()
+            continue
+        sync_calls.append(tc)
+
+    # Launch sync tool calls concurrently as async tasks.
+    sync_tasks: list[asyncio.Task[str]] = [
         asyncio.ensure_future(
             _call_tool(
                 task_id,
@@ -2233,21 +2240,19 @@ async def _execute_tools(
                 workspace_path=workspace_path,
             )
         )
-        for tc in tool_calls
+        for tc in sync_calls
     ]
-    # DBOS.asyncio_wait checkpoints task completion state for
-    # deterministic recovery on replay. Cast needed because list
-    # is invariant and asyncio_wait expects list[Awaitable[Any]].
-    await asyncio_wait(
-        cast(list[Any], tasks),
-        return_when=asyncio.ALL_COMPLETED,
-    )
-
-    # Map results back by position (tasks and tool_calls share
-    # the same order).
-    results: dict[str, str] = {
-        tool_calls[i].call_id: tasks[i].result() for i in range(len(tool_calls))
-    }
+    if sync_tasks:
+        # DBOS.asyncio_wait checkpoints task completion state for
+        # deterministic recovery on replay. Cast needed because
+        # list is invariant and asyncio_wait expects
+        # list[Awaitable[Any]].
+        await asyncio_wait(
+            cast(list[Any], sync_tasks),
+            return_when=asyncio.ALL_COMPLETED,
+        )
+        for i, tc in enumerate(sync_calls):
+            results[tc.call_id] = sync_tasks[i].result()
 
     # Persist in original call order so the LLM sees outputs
     # matching the function_call item sequence.

@@ -140,6 +140,7 @@ read_stream_async = DBOS.read_stream_async
 # Async APIs for parallel tool execution
 # (see designs/PARALLEL_TOOL_CALLS.md)
 dbos_recv_async = DBOS.recv_async
+dbos_send_async = DBOS.send_async
 dbos_sleep_async = DBOS.sleep_async
 asyncio_wait = DBOS.asyncio_wait
 close_stream_async = DBOS.close_stream_async
@@ -165,6 +166,7 @@ __all__ = [
     "dbos_recv",
     "dbos_recv_async",
     "dbos_send",
+    "dbos_send_async",
     "dbos_sleep",
     "dbos_sleep_async",
     "send_direct",
