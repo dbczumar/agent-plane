@@ -21,6 +21,7 @@ Agent-facing tools (``terminal_run``, ``terminal_list``,
 from agent_plane.terminals.manager import (
     ShellCapExceeded,
     ShellNameInvalid,
+    TaskStdoutDelta,
     TerminalManager,
 )
 from agent_plane.terminals.registry import TerminalManagerRegistry
@@ -32,6 +33,7 @@ __all__ = [
     "Shell",
     "ShellCapExceeded",
     "ShellNameInvalid",
+    "TaskStdoutDelta",
     "TerminalManager",
     "TerminalManagerRegistry",
 ]
