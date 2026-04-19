@@ -30,8 +30,8 @@ from typing import Annotated, Any, get_args, get_origin
 from pydantic import Field, create_model
 from pydantic.fields import FieldInfo
 
-from agent_plane.tools._docstring import parse_google_docstring
-from agent_plane.tools._strict import ensure_strict_schema
+from ._docstring import parse_google_docstring
+from ._strict import ensure_strict_schema
 
 _logger = logging.getLogger(__name__)
 

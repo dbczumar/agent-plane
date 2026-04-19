@@ -54,7 +54,7 @@ def _write_decorated_tool(
     indented_body = "\n".join(f"    {line}" for line in body_lines)
     code = (
         '"""Test tool."""\n'
-        "from agent_plane.tools import tool\n"
+        "from agent_plane_client import tool\n"
         "\n"
         "\n"
         f"@tool{extra_decoration}\n"
@@ -233,7 +233,7 @@ def test_load_multiple_tools_in_one_file(tmp_path: Path) -> None:
     multi = textwrap.dedent(
         '''\
         """Multi-tool file."""
-        from agent_plane.tools import tool
+        from agent_plane_client import tool
 
 
         @tool
@@ -460,7 +460,7 @@ def test_tool_get_schema_uses_metadata_name_and_description(
         textwrap.dedent(
             '''\
             """Doctool file."""
-            from agent_plane.tools import tool
+            from agent_plane_client import tool
 
 
             @tool
@@ -498,7 +498,7 @@ def test_pep723_scanning_at_load_time(tmp_path: Path) -> None:
             # dependencies = ["requests>=2.0"]
             # ///
             """A tool with PEP 723 deps."""
-            from agent_plane.tools import tool
+            from agent_plane_client import tool
 
 
             @tool
@@ -564,7 +564,7 @@ def test_runner_dispatches_to_named_function(tmp_path: Path) -> None:
         textwrap.dedent(
             '''\
             """Multi-tool file."""
-            from agent_plane.tools import tool
+            from agent_plane_client import tool
 
 
             @tool
@@ -593,7 +593,7 @@ def test_runner_rejects_undecorated_function(tmp_path: Path) -> None:
         textwrap.dedent(
             '''\
             """Mixed file with both decorated and bare functions."""
-            from agent_plane.tools import tool
+            from agent_plane_client import tool
 
 
             @tool
@@ -632,7 +632,7 @@ def test_runner_runtime_error(tmp_path: Path) -> None:
         textwrap.dedent(
             '''\
             """Tool that always raises."""
-            from agent_plane.tools import tool
+            from agent_plane_client import tool
 
 
             @tool
@@ -658,7 +658,7 @@ def test_runner_serializes_dict_return(tmp_path: Path) -> None:
         textwrap.dedent(
             '''\
             """Returns a dict."""
-            from agent_plane.tools import tool
+            from agent_plane_client import tool
 
 
             @tool
@@ -682,7 +682,7 @@ def test_runner_passes_string_return_unchanged(tmp_path: Path) -> None:
         textwrap.dedent(
             '''\
             """Returns a string."""
-            from agent_plane.tools import tool
+            from agent_plane_client import tool
 
 
             @tool

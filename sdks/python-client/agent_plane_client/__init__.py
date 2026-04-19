@@ -58,6 +58,7 @@ from ._transforms import (
     skip_blocks,
     skip_intermediate_ends,
 )
+from .tools import ToolMetadata, tool
 
 __all__ = [
     "AgentPlaneClient",
@@ -85,10 +86,12 @@ __all__ = [
     "ToolExecution",
     "ToolGroup",
     "ToolHandler",
+    "ToolMetadata",
     "ToolResultBlock",
     "merge_text_across_iterations",
     "only_agent",
     "pipe",
     "skip_blocks",
     "skip_intermediate_ends",
+    "tool",
 ]

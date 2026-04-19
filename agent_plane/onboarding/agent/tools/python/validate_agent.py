@@ -5,7 +5,7 @@ validator that ``ap server`` uses. A passing validation means
 the agent will load and serve correctly.
 """
 
-from agent_plane.tools import tool
+from agent_plane_client import tool
 
 
 @tool

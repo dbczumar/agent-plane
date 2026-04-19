@@ -1,16 +1,18 @@
 # Python client examples
 
-Examples for the `agent_plane_client` package (see `sdks/python-client/`).
+Examples for the [`agent_plane_client`](../../../sdks/python-client/) package.
 
 ## `quickstart.py`
 
-A five-demo tour covering the SDK surface you're most likely to need:
+A tour of the patterns you'll actually use when building apps on top
+of agent-plane:
 
-1. One-shot invocation (send → collect → print)
-2. Raw event stream (typed SSE events)
-3. Semantic blocks via `BlockStream`
-4. Multi-turn sessions (automatic `previous_response_id` threading)
-5. Client-side tools (register a local function, let the agent call it)
+1. `client.query(...)` — ask, get the final text as a string.
+2. `client.query(..., stream=True)` — stream text chunks as they arrive.
+3. `session.query(...)` — multi-turn conversation, IDs threaded for you.
+4. Client-side tools — register a local function, the agent calls it.
+5. File attachments — multi-modal input (text files, images, PDFs).
+6. Pointer to `BlockStream` for cases where plain text isn't enough.
 
 ### Run
 
@@ -21,27 +23,15 @@ pip install -e sdks/python-client
 OPENAI_API_KEY=sk-... python examples/clients/python/quickstart.py
 ```
 
-The script spins up a temporary `agent-plane` server via `LocalServer`,
-deploys the `archer` research agent, runs all five demos sequentially,
-and shuts the server down on exit.
+The script spins up a temporary server via `LocalServer`, deploys the
+`archer` agent, runs all six sections, and shuts the server down on
+exit.
 
-### Customizing
+### Pointing at an existing server
 
-Each demo is a standalone `async` function. To try a demo in isolation,
-copy the function into your own script alongside the top-level imports
-and the `LocalServer` block from `main()`.
-
-To point at an already-running agent-plane server instead of spinning
-one up, replace:
-
-```python
-async with LocalServer(agent_path=AGENT_PATH) as server:
-    await demo_one_shot(server.client)
-```
-
-with:
+Replace the `LocalServer` block with:
 
 ```python
 async with AgentPlaneClient(base_url="http://localhost:8080") as client:
-    await demo_one_shot(client)
+    text = await client.query(model="archer", input="hello")
 ```

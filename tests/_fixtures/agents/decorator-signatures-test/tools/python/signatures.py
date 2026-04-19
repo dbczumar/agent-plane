@@ -10,9 +10,8 @@ Covers:
 
 from typing import Annotated
 
+from agent_plane_client import tool
 from pydantic import BaseModel, Field
-
-from agent_plane.tools import tool
 
 
 class PersonRecord(BaseModel):

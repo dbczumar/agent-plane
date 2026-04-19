@@ -32,7 +32,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, ParamSpec, TypeVar, overload
 
-from agent_plane.tools._schema import build_function_schema
+from ._schema import build_function_schema
 
 # Marker attribute name. The framework's loader scans
 # ``module.__dict__`` for objects carrying this attribute to

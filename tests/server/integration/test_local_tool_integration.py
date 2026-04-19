@@ -28,7 +28,7 @@ _AGENT_NAME = "local-tool-test-agent"
 
 _WORD_COUNT_SOURCE = '''\
 """Count words in text."""
-from agent_plane.tools import tool
+from agent_plane_client import tool
 
 
 @tool
@@ -244,7 +244,7 @@ async def test_local_tool_crash_does_not_kill_server(
     }
     crash_source = '''\
 """A tool that crashes."""
-from agent_plane.tools import tool
+from agent_plane_client import tool
 
 
 @tool
@@ -301,7 +301,7 @@ def crasher() -> str:
 
 _MULTI_TOOL_SOURCE = '''\
 """A file exporting two @tool functions (G16)."""
-from agent_plane.tools import tool
+from agent_plane_client import tool
 
 
 @tool

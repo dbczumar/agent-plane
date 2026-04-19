@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import mimetypes
 import pathlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Iterator
 
 # Import at the type level to avoid circular imports at runtime.
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from ._events import (
     ResponseCancelled,
@@ -174,6 +175,121 @@ class Session:
 
             yield event
 
+    @overload
+    async def query(
+        self,
+        input: str | list[dict[str, object]],
+        *,
+        files: list[str] | None = ...,
+        tools: list[Callable[..., Any]] | None = ...,
+        stream: Literal[False] = ...,
+    ) -> str: ...
+
+    @overload
+    async def query(
+        self,
+        input: str | list[dict[str, object]],
+        *,
+        files: list[str] | None = ...,
+        tools: list[Callable[..., Any]] | None = ...,
+        stream: Literal[True],
+    ) -> AsyncIterator[str]: ...
+
+    async def query(
+        self,
+        input: str | list[dict[str, object]],
+        *,
+        files: list[str] | None = None,
+        tools: list[Callable[..., Any]] | None = None,
+        stream: bool = False,
+    ) -> str | AsyncIterator[str]:
+        """Send a prompt and get text back.
+
+        Default returns the final assistant text as a string::
+
+            text = await session.query("hello")
+
+        With ``stream=True`` returns an async iterator over text
+        chunks in order::
+
+            it = await session.query("hello", stream=True)
+            async for chunk in it:
+                print(chunk, end="", flush=True)
+
+        Client-side tools can be passed per-call via ``tools=``, or
+        configured session-wide via ``client.session(tool_handler=...)``.
+        If this turn's ``tools=`` is given, it OVERRIDES any session
+        handler for this call only.
+
+        :param input: User text or a list of content-block dicts,
+            e.g. ``"hello"`` or
+            ``[{"type": "input_text", "text": "hi"}]``.
+        :param files: Optional list of local file paths to upload and
+            attach to the turn, e.g. ``["./data.csv"]``.
+        :param tools: Optional list of ``@tool``-decorated functions
+            the agent may call on this turn. Overrides the session's
+            configured ``tool_handler`` for this call only.
+        :param stream: If True, return an ``AsyncIterator[str]`` that
+            yields text chunks as they arrive. If False (default),
+            return the final text after the response completes.
+        :returns: The assistant's final text (``stream=False``) or an
+            async iterator of text chunks (``stream=True``). Empty
+            string / empty iterator if the agent produced no text.
+        :raises AgentPlaneError: If the response ends in an error.
+        """
+        if stream:
+            return self._stream_text(input, files=files, tools=tools)
+        return await self._collect_text(input, files=files, tools=tools)
+
+    async def _collect_text(
+        self,
+        input: str | list[dict[str, object]],
+        *,
+        files: list[str] | None,
+        tools: list[Callable[..., Any]] | None,
+    ) -> str:
+        """Run a turn and return the final assistant text."""
+        # Local imports avoid a circular dep at module load — _stream
+        # imports _session under TYPE_CHECKING.
+        from ._blocks import TextDone
+        from ._stream import BlockStream
+        from ._transforms import merge_text_across_iterations, pipe, skip_intermediate_ends
+
+        with _per_call_tool_override(self, tools):
+            block_stream = BlockStream()
+            final_text = ""
+            async for block in pipe(
+                block_stream.stream(self, input, files=files),
+                # Merges per-iteration text into one TextDone per response,
+                # so we don't truncate to just the last iteration's text.
+                merge_text_across_iterations(),
+                skip_intermediate_ends(),
+            ):
+                if isinstance(block, TextDone):
+                    final_text = block.full_text
+            return final_text
+
+    async def _stream_text(
+        self,
+        input: str | list[dict[str, object]],
+        *,
+        files: list[str] | None,
+        tools: list[Callable[..., Any]] | None,
+    ) -> AsyncIterator[str]:
+        """Run a turn and yield text chunks as they arrive."""
+        from ._blocks import TextChunk
+        from ._stream import BlockStream
+        from ._transforms import pipe, skip_intermediate_ends
+
+        with _per_call_tool_override(self, tools):
+            block_stream = BlockStream()
+            async for block in pipe(
+                block_stream.stream(self, input, files=files),
+                skip_intermediate_ends(),
+            ):
+                if isinstance(block, TextChunk):
+                    yield block.text
+
     async def cancel(self) -> Response | None:
         """Cancel the current in-progress response.
 
@@ -228,3 +344,32 @@ class Session:
                 )
 
         return blocks
+
+
+@contextlib.contextmanager
+def _per_call_tool_override(
+    session: Session,
+    tools: list[Callable[..., Any]] | None,
+) -> Iterator[None]:
+    """Temporarily override ``session._tool_handler`` for one call.
+
+    If ``tools`` is ``None``, the session's configured handler is
+    used unchanged. Otherwise a handler is built from the decorated
+    functions and swapped in for the duration of the ``with`` block;
+    the original is restored on exit, even on exception.
+
+    :param session: The session whose ``_tool_handler`` to override.
+    :param tools: List of ``@tool``-decorated functions, or ``None``
+        to leave the session's handler in place.
+    """
+    if tools is None:
+        yield
+        return
+    from .tools import build_tool_handler
+
+    previous = session._tool_handler
+    session._tool_handler = build_tool_handler(tools)
+    try:
+        yield
+    finally:
+        session._tool_handler = previous

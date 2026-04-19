@@ -685,7 +685,7 @@ def _write_local_tool(
     py_dir.mkdir(parents=True, exist_ok=True)
     code = (
         '"""Test tool."""\n'
-        "from agent_plane.tools import tool\n"
+        "from agent_plane_client import tool\n"
         "\n"
         "\n"
         "@tool\n"

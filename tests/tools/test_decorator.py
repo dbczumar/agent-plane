@@ -11,13 +11,13 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-
-from agent_plane.tools import ToolMetadata, tool
-from agent_plane.tools.decorator import (
+from agent_plane_client.tools import (
     TOOL_MARKER_ATTR,
-    _validate_decorator_target,
+    ToolMetadata,
     get_tool_metadata,
+    tool,
 )
+from agent_plane_client.tools._decorator import _validate_decorator_target
 
 # ─── Module-level tool fixtures ──────────────────────────────────────
 

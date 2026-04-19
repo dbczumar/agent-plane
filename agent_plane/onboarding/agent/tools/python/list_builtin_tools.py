@@ -10,7 +10,7 @@ transitively pulls in modules that conflict with the ``mcp`` pip
 package in subprocess environments).
 """
 
-from agent_plane.tools import tool
+from agent_plane_client import tool
 
 # Maps every builtin tool name to (module_path, class_name).
 # This is the sole source of truth — when a new builtin is added,

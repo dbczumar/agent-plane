@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import pytest
-
-from agent_plane.tools._docstring import ParsedDocstring, parse_google_docstring
+from agent_plane_client.tools._docstring import ParsedDocstring, parse_google_docstring
 
 
 def test_parse_empty_docstring() -> None:

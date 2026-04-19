@@ -43,10 +43,11 @@ from types import ModuleType
 # (strings, ints, nested objects, arrays) — no specific type fits.
 from typing import Any
 
+from agent_plane_client.tools import ToolMetadata, get_tool_metadata
+
 from agent_plane.spec.types import LocalToolInfo, SandboxConfig
 from agent_plane.tools._pep723 import parse_inline_metadata
 from agent_plane.tools.base import Tool, ToolContext
-from agent_plane.tools.decorator import ToolMetadata, get_tool_metadata
 
 _logger = logging.getLogger(__name__)
 

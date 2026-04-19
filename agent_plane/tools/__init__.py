@@ -7,8 +7,8 @@ Public API (lazy):
 - ``ClientSideTool``: A tool presented to the LLM but executed by the caller.
 - ``ClientSideToolSpec``: Configuration for a client-side tool.
 - ``LocalPythonTool``: A tool backed by a local Python file in the agent image.
-- ``tool``: Decorator for authoring custom Python tools as typed functions.
-- ``ToolMetadata``: The metadata object the decorator attaches.
+The ``tool`` decorator and ``ToolMetadata`` now live in
+``agent_plane_client.tools`` — import them from there.
 
 Imports are lazy so that loading ``agent_plane.tools`` does not pull
 in heavy submodules (``manager`` transitively imports ``mcp``, which
@@ -28,13 +28,16 @@ if TYPE_CHECKING:
         ClientSideTool,
         ClientSideToolSpec,
     )
-    from agent_plane.tools.decorator import ToolMetadata, tool
     from agent_plane.tools.local import LocalPythonTool
     from agent_plane.tools.manager import ToolManager
 
 
 # Map exported name → (submodule path, attribute name).
 # Add an entry here when adding a new public re-export.
+# NOTE: The `tool` decorator and `ToolMetadata` now live in the
+# `agent_plane_client.tools` package (see sdks/python-client/). Import
+# them from there — they used to be re-exported here but the
+# duplicate surface was removed in the SDK carve-out.
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "Tool": ("agent_plane.tools.base", "Tool"),
     "ToolContext": ("agent_plane.tools.base", "ToolContext"),
@@ -43,8 +46,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "agent_plane.tools.client_specified",
         "ClientSideToolSpec",
     ),
-    "ToolMetadata": ("agent_plane.tools.decorator", "ToolMetadata"),
-    "tool": ("agent_plane.tools.decorator", "tool"),
     "LocalPythonTool": ("agent_plane.tools.local", "LocalPythonTool"),
     "ToolManager": ("agent_plane.tools.manager", "ToolManager"),
 }
@@ -55,11 +56,12 @@ def __getattr__(name: str) -> Any:
     Resolve public re-exports lazily on attribute access.
 
     Importing one symbol from this package no longer drags in
-    every submodule. In particular, subprocess-loaded tool files
-    can ``from agent_plane.tools import tool`` without triggering
-    the ``ToolManager`` → ``mcp`` import chain (which conflicts
-    with the upstream ``mcp`` pip package in subprocess
-    environments — see ``list_builtin_tools.py`` for context).
+    every submodule. Subprocess-loaded tool files import the
+    ``tool`` decorator from ``agent_plane_client`` (not here),
+    which avoids triggering the ``ToolManager`` → ``mcp`` import
+    chain that conflicts with the upstream ``mcp`` pip package
+    in subprocess environments — see ``list_builtin_tools.py``
+    for context on the conflict.
 
     :param name: The attribute name being accessed.
     :returns: The resolved attribute from the appropriate
@@ -83,6 +85,4 @@ __all__ = [
     "Tool",
     "ToolContext",
     "ToolManager",
-    "ToolMetadata",
-    "tool",
 ]

@@ -22,7 +22,7 @@ def _write_tool(py_dir: Path, filename: str, func_name: str) -> None:
     py_dir.mkdir(parents=True, exist_ok=True)
     code = (
         '"""tool fixture."""\n'
-        "from agent_plane.tools import tool\n"
+        "from agent_plane_client import tool\n"
         "\n"
         "\n"
         "@tool\n"
@@ -130,7 +130,7 @@ def test_multi_tool_file_collision_with_builtin(tmp_path: Path) -> None:
     multi = textwrap.dedent(
         '''\
         """Multi-tool file with one colliding name."""
-        from agent_plane.tools import tool
+        from agent_plane_client import tool
 
 
         @tool

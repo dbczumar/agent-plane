@@ -9,7 +9,7 @@ Demonstrates PEP 723 inline dependencies — ``uv`` auto-installs
 ``ftfy`` on first invocation.
 """
 
-from agent_plane.tools import tool
+from agent_plane_client import tool
 
 
 @tool
