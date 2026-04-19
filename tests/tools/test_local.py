@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 from pathlib import Path
 
 import pytest
@@ -201,10 +202,13 @@ def test_cancel_kills_subprocess(tmp_path: Path, tool_ctx: ToolContext) -> None:
 
     deadline = time.time() + 5.0
     while time.time() < deadline:
-        if tool._proc is not None and tool._proc.pid:
+        with tool._procs_lock:
+            started = bool(tool._live_procs)
+        if started:
             break
         time.sleep(0.05)
-    assert tool._proc is not None, "subprocess never started"
+    with tool._procs_lock:
+        assert tool._live_procs, "subprocess never started"
 
     tool.cancel()
     thread.join(timeout=5.0)
@@ -402,7 +406,7 @@ def _make_tool(
 def test_build_command_plain(tmp_path: Path) -> None:
     """No srt, no uv → ``[python, _runner.py]``."""
     tool = _make_tool(tmp_path)
-    cmd = tool._build_command()
+    cmd = tool._build_command(state_root=None)
     assert cmd[0] == sys.executable
     assert cmd[1].endswith("_runner.py")
 
@@ -415,7 +419,7 @@ def test_build_command_with_uv(tmp_path: Path) -> None:
         inline_deps=["ftfy>=6.0"],
         uv_available=True,
     )
-    cmd = tool._build_command()
+    cmd = tool._build_command(state_root=None)
     assert cmd[:2] == ["uv", "run"]
     assert "--with" in cmd
     assert "ftfy>=6.0" in cmd
@@ -426,7 +430,7 @@ def test_build_command_with_uv(tmp_path: Path) -> None:
 def test_build_command_with_srt(tmp_path: Path) -> None:
     """srt available + sandbox → ``srt -c '<command>'``."""
     tool = _make_tool(tmp_path, srt_available=True, sandbox_enabled=True)
-    cmd = tool._build_command()
+    cmd = tool._build_command(state_root=None)
     assert cmd[0] == "srt"
     assert cmd[1] == "-c"
 
@@ -434,14 +438,14 @@ def test_build_command_with_srt(tmp_path: Path) -> None:
 def test_build_command_srt_disabled(tmp_path: Path) -> None:
     """srt available but sandbox disabled → no srt prefix."""
     tool = _make_tool(tmp_path, srt_available=True, sandbox_enabled=False)
-    cmd = tool._build_command()
+    cmd = tool._build_command(state_root=None)
     assert cmd[0] == sys.executable
 
 
 def test_build_command_docker(tmp_path: Path) -> None:
     """docker_image set → docker run command."""
     tool = _make_tool(tmp_path, docker_image="python:3.11")
-    cmd = tool._build_command()
+    cmd = tool._build_command(state_root=None)
     assert cmd[0] == "docker"
     assert "run" in cmd
     assert "python:3.11" in cmd
@@ -695,3 +699,101 @@ def test_runner_passes_string_return_unchanged(tmp_path: Path) -> None:
     response = _run_runner_with_request(py_dir / "strret.py", "strret", {"value": "world"})
     # No extra quoting / JSON wrapping for str returns.
     assert response["result"] == "hello world"
+
+
+def test_concurrent_invoke_does_not_race_on_instance_state(
+    tmp_path: Path,
+    tool_ctx: ToolContext,
+) -> None:
+    """Concurrent invocations on the same tool instance must not race.
+
+    Regression test: ``LocalPythonTool`` previously stashed the
+    live subprocess on ``self._proc`` during each ``invoke()``
+    call and reset it to ``None`` in the ``finally``. With
+    multiple concurrent tool calls on the same instance (the
+    runtime dispatches parallel ``function_call`` items), one
+    call's ``self._proc = None`` would race another call's
+    ``self._proc.returncode`` read and raise
+    ``AttributeError: 'NoneType' object has no attribute
+    'returncode'``.
+
+    What this test verifies:
+    * All N concurrent invocations return a non-error result
+      string (so no ``AttributeError`` bubbled through).
+    * No call returns the "Error:" sentinel prefix that
+      ``_invoke_subprocess`` emits on subprocess failure — the
+      race produced exactly that failure mode in practice.
+    * After all calls complete, ``_live_procs`` is empty (cleanup
+      ran on every path).
+
+    Reasonable N (16) is enough to catch the race: if the old
+    single-``self._proc`` code reappears, even 2 concurrent calls
+    would flake. 16 makes the regression unmissable on CI.
+
+    The testing skill's "concurrency test requirements" (blocked
+    LLM call + release) don't apply here — this is not a workflow
+    test. The blocked-call pattern exists to freeze an LLM
+    response at a known point; we're instead testing the
+    Python-level race inside ``LocalPythonTool.invoke``, and the
+    ``threading.Barrier`` is the analogous synchronization
+    primitive: it forces N workers to enter ``invoke()`` at the
+    same wall-clock moment so the instance-state race actually
+    races.
+    """
+    py_dir = tmp_path / "tools" / "python"
+    _write_decorated_tool(py_dir, "echo_concurrent.py", func_name="echo_concurrent")
+    info = LocalToolInfo(
+        name="echo_concurrent",
+        path="tools/python/echo_concurrent.py",
+        language="python",
+    )
+    tools = load_local_python_tools([info], tmp_path)
+    tool = tools[0]
+
+    num_calls = 16
+    results: list[str] = [""] * num_calls
+    errors: list[BaseException | None] = [None] * num_calls
+    # Start-gate: every worker blocks on the barrier so all N
+    # invocations enter ``invoke()`` around the same wall-clock
+    # moment. Without this, threads serialize naturally and the
+    # race window shrinks.
+    barrier = threading.Barrier(num_calls)
+
+    def _worker(i: int) -> None:
+        barrier.wait()
+        try:
+            results[i] = tool.invoke(json.dumps({"value": f"v{i}"}), tool_ctx)
+        except Exception as exc:  # noqa: BLE001 — capture any exception for the assertion below; the race manifests as AttributeError
+            errors[i] = exc
+
+    threads = [threading.Thread(target=_worker, args=(i,)) for i in range(num_calls)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30.0)
+        assert not t.is_alive(), "worker did not complete"
+
+    # No thread raised — the NoneType bug would surface here.
+    for i, err in enumerate(errors):
+        assert err is None, f"worker {i} raised {err!r}"
+
+    # Every call produced its own distinct result. If the race
+    # had swapped outputs between calls, the mapping would break.
+    for i, r in enumerate(results):
+        assert not r.startswith("Error:"), (
+            f"worker {i} got error string {r!r}. A NoneType race on "
+            f"self._proc.returncode surfaces as Error: here."
+        )
+        assert f"v{i}" in r, (
+            f"worker {i} got {r!r}, doesn't contain its own input 'v{i}'. "
+            f"If two calls' arguments got crossed, the instance state "
+            f"is still being shared improperly."
+        )
+
+    # Cleanup ran on every finally — no live procs leaked.
+    with tool._procs_lock:
+        leaked = list(tool._live_procs)
+    assert leaked == [], (
+        f"_live_procs should be empty after all calls complete, got {leaked}. "
+        f"A finally branch is skipping the discard() call."
+    )

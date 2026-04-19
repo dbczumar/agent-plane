@@ -36,6 +36,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import ModuleType
 
@@ -124,13 +125,15 @@ class LocalPythonTool(Tool):
         self._sandbox_enabled = sandbox_enabled
         self._srt_available = srt_available
         self._uv_available = uv_available
-        self._proc: subprocess.Popen[bytes] | None = None
-        self._workspace: Path | None = None
-        # Set on each invoke() to the per-conversation, per-agent
-        # tool-state dir (or ``None`` for stateless tools / tools
-        # invoked without a workspace). Read by ``_prepend_srt`` to
-        # whitelist the dir for writes inside the srt sandbox.
-        self._state_root: str | None = None
+        # Live subprocesses from any in-flight ``invoke()`` — tracked
+        # as a set guarded by a lock so ``cancel()`` can kill all of
+        # them at once. A single ``self._proc`` would race when the
+        # runtime dispatches multiple concurrent tool calls on the
+        # same tool instance (six parallel add_task calls on a
+        # stateful tool, for example): each overwrites the previous
+        # and ``self._proc.returncode`` reads fail with None.
+        self._live_procs: set[subprocess.Popen[bytes]] = set()
+        self._procs_lock = threading.Lock()
 
     def name(self) -> str:  # type: ignore[override]
         """
@@ -226,9 +229,6 @@ class LocalPythonTool(Tool):
             state_dir = ctx.workspace / ".tool_state" / ctx.agent_id
             state_dir.mkdir(parents=True, exist_ok=True)
             state_root = str(state_dir)
-        # Stash on ``self`` so ``_prepend_srt`` / the settings
-        # writer can whitelist this path inside the sandbox.
-        self._state_root = state_root
 
         request = json.dumps(
             {
@@ -239,55 +239,67 @@ class LocalPythonTool(Tool):
             }
         ).encode()
 
-        # Pass workspace to the subprocess so local tools can resolve
-        # relative paths (e.g. validate_agent resolving sandbox dirs).
-        self._workspace = ctx.workspace
-
         # srt and Docker both wrap the command in their own process
         # chain, so the fd 3 pipe doesn't survive to the inner
         # Python process. Use the stdout protocol instead.
         srt_active = self._srt_available and self._sandbox_enabled
         use_stdout = self._sandbox_config.docker_image is not None or srt_active
+        cmd = self._build_command(state_root=state_root)
         if use_stdout:
-            return self._invoke_stdout(request)
-        return self._invoke_subprocess(request)
+            return self._invoke_stdout(cmd, request, workspace=ctx.workspace)
+        return self._invoke_subprocess(cmd, request, workspace=ctx.workspace)
 
-    def _invoke_subprocess(self, request: bytes) -> str:
+    def _invoke_subprocess(
+        self,
+        cmd: list[str],
+        request: bytes,
+        *,
+        workspace: Path | None,
+    ) -> str:
         """
         Run the tool via a local subprocess with fd 3 pipe.
 
+        :param cmd: Command list to spawn.
         :param request: JSON-encoded request bytes.
+        :param workspace: Per-conversation workspace path, forwarded
+            via ``_AP_WORKSPACE``. ``None`` skips the env var.
         :returns: Tool result or error string.
         """
         read_fd, write_fd = os.pipe()
         try:
             env = {**os.environ, "_AP_RESPONSE_FD": str(write_fd)}
-            if self._workspace is not None:
-                env["_AP_WORKSPACE"] = str(self._workspace)
-            self._proc = subprocess.Popen(
-                self._build_command(),
+            if workspace is not None:
+                env["_AP_WORKSPACE"] = str(workspace)
+            proc = subprocess.Popen(
+                cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 pass_fds=(write_fd,),
                 env=env,
             )
+            with self._procs_lock:
+                self._live_procs.add(proc)
             os.close(write_fd)
             write_fd = -1
-
-            stdout, stderr = self._proc.communicate(input=request)
-            return _read_fd3_response(
-                read_fd,
-                self._proc.returncode,
-                stderr,
-            )
+            try:
+                stdout, stderr = proc.communicate(input=request)
+                return _read_fd3_response(read_fd, proc.returncode, stderr)
+            finally:
+                with self._procs_lock:
+                    self._live_procs.discard(proc)
         finally:
-            self._proc = None
             if write_fd != -1:
                 os.close(write_fd)
             os.close(read_fd)
 
-    def _invoke_stdout(self, request: bytes) -> str:
+    def _invoke_stdout(
+        self,
+        cmd: list[str],
+        request: bytes,
+        *,
+        workspace: Path | None,
+    ) -> str:
         """
         Run the tool via stdout protocol (for srt and Docker).
 
@@ -296,35 +308,42 @@ class LocalPythonTool(Tool):
         writes the response to stdout with a ``__AP_RESPONSE__:``
         prefix instead.
 
+        :param cmd: Command list to spawn.
         :param request: JSON-encoded request bytes.
+        :param workspace: Per-conversation workspace path, forwarded
+            via ``_AP_WORKSPACE``. ``None`` skips the env var.
         :returns: Tool result or error string.
         """
+        env = {**os.environ, "_AP_RESPONSE_MODE": "stdout"}
+        if workspace is not None:
+            env["_AP_WORKSPACE"] = str(workspace)
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        with self._procs_lock:
+            self._live_procs.add(proc)
         try:
-            env = {**os.environ, "_AP_RESPONSE_MODE": "stdout"}
-            if self._workspace is not None:
-                env["_AP_WORKSPACE"] = str(self._workspace)
-            self._proc = subprocess.Popen(
-                self._build_command(),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-            )
-            stdout, stderr = self._proc.communicate(input=request)
-            return _read_stdout_response(
-                stdout,
-                self._proc.returncode,
-                stderr,
-            )
+            stdout, stderr = proc.communicate(input=request)
+            return _read_stdout_response(stdout, proc.returncode, stderr)
         finally:
-            self._proc = None
+            with self._procs_lock:
+                self._live_procs.discard(proc)
 
-    def _build_command(self) -> list[str]:
+    def _build_command(self, *, state_root: str | None) -> list[str]:
         """
         Build the subprocess command based on execution tier.
 
         Priority: Docker > srt+uv > srt > uv > plain.
 
+        :param state_root: Per-call ToolState directory (or ``None``
+            for stateless tools). Threaded through so the srt
+            settings file, written per invocation, whitelists the
+            right path — passing via ``self`` would race between
+            concurrent ``invoke()`` calls.
         :returns: The command list for ``subprocess.Popen``.
         """
         if self._sandbox_config.docker_image is not None:
@@ -336,7 +355,7 @@ class LocalPythonTool(Tool):
         # to its cache). srt wraps only the inner python command.
         if self._info.has_inline_deps and self._uv_available:
             return self._build_uv_command(base)
-        base = self._prepend_srt(base)
+        base = self._prepend_srt(base, state_root=state_root)
         return base
 
     def _build_uv_command(self, base: list[str]) -> list[str]:
@@ -369,7 +388,12 @@ class LocalPythonTool(Tool):
             uv_args.extend(["--", "python", _RUNNER_PATH])
         return uv_args
 
-    def _prepend_srt(self, cmd: list[str]) -> list[str]:
+    def _prepend_srt(
+        self,
+        cmd: list[str],
+        *,
+        state_root: str | None,
+    ) -> list[str]:
         """
         Prepend ``srt`` if sandbox is enabled and available.
 
@@ -388,6 +412,9 @@ class LocalPythonTool(Tool):
         which would hide the venv python from the runner.
 
         :param cmd: The base command to wrap.
+        :param state_root: Per-call ToolState directory, or ``None``
+            for stateless invocations. A stateless call skips the
+            ``-s`` settings file entirely.
         :returns: The wrapped command.
         """
         if not (self._srt_available and self._sandbox_enabled):
@@ -395,46 +422,9 @@ class LocalPythonTool(Tool):
         import shlex
 
         base = ["srt"]
-        if self._state_root is not None:
-            base += ["-s", self._write_srt_settings_file()]
+        if state_root is not None:
+            base += ["-s", _write_srt_settings_file(state_root)]
         return [*base, "-c", shlex.join(cmd)]
-
-    def _write_srt_settings_file(self) -> str:
-        """Write a per-invocation srt settings file for stateful tools.
-
-        The file whitelists ``self._state_root`` as writable while
-        leaving reads unrestricted (empty ``denyRead``), so the
-        subprocess can still resolve the venv python and its
-        imports. The settings shape matches srt's JSON schema —
-        ``network.{allowedDomains,deniedDomains}`` + ``filesystem.
-        {denyRead,allowRead,allowWrite,denyWrite}`` (see srt's
-        ``SandboxManager`` reference).
-
-        Temp files are intentionally not cleaned up: the payload
-        is trivial (~100 bytes), each invocation writes a fresh
-        one, and the OS tmpwatch handles eventual garbage
-        collection. Cleaning up per-invocation would require
-        another try/finally around the subprocess call, which
-        isn't worth it.
-
-        :returns: Absolute path to the written settings JSON.
-        """
-        import json as _json
-        import tempfile as _tempfile
-
-        settings = {
-            "network": {"allowedDomains": [], "deniedDomains": []},
-            "filesystem": {
-                "denyRead": [],
-                "allowRead": [],
-                "allowWrite": [self._state_root],
-                "denyWrite": [],
-            },
-        }
-        fd, path = _tempfile.mkstemp(suffix=".srt.json")
-        with os.fdopen(fd, "w") as f:
-            _json.dump(settings, f)
-        return path
 
     def _build_docker_command(self) -> list[str]:
         """
@@ -471,17 +461,59 @@ class LocalPythonTool(Tool):
 
     def cancel(self) -> None:
         """
-        Kill the subprocess on timeout.
+        Kill every in-flight subprocess on timeout.
 
         Called by ``call_tool_with_timeout`` when the deadline
-        expires. Sends SIGKILL — the subprocess dies immediately.
+        expires. Sends SIGKILL to each tracked subprocess; any
+        parallel invocations in progress at the same time all get
+        cancelled, which matches the semantics of "this tool's
+        deadline expired."
         """
-        proc = self._proc
-        if proc is not None:
+        with self._procs_lock:
+            procs = list(self._live_procs)
+        for proc in procs:
             try:
                 proc.kill()
             except ProcessLookupError:
                 pass
+
+
+def _write_srt_settings_file(state_root: str) -> str:
+    """Write a per-invocation srt settings file for stateful tools.
+
+    The file whitelists ``state_root`` as writable while leaving
+    reads unrestricted (empty ``denyRead``), so the subprocess can
+    still resolve the venv python and its imports. The settings
+    shape matches srt's JSON schema —
+    ``network.{allowedDomains,deniedDomains}`` + ``filesystem.
+    {denyRead,allowRead,allowWrite,denyWrite}`` (see srt's
+    ``SandboxManager`` reference).
+
+    Temp files are intentionally not cleaned up: the payload is
+    trivial (~100 bytes), each invocation writes a fresh one, and
+    the OS tmpwatch handles eventual garbage collection. Cleaning
+    up per-invocation would require another try/finally around
+    the subprocess call, which isn't worth it.
+
+    :param state_root: Directory to whitelist as writable inside
+        the sandbox.
+    :returns: Absolute path to the written settings JSON.
+    """
+    import tempfile as _tempfile
+
+    settings = {
+        "network": {"allowedDomains": [], "deniedDomains": []},
+        "filesystem": {
+            "denyRead": [],
+            "allowRead": [],
+            "allowWrite": [state_root],
+            "denyWrite": [],
+        },
+    }
+    fd, path = _tempfile.mkstemp(suffix=".srt.json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(settings, f)
+    return path
 
 
 def _read_fd3_response(
