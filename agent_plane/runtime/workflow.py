@@ -4593,16 +4593,26 @@ async def _run_agent_loop(
                         # Re-run the LLM so it can see collected
                         # results and any steered messages.
                         continue
-                    if pending_tool_tasks:
-                        # End-of-turn async-tool auto-collect (D5):
-                        # the LLM has finished but background tools
-                        # are still running. Persist the LLM text
-                        # first so it isn't lost (same ghost-token
-                        # rationale as _persist_text_before_auto_collect),
-                        # then block on the topic until at least one
-                        # signal arrives. The next iteration's drain
-                        # picks up any remaining completions and the
-                        # LLM gets another turn with the results.
+                    # End-of-turn async-tool auto-collect (D5).
+                    # Two race cases combined into one branch:
+                    # * pending_tool_tasks non-empty: a child is
+                    #   still running — we MUST wait so the LLM
+                    #   doesn't return without it.
+                    # * pending_tool_tasks empty BUT non-blocking
+                    #   drain returns payloads: a child terminated
+                    #   AFTER iteration-top drain but BEFORE this
+                    #   point. The signal sits in the DBOS queue
+                    #   and would be lost if we fell through to
+                    #   _handle_final_response. Drain + continue.
+                    late_drained: list[dict[str, Any]] = []
+                    if not pending_tool_tasks:
+                        late_drained = await _drain_async_completions(
+                            block_for_one=False,
+                        )
+                    if pending_tool_tasks or late_drained:
+                        # Persist the LLM text first so it isn't
+                        # lost (ghost-token rationale matches
+                        # _persist_text_before_auto_collect).
                         text = _get_text_content(llm_resp)
                         file_annotations = _collect_file_annotations(output_items)
                         _emit_file_annotations(task_id, file_annotations)
@@ -4620,16 +4630,32 @@ async def _run_agent_loop(
                             output_items,
                         )
                         history.extend(persisted)
-                        drained = await _drain_async_completions(
-                            block_for_one=True,
-                        )
-                        _persist_async_completions(
-                            task_id,
-                            conversation_id,
-                            drained,
-                            output_items,
-                            conv_store,
-                        )
+                        if late_drained:
+                            # Already-drained payloads need
+                            # persisting; pending case will block
+                            # for at least one more.
+                            _persist_async_completions(
+                                task_id,
+                                conversation_id,
+                                late_drained,
+                                output_items,
+                                conv_store,
+                            )
+                        if pending_tool_tasks:
+                            # Block on the topic until at least
+                            # one signal arrives. The next
+                            # iteration's drain picks up
+                            # remaining completions.
+                            blocking = await _drain_async_completions(
+                                block_for_one=True,
+                            )
+                            _persist_async_completions(
+                                task_id,
+                                conversation_id,
+                                blocking,
+                                output_items,
+                                conv_store,
+                            )
                         continue
                     result = await _handle_final_response(
                         task_id,
