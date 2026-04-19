@@ -18,7 +18,6 @@ from agent_plane.runtime.background_tool_workflow import (
     truncate_traceback,
 )
 
-
 # ─── truncate_for_llm ────────────────────────────────────────
 
 

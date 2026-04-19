@@ -136,9 +136,7 @@ def _read_fd3_response(
     if not raw:
         stderr_text = stderr.decode(errors="replace").strip()
         if returncode != 0:
-            raise RuntimeError(
-                f"tool subprocess exited with code {returncode}: {stderr_text}"
-            )
+            raise RuntimeError(f"tool subprocess exited with code {returncode}: {stderr_text}")
         raise RuntimeError(f"tool produced no response. stderr: {stderr_text}")
 
     try:

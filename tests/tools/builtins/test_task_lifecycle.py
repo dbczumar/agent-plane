@@ -7,7 +7,7 @@ server-integration suite.
 
 from __future__ import annotations
 
-from agent_plane.entities.task import Task, TaskStatus
+from agent_plane.entities.task import Task
 from agent_plane.tools.builtins.task_lifecycle import (
     _ACTIVITY_MAX_CHARS,
     CancelTaskTool,
@@ -16,7 +16,6 @@ from agent_plane.tools.builtins.task_lifecycle import (
     _build_check_payload,
     _truncate_content_field,
 )
-
 
 # ─── truncation helper ───────────────────────────────────────
 

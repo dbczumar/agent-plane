@@ -154,9 +154,7 @@ def format_failure_payload(exc: BaseException) -> dict[str, str]:
         and ``"traceback"`` (truncated to the line budget) keys.
         Both values are JSON-safe strings.
     """
-    tb_text = "".join(
-        traceback.format_exception(type(exc), exc, exc.__traceback__)
-    )
+    tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     return {
         "message": f"{type(exc).__name__}: {exc}",
         "traceback": truncate_traceback(tb_text),
