@@ -163,8 +163,24 @@ class SqlAlchemyConversationStore(ConversationStore):
             # clean exception type the spawn/send tools can map
             # to a name_already_exists tool error. Other integrity
             # violations (FK, check constraints) re-raise.
+            #
+            # Detection prefers the specific index name (Postgres
+            # surfaces it directly), and falls back to the
+            # ``parent_conversation_id`` + ``title`` column
+            # signature (SQLite tends to format the message that
+            # way). This is narrower than a generic "unique"
+            # check, which would misclassify any future unique
+            # constraint added to the conversations table.
             msg = str(exc).lower()
-            if "ix_conversations_parent_title_unique" in msg or "unique" in msg:
+            is_partial_index_violation = (
+                "ix_conversations_parent_title_unique" in msg
+                or (
+                    "unique" in msg
+                    and "parent_conversation_id" in msg
+                    and "title" in msg
+                )
+            )
+            if is_partial_index_violation:
                 raise NameAlreadyExistsError(
                     f"sub-agent name already exists under parent "
                     f"{parent_conversation_id!r}: title={title!r}"

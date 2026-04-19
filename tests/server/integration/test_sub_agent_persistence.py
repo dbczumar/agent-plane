@@ -162,9 +162,7 @@ async def test_spawn_persists_named_child_with_correct_title(
     # would never match. If parent_conversation_id were null
     # the partial unique index wouldn't fire and ambient hint
     # wouldn't surface this child.
-    assert child.title == "coder:auth", (
-        f"Child title must be '<type>:<name>'; got {child.title!r}"
-    )
+    assert child.title == "coder:auth", f"Child title must be '<type>:<name>'; got {child.title!r}"
     assert child.parent_conversation_id == parent_conv_id
 
 
@@ -277,8 +275,7 @@ async def test_send_to_sub_agent_appends_to_existing_conversation(
         f"user_texts={user_texts}"
     )
     assert any("now add tests" in t for t in user_texts), (
-        f"Turn 2's input missing from child conversation. "
-        f"user_texts={user_texts}"
+        f"Turn 2's input missing from child conversation. user_texts={user_texts}"
     )
 
 
@@ -343,17 +340,14 @@ async def test_spawn_duplicate_name_returns_name_already_exists(
     # working. If both failed, _spawn_one is too aggressive.
     successes = [o for o in fco_outputs if "task_id" in o]
     failures = [
-        o
-        for o in fco_outputs
-        if isinstance(o, dict) and o.get("error") == "name_already_exists"
+        o for o in fco_outputs if isinstance(o, dict) and o.get("error") == "name_already_exists"
     ]
     assert len(successes) == 1, (
         f"Expected exactly 1 successful spawn; got {len(successes)}. "
         f"Both successful = unique index not enforced."
     )
     assert len(failures) == 1, (
-        f"Expected exactly 1 name_already_exists; got {len(failures)}. "
-        f"Outputs: {fco_outputs}"
+        f"Expected exactly 1 name_already_exists; got {len(failures)}. Outputs: {fco_outputs}"
     )
     # The failure payload must include the offending (type, name)
     # so the LLM can recover deterministically.
@@ -403,8 +397,7 @@ async def test_send_to_unknown_name_returns_sub_agent_not_found(
         (
             i
             for i in items
-            if i.get("type") == "function_call_output"
-            and i.get("call_id") == "call_send_unknown"
+            if i.get("type") == "function_call_output" and i.get("call_id") == "call_send_unknown"
         ),
         None,
     )
@@ -667,8 +660,8 @@ async def test_ambient_hint_appears_in_followup_prompt(
         and "Open sub-agents:" in str(c.received_kwargs.get("instructions") or "")
     ]
     assert matched, (
-        f"No LLM call across the whole test had the ambient hint "
-        f"with 'Open sub-agents:' + 'coder:auth' in its "
-        f"instructions field. D6 wiring broken or no turn-2 call "
-        f"reached the LLM with the hint applied."
+        "No LLM call across the whole test had the ambient hint "
+        "with 'Open sub-agents:' + 'coder:auth' in its "
+        "instructions field. D6 wiring broken or no turn-2 call "
+        "reached the LLM with the hint applied."
     )

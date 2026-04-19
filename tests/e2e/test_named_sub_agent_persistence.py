@@ -155,11 +155,7 @@ def _conversation_items(http_client: httpx.Client, conversation_id: str) -> list
 
 def _function_call_names(items: list[dict]) -> list[str]:
     """Return the names of all function_call items in order."""
-    return [
-        item.get("name", "")
-        for item in items
-        if item.get("type") == "function_call"
-    ]
+    return [item.get("name", "") for item in items if item.get("type") == "function_call"]
 
 
 # ─── Tests ───────────────────────────────────────────────────
@@ -186,13 +182,11 @@ def test_spawn_named_sub_agent_e2e(
         ),
     )
     assert body["status"] == "completed", (
-        f"Turn did not complete: status={body.get('status')!r}, "
-        f"error={body.get('error')!r}"
+        f"Turn did not complete: status={body.get('status')!r}, error={body.get('error')!r}"
     )
     final = _final_text(body)
     assert "RESEARCHER_PHASE4_OK" in final, (
-        f"Expected the researcher marker in the final response. "
-        f"Got: {final!r}"
+        f"Expected the researcher marker in the final response. Got: {final!r}"
     )
 
     # Verify the child conversation was titled "researcher:auth".
@@ -204,8 +198,7 @@ def test_spawn_named_sub_agent_e2e(
         if item.get("type") == "function_call" and item.get("name") == "spawn_sub_agent"
     ]
     assert len(spawn_calls) >= 1, (
-        f"Expected at least 1 spawn_sub_agent call; got "
-        f"{_function_call_names(items)}"
+        f"Expected at least 1 spawn_sub_agent call; got {_function_call_names(items)}"
     )
     # The spawn arguments must include name="auth" — proves
     # the LLM picked up the new required field from the schema.
@@ -322,7 +315,7 @@ def test_ambient_hint_steers_followup_to_send_e2e(
     fc_names = _function_call_names(items_t2)
     # Find function calls that came AFTER the turn-1 ones —
     # turn 1 had a spawn, turn 2's calls are the new ones.
-    new_calls = fc_names[len(_function_call_names(items_t1)):]
+    new_calls = fc_names[len(_function_call_names(items_t1)) :]
     assert "send_to_sub_agent" in new_calls, (
         f"Turn 2's neutral prompt didn't trigger send_to_sub_agent "
         f"— ambient hint failed to surface the existing sub-agent. "
@@ -355,12 +348,8 @@ def test_parallel_named_sub_agents_e2e(
     )
     assert body["status"] == "completed"
     final = _final_text(body)
-    assert "RESEARCHER_PHASE4_OK" in final, (
-        f"Researcher marker missing from final: {final!r}"
-    )
-    assert "SUMMARIZER_PHASE4_OK" in final, (
-        f"Summarizer marker missing from final: {final!r}"
-    )
+    assert "RESEARCHER_PHASE4_OK" in final, f"Researcher marker missing from final: {final!r}"
+    assert "SUMMARIZER_PHASE4_OK" in final, f"Summarizer marker missing from final: {final!r}"
 
 
 def test_cross_parent_named_isolation_e2e(
