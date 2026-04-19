@@ -22,6 +22,7 @@ fake per the testing skill (rule #3).
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -51,9 +52,30 @@ class MockToolCall:
 
     result: str = "mock-tool-result"
     exception: BaseException | None = None
-    block_before_response: asyncio.Event | None = None
-    call_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # threading.Event (not asyncio.Event) so the test event loop
+    # can ``set()`` cross-loop into DBOS's background event loop
+    # where the tool body runs. asyncio.Event is loop-bound and
+    # silently fails to wake awaiters across loops.
+    block_before_response: threading.Event | None = None
+    call_event: threading.Event = field(default_factory=threading.Event)
     received_arguments: dict[str, Any] | None = field(default=None, repr=False)
+
+    async def wait_called(self, *, timeout: float = 10.0) -> None:
+        """
+        Asynchronously wait until this MockToolCall was entered.
+
+        Bridges the underlying sync ``threading.Event`` into an
+        awaitable so tests can ``await call.wait_called()``
+        regardless of which loop the tool body runs on.
+
+        :param timeout: Max seconds to wait. ``TimeoutError``
+            raised if exceeded.
+        """
+        await asyncio.to_thread(self.call_event.wait, timeout)
+        if not self.call_event.is_set():
+            raise TimeoutError(
+                f"MockToolCall.call_event not set within {timeout}s",
+            )
 
     def release(self) -> None:
         """Unblock a tool body waiting on ``block_before_response``."""
@@ -117,7 +139,7 @@ class ControllableMockTool:
         call = MockToolCall(
             result=result,
             exception=exception,
-            block_before_response=asyncio.Event() if block else None,
+            block_before_response=threading.Event() if block else None,
         )
         self._queue.append(call)
         return call
@@ -141,7 +163,10 @@ class ControllableMockTool:
         self.received_calls.append(call)
         call.call_event.set()
         if call.block_before_response is not None:
-            await call.block_before_response.wait()
+            # threading.Event.wait is sync — bridge to async via
+            # asyncio.to_thread so the surrounding loop yields
+            # while the offloaded thread blocks.
+            await asyncio.to_thread(call.block_before_response.wait)
         if call.exception is not None:
             raise call.exception
         return call.result

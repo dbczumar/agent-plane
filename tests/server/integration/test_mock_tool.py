@@ -102,7 +102,7 @@ async def test_blocked_call_does_not_return_until_release() -> None:
     # Wait until the body has signalled entry, then prove it's
     # still suspended — if it weren't blocking, the task would
     # already be done by the time we ask.
-    await asyncio.wait_for(call.call_event.wait(), timeout=1.0)
+    await call.wait_called(timeout=1.0)
     assert not invoke_task.done(), (
         "Blocked call returned before release() was called — "
         "block_before_response is not actually gating the body."
@@ -130,7 +130,7 @@ async def test_call_event_fires_before_block_so_test_can_synchronize() -> None:
     # If call_event were set after block_before_response.wait(),
     # this wait_for would time out — the body would be parked on
     # the block event forever and never set call_event.
-    await asyncio.wait_for(call.call_event.wait(), timeout=1.0)
+    await call.wait_called(timeout=1.0)
 
     call.release()
     await invoke_task
@@ -146,7 +146,7 @@ async def test_release_all_unblocks_every_pending_call() -> None:
     # Start the first invocation so it sits in the consumed list,
     # blocked.
     invoke_task = asyncio.create_task(tool())
-    await asyncio.wait_for(call_consumed.call_event.wait(), timeout=1.0)
+    await call_consumed.wait_called(timeout=1.0)
 
     # release_all should unblock both: the in-flight one (so the
     # task finishes) AND the still-queued one (so a future invoke
@@ -171,11 +171,15 @@ async def test_release_all_unblocks_every_pending_call() -> None:
 
 def test_default_mock_call_has_no_block_event() -> None:
     """A non-blocking call has ``block_before_response=None``."""
+    import threading
+
     call = MockToolCall()
     # If block_before_response were always created, every call
     # would have a release() side-effect — release_all wouldn't
     # be able to distinguish blocking from non-blocking calls.
     assert call.block_before_response is None
     # call_event always exists — tests can wait on it whether
-    # the call blocks or not.
-    assert isinstance(call.call_event, asyncio.Event)
+    # the call blocks or not. threading.Event (not asyncio.Event)
+    # so cross-loop set()/wait() works between the test loop and
+    # DBOS's background workflow loop.
+    assert isinstance(call.call_event, threading.Event)

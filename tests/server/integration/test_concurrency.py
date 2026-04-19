@@ -79,7 +79,7 @@ async def test_steering_delivers_to_running_workflow(
     assert first.body["status"] == "queued"
 
     # Gate: workflow is inside the LLM call
-    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
+    await call_1.wait_called(timeout=10)
 
     # Concurrent action: steer while workflow is blocked
     second = await create_test_response(
@@ -148,7 +148,7 @@ async def test_steering_preserves_position_order(
     conv_id = first.body["conversation"]["id"]
 
     # Gate: workflow is inside the LLM call
-    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
+    await call_1.wait_called(timeout=10)
 
     # Concurrent action: steer while workflow is blocked
     await create_test_response(
@@ -222,7 +222,7 @@ async def test_multiple_steering_messages_while_blocked(
     conv_id = first.body["conversation"]["id"]
 
     # Gate: workflow is inside the LLM call
-    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
+    await call_1.wait_called(timeout=10)
 
     # Concurrent action 1: first steering message
     steer_1 = await create_test_response(
@@ -321,12 +321,12 @@ async def test_steering_during_tool_execution(
     conv_id = first.body["conversation"]["id"]
 
     # Gate 1: workflow is blocked before returning tool calls
-    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
+    await call_1.wait_called(timeout=10)
     call_1.release()
 
     # Gate 2: tool executed, LLM called again with results,
     # now blocked in second LLM call
-    await asyncio.wait_for(call_2.call_event.wait(), timeout=10)
+    await call_2.wait_called(timeout=10)
 
     # Concurrent action: steer while blocked in second LLM call
     # (tool results are already persisted at this point)
@@ -402,7 +402,7 @@ async def test_steer_during_handle_final_response_creates_new_task(
     conv_id = first.body["conversation"]["id"]
 
     # Gate: workflow blocked in LLM call 1
-    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
+    await call_1.wait_called(timeout=10)
 
     # Steer A: leopard delivered during LLM call 1
     steer_a = await create_test_response(
@@ -498,7 +498,7 @@ async def test_chained_steering_across_iterations(
     conv_id = first.body["conversation"]["id"]
 
     # Gate 1: workflow blocked in LLM call 1
-    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
+    await call_1.wait_called(timeout=10)
 
     # Steer A: deliver "leopard" while LLM call 1 is in progress
     steer_a = await create_test_response(
@@ -514,7 +514,7 @@ async def test_chained_steering_across_iterations(
     # Release LLM call 1 → _handle_final_response detects
     # leopard → _SteeringRetry → loop continues → LLM call 2
     call_1.release()
-    await asyncio.wait_for(call_2.call_event.wait(), timeout=10)
+    await call_2.wait_called(timeout=10)
 
     # Steer B: deliver "moose" while LLM call 2 is in progress.
     # This is the critical test: the inbox must still be open
@@ -536,7 +536,7 @@ async def test_chained_steering_across_iterations(
     # Release LLM call 2 → detects moose → _SteeringRetry →
     # LLM call 3
     call_2.release()
-    await asyncio.wait_for(call_3.call_event.wait(), timeout=10)
+    await call_3.wait_called(timeout=10)
 
     # Release LLM call 3 → completes
     call_3.release()
@@ -614,7 +614,7 @@ async def test_steering_between_persist_and_close_inbox(
     conv_id = first.body["conversation"]["id"]
 
     # Gate: workflow is inside the LLM call
-    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
+    await call_1.wait_called(timeout=10)
 
     # NOTE: Monkeypatching _check_steering_inbox (a private function)
     # is necessary because the race window between Step 2 and Step 3
@@ -780,7 +780,7 @@ async def test_steering_during_streaming_processed_after_complete(
     conv_id = first.body["conversation"]["id"]
 
     # Gate: workflow is blocked before the stream starts
-    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
+    await call_1.wait_called(timeout=10)
 
     # Concurrent action: steer while workflow is blocked.
     # In production, this would arrive mid-stream (during
@@ -856,10 +856,15 @@ async def test_steering_during_llm_retry(
     await create_test_agent(client)
 
     # Skip backoff sleep so tests don't wait 2+ seconds.
-    # The steering mechanism is orthogonal to sleep duration.
+    # The async LLM-call path uses asyncio.sleep, not time.sleep
+    # — patch the module-level reference so the await yields a
+    # zero-tick instead of a real backoff.
+    async def _no_backoff(_delay: float) -> None:
+        return None
+
     monkeypatch.setattr(
-        "agent_plane.runtime.llm_retry.time.sleep",
-        lambda _: None,
+        "agent_plane.runtime.llm_retry.asyncio.sleep",
+        _no_backoff,
     )
 
     # Call 1: raises HTTP 429 — classified as retryable.
@@ -891,7 +896,7 @@ async def test_steering_during_llm_retry(
 
     # Gate: call_1 fires and raises immediately. execute_with_retry
     # retries → call_2 fires and blocks.
-    await asyncio.wait_for(call_2.call_event.wait(), timeout=10)
+    await call_2.wait_called(timeout=10)
 
     # Concurrent action: steer while the retry is blocked in
     # the LLM call.
@@ -978,7 +983,7 @@ async def test_foreground_steering_returns_immediately(
     conv_id = first.body["conversation"]["id"]
 
     # Gate: workflow blocked in LLM call
-    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
+    await call_1.wait_called(timeout=10)
 
     # Concurrent action: steer with background=false.
     # This MUST return immediately (not block until completion).
@@ -1147,8 +1152,8 @@ async def test_steering_during_auto_collect(
 
     # Gate: both blocked calls are entered. Now we know the
     # parent and sub-agent are each sitting on a blocked call.
-    await asyncio.wait_for(call_a.call_event.wait(), timeout=10)
-    await asyncio.wait_for(call_b.call_event.wait(), timeout=10)
+    await call_a.wait_called(timeout=10)
+    await call_b.wait_called(timeout=10)
 
     parent_call, sub_call = _identify_parent_and_sub(
         call_a,
@@ -1309,8 +1314,8 @@ async def test_ghost_text_persisted_before_auto_collect(
     conv_id = first.body["conversation"]["id"]
 
     # Gate: both blocked calls are entered.
-    await asyncio.wait_for(call_a.call_event.wait(), timeout=10)
-    await asyncio.wait_for(call_b.call_event.wait(), timeout=10)
+    await call_a.wait_called(timeout=10)
+    await call_b.wait_called(timeout=10)
 
     parent_call, sub_call = _identify_parent_and_sub(
         call_a,
@@ -1403,7 +1408,7 @@ async def test_cancel_during_llm_call(
     response_id = result.body["id"]
 
     # Gate: workflow is inside the LLM call
-    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
+    await call_1.wait_called(timeout=10)
 
     # Concurrent action: cancel while blocked in LLM
     cancel_resp = await client.post(
@@ -1449,7 +1454,7 @@ async def test_cancel_idempotent_while_blocked(
     response_id = result.body["id"]
 
     # Gate: workflow is inside the LLM call
-    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
+    await call_1.wait_called(timeout=10)
 
     # Concurrent action: cancel twice while still blocked
     resp1 = await client.post(
@@ -1497,7 +1502,7 @@ async def test_steering_then_cancel_preserves_message(
     conv_id = first.body["conversation"]["id"]
 
     # Gate: workflow is inside the LLM call
-    await asyncio.wait_for(call_1.call_event.wait(), timeout=10)
+    await call_1.wait_called(timeout=10)
 
     # Concurrent action 1: steer while blocked
     steer = await create_test_response(

@@ -82,8 +82,14 @@ class MockCall:
 
     text: str = "Hello from the test agent."
     tool_calls: list[dict[str, str]] | None = None
-    block_before_response: asyncio.Event | None = None
-    call_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # threading.Event (not asyncio.Event) so the test event loop
+    # can ``set()`` cross-loop into DBOS's background event loop
+    # where the workflow body runs. asyncio.Event's internal
+    # futures are loop-bound — calling ``set()`` from loop A
+    # never wakes a ``wait()`` parked on loop B (silent hang
+    # under any block=True mock LLM scenario).
+    block_before_response: threading.Event | None = None
+    call_event: threading.Event = field(default_factory=threading.Event)
     stream_tokens: bool = False
     exception: Exception | None = None
     # Callable[[dict[str, Any]], list[dict[str, str]]] — generates
@@ -103,6 +109,26 @@ class MockCall:
         default=None,
         repr=False,
     )
+
+    async def wait_called(self, *, timeout: float = 10.0) -> None:
+        """
+        Asynchronously wait until this MockCall has been entered.
+
+        Bridges the underlying sync ``threading.Event`` (chosen
+        because the workflow body runs on DBOS's
+        ``_background_event_loop`` while the test runs on
+        pytest-asyncio's loop, and asyncio.Event doesn't sync
+        cross-loop) into an awaitable the test can use.
+
+        :param timeout: Max seconds to wait. ``TimeoutError`` is
+            raised if exceeded — matches the prior behavior of
+            ``asyncio.wait_for(call.call_event.wait(), timeout)``.
+        """
+        await asyncio.to_thread(self.call_event.wait, timeout)
+        if not self.call_event.is_set():
+            raise TimeoutError(
+                f"MockCall.call_event not set within {timeout}s",
+            )
 
     def release(self) -> None:
         """
@@ -209,7 +235,7 @@ class ControllableMockClient:
             text=text or self._default_text,
             tool_calls=tool_calls,
             tool_calls_fn=tool_calls_fn,
-            block_before_response=asyncio.Event() if block else None,
+            block_before_response=threading.Event() if block else None,
             stream_tokens=stream_tokens,
             exception=exception,
             exception_fn=exception_fn,
@@ -304,13 +330,18 @@ class _MockResponsesNamespace:
             dynamic = call.tool_calls_fn(kwargs)
             if dynamic is not None:
                 call.tool_calls = dynamic
-        # Signal that this call has been entered
+        # Signal that this call has been entered. threading.Event
+        # is thread-safe — set() from any loop wakes wait() in
+        # any other loop, which matters because the workflow
+        # body runs on DBOS's _background_event_loop while the
+        # test runs on pytest-asyncio's loop.
         call.call_event.set()
-        # Optionally block until the test releases us.
-        # asyncio.Event.wait() yields to the event loop, so
-        # other tasks (e.g. the test) can proceed.
+        # Optionally block until the test releases us. Use
+        # asyncio.to_thread to bridge a sync threading.Event
+        # wait into the async event loop without parking the
+        # loop — the offloaded thread blocks; the loop yields.
         if call.block_before_response is not None:
-            await call.block_before_response.wait()
+            await asyncio.to_thread(call.block_before_response.wait)
         # Raise configured exception (simulates retryable errors).
         # exception_fn fires only if its predicate decides this
         # specific kwargs payload should fail; useful for FIFO-

@@ -331,7 +331,7 @@ async def run_server_1(
     # Gate: workflow passed the tool call and entered
     # LLM call 2 (the blocked one).  asyncio.Event.wait() yields
     # to the event loop so the workflow can progress.
-    await asyncio.wait_for(call_block.call_event.wait(), timeout=10)
+    await call_block.wait_called(timeout=10)
     # wait_for raises TimeoutError if 10s exceeded; reaching here
     # means the LLM call was entered.
 
@@ -530,7 +530,7 @@ async def run_server_1_with_steering(
     # Wait for LLM to be entered (workflow is running).
     # asyncio.Event.wait() yields to the event loop so the
     # workflow can progress.
-    await asyncio.wait_for(call_block.call_event.wait(), timeout=10)
+    await call_block.wait_called(timeout=10)
     # wait_for raises TimeoutError if 10s exceeded; reaching here
     # means the LLM call was entered.
 

@@ -223,7 +223,7 @@ async def test_cancel_active_response(
     assert created.body["status"] == "queued"
 
     # Wait for the LLM call to start so we know the workflow is active
-    await asyncio.wait_for(call.call_event.wait(), timeout=5)
+    await call.wait_called(timeout=5)
 
     resp = await client.post(f"/v1/responses/{response_id}/cancel")
     assert resp.status_code == 200

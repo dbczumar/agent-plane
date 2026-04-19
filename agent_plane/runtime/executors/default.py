@@ -540,15 +540,22 @@ async def _open_stream_with_retry(
                     classified,
                 )
                 if chat_span is not None:
+                    # mlflow's LiveSpan.add_event takes a SpanEvent
+                    # object — passing name=, attributes= as
+                    # kwargs raises TypeError.
+                    from mlflow.entities import SpanEvent
+
                     chat_span.add_event(
-                        "gen_ai.retry",
-                        attributes={
-                            "attempt": attempt + 1,
-                            "max_attempts": retry_config.max_attempts,
-                            "error.type": type(exc).__name__,
-                            "error.message": str(exc),
-                            "backoff_seconds": delay,
-                        },
+                        SpanEvent(
+                            name="gen_ai.retry",
+                            attributes={
+                                "attempt": attempt + 1,
+                                "max_attempts": retry_config.max_attempts,
+                                "error.type": type(exc).__name__,
+                                "error.message": str(exc),
+                                "backoff_seconds": delay,
+                            },
+                        )
                     )
                 await asyncio.sleep(delay)
 
