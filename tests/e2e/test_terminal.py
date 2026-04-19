@@ -17,6 +17,7 @@ persistent-terminal rollout.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -181,13 +182,16 @@ def _parse_terminal_run_stdout(fco_items: list[dict[str, Any]]) -> list[str]:
     "shell": "default"}``. Tests routinely want just the stdout
     strings to substring-match against.
 
+    Fails loud if no output parses — silently returning an empty list
+    would let tests pass with vacuous assertions when the tool
+    dispatch is actually broken (no outputs arrived, or all outputs
+    are from some other tool).
+
     :param fco_items: Items from ``_get_output_items(body,
         "function_call_output")``.
-    :returns: The stdout field from each parseable output. Items that
-        are not valid JSON or don't have a stdout field are skipped.
+    :returns: The stdout field from each parseable terminal_run output.
+    :raises AssertionError: If no terminal_run outputs were parseable.
     """
-    import json
-
     stdouts: list[str] = []
     for i in fco_items:
         raw = i.get("output") or ""
@@ -197,6 +201,13 @@ def _parse_terminal_run_stdout(fco_items: list[dict[str, Any]]) -> list[str]:
             continue
         if isinstance(parsed, dict) and "stdout" in parsed:
             stdouts.append(parsed.get("stdout") or "")
+    assert stdouts, (
+        f"No terminal_run outputs were parseable. Got "
+        f"{len(fco_items)} function_call_output items; none had a "
+        f"'stdout' field. Either no terminal_run was invoked, or the "
+        f"outputs are all from a different tool. Raw items: "
+        f"{[i.get('output', '')[:120] for i in fco_items]}"
+    )
     return stdouts
 
 
@@ -368,16 +379,43 @@ def test_terminal_list_and_close_round_trip(
     assert final2["status"] == "completed"
 
     # Confirm the agent used terminal_list and that its output
-    # contained both shell names.
+    # contained both shell names. Parse the terminal_list JSON
+    # directly (not substring-match the whole response) so a coincidental
+    # "main" or "dev" appearing elsewhere — e.g. in the LLM's own text
+    # message or in a stdout field from a stray terminal_run — doesn't
+    # satisfy the assertion.
     list_calls = _get_output_items(final2, "function_call", "terminal_list")
     assert len(list_calls) >= 1, "Expected terminal_list to be invoked."
-    fco = _get_output_items(final2, "function_call_output")
-    list_outputs = " ".join(i.get("output") or "" for i in fco)
-    # The tool's raw JSON payload includes the names as strings.
-    # If only one appears, the manager isn't tracking both shells.
-    assert "main" in list_outputs and "dev" in list_outputs, (
-        f"terminal_list should show both 'main' and 'dev', got: "
-        f"{list_outputs[:300]}"
+    list_call_ids = {c.get("call_id") for c in list_calls}
+    list_json_outputs = [
+        i.get("output") or ""
+        for i in _get_output_items(final2, "function_call_output")
+        if i.get("call_id") in list_call_ids
+    ]
+    assert list_json_outputs, (
+        "No function_call_output items matched the terminal_list call_ids. "
+        "The tool call was issued but never got an output — workflow bug."
+    )
+    shell_sets = []
+    for raw in list_json_outputs:
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError) as exc:
+            raise AssertionError(
+                f"terminal_list output is not valid JSON: {raw!r} ({exc})"
+            ) from exc
+        shells_val = parsed.get("shells")
+        assert isinstance(shells_val, list), (
+            f"terminal_list output missing 'shells' list: got {parsed!r}"
+        )
+        shell_sets.append(set(shells_val))
+    all_shells_seen: set[str] = set().union(*shell_sets)
+    # Both 'main' and 'dev' must appear in the structured shells list
+    # — not anywhere in the raw bytes. This rules out the false-positive
+    # where 'main' shows up in some other field's value.
+    assert {"main", "dev"}.issubset(all_shells_seen), (
+        f"terminal_list should show both 'main' and 'dev', got "
+        f"shells={all_shells_seen!r}"
     )
 
     # Turn 3: close 'main'.
@@ -417,33 +455,37 @@ def test_terminal_list_and_close_round_trip(
     final4 = poll_until_terminal(http_client, rid4, timeout=120)
     assert final4["status"] == "completed"
 
-    fco4 = _get_output_items(final4, "function_call_output")
-    list_outputs_after = " ".join(i.get("output") or "" for i in fco4)
-    # Check the raw tool output (not the LLM's prose, which might
-    # summarize vaguely). The JSON payload for terminal_list is
-    # ``{"shells": [...]}`` — after close, 'main' must not appear.
-    # We check in the specific ``terminal_list`` function_call_output
-    # rather than the whole response body, since the LLM's text
-    # message could contain 'main' for other reasons.
-    list_tool_outputs = [
+    # Parse the post-close terminal_list output as structured JSON
+    # — same approach as the earlier assertion in this test. Guarantees
+    # we're checking the actual registry state, not any substring that
+    # could match for unrelated reasons.
+    list_calls_4 = _get_output_items(final4, "function_call", "terminal_list")
+    assert len(list_calls_4) >= 1, "Turn 4 didn't invoke terminal_list."
+    list_call_ids_4 = {c.get("call_id") for c in list_calls_4}
+    list_json_after = [
         i.get("output") or ""
-        for i in fco4
-        if any(
-            fc.get("call_id") == i.get("call_id")
-            and fc.get("name") == "terminal_list"
-            for fc in _get_output_items(final4, "function_call")
-        )
+        for i in _get_output_items(final4, "function_call_output")
+        if i.get("call_id") in list_call_ids_4
     ]
-    combined_tool_json = " ".join(list_tool_outputs)
-    assert '"dev"' in combined_tool_json, (
+    assert list_json_after, "terminal_list produced no outputs in turn 4."
+    shells_after: set[str] = set()
+    for raw in list_json_after:
+        parsed = json.loads(raw)
+        shells_val = parsed.get("shells")
+        assert isinstance(shells_val, list), (
+            f"terminal_list output missing 'shells': {parsed!r}"
+        )
+        shells_after.update(shells_val)
+    # 'dev' should still be present (we didn't close it).
+    assert "dev" in shells_after, (
         f"Expected 'dev' still in terminal_list after closing 'main', "
-        f"got: {combined_tool_json[:300]}"
+        f"got shells={shells_after!r}"
     )
-    assert '"main"' not in combined_tool_json, (
+    # 'main' must be gone — this is the whole point of close.
+    assert "main" not in shells_after, (
         f"Expected 'main' to be GONE from terminal_list after close, "
-        f"but it's still there. terminal_close may not be evicting "
-        f"shells. list_outputs: {list_outputs_after[:300]}; "
-        f"tool-only outputs: {combined_tool_json[:300]}"
+        f"but the registry still reports shells={shells_after!r}. "
+        f"terminal_close is not evicting shells from the manager."
     )
 
 

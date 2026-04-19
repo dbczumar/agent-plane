@@ -84,8 +84,16 @@ async def _create_terminal_agent(client: httpx.AsyncClient) -> None:
 def _tool_outputs(body: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract and JSON-parse every function_call_output in a response.
 
+    Fails loud if an output is present but un-parseable as JSON: every
+    output that reaches this helper should be a ``terminal_run`` /
+    ``terminal_list`` / ``terminal_close`` JSON blob. A non-JSON item
+    would indicate the tool path produced a raw-string error (a
+    bug) and silently skipping it would mask that.
+
     :param body: The response body from ``GET /v1/responses/{id}``.
-    :returns: Parsed tool outputs. Unparseable entries are skipped.
+    :returns: Parsed tool-output dicts with ``_call_id`` spliced in.
+    :raises AssertionError: If a function_call_output can't be parsed
+        as a JSON dict.
     """
     parsed: list[dict[str, Any]] = []
     for item in body.get("output", []):
@@ -94,11 +102,17 @@ def _tool_outputs(body: dict[str, Any]) -> list[dict[str, Any]]:
         raw = item.get("output") or ""
         try:
             obj = json.loads(raw)
-        except (ValueError, TypeError):
-            continue
-        if isinstance(obj, dict):
-            obj["_call_id"] = item.get("call_id")
-            parsed.append(obj)
+        except (ValueError, TypeError) as exc:
+            raise AssertionError(
+                f"function_call_output is not JSON-parseable: "
+                f"call_id={item.get('call_id')!r}, raw={raw[:200]!r} ({exc})"
+            ) from exc
+        assert isinstance(obj, dict), (
+            f"function_call_output was parseable but not a dict: "
+            f"{obj!r} (call_id={item.get('call_id')!r})"
+        )
+        obj["_call_id"] = item.get("call_id")
+        parsed.append(obj)
     return parsed
 
 
@@ -157,16 +171,29 @@ async def test_shell_busy_on_parallel_same_shell_dispatch(
     await _create_terminal_agent(client)
 
     # Call 1: one assistant message with two parallel terminal_run
-    # tool calls. Call 1 runs a ~0.5s sleep to hold the cmd lock;
-    # call 2 is a quick echo — it must land while the sleep is
-    # in flight, get shell_busy back, and return without blocking.
+    # tool calls. Call 1 runs a 2-second sleep to hold the shell's
+    # cmd lock; call 2 is a quick echo.
+    #
+    # Determinism argument: the workflow dispatches both calls via
+    # ``asyncio.ensure_future`` in list order, so call 1's
+    # ``asyncio.to_thread`` starts first. That thread acquires the
+    # shell's cmd lock and enters ``sleep 2``. Call 2's thread
+    # starts milliseconds later; its non-blocking ``acquire()``
+    # sees the lock held and returns ``shell_busy`` immediately.
+    #
+    # 2 seconds is ~10,000x the inter-dispatch gap, so the race window
+    # for call 2 landing before call 1 acquires the lock is effectively
+    # zero. If call 1 takes >2s to reach its acquire (e.g. thread-pool
+    # stall), the test would fail with count==0 shell_busy (both
+    # completed) — which still correctly signals "something is wrong
+    # with dispatch or the lock."
     mock_llm.add_call(
         tool_calls=[
             {
                 "call_id": "call_sleep",
                 "name": "terminal_run",
                 "arguments": json.dumps(
-                    {"command": "sleep 0.5 && echo slow", "shell": "default"}
+                    {"command": "sleep 2 && echo slow", "shell": "default"}
                 ),
             },
             {
@@ -269,12 +296,21 @@ async def test_shell_cap_exceeded_on_eleventh_shell(
     # Exactly one over-cap call: the 11th attempt raises
     # ShellCapExceeded which the tool translates to
     # ``status="shell_cap_exceeded"``.
+    #
+    # Why exactly 1 (not 0, not >=1): the cap check is performed
+    # inside ``TerminalManager._lock``, which serializes all
+    # check-then-create operations. With 11 contending calls on
+    # a fresh manager, exactly 10 calls see ``len(shells) < 10``
+    # and create; the 11th sees ``len(shells) == 10`` and raises.
+    # Any other count is a bug:
+    #   - 0 → the cap is not enforced (unbounded shell growth).
+    #   - 2+ → the cap check is not atomic (two threads both saw
+    #     len < 10 simultaneously; lock is missing or leaked).
     assert statuses.count("shell_cap_exceeded") == 1, (
         f"Expected exactly one shell_cap_exceeded among 11 parallel "
-        f"calls, got statuses={statuses}. If 0, the cap isn't firing "
-        f"— the manager accepted all 11 shells. If >1, more than one "
-        f"call hit the cap-check race simultaneously (unexpected — "
-        f"the manager's lock should serialize cap checks)."
+        f"calls, got statuses={statuses}. If 0: the cap isn't firing. "
+        f"If >1: the cap check isn't atomic under the manager's lock "
+        f"— two threads both saw count<10 simultaneously."
     )
     # The other 10 completed successfully.
     assert statuses.count("completed") == 10, (
@@ -329,6 +365,16 @@ async def test_crashed_shell_replaced_on_next_run(
     assert r1.status_code == 200
     body1 = await _wait_for_completion(client, r1.body["id"])
     assert body1["status"] == "completed"
+
+    # Before turn 2 we want bash to have actually exited so the
+    # ``is_alive()`` check in ``_get_or_create_shell`` returns False
+    # and the dead-shell sweep fires. The prior ``_wait_for_completion``
+    # already blocked until turn 1's workflow finished all its steps,
+    # including the shell's run_sync — which by contract only returns
+    # after the D marker (completed) or after a SIGKILL escalation
+    # (shell_crashed). In either terminal case bash has exited. No
+    # additional wait needed; rely on this invariant rather than a
+    # sleep.
 
     # Turn 2: same shell name, fresh bash should appear via
     # auto-sweep.
