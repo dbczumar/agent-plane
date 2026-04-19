@@ -20,6 +20,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.output.defaults import create_output
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style as PTStyle
 from rich.console import Console
@@ -205,11 +206,26 @@ class TerminalHost:
             if self.on_help is not None:
                 self.on_help()
 
+        # Build Output with CPR probing disabled. Some terminals
+        # (tmux layouts, SSH sessions, certain multiplexers) drop
+        # the cursor-position response, which makes prompt_toolkit
+        # print a noisy warning and fall back anyway. Since we
+        # never rely on the CPR result (the renderer positions
+        # widgets by our own accounting), skip the probe entirely.
+        # ``enable_cpr`` is an attribute on ``Vt100_Output`` (real
+        # TTY); ``PlainTextOutput`` (pipe/redirected stdout) has
+        # no such attribute — the hasattr guard keeps both paths
+        # working.
+        _output = create_output()
+        if hasattr(_output, "enable_cpr"):
+            _output.enable_cpr = False
+
         self._prompt = PromptSession(
             history=FileHistory(os.path.expanduser(history_file)),
             style=style,
             erase_when_done=True,
             key_bindings=kb,
+            output=_output,
         )
 
     async def __aenter__(self) -> TerminalHost:
