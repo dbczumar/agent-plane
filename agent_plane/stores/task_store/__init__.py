@@ -367,6 +367,30 @@ class TaskStore(ABC):
         """
         ...
 
+    @abstractmethod
+    def list_tasks_sync(
+        self,
+        conversation_id: str | None = None,
+        agent_id: str | None = None,
+        root_task_id: str | None = None,
+    ) -> list[Task]:
+        """
+        Synchronous variant of :meth:`list_tasks`.
+
+        Required by sync builtin tools (e.g. Phase 4
+        ``send_to_sub_agent``) that run inside the workflow's
+        thread executor and cannot await the async variant.
+
+        Same filter semantics as :meth:`list_tasks`.
+
+        :param conversation_id: Optional conversation ID filter.
+        :param agent_id: Optional agent ID filter.
+        :param root_task_id: Optional root task ID filter.
+        :returns: A list of matching :class:`Task` objects,
+            ordered by ``created_at`` descending.
+        """
+        ...
+
     # ── Pending tool call methods ─────────────────────────
 
     @abstractmethod

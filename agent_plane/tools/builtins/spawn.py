@@ -482,6 +482,410 @@ def _spawn_one(
     return task.id
 
 
+# ── Phase 4: send_to_sub_agent ────────────────────────
+
+
+class SendToSubAgentTool(Tool):
+    """
+    Continue an existing named sub-agent's conversation.
+
+    Phase 4 — strict continue-only counterpart to
+    ``spawn_sub_agent``. The LLM identifies an existing child
+    by ``(type, name)``; ``send_to_sub_agent`` looks up the
+    titled child conversation, appends the user message as the
+    first item of a NEW task on that conversation, and starts
+    the sub-agent workflow. The sub-agent's
+    ``_load_initial_history`` will see the full prior history
+    plus the new message, so it "remembers" earlier turns.
+
+    Errors:
+    * ``sub_agent_not_found`` — no child conversation matches
+      the ``(type, name)`` pair under this parent. The LLM
+      should call ``spawn_sub_agent`` first.
+    * ``sub_agent_busy`` — a task is already running on that
+      child conversation. The LLM should wait for the current
+      task's completion (it will arrive via the
+      async_work_complete drain) before sending again.
+
+    :param sub_specs: Name-to-AgentSpec mapping for available
+        sub-agent types (same dict the spawn tool gets — used
+        only to validate the requested ``type``).
+    """
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"send_to_sub_agent"``."""
+        return "send_to_sub_agent"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Continue an existing named sub-agent's conversation. "
+            "The sub-agent must have been previously created with "
+            "spawn_sub_agent(type=..., name=...) — strict continue-"
+            "only. Returns sub_agent_not_found if no such child "
+            "exists, or sub_agent_busy if another task is currently "
+            "running on that conversation."
+        )
+
+    def __init__(self, sub_specs: dict[str, AgentSpec]) -> None:
+        """
+        Initialize with the agent's available sub-agent specs.
+
+        :param sub_specs: Name-to-AgentSpec mapping.
+        """
+        self._sub_specs = sub_specs
+
+    def get_schema(self) -> dict[str, Any]:
+        """
+        Return the OpenAI-format tool schema.
+
+        :returns: Dict with ``"type": "function"`` and a
+            ``"function"`` sub-dict.
+        """
+        return _build_send_to_sub_agent_schema(self._sub_specs)
+
+    def invoke(self, arguments: str, ctx: ToolContext) -> str:
+        """
+        Continue an existing sub-agent's conversation.
+
+        :param arguments: JSON-encoded arguments string, e.g.
+            ``'{"type": "coder", "name": "auth",
+            "input": "now add tests"}'``.
+        :param ctx: Server-side execution context.
+        :returns: JSON handle string with ``task_id``, ``kind``,
+            ``type``, ``name``, ``status``, and ``message``
+            keys; on error, ``{"error": "...", ...}``.
+        """
+        args = _parse_send_to_sub_agent_args(arguments)
+        if isinstance(args, str):
+            return args
+        sa_type: str = args["type"]
+        sa_name: str = args["name"]
+        sa_input: str = args["input"]
+        if sa_type not in self._sub_specs:
+            return json.dumps(
+                {"error": f"unknown sub-agent type: {sa_type!r}"},
+            )
+
+        client_tools: list[dict[str, Any]] = args.get("client_tools", []) or []
+        root_task_id = _resolve_root_task_id(ctx.task_id)
+        parent_conversation_id = _resolve_parent_conversation_id(ctx.task_id)
+        try:
+            task_id = _send_to_one(
+                agent_id=ctx.agent_id,
+                agent_name=sa_type,
+                sa_name=sa_name,
+                user_input=sa_input,
+                root_task_id=root_task_id,
+                parent_conversation_id=parent_conversation_id,
+                client_tools=client_tools,
+            )
+        except _SubAgentNotFoundError as exc:
+            return json.dumps(
+                {
+                    "error": "sub_agent_not_found",
+                    "message": str(exc),
+                    "type": sa_type,
+                    "name": sa_name,
+                }
+            )
+        except _SubAgentBusyError as exc:
+            return json.dumps(
+                {
+                    "error": "sub_agent_busy",
+                    "message": str(exc),
+                    "type": sa_type,
+                    "name": sa_name,
+                }
+            )
+        return json.dumps(
+            {
+                "task_id": task_id,
+                "kind": "sub_agent",
+                "type": sa_type,
+                "name": sa_name,
+                "status": "in_progress",
+                "message": _spawn_handle_message(task_id, sa_type, sa_name),
+            }
+        )
+
+
+def _build_send_to_sub_agent_schema(
+    sub_specs: dict[str, AgentSpec],
+) -> dict[str, Any]:
+    """
+    Build the OpenAI function schema for ``send_to_sub_agent``.
+
+    :param sub_specs: Name-to-AgentSpec mapping.
+    :returns: OpenAI function-format schema dict.
+    """
+    type_enum = sorted(sub_specs.keys())
+    return {
+        "type": "function",
+        "function": {
+            "name": SendToSubAgentTool.name(),
+            "description": SendToSubAgentTool.description(),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": type_enum,
+                        "description": (
+                            "The sub-agent type. Must match the "
+                            "type passed to the original "
+                            "spawn_sub_agent call."
+                        ),
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "The instance name from the original "
+                            "spawn_sub_agent call. Returns "
+                            "sub_agent_not_found if no such "
+                            "child exists."
+                        ),
+                    },
+                    "input": {
+                        "type": "string",
+                        "description": (
+                            "The new user-input message to "
+                            "append to the sub-agent's "
+                            "conversation. The sub-agent's "
+                            "next turn sees the full prior "
+                            "history plus this message."
+                        ),
+                    },
+                },
+                "required": ["type", "name", "input"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _parse_send_to_sub_agent_args(
+    arguments: str,
+) -> dict[str, Any] | str:
+    """
+    Parse and validate ``SendToSubAgentTool`` arguments.
+
+    :param arguments: Raw JSON string from the LLM.
+    :returns: Parsed dict on success, or a JSON error string on
+        failure (returned verbatim to the LLM so it can
+        correct and retry).
+    """
+    try:
+        args = json.loads(arguments) if arguments else {}
+    except (json.JSONDecodeError, TypeError) as exc:
+        return json.dumps({"error": f"invalid arguments: {exc}"})
+    if not isinstance(args, dict):
+        return json.dumps({"error": "arguments must be a JSON object"})
+    for required in ("type", "name", "input"):
+        if required not in args:
+            return json.dumps({"error": f"missing required field: {required}"})
+    return args
+
+
+class _SubAgentNotFoundError(Exception):
+    """Raised by ``_send_to_one`` when no matching child exists."""
+
+
+class _SubAgentBusyError(Exception):
+    """Raised by ``_send_to_one`` when the child has an in-flight task."""
+
+
+def _send_to_one(
+    *,
+    agent_id: str,
+    agent_name: str,
+    sa_name: str,
+    user_input: str,
+    root_task_id: str,
+    parent_conversation_id: str,
+    client_tools: list[dict[str, Any]] | None = None,
+) -> str:
+    """
+    Look up an existing named child conversation, append the
+    user message, create a new task on it, and start execution.
+
+    Phase 4 strict continue-only path. Resolves the child via
+    ``(parent_conversation_id, title="<type>:<name>")``. Errors
+    when the child is missing or has a non-terminal task already
+    running.
+
+    :param agent_id: The root registered agent ID.
+    :param agent_name: The sub-agent's TYPE.
+    :param sa_name: The sub-agent's instance NAME.
+    :param user_input: The user's new input message.
+    :param root_task_id: The top-level task ID for tunneling.
+    :param parent_conversation_id: The owning parent
+        conversation's id (must match the parent that spawned
+        the original child).
+    :param client_tools: Optional client-side tool schemas.
+    :returns: The new task ID.
+    :raises _SubAgentNotFoundError: If no child matches.
+    :raises _SubAgentBusyError: If the child has a non-terminal
+        task in flight.
+    """
+    from agent_plane.entities.task import TERMINAL_STATUSES
+    from agent_plane.runtime import (
+        get_conversation_store,
+        get_task_store,
+    )
+
+    conv_store = get_conversation_store()
+    task_store = get_task_store()
+
+    title = f"{agent_name}:{sa_name}"
+    children = conv_store.list_conversations(
+        kind="sub_agent",
+        parent_conversation_id=parent_conversation_id,
+        # We do NOT need pagination here — same parent typically
+        # has a small number of named sub-agents. The default
+        # limit (20) plus an explicit bump-to-100 covers the
+        # realistic worst case without complicating the lookup.
+        limit=100,
+    )
+    match = next((c for c in children.data if c.title == title), None)
+    if match is None:
+        raise _SubAgentNotFoundError(
+            f"no sub-agent of type {agent_name!r} named {sa_name!r} exists in this conversation",
+        )
+
+    # Reject if the child has a non-terminal task running.
+    # Otherwise the new task would race with the in-flight one,
+    # both producing assistant responses on the same conversation
+    # and confusing the LLM.
+    existing_tasks = task_store.list_tasks_sync(conversation_id=match.id)
+    iter_existing = existing_tasks.data if hasattr(existing_tasks, "data") else existing_tasks
+    for t in iter_existing:
+        if t.status not in TERMINAL_STATUSES:
+            raise _SubAgentBusyError(
+                f"sub-agent {agent_name}:{sa_name} is busy with task {t.id!r}; "
+                f"wait for its completion (it will auto-deliver via the drain) "
+                f"before sending again",
+            )
+
+    task = task_store.create(
+        conversation_id=match.id,
+        agent_id=agent_id,
+        agent_name=agent_name,
+        root_task_id=root_task_id,
+        kind="sub_agent",
+    )
+
+    conv_store.append(
+        match.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=task.id,
+                data=MessageData(
+                    role="user",
+                    content=[
+                        {"type": "input_text", "text": user_input},
+                    ],
+                ),
+            ),
+        ],
+    )
+
+    task_store.start(task.id, tools=client_tools or None)
+    return task.id
+
+
+# ── Phase 4: list_sub_agents ──────────────────────────
+
+
+class ListSubAgentsTool(Tool):
+    """
+    List the named sub-agents that already exist under this conversation.
+
+    Phase 4 — purely informational. The LLM uses the result to
+    decide whether to call ``send_to_sub_agent`` (existing) or
+    ``spawn_sub_agent`` (new). The output is intentionally a
+    minimal ``{type, name}`` list — no timestamps, no task
+    counts, no statuses — so it doesn't grow large or shift
+    across turns for trivial reasons.
+    """
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"list_sub_agents"``."""
+        return "list_sub_agents"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "List named sub-agents already created under this "
+            "conversation. Returns {sub_agents: [{type, name}, "
+            "...]}. Empty list when no sub-agents have been "
+            "spawned. Use the result to decide between "
+            "send_to_sub_agent (continue) and spawn_sub_agent "
+            "(new)."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """
+        Return the OpenAI-format tool schema.
+
+        :returns: Dict with ``"type": "function"`` and a
+            ``"function"`` sub-dict; no parameters.
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": ListSubAgentsTool.name(),
+                "description": ListSubAgentsTool.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    def invoke(self, arguments: str, ctx: ToolContext) -> str:
+        """
+        Return the named sub-agents under the caller's conversation.
+
+        :param arguments: Ignored (the schema declares no
+            parameters; the LLM occasionally passes ``"{}"``).
+        :param ctx: Server-side execution context.
+        :returns: JSON ``{"sub_agents": [{"type": ...,
+            "name": ...}, ...]}``.
+        """
+        from agent_plane.runtime import get_conversation_store
+
+        parent_conversation_id = _resolve_parent_conversation_id(ctx.task_id)
+        conv_store = get_conversation_store()
+        children = conv_store.list_conversations(
+            kind="sub_agent",
+            parent_conversation_id=parent_conversation_id,
+            # 100 is a safe ceiling — agents that need more named
+            # sub-agents than this are an antipattern; the LLM
+            # would lose track regardless.
+            limit=100,
+        )
+        result: list[dict[str, str]] = []
+        for child in children.data:
+            # Title is "<type>:<name>" — split into the LLM-
+            # friendly fields. Skip rows whose title doesn't
+            # match the convention (defensive — Phase-3
+            # anonymous spawns left None titles, but those have
+            # NULL parent_conversation_id and won't appear in
+            # this query at all).
+            if child.title is None or ":" not in child.title:
+                continue
+            sa_type, _, sa_name = child.title.partition(":")
+            result.append({"type": sa_type, "name": sa_name})
+        return json.dumps({"sub_agents": result})
+
+
 # ── Check / result helpers ────────────────────────────
 
 

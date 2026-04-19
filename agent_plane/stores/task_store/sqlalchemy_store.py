@@ -198,6 +198,23 @@ async def _enrich_from_dbos(task: Task) -> Task:
     return _apply_workflow_status(task, wf_status)
 
 
+def _enrich_from_dbos_sync(task: Task) -> Task:
+    """
+    Synchronous variant of :func:`_enrich_from_dbos`.
+
+    Used by ``list_tasks_sync`` so callers in sync tool bodies
+    (which the workflow's thread executor runs) can enumerate
+    tasks without crossing back into the async runtime.
+
+    :param task: The :class:`Task` to enrich.
+    :returns: The enriched :class:`Task`.
+    """
+    wf_status: WorkflowStatus | None = get_workflow_status(task.id)
+    if wf_status is None:
+        return task
+    return _apply_workflow_status(task, wf_status)
+
+
 def _row_to_item(row: SqlConversationItem) -> ConversationItem:
     """
     Convert a :class:`SqlConversationItem` ORM row to a
@@ -720,6 +737,40 @@ class SqlAlchemyTaskStore(TaskStore):
         for t in tasks:
             enriched.append(await _enrich_from_dbos(t))
         return enriched
+
+    def list_tasks_sync(
+        self,
+        conversation_id: str | None = None,
+        agent_id: str | None = None,
+        root_task_id: str | None = None,
+    ) -> list[Task]:
+        """
+        Synchronous variant of :meth:`list_tasks`.
+
+        Used by the Phase 4 ``send_to_sub_agent`` builtin (which
+        runs inside the workflow's thread executor) to detect
+        whether a child conversation already has a non-terminal
+        task in flight.
+
+        :param conversation_id: Optional conversation ID filter.
+        :param agent_id: Optional agent ID filter.
+        :param root_task_id: Optional root task ID filter.
+        :returns: A list of matching :class:`Task` objects,
+            ordered by ``created_at`` descending.
+        """
+        with self._session() as session:
+            stmt = select(SqlTask)
+            if conversation_id:
+                stmt = stmt.where(SqlTask.conversation_id == conversation_id)
+            if agent_id:
+                stmt = stmt.where(SqlTask.agent_id == agent_id)
+            if root_task_id:
+                stmt = stmt.where(SqlTask.root_task_id == root_task_id)
+            stmt = stmt.order_by(SqlTask.created_at.desc())
+            rows = list(session.execute(stmt).scalars().all())
+            tasks = [_to_entity(r) for r in rows]
+
+        return [_enrich_from_dbos_sync(t) for t in tasks]
 
     # ── Pending tool call helpers ─────────────────────────
 

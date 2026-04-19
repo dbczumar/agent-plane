@@ -18,8 +18,10 @@ from agent_plane.errors import AgentPlaneError, ErrorCode
 from agent_plane.spec import AgentSpec
 from agent_plane.tools.base import Tool, ToolContext, is_valid_tool_name
 from agent_plane.tools.builtins import (
+    ListSubAgentsTool,
     LoadSkillTool,
     ReadSkillFileTool,
+    SendToSubAgentTool,
     SpawnSubAgentTool,
     any_skill_has_resources,
     get_builtin_tool,
@@ -237,6 +239,16 @@ class ToolManager:
         self._tools[SpawnSubAgentTool.name()] = SpawnSubAgentTool(
             sub_specs=sub_specs,
         )
+        # Phase 4: send_to_sub_agent reuses the same sub_specs for
+        # type validation; persistence is via the conversation
+        # title="<type>:<name>" partial unique index.
+        self._tools[SendToSubAgentTool.name()] = SendToSubAgentTool(
+            sub_specs=sub_specs,
+        )
+        # Phase 4: list_sub_agents needs no spec — it scans the
+        # caller's child conversations regardless of which types
+        # the parent declared.
+        self._tools[ListSubAgentsTool.name()] = ListSubAgentsTool()
 
     def _register_local_tools(self, workdir: Path | None) -> None:
         """
