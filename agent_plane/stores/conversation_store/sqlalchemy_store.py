@@ -43,6 +43,7 @@ def _to_conversation(row: SqlConversation) -> Conversation:
         updated_at=row.updated_at,
         title=row.title,
         kind=row.kind,
+        parent_conversation_id=row.parent_conversation_id,
     )
 
 
@@ -114,25 +115,62 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             session.execute(stmt)
 
-    def create_conversation(self, kind: str = "default") -> Conversation:
+    def create_conversation(
+        self,
+        kind: str = "default",
+        title: str | None = None,
+        parent_conversation_id: str | None = None,
+    ) -> Conversation:
         """
         Create a new conversation in the database.
 
         :param kind: Conversation type. ``"default"`` for
             user-initiated, ``"sub_agent"`` for sub-agent
             execution conversations.
+        :param title: Optional title. Phase 4 named sub-agents
+            store ``"<type>:<name>"`` so the partial unique
+            index enforces ``(parent_conversation_id, title)``
+            uniqueness within a parent.
+        :param parent_conversation_id: Phase 4 — id of the
+            owning parent conversation. ``None`` for top-level.
         :returns: The newly created :class:`Conversation`.
+        :raises NameAlreadyExistsError: If
+            ``parent_conversation_id`` is set and a sibling row
+            with the same ``title`` already exists.
         """
+        from sqlalchemy.exc import IntegrityError
+
+        from agent_plane.stores.conversation_store import NameAlreadyExistsError
+
         now = now_epoch()
         row = SqlConversation(
             id=generate_conversation_id(),
             created_at=now,
             updated_at=now,
+            title=title,
             kind=kind,
+            parent_conversation_id=parent_conversation_id,
         )
-        with self._session() as session:
-            session.add(row)
-            return _to_conversation(row)
+        try:
+            with self._session() as session:
+                session.add(row)
+                # Convert inside the session so the entity is
+                # populated before SQLAlchemy detaches it on
+                # session close.
+                return _to_conversation(row)
+        except IntegrityError as exc:
+            # Translate the partial-unique-index violation into a
+            # clean exception type the spawn/send tools can map
+            # to a name_already_exists tool error. Other integrity
+            # violations (FK, check constraints) re-raise.
+            msg = str(exc).lower()
+            if "ix_conversations_parent_title_unique" in msg or "unique" in msg:
+                raise NameAlreadyExistsError(
+                    f"sub-agent name already exists under parent "
+                    f"{parent_conversation_id!r}: title={title!r}"
+                ) from exc
+            raise
+
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """
@@ -412,6 +450,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         order: str = "desc",
         kind: str | None = "default",
         sort_by: str = "created_at",
+        parent_conversation_id: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -427,6 +466,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param kind: Filter to conversations of this kind.
         :param sort_by: Column to sort on, ``"created_at"``
             or ``"updated_at"``.
+        :param parent_conversation_id: Phase 4 — when set, only
+            return conversations whose parent matches. ``None``
+            disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
@@ -438,6 +480,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Filter by kind when specified (None = no filter).
             if kind is not None:
                 stmt = stmt.where(SqlConversation.kind == kind)
+            if parent_conversation_id is not None:
+                stmt = stmt.where(
+                    SqlConversation.parent_conversation_id == parent_conversation_id,
+                )
             if after:
                 stmt = self._apply_cursor(stmt, after, sort_col, is_desc, forward=True)
             if before:
