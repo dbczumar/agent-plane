@@ -76,9 +76,7 @@ async def _create_terminal_agent(client: httpx.AsyncClient) -> None:
         "/api/agents",
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
     )
-    assert resp.status_code == 201, (
-        f"Agent creation failed: {resp.status_code} {resp.text}"
-    )
+    assert resp.status_code == 201, f"Agent creation failed: {resp.status_code} {resp.text}"
 
 
 def _tool_outputs(body: dict[str, Any]) -> list[dict[str, Any]]:
@@ -192,16 +190,12 @@ async def test_shell_busy_on_parallel_same_shell_dispatch(
             {
                 "call_id": "call_sleep",
                 "name": "terminal_run",
-                "arguments": json.dumps(
-                    {"command": "sleep 2 && echo slow", "shell": "default"}
-                ),
+                "arguments": json.dumps({"command": "sleep 2 && echo slow", "shell": "default"}),
             },
             {
                 "call_id": "call_fast",
                 "name": "terminal_run",
-                "arguments": json.dumps(
-                    {"command": "echo fast", "shell": "default"}
-                ),
+                "arguments": json.dumps({"command": "echo fast", "shell": "default"}),
             },
         ],
     )
@@ -237,8 +231,7 @@ async def test_shell_busy_on_parallel_same_shell_dispatch(
         f"both calls raced past the lock (missing lock regression)."
     )
     assert statuses.count("completed") == 1, (
-        f"Expected exactly one 'completed' status (the winner), "
-        f"got {statuses}."
+        f"Expected exactly one 'completed' status (the winner), got {statuses}."
     )
 
 
@@ -269,9 +262,7 @@ async def test_shell_cap_exceeded_on_eleventh_shell(
         {
             "call_id": f"call_{i}",
             "name": "terminal_run",
-            "arguments": json.dumps(
-                {"command": "echo hi", "shell": f"s{i}"}
-            ),
+            "arguments": json.dumps({"command": "echo hi", "shell": f"s{i}"}),
         }
         for i in range(11)
     ]
@@ -289,8 +280,7 @@ async def test_shell_cap_exceeded_on_eleventh_shell(
 
     outputs = _tool_outputs(body)
     assert len(outputs) == 11, (
-        f"Expected 11 terminal_run outputs (one per declared call), "
-        f"got {len(outputs)}."
+        f"Expected 11 terminal_run outputs (one per declared call), got {len(outputs)}."
     )
     statuses = [o.get("status") for o in outputs]
     # Exactly one over-cap call: the 11th attempt raises
@@ -349,9 +339,7 @@ async def test_crashed_shell_replaced_on_next_run(
             {
                 "call_id": "call_exit",
                 "name": "terminal_run",
-                "arguments": json.dumps(
-                    {"command": "exit 0", "shell": "default"}
-                ),
+                "arguments": json.dumps({"command": "exit 0", "shell": "default"}),
             },
         ],
     )
@@ -417,8 +405,7 @@ async def test_crashed_shell_replaced_on_next_run(
     # a canned 'completed' from some other path).
     stdout = outputs2[0].get("stdout") or ""
     assert "alive-in-fresh-shell" in stdout, (
-        f"Fresh shell ran but produced no output — likely a spawn "
-        f"failure. stdout: {stdout!r}"
+        f"Fresh shell ran but produced no output — likely a spawn failure. stdout: {stdout!r}"
     )
 
 
@@ -467,9 +454,7 @@ async def test_idle_reaper_collects_managers_through_registry(
             {
                 "call_id": "call_touch",
                 "name": "terminal_run",
-                "arguments": json.dumps(
-                    {"command": "echo hi", "shell": "default"}
-                ),
+                "arguments": json.dumps({"command": "echo hi", "shell": "default"}),
             },
         ],
     )

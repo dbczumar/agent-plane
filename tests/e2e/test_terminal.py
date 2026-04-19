@@ -240,29 +240,21 @@ def test_named_shells_are_isolated(
         "/v1/responses",
         json={
             "model": terminal_test_agent,
-            "input": (
-                "Use terminal_run with shell='dev' to run: "
-                "export FLAVOR=vanilla"
-            ),
+            "input": ("Use terminal_run with shell='dev' to run: export FLAVOR=vanilla"),
             "background": True,
         },
     )
     resp1.raise_for_status()
     rid1 = resp1.json()["id"]
     final1 = poll_until_terminal(http_client, rid1, timeout=120)
-    assert final1["status"] == "completed", (
-        f"Turn 1 failed: {final1.get('error')}"
-    )
+    assert final1["status"] == "completed", f"Turn 1 failed: {final1.get('error')}"
 
     # Turn 2: set in 'test' — DIFFERENT shell.
     resp2 = http_client.post(
         "/v1/responses",
         json={
             "model": terminal_test_agent,
-            "input": (
-                "Use terminal_run with shell='test' to run: "
-                "export FLAVOR=chocolate"
-            ),
+            "input": ("Use terminal_run with shell='test' to run: export FLAVOR=chocolate"),
             "previous_response_id": rid1,
             "background": True,
         },
@@ -270,9 +262,7 @@ def test_named_shells_are_isolated(
     resp2.raise_for_status()
     rid2 = resp2.json()["id"]
     final2 = poll_until_terminal(http_client, rid2, timeout=120)
-    assert final2["status"] == "completed", (
-        f"Turn 2 failed: {final2.get('error')}"
-    )
+    assert final2["status"] == "completed", f"Turn 2 failed: {final2.get('error')}"
 
     # Turn 3: read from both shells, back to back.
     resp3 = http_client.post(
@@ -292,9 +282,7 @@ def test_named_shells_are_isolated(
     resp3.raise_for_status()
     rid3 = resp3.json()["id"]
     final3 = poll_until_terminal(http_client, rid3, timeout=120)
-    assert final3["status"] == "completed", (
-        f"Turn 3 failed: {final3.get('error')}"
-    )
+    assert final3["status"] == "completed", f"Turn 3 failed: {final3.get('error')}"
 
     # The LLM should have called terminal_run twice in turn 3 — once
     # per shell. If it collapsed to one call, we can't prove
@@ -414,8 +402,7 @@ def test_terminal_list_and_close_round_trip(
     # — not anywhere in the raw bytes. This rules out the false-positive
     # where 'main' shows up in some other field's value.
     assert {"main", "dev"}.issubset(all_shells_seen), (
-        f"terminal_list should show both 'main' and 'dev', got "
-        f"shells={all_shells_seen!r}"
+        f"terminal_list should show both 'main' and 'dev', got shells={all_shells_seen!r}"
     )
 
     # Turn 3: close 'main'.
@@ -423,9 +410,7 @@ def test_terminal_list_and_close_round_trip(
         "/v1/responses",
         json={
             "model": terminal_test_agent,
-            "input": (
-                "Call terminal_close with shell='main'. That's it."
-            ),
+            "input": ("Call terminal_close with shell='main'. That's it."),
             "previous_response_id": rid2,
             "background": True,
         },
@@ -443,8 +428,7 @@ def test_terminal_list_and_close_round_trip(
         json={
             "model": terminal_test_agent,
             "input": (
-                "Call terminal_list (no arguments). Tell me "
-                "exactly which shells are open now."
+                "Call terminal_list (no arguments). Tell me exactly which shells are open now."
             ),
             "previous_response_id": rid3,
             "background": True,
@@ -472,14 +456,11 @@ def test_terminal_list_and_close_round_trip(
     for raw in list_json_after:
         parsed = json.loads(raw)
         shells_val = parsed.get("shells")
-        assert isinstance(shells_val, list), (
-            f"terminal_list output missing 'shells': {parsed!r}"
-        )
+        assert isinstance(shells_val, list), f"terminal_list output missing 'shells': {parsed!r}"
         shells_after.update(shells_val)
     # 'dev' should still be present (we didn't close it).
     assert "dev" in shells_after, (
-        f"Expected 'dev' still in terminal_list after closing 'main', "
-        f"got shells={shells_after!r}"
+        f"Expected 'dev' still in terminal_list after closing 'main', got shells={shells_after!r}"
     )
     # 'main' must be gone — this is the whole point of close.
     assert "main" not in shells_after, (
@@ -513,8 +494,7 @@ def test_close_then_recreate_yields_fresh_shell(
         json={
             "model": terminal_test_agent,
             "input": (
-                "Use terminal_run with shell='scratch' to run: "
-                "export SHOULD_VANISH=yes_im_here"
+                "Use terminal_run with shell='scratch' to run: export SHOULD_VANISH=yes_im_here"
             ),
             "background": True,
         },
@@ -542,10 +522,7 @@ def test_close_then_recreate_yields_fresh_shell(
         "/v1/responses",
         json={
             "model": terminal_test_agent,
-            "input": (
-                "Use terminal_run with shell='scratch' to run: "
-                "echo VAR=$SHOULD_VANISH"
-            ),
+            "input": ("Use terminal_run with shell='scratch' to run: echo VAR=$SHOULD_VANISH"),
             "previous_response_id": rid2,
             "background": True,
         },
@@ -672,8 +649,7 @@ def test_large_output_is_truncated_with_disk_path(
         json={
             "model": terminal_test_agent,
             "input": (
-                "Use terminal_run to run: "
-                "python3 -c 'import sys; sys.stdout.write(\"x\" * 50000)'"
+                "Use terminal_run to run: python3 -c 'import sys; sys.stdout.write(\"x\" * 50000)'"
             ),
             "background": True,
         },
@@ -698,9 +674,7 @@ def test_large_output_is_truncated_with_disk_path(
         f"leaks more than head+tail."
     )
     # Truncation marker present.
-    assert "truncated" in stdout, (
-        f"Expected 'truncated' marker in stdout, got: {stdout[:300]}"
-    )
+    assert "truncated" in stdout, f"Expected 'truncated' marker in stdout, got: {stdout[:300]}"
     # Disk log path surfaced, so the agent can ``cat`` the full output.
     assert ".agent_plane/terminal/" in stdout, (
         f"Expected disk-log path in stdout, got: {stdout[:300]}"
