@@ -261,10 +261,15 @@ def test_parse_invalid_data() -> None:
 
 
 def test_conversation_title_defaults_to_none() -> None:
-    conv = Conversation(id="conv_1", created_at=1700000000)
+    conv = Conversation(id="conv_1", created_at=1700000000, updated_at=1700000000)
     assert conv.title is None
 
 
 def test_conversation_title_set() -> None:
-    conv = Conversation(id="conv_1", created_at=1700000000, title="Weather chat")
+    conv = Conversation(
+        id="conv_1",
+        created_at=1700000000,
+        updated_at=1700000000,
+        title="Weather chat",
+    )
     assert conv.title == "Weather chat"
