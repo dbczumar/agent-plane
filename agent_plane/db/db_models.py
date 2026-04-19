@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -88,6 +97,10 @@ class SqlConversation(Base):
         ``None`` when not provided.
     :param kind: Conversation type. ``"default"`` for user-initiated,
         ``"sub_agent"`` for sub-agent execution conversations.
+    :param parent_conversation_id: For Phase 4 named sub-agents,
+        points at the parent conversation. ``None`` for top-level
+        conversations. ``ON DELETE CASCADE`` so removing a parent
+        cleans up the entire sub-tree.
     """
 
     __tablename__ = "conversations"
@@ -97,12 +110,31 @@ class SqlConversation(Base):
     updated_at: Mapped[int] = mapped_column(Integer)
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
     kind: Mapped[str] = mapped_column(String(32), default="default")
+    parent_conversation_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=True,
+    )
 
     __table_args__ = (
         CheckConstraint("kind IN ('default', 'sub_agent')", name="ck_conversations_kind"),
         Index("ix_conversations_created_at", "created_at"),
         Index("ix_conversations_updated_at", "updated_at"),
         Index("ix_conversations_kind", "kind"),
+        # Phase 4: partial unique index on (parent_conversation_id,
+        # title) prevents two same-named children under the same
+        # parent (G36 race protection at the DB layer). The
+        # ``sqlite_where`` / ``postgresql_where`` clauses scope the
+        # index so multiple top-level conversations (NULL parent)
+        # remain valid.
+        Index(
+            "ix_conversations_parent_title_unique",
+            "parent_conversation_id",
+            "title",
+            unique=True,
+            sqlite_where=text("parent_conversation_id IS NOT NULL"),
+            postgresql_where=text("parent_conversation_id IS NOT NULL"),
+        ),
     )
 
 

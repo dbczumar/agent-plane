@@ -41,12 +41,36 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.Integer(), nullable=False),
         sa.Column("title", sa.Text(), nullable=True),
         sa.Column("kind", sa.String(length=32), nullable=False, server_default="default"),
+        # Phase 4: pointer from a sub-agent's child conversation to
+        # its parent conversation. NULL for top-level conversations.
+        # ON DELETE CASCADE so removing a parent recursively cleans
+        # up all descendants (and via the items/tasks FK cascades,
+        # everything they own).
+        sa.Column(
+            "parent_conversation_id",
+            sa.String(length=64),
+            sa.ForeignKey("conversations.id", ondelete="CASCADE"),
+            nullable=True,
+        ),
         sa.CheckConstraint("kind IN ('default', 'sub_agent')", name="ck_conversations_kind"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_conversations_created_at", "conversations", ["created_at"], unique=False)
     op.create_index("ix_conversations_updated_at", "conversations", ["updated_at"], unique=False)
     op.create_index("ix_conversations_kind", "conversations", ["kind"], unique=False)
+    # Phase 4: partial unique index on (parent_conversation_id, title)
+    # prevents two same-named children under the same parent at the
+    # DB layer (G36 race protection). The WHERE clause excludes top-
+    # level conversations (parent_conversation_id IS NULL) so multiple
+    # untitled top-level conversations remain valid.
+    op.create_index(
+        "ix_conversations_parent_title_unique",
+        "conversations",
+        ["parent_conversation_id", "title"],
+        unique=True,
+        sqlite_where=sa.text("parent_conversation_id IS NOT NULL"),
+        postgresql_where=sa.text("parent_conversation_id IS NOT NULL"),
+    )
     op.create_table(
         "files",
         sa.Column("id", sa.String(length=64), nullable=False),
@@ -186,6 +210,7 @@ def downgrade() -> None:
     op.drop_table("conversation_items")
     op.drop_index("ix_files_created_at", table_name="files")
     op.drop_table("files")
+    op.drop_index("ix_conversations_parent_title_unique", table_name="conversations")
     op.drop_index("ix_conversations_kind", table_name="conversations")
     op.drop_index("ix_conversations_updated_at", table_name="conversations")
     op.drop_index("ix_conversations_created_at", table_name="conversations")
