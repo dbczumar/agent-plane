@@ -392,16 +392,56 @@ class ToolResult(BaseModel):
     output: str
 
 
+class AsyncToolResult(BaseModel):
+    """
+    Phase 5: a single async-client-tool result submitted by PATCH.
+
+    Distinct from :class:`ToolResult` because async client tools
+    are dispatched as kind="client_tool" tasks (not parking),
+    so the lookup key is the server-issued ``task_id`` (not the
+    LLM's ``call_id``). Carries a status enum + optional
+    output / error so success and failure paths share one
+    schema. Idempotent — a second PATCH with the same task_id
+    is a no-op.
+
+    :param task_id: The server-issued task identifier from the
+        ``function_call_output`` handle the LLM saw, e.g.
+        ``"resp_async_xyz"``.
+    :param status: Terminal status — one of ``"completed"``,
+        ``"failed"``, or ``"cancelled"``.
+    :param output: For ``status="completed"`` only: the tool's
+        string output. ``None`` on failure / cancellation.
+    :param error: For ``status="failed"`` only: dict with
+        ``message`` (exception class + message) and
+        ``traceback`` (truncated). ``None`` for non-failed.
+    """
+
+    task_id: str
+    status: str
+    output: str | None = None
+    error: dict[str, str] | None = None
+
+
 class PatchResponseRequest(BaseModel):
     """
     Request body for ``PATCH /v1/responses/{id}``.
 
-    Submits tool results for tunneled client-side tool calls
-    that have ``status: "action_required"`` in the response
-    output.
+    Submits tool results for tunneled client-side tool calls.
+    Phase 5: a single PATCH may carry both legacy
+    ``tool_results`` (for synchronous client tools that took
+    the parking path) AND ``async_tool_results`` (for
+    ``synchronous=false`` client tools dispatched as
+    ``kind="client_tool"`` tasks). Both lists are optional and
+    independent — one PATCH can complete a sync tool and an
+    async tool in the same body.
 
-    :param tool_results: List of tool results to submit. Each
-        entry maps a ``call_id`` to its output string.
+    :param tool_results: Sync client-tool results — each entry
+        maps a ``call_id`` to its output string. Used for the
+        legacy parking path.
+    :param async_tool_results: Phase 5 async client-tool
+        results — each entry carries a ``task_id`` + status +
+        optional output/error.
     """
 
-    tool_results: list[ToolResult]
+    tool_results: list[ToolResult] = []
+    async_tool_results: list[AsyncToolResult] = []

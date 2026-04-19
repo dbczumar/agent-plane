@@ -210,6 +210,85 @@ def _apply_tool_results(
                 )
 
 
+async def _apply_async_tool_results(
+    req: PatchResponseRequest,
+    task_store: TaskStore,
+) -> None:
+    """
+    Apply Phase 5 async client-tool results from a PATCH request.
+
+    For each ``async_tool_result`` entry:
+    1. Look up the task by ``task_id``; 404 if not found.
+    2. If the task is already terminal (e.g. server-side cancel
+       beat the client's PATCH), keep the prior terminal status
+       — late "completed" PATCHes do NOT override an earlier
+       "cancelled" (G3 first-write-wins).
+    3. Otherwise, mark the task terminal in ``task_store`` via
+       ``finalize_async_task`` and signal the parent on the
+       unified ``async_work_complete`` topic so the parent's
+       drain auto-delivers the result.
+
+    Idempotent — a second PATCH with the same ``task_id`` after
+    a terminal status hits step 2 (no-op).
+
+    :param req: The PATCH request with async tool results.
+    :param task_store: Task store for the lookup + finalization.
+    :raises AgentPlaneError: NOT_FOUND if the task_id is unknown.
+    """
+    from agent_plane.entities.task import TERMINAL_STATUSES
+    from agent_plane.runtime.background_tool_workflow import (
+        ASYNC_WORK_COMPLETE_TOPIC,
+    )
+    from agent_plane.runtime.durability import dbos_send_async
+
+    for async_result in req.async_tool_results:
+        task = await task_store.get(async_result.task_id)
+        if task is None:
+            raise AgentPlaneError(
+                f"Async client-tool task {async_result.task_id!r} not found.",
+                code=ErrorCode.NOT_FOUND,
+            )
+        if task.kind != "client_tool":
+            raise AgentPlaneError(
+                f"Task {async_result.task_id!r} is not a client_tool "
+                f"task (kind={task.kind!r}); use tool_results for sync "
+                f"client tools or check_task for other kinds.",
+                code=ErrorCode.CONFLICT,
+            )
+        if task.status in TERMINAL_STATUSES:
+            # G3: first-write-wins. The task was already
+            # cancelled or completed (probably via cancel_task
+            # racing the PATCH); silently accept the late PATCH
+            # without changing terminal status. Don't re-signal
+            # the parent — the original terminal write already
+            # did that.
+            continue
+
+        # Mark terminal in the task_store and signal the parent.
+        await task_store.finalize_async_task(
+            task_id=async_result.task_id,
+            status=async_result.status,
+            output=async_result.output or "",
+            error=async_result.error,
+        )
+        # Resolve the parent task for the signal target. The
+        # task row carries root_task_id, which is the
+        # async_work_complete recipient.
+        parent_task_id = task.root_task_id or task.id
+        payload: dict[str, Any] = {
+            "task_id": async_result.task_id,
+            "kind": "client_tool",
+            "status": async_result.status,
+            "output": async_result.output or "",
+            "error": async_result.error,
+        }
+        await dbos_send_async(
+            parent_task_id,
+            payload,
+            topic=ASYNC_WORK_COMPLETE_TOPIC,
+        )
+
+
 def _normalize_input(
     raw_input: str | list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1027,11 +1106,19 @@ def create_responses_router(
         # idempotent — partial delivery is safe because the park
         # loop waits for ALL its pending IDs. Uses sync store
         # APIs, so runs in a thread.
-        await asyncio.to_thread(
-            _apply_tool_results,
-            req,
-            task_store,
-        )
+        if req.tool_results:
+            await asyncio.to_thread(
+                _apply_tool_results,
+                req,
+                task_store,
+            )
+        # Phase 5: process async client-tool results separately
+        # — these are kind="client_tool" tasks dispatched
+        # without parking; the result lookup uses task_id (not
+        # call_id) and signals the parent's drain via the
+        # unified async_work_complete topic.
+        if req.async_tool_results:
+            await _apply_async_tool_results(req, task_store)
         # Re-fetch to capture any output changes from completed
         # tool calls.
         updated_task = await task_store.get(response_id)

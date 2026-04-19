@@ -391,6 +391,34 @@ class TaskStore(ABC):
         """
         ...
 
+    @abstractmethod
+    async def finalize_async_task(
+        self,
+        *,
+        task_id: str,
+        status: str,
+        output: str = "",
+        error: dict[str, str] | None = None,
+    ) -> None:
+        """
+        Phase 5: mark a non-DBOS task terminal with a result.
+
+        Used by the PATCH ``async_tool_results`` handler to
+        record the client's reported outcome on a
+        ``kind="client_tool"`` task. Tasks WITH a DBOS
+        workflow should NOT use this — DBOS itself is the
+        source of truth for their status.
+
+        :param task_id: The task's id.
+        :param status: Terminal status — one of ``"completed"``,
+            ``"failed"``, ``"cancelled"``.
+        :param output: The string output for ``"completed"``.
+        :param error: For ``"failed"`` only — dict with
+            ``message`` and ``traceback`` keys.
+        :raises LookupError: If the task does not exist.
+        """
+        ...
+
     # ── Pending tool call methods ─────────────────────────
 
     @abstractmethod

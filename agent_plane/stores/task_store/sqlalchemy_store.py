@@ -13,6 +13,7 @@ assembles the full Task entity from both the DB row and DBOS state.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -123,6 +124,23 @@ def _to_entity(row: SqlTask) -> Task:
     :returns: A :class:`Task` dataclass instance with status
         defaulting to ``"queued"``.
     """
+    # Phase 5 — for tasks without a DBOS workflow (e.g. async
+    # client tools), the manual_* columns hold the terminal
+    # status set by the PATCH async_tool_results handler.
+    # Surface these on _to_entity so check_task / list_tasks
+    # see the right state. For tasks with a DBOS workflow,
+    # manual_status is NULL and ``_enrich_from_dbos`` overwrites
+    # the queued default with live workflow state.
+    initial_status = row.manual_status or TaskStatus.QUEUED.value
+    initial_output: list[dict[str, Any]] = []
+    initial_error: dict[str, str] | None = None
+    if row.manual_output:
+        initial_output = [{"text": row.manual_output}]
+    if row.manual_error_message:
+        initial_error = {
+            "message": row.manual_error_message,
+            "traceback": row.manual_error_traceback or "",
+        }
     return Task(
         id=row.id,
         conversation_id=row.conversation_id,
@@ -136,7 +154,9 @@ def _to_entity(row: SqlTask) -> Task:
         kind=row.kind,
         # task.status is typed str; store the enum's .value so f-string
         # formatting produces "queued" not "TaskStatus.QUEUED".
-        status=TaskStatus.QUEUED.value,
+        status=initial_status,
+        output=initial_output,
+        error=initial_error,
         # instructions and reasoning are populated by _apply_workflow_status
         # from DBOS workflow inputs, not from the DB row.
     )
@@ -657,6 +677,52 @@ class SqlAlchemyTaskStore(TaskStore):
             return []
 
     # ── Cancel / Delete ───────────────────────────────────
+
+    async def finalize_async_task(
+        self,
+        *,
+        task_id: str,
+        status: str,
+        output: str = "",
+        error: dict[str, str] | None = None,
+    ) -> None:
+        """
+        Phase 5: mark a non-DBOS task terminal with a result.
+
+        Used by the PATCH ``async_tool_results`` handler to
+        record the client's reported outcome on a
+        ``kind="client_tool"`` task. Writes the manual_*
+        columns on the row; the next ``_to_entity`` will surface
+        them as ``status`` / ``output`` / ``error``.
+
+        :param task_id: The task's id.
+        :param status: Terminal status — one of ``"completed"``,
+            ``"failed"``, ``"cancelled"``.
+        :param output: The string output for ``"completed"``
+            (empty string otherwise).
+        :param error: For ``"failed"`` only — dict with
+            ``message`` and ``traceback`` keys.
+        :raises LookupError: If the task does not exist.
+        """
+        from sqlalchemy import update
+
+        def _do_update() -> None:
+            with self._session() as session:
+                stmt = (
+                    update(SqlTask)
+                    .where(SqlTask.id == task_id)
+                    .values(
+                        manual_status=status,
+                        manual_output=output,
+                        manual_error_message=(error or {}).get("message"),
+                        manual_error_traceback=(error or {}).get("traceback"),
+                    )
+                )
+                result = session.execute(stmt)
+                if result.rowcount == 0:
+                    raise LookupError(f"task {task_id!r} not found")
+
+        await asyncio.to_thread(_do_update)
 
     def cancel(self, task_id: str) -> Task:
         """

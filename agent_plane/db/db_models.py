@@ -193,6 +193,22 @@ class SqlTask(Base):
     kind: Mapped[str] = mapped_column(
         String(32), default="agent_task", server_default="agent_task"
     )
+    # Phase 5 — terminal status / output / error for tasks that
+    # have NO DBOS workflow (e.g. ``kind="client_tool"`` async
+    # client-tool tasks finalized via PATCH async_tool_results).
+    # For tasks WITH a DBOS workflow, these stay NULL and the
+    # store's ``_enrich_from_dbos`` overlay supplies the live
+    # values from DBOS instead.
+    manual_status: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    manual_output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    manual_error_message: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    manual_error_traceback: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
 
     __table_args__ = (
         Index("ix_tasks_conversation_id", "conversation_id"),

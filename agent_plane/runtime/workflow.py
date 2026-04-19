@@ -2982,17 +2982,43 @@ async def cancel_pending_child_tools(parent_task_id: str) -> None:
     children = await task_store.list_tasks(root_task_id=parent_task_id)
     iter_children = children.data if hasattr(children, "data") else children
     for child in iter_children:
-        if child.kind != _TOOL_KIND:
-            continue
         if child.status in TERMINAL_STATUSES:
             continue
-        try:
-            await cancel_workflow_async(child.id)
-        except Exception:
-            _logger.exception(
-                "failed to cancel child tool task %s during parent cancel",
-                child.id,
-            )
+        if child.kind == _TOOL_KIND:
+            # @tool(synchronous=False) — kill its DBOS workflow.
+            try:
+                await cancel_workflow_async(child.id)
+            except Exception:
+                _logger.exception(
+                    "failed to cancel child tool task %s during parent cancel",
+                    child.id,
+                )
+        elif child.kind == _CLIENT_TOOL_KIND:
+            # Client-side async tool — there's no server-side
+            # workflow. Mark the task row cancelled in-store
+            # and emit a response.client_task.cancel SSE event
+            # so the client cancels its local asyncio task and
+            # PATCHes back. The drain doesn't get a signal here
+            # — the client's PATCH will trigger one via the
+            # normal async_tool_results path.
+            try:
+                await task_store.finalize_async_task(
+                    task_id=child.id,
+                    status="cancelled",
+                )
+                _write_output(
+                    parent_task_id,
+                    {
+                        "type": "response.client_task.cancel",
+                        "task_id": child.id,
+                    },
+                )
+            except Exception:
+                _logger.exception(
+                    "failed to cancel client_tool task %s during parent cancel",
+                    child.id,
+                )
+        # Other kinds (sub_agent) handled by their own signaling.
 
 
 # ─── Async work drain ──────────────────────────────────────
