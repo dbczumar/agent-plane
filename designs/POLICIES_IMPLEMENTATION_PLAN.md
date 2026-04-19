@@ -5,6 +5,61 @@ is self-contained, independently testable, and leaves the
 codebase shippable. Phases may be merged individually; the
 system is only feature-complete after Phase 11.
 
+## Omniagents test + example parity — load-bearing assurance
+
+Agent-plane's policy system is a port of omniagents'. The
+omniagents test suite already verifies every invariant this
+design inherits. **Every agent-plane phase must include the
+ported versions of the relevant omniagents tests**, adapted
+to agent-plane's spec shape (YAML keys renamed per the port,
+DBOS-durable workflow instead of in-memory Session, etc.)
+but preserving the original assertion semantics.
+
+### Reference test files
+
+| omniagents file | lines | agent-plane phase |
+|---|---|---|
+| `tests/test_policies.py` | 320 | Phase 3 (LabelPolicy), Phase 4 (FunctionPolicy), Phase 7 (PromptPolicy) |
+| `tests/test_labels_and_policies.py` | 1051 | Phase 2 (engine), Phase 3, Phase 4, Phase 7, Phase 8 (ASK flow) |
+| `tests/test_label_examples.py` | 848 | Phase 8 + e2e (multi-dimensional IFC scenarios) |
+| `tests/test_label_propagation.py` | 292 | deferred — v2 / G5 sub-agent propagation |
+
+### Reference example YAMLs — ported as e2e fixtures
+
+| omniagents example | agent-plane e2e fixture | exercises |
+|---|---|---|
+| `examples/agent_with_policies.yaml` | `tests/_fixtures/agents/policies-demo/` | FunctionPolicy + PromptPolicy (input + output phases) |
+| `examples/rate_limited_search_agent.yaml` | `tests/_fixtures/agents/rate-limited-search/` | Stateful FunctionPolicy + ASK timeout |
+| `examples/secure_research_agent.yaml` | `tests/_fixtures/agents/secure-research/` | Full IFC scenario — labels + label policies + enforcement |
+
+Each phase's test-coverage list below calls out which
+omniagents test cases it ports. When a test name appears in
+both the omniagents file and the agent-plane phase, the
+**assertion semantics must match**; only framework-specific
+plumbing (store setup, spec loading) differs.
+
+### E2E priority
+
+Per user direction: **e2e tests take priority over unit
+tests** when coverage trade-offs appear. A phase ships with
+at least one e2e test exercising the ported omniagents
+example YAML against a real agent-plane workflow, even if
+some unit-level coverage is still pending. The e2e agents
+live under `tests/_fixtures/agents/` (alongside existing
+`sub-agent-test`, etc.) and run under `tests/e2e/` with the
+`--llm-api-key` flag, matching agent-plane's existing e2e
+pattern.
+
+### Phase-closure check
+
+Before closing a phase: `diff` the ported test list against
+the corresponding omniagents test file. Any omniagents test
+NOT in the ported list either (a) must be added, or (b)
+needs a written justification for its exclusion (e.g. "tests
+a v2 feature we defer").
+
+---
+
 ## Design-adherence assurance — applies to every phase
 
 Before closing any phase:
@@ -211,15 +266,27 @@ Simplest policy type; exercises condition gating and
   `apply_label_writes`, not in the policy.
 
 **Test coverage.**
-- `tests/runtime/policies/test_label_policy.py`: all three
-  actions fire; `set_labels` reaches `apply_label_writes`;
-  condition-gated policy does not fire when label state
-  doesn't match; schemaless labels set freely; monotonic
-  violations silently dropped.
+- `tests/runtime/policies/test_label_policy.py` — ports the
+  omniagents `test_labels_and_policies.py` cases that cover
+  label policies specifically:
+  `test_load_label_policy_produces_function_policy`,
+  `test_label_policy_with_set_labels`,
+  `test_label_set_by_policy_on_tool_call`,
+  `test_condition_matches`, `test_condition_no_match`,
+  `test_list_condition_or`, `test_multi_key_and`,
+  `test_match_tools_filter`,
+  `test_match_tools_ignored_for_non_tool_call`,
+  `test_labels_change_future_policy_decisions`,
+  `test_engine_enforces_root_label_schema_monotonicity`,
+  `test_invalid_initial_label_value_rejected_by_schema`.
 - `tests/runtime/policies/test_label_policy_composition.py`:
   DENY short-circuits; earlier ALLOWing writes still land
   on DENY; ASK accumulates and withholds labels (verify
   nothing wrote to the store until explicit apply).
+  Ports `test_deny_short_circuits`,
+  `test_ask_continues_evaluation`,
+  `test_all_policies_evaluated`, `test_phase_filtering`
+  from omniagents `test_policies.py`.
 
 **Adherence check.** Read §4 engine loop line-by-line with
 the LabelPolicy test in hand — every step in the pseudocode
@@ -253,7 +320,26 @@ has an assertion covering it.
   policies keep state across evaluations in the same run;
   new instance per workflow.
 
-**Test coverage.**
+**Test coverage.** Ports these omniagents
+`test_policies.py` cases:
+`test_allow_by_default`, `test_sync_callable_block`,
+`test_sync_callable_allow`, `test_async_callable`,
+`test_callable_returns_dict`, `test_deny_action_from_dict`,
+`test_tool_call_rate_limit`, `test_reset_turn` (renamed —
+agent-plane's per-workflow instance replaces
+`reset_turn`), plus the `test_labels_and_policies.py`
+FunctionPolicy-context cases:
+`test_two_arg_callable_still_works` (now `test_single_arg_ctx`
+since agent-plane uses `EvaluationContext`),
+`test_three_arg_callable_receives_context`,
+`test_three_arg_callable_reads_labels_for_decision`,
+`test_three_arg_async_callable`,
+`test_dict_return_set_labels`,
+`test_no_session_gives_empty_labels` (renamed —
+agent-plane's `_context()` always returns a dict),
+`test_rate_limit_counter_isolated`,
+`test_zero_arg_factory_copy_creates_fresh_state`.
+
 - `tests/runtime/policies/test_function_policy_sync.py`:
   bare `def` callable; action whitelist filtering;
   set_labels filtering.
@@ -272,6 +358,10 @@ has an assertion covering it.
 
 **Adherence check.** Point-check the `rate_limit_search`
 example from §9.1 is runnable verbatim against this code.
+Copy omniagents `examples/search_rate_limit_policy.py`
+into `tests/_fixtures/agents/rate-limited-search/tools/python/`
+and confirm the factory-with-arguments form produces the
+same closure behavior.
 
 ---
 
@@ -388,7 +478,18 @@ single runtime component.
 - §9.4: testability hook works — no live LLM required for
   unit tests.
 
-**Test coverage.**
+**Test coverage.** Ports these omniagents
+`test_policies.py` PromptPolicy cases:
+`test_prompt_policy_input_is_json_envelope`,
+`test_prompt_policy_allows_from_json`,
+`test_prompt_policy_denies_content`,
+`test_prompt_policy_can_set_labels_when_enabled`,
+`test_prompt_policy_ignores_set_labels_when_disabled`,
+`test_prompt_policy_uses_configured_executor_spec`
+(renamed — agent-plane uses `llm:` override, not
+`executor:`), `test_prompt_policy_loader_fields`,
+`test_prompt_policy_invalid_json_blocks`.
+
 - `tests/runtime/policies/test_prompt_policy_happy.py`:
   stub classifier returns ALLOW, policy result ALLOWs;
   writes match declared whitelist.
@@ -446,7 +547,19 @@ workflow only; client changes in Phase 10.
 - §8 "Shared topic": `tool_result` is the park/wake
   channel, same as client-tool tunneling.
 
-**Test coverage.**
+**Test coverage.** Ports these omniagents
+`test_labels_and_policies.py` ASK-flow cases:
+`test_label_policy_ask_approve`,
+`test_label_policy_ask_handler_receives_tool_args`
+(renamed — agent-plane's approval payload carries
+`content_preview` instead of raw tool_args),
+`test_ask_handler_internal_type_error_is_not_silently_retried`,
+`test_label_policy_ask_deny`,
+`test_ask_timeout`,
+`test_ask_user_denies_not_timeout_message`,
+`test_no_handler_denies` (agent-plane equivalent:
+timeout on no PATCH → DENY).
+
 - `tests/server/integration/test_policy_approval_happy.py`:
   policy ASKs → PATCH approves → workflow resumes →
   label writes land.
@@ -465,6 +578,19 @@ workflow only; client changes in Phase 10.
   three policies all ASK with overlapping `set_labels`;
   single approval → all three policies' writes land
   (last-writer-wins across YAML order).
+
+**E2E coverage — mandatory before closing Phase 8.**
+`tests/e2e/test_policies_approval_e2e.py` runs the
+ported `agent_with_policies.yaml` fixture end-to-end
+with a live LLM and real PATCH round-trip. Validates
+that (a) blocked tool calls return the sentinel the LLM
+reacts to, (b) blocked input surfaces the DENY in the
+response, (c) an ASK policy parks, a client PATCHes
+approval, and the workflow resumes.
+`tests/e2e/test_secure_research_e2e.py` runs the full
+IFC scenario from `secure_research_agent.yaml` — web
+search taints integrity, doc read taints confidentiality,
+shell combo → DENY, solo → ASK.
 
 **Adherence check.** End-to-end: trace one approval from
 policy ASK through PATCH through workflow wake, hitting
