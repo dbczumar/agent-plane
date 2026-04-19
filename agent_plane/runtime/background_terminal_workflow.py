@@ -187,10 +187,7 @@ def _result_to_payload(
     # Render a compact, LLM-friendly output. Full stdout is already
     # capped at ~30 KB inline (§6.7); truncate_for_llm adds a safety
     # margin to match the @tool path's budget.
-    body = (
-        f"shell={shell_name!r} exit_code={exit_code} status={status!r}\n"
-        f"stdout:\n{stdout}"
-    )
+    body = f"shell={shell_name!r} exit_code={exit_code} status={status!r}\nstdout:\n{stdout}"
     output = truncate_for_llm(body)
 
     if status == "completed":
@@ -294,9 +291,7 @@ async def background_terminal_workflow(
     return _payload_to_dict(payload)
 
 
-async def _send_payload(
-    parent_task_id: str, payload: AsyncWorkCompletePayload
-) -> None:
+async def _send_payload(parent_task_id: str, payload: AsyncWorkCompletePayload) -> None:
     """Send the completion payload to the parent workflow's drain.
 
     Thin wrapper around ``dbos_send_async`` so the workflow body

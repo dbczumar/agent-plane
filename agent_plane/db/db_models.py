@@ -201,8 +201,7 @@ class SqlTask(Base):
         Index("ix_tasks_root_task_id", "root_task_id"),
         Index("ix_tasks_kind", "kind"),
         CheckConstraint(
-            "kind IN ('agent_task', 'tool', 'sub_agent', "
-            "'client_tool', 'terminal')",
+            "kind IN ('agent_task', 'tool', 'sub_agent', 'client_tool', 'terminal')",
             name="ck_tasks_kind",
         ),
     )

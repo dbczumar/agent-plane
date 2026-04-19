@@ -255,8 +255,8 @@ class TerminalRunTool(Tool):
             start_workflow,
         )
         from agent_plane.runtime.workflow import (
-            _AsyncToolHandle,
             _async_handle_message,
+            _AsyncToolHandle,
             _to_thread,
         )
 
@@ -297,12 +297,11 @@ class TerminalRunTool(Tool):
         # first ``manager.run_sync`` call, which owns the shell
         # from a single thread.
         from pathlib import Path as _Path
+
         from agent_plane.runtime import get_terminal_registry
 
         registry = get_terminal_registry()
-        manager = registry.for_conversation(
-            parent_conversation_id, _Path(workspace_path)
-        )
+        manager = registry.for_conversation(parent_conversation_id, _Path(workspace_path))
         task_store = get_task_store()
 
         def _create_row_and_register() -> Any:

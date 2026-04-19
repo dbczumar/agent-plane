@@ -28,58 +28,6 @@ from agent_plane.entities import (
 )
 from agent_plane.entities.task import TERMINAL_STATUSES, Task
 from agent_plane.errors import AgentPlaneError, ErrorCode
-
-# Task kind for background `@tool(synchronous=False)` work items —
-# the unit the parent loop separates from the polling-based
-# sub-agent path so each kind uses the right collection mechanism.
-_TOOL_KIND = "tool"
-_SUB_AGENT_KIND = "sub_agent"
-_TERMINAL_KIND = "terminal"
-# Kinds whose completion arrives via the async_work_complete drain
-# (Phase 2: tools; Phase 3: sub-agents; Phase 2+ terminal: async
-# terminal_run commands). The legacy "agent_task" kind is the
-# top-level user turn — always tracked separately.
-_DRAIN_KINDS = frozenset({_TOOL_KIND, _SUB_AGENT_KIND, _TERMINAL_KIND})
-
-# Per-payload character cap for sub-agent output piggy-backed on
-# the async_work_complete signal (matches the @tool path's
-# ``truncate_for_llm`` budget — keeps the LLM-facing system
-# message under control regardless of which kind produced it).
-_SUB_AGENT_OUTPUT_BUDGET = 10_000
-
-# G20: cadence for `response.heartbeat` SSE events emitted while
-# the parent loop is blocked on the async-tool drain. 15 s keeps
-# proxies that close idle connections at 30 s safely under their
-# threshold without flooding the channel with pings.
-_HEARTBEAT_INTERVAL_S = 15.0
-
-# Generic type variable used by ``_to_thread`` (pure helper).
-_T = TypeVar("_T")
-
-# Hard upper bound on LLM turns per execution. Prevents runaway
-# loops. See designs/AGENTLOOP.md "Not Yet" for making this
-# configurable.
-_MAX_ITERATIONS = 1000
-
-# SSE event types emitted for reasoning content (set by the
-# streaming accumulator and consumed by the terminal frontend).
-_REASONING_TEXT_EVENT = "response.reasoning_text.delta"
-_REASONING_SUMMARY_EVENT = "response.reasoning_summary_text.delta"
-_REASONING_STARTED_EVENT = "response.reasoning.started"
-
-# Executor storage layout — each (conversation, agent) gets a
-# stable subdir under ``_EXECUTOR_STORAGE_BASE`` that persists
-# across tasks. The artifact-store key prefix mirrors the disk
-# layout so snapshots round-trip cleanly.
-_EXECUTOR_STORAGE_KEY_PREFIX = "executor_storage"
-_EXECUTOR_STORAGE_BASE = Path.home() / ".agent-plane" / "executor_storage"
-
-# Client-side tool result polling — used by
-# ``_build_await_tool_output`` while waiting for a PATCH'd
-# function_call_output to arrive.
-_TOOL_POLL_INTERVAL_SECONDS = 0.5
-_TOOL_POLL_TIMEOUT_SECONDS = 600
-
 from agent_plane.llms import Client as LLMClient
 from agent_plane.llms.errors import (
     ContextWindowExceededError,
@@ -168,7 +116,60 @@ from agent_plane.tools.client_specified import (
     parse_client_side_tool_specs,
 )
 
+# ── Module-level constants ────────────────────────────────────
+
 _logger = logging.getLogger(__name__)
+
+# Task kind for background `@tool(synchronous=False)` work items —
+# the unit the parent loop separates from the polling-based
+# sub-agent path so each kind uses the right collection mechanism.
+_TOOL_KIND = "tool"
+_SUB_AGENT_KIND = "sub_agent"
+_TERMINAL_KIND = "terminal"
+# Kinds whose completion arrives via the async_work_complete drain
+# (Phase 2: tools; Phase 3: sub-agents; Phase 2+ terminal: async
+# terminal_run commands). The legacy "agent_task" kind is the
+# top-level user turn — always tracked separately.
+_DRAIN_KINDS = frozenset({_TOOL_KIND, _SUB_AGENT_KIND, _TERMINAL_KIND})
+
+# Per-payload character cap for sub-agent output piggy-backed on
+# the async_work_complete signal (matches the @tool path's
+# ``truncate_for_llm`` budget — keeps the LLM-facing system
+# message under control regardless of which kind produced it).
+_SUB_AGENT_OUTPUT_BUDGET = 10_000
+
+# G20: cadence for `response.heartbeat` SSE events emitted while
+# the parent loop is blocked on the async-tool drain. 15 s keeps
+# proxies that close idle connections at 30 s safely under their
+# threshold without flooding the channel with pings.
+_HEARTBEAT_INTERVAL_S = 15.0
+
+# Generic type variable used by ``_to_thread`` (pure helper).
+_T = TypeVar("_T")
+
+# Hard upper bound on LLM turns per execution. Prevents runaway
+# loops. See designs/AGENTLOOP.md "Not Yet" for making this
+# configurable.
+_MAX_ITERATIONS = 1000
+
+# SSE event types emitted for reasoning content (set by the
+# streaming accumulator and consumed by the terminal frontend).
+_REASONING_TEXT_EVENT = "response.reasoning_text.delta"
+_REASONING_SUMMARY_EVENT = "response.reasoning_summary_text.delta"
+_REASONING_STARTED_EVENT = "response.reasoning.started"
+
+# Executor storage layout — each (conversation, agent) gets a
+# stable subdir under ``_EXECUTOR_STORAGE_BASE`` that persists
+# across tasks. The artifact-store key prefix mirrors the disk
+# layout so snapshots round-trip cleanly.
+_EXECUTOR_STORAGE_KEY_PREFIX = "executor_storage"
+_EXECUTOR_STORAGE_BASE = Path.home() / ".agent-plane" / "executor_storage"
+
+# Client-side tool result polling — used by
+# ``_build_await_tool_output`` while waiting for a PATCH'd
+# function_call_output to arrive.
+_TOOL_POLL_INTERVAL_SECONDS = 0.5
+_TOOL_POLL_TIMEOUT_SECONDS = 600
 
 
 def _monotonic() -> float:
@@ -2646,8 +2647,7 @@ async def _dispatch_local_python_tool_async(
 
     if not isinstance(tool, LocalPythonTool):
         raise RuntimeError(
-            f"local-python async dispatch requires LocalPythonTool, "
-            f"got {type(tool).__name__}"
+            f"local-python async dispatch requires LocalPythonTool, got {type(tool).__name__}"
         )
 
     task_store = get_task_store()
@@ -2657,13 +2657,10 @@ async def _dispatch_local_python_tool_async(
         # Fall back to the parent row's conversation_id for legacy
         # callers that don't pass it. Kept as a defensive path —
         # the workflow body always has conversation_id available now.
-        parent_row = await _to_thread(
-            lambda: task_store.get_sync(parent_task_id)
-        )
+        parent_row = await _to_thread(lambda: task_store.get_sync(parent_task_id))
         if parent_row is None:
             raise RuntimeError(
-                f"parent task {parent_task_id!r} not found — async "
-                f"dispatch invariant broken"
+                f"parent task {parent_task_id!r} not found — async dispatch invariant broken"
             )
         conv_id = parent_row.conversation_id
 

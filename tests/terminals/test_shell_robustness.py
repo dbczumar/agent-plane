@@ -291,9 +291,7 @@ def _wait_for_flag(flag: Path, timeout_s: float) -> bool:
     return False
 
 
-def test_concurrent_run_on_same_shell_returns_shell_busy(
-    shell: Shell, tmp_path: Path
-) -> None:
+def test_concurrent_run_on_same_shell_returns_shell_busy(shell: Shell, tmp_path: Path) -> None:
     """A second thread's run_sync returns shell_busy while the first is running.
 
     The §6.1 Option D semantic: a terminal_run on a shell that's
@@ -321,9 +319,7 @@ def test_concurrent_run_on_same_shell_returns_shell_busy(
         # touch → flag becomes visible; sleep → holds the cmd lock.
         # The second run_sync call fires *after* the flag appears,
         # so it's guaranteed to collide with the sleep.
-        first_result.append(
-            shell.run_sync(f"touch {flag} && sleep 2 && echo first")
-        )
+        first_result.append(shell.run_sync(f"touch {flag} && sleep 2 && echo first"))
 
     t1 = threading.Thread(target=first_runner)
     t1.start()
@@ -360,9 +356,7 @@ def test_concurrent_run_on_same_shell_returns_shell_busy(
     assert "first" in r1.stdout  # type: ignore[attr-defined]
 
 
-def test_shell_busy_does_not_leave_shell_wedged(
-    shell: Shell, tmp_path: Path
-) -> None:
+def test_shell_busy_does_not_leave_shell_wedged(shell: Shell, tmp_path: Path) -> None:
     """After a shell_busy collision resolves, the shell is usable again.
 
     Regression guard: if the non-blocking acquire path mistakenly
@@ -406,9 +400,7 @@ def test_shell_busy_does_not_leave_shell_wedged(
 # ── interrupt() — sends SIGINT to the running command ──────────
 
 
-def test_interrupt_kills_running_command_shell_survives(
-    shell: Shell, tmp_path: Path
-) -> None:
+def test_interrupt_kills_running_command_shell_survives(shell: Shell, tmp_path: Path) -> None:
     """``shell.interrupt()`` unblocks a sleeping command and returns
     ``status="killed"``; the shell itself is still usable.
 
@@ -485,7 +477,8 @@ def test_peek_partial_stdout_empty_before_command() -> None:
     """
     from pathlib import Path as _Path
 
-    from agent_plane.terminals import PartialReadResult, Shell as _Shell
+    from agent_plane.terminals import PartialReadResult
+    from agent_plane.terminals import Shell as _Shell
 
     with tempfile_dir() as d:
         s = _Shell.spawn("peek-empty", _Path(d), sandbox_enabled=False)
@@ -516,9 +509,7 @@ def test_peek_partial_stdout_returns_delta_during_command(
 
     def _run() -> None:
         result_holder.append(
-            shell.run_sync(
-                "echo chunk-one; sleep 0.6; echo chunk-two; sleep 0.1"
-            )
+            shell.run_sync("echo chunk-one; sleep 0.6; echo chunk-two; sleep 0.1")
         )
         done.set()
 
@@ -530,9 +521,7 @@ def test_peek_partial_stdout_returns_delta_during_command(
         first = shell.peek_partial_stdout(0)
         while "chunk-one" not in first.text and __import__("time").monotonic() < deadline:
             first = shell.peek_partial_stdout(0)
-        assert "chunk-one" in first.text, (
-            f"First peek didn't see chunk-one; got {first.text!r}."
-        )
+        assert "chunk-one" in first.text, f"First peek didn't see chunk-one; got {first.text!r}."
         assert "chunk-two" not in first.text, (
             f"First peek already saw chunk-two — the sleep in the "
             f"bash command didn't hold: {first.text!r}."
@@ -544,14 +533,12 @@ def test_peek_partial_stdout_returns_delta_during_command(
         while "chunk-two" not in second.text and __import__("time").monotonic() < deadline2:
             second = shell.peek_partial_stdout(first.new_cursor)
         assert "chunk-two" in second.text, (
-            f"Second peek didn't see chunk-two within 3s; got "
-            f"{second.text!r}."
+            f"Second peek didn't see chunk-two within 3s; got {second.text!r}."
         )
         # Crucially: chunk-one should NOT appear again — it was
         # before the cursor.
         assert "chunk-one" not in second.text, (
-            f"Second peek returned chunk-one again — cursor wasn't "
-            f"advancing: {second.text!r}."
+            f"Second peek returned chunk-one again — cursor wasn't advancing: {second.text!r}."
         )
     finally:
         done.wait(timeout=5.0)

@@ -308,9 +308,7 @@ class Shell:
         return cls(name=name, workspace=workspace, proc=proc)
 
     @staticmethod
-    def _build_spawn_argv(
-        workspace: Path, sandbox_enabled: bool
-    ) -> tuple[str, list[str]]:
+    def _build_spawn_argv(workspace: Path, sandbox_enabled: bool) -> tuple[str, list[str]]:
         """Build the (executable, argv) pair passed to pexpect.spawn.
 
         When ``sandbox_enabled`` is True, returns an invocation of

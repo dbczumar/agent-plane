@@ -288,9 +288,7 @@ def test_concurrent_run_sync_same_name_creates_one_shell(
     original_spawn = Shell.spawn
     spawn_lock = threading.Lock()
 
-    def counting_spawn(
-        name: str, workspace: Path, *, sandbox_enabled: bool = True
-    ) -> Shell:
+    def counting_spawn(name: str, workspace: Path, *, sandbox_enabled: bool = True) -> Shell:
         nonlocal spawn_count
         with spawn_lock:
             spawn_count += 1
@@ -425,29 +423,32 @@ def test_peek_task_stdout_returns_delta(
         # First peek: wait until part-one arrives.
         deadline = __import__("time").monotonic() + 3.0
         first = manager.peek_task_stdout("tid_peek")
-        while first is not None and "part-one" not in first[0] and __import__("time").monotonic() < deadline:
+        while (
+            first is not None
+            and "part-one" not in first.text
+            and __import__("time").monotonic() < deadline
+        ):
             first = manager.peek_task_stdout("tid_peek")
         assert first is not None
-        text1, lost1 = first
-        assert "part-one" in text1
-        assert "part-two" not in text1, (
-            f"First peek too late — part-two already appeared: {text1!r}"
+        assert "part-one" in first.text
+        assert "part-two" not in first.text, (
+            f"First peek too late — part-two already appeared: {first.text!r}"
         )
-        assert lost1 == 0  # ring buffer has ample space
+        assert first.lost_bytes == 0  # ring buffer has ample space
 
         # Second peek: only new bytes (part-two), not part-one again.
         deadline2 = __import__("time").monotonic() + 3.0
         second = manager.peek_task_stdout("tid_peek")
-        while second is not None and "part-two" not in second[0] and __import__("time").monotonic() < deadline2:
+        while (
+            second is not None
+            and "part-two" not in second.text
+            and __import__("time").monotonic() < deadline2
+        ):
             second = manager.peek_task_stdout("tid_peek")
         assert second is not None
-        text2, _ = second
-        assert "part-two" in text2, (
-            f"Second peek didn't see part-two: {text2!r}"
-        )
-        assert "part-one" not in text2, (
-            f"Second peek returned part-one again — cursor didn't "
-            f"advance. Got: {text2!r}"
+        assert "part-two" in second.text, f"Second peek didn't see part-two: {second.text!r}"
+        assert "part-one" not in second.text, (
+            f"Second peek returned part-one again — cursor didn't advance. Got: {second.text!r}"
         )
     finally:
         t.join(timeout=5.0)
@@ -489,9 +490,8 @@ def test_register_overwrite_resets_cursor(
     # yet in this test). Cursor is back to 0 so we can see it.
     peek = manager.peek_task_stdout("tid")
     assert peek is not None
-    text, _ = peek
     # The original "first" may or may not still be in the ring
     # depending on whether the next run_sync already reset it.
     # The invariant here is just: peek didn't error, cursor moved
     # forward from 0.
-    assert isinstance(text, str)
+    assert isinstance(peek.text, str)

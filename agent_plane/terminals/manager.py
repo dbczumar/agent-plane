@@ -22,6 +22,7 @@ Callers never see either lock.
 
 from __future__ import annotations
 
+import dataclasses
 import re
 import threading
 import time
@@ -29,6 +30,30 @@ from collections.abc import Callable
 from pathlib import Path
 
 from agent_plane.terminals.shell import RunResult, Shell
+
+
+@dataclasses.dataclass(frozen=True)
+class TaskStdoutDelta:
+    """Delta stdout read for an async terminal task.
+
+    Returned by :meth:`TerminalManager.peek_task_stdout`. Named
+    fields (rather than a tuple) so callers can access ``.text`` and
+    ``.lost_bytes`` without positional fragility and so the shape
+    is extensible if we add e.g. timestamps later.
+
+    :param text: ANSI-stripped stdout bytes emitted by the command
+        since the caller's last :meth:`peek_task_stdout` call.
+        Empty string if no new output.
+    :param lost_bytes: Count of bytes that were evicted from the
+        shell's ring buffer before the caller could read them.
+        Non-zero when the command produced bursty output exceeding
+        the 1 MB ring's remaining capacity between peeks. Callers
+        can surface this as a ``[... N bytes lost ...]`` marker.
+    """
+
+    text: str
+    lost_bytes: int
+
 
 # Agent-provided shell names. Ratified in §7.1 sub-decisions:
 # - must start with a letter,
@@ -79,7 +104,7 @@ class TerminalManager:
         workspace: Path,
         *,
         sandbox_enabled: bool = True,
-        on_empty: Callable[[str, "TerminalManager"], None] | None = None,
+        on_empty: Callable[[str, TerminalManager], None] | None = None,
     ) -> None:
         """Construct an empty manager for one conversation.
 
@@ -450,9 +475,7 @@ class TerminalManager:
                 return None
             return self._shells.get(shell_name)
 
-    def peek_task_stdout(
-        self, task_id: str
-    ) -> tuple[str, int] | None:
+    def peek_task_stdout(self, task_id: str) -> TaskStdoutDelta | None:
         """Return the stdout delta for ``task_id`` since the last peek.
 
         Used by ``check_task(kind="terminal")`` to produce
@@ -461,13 +484,11 @@ class TerminalManager:
         a subsequent call returns only newer bytes.
 
         :param task_id: The background task's id.
-        :returns: A tuple ``(text, lost_bytes)`` where ``text`` is
-            the ANSI-stripped delta and ``lost_bytes`` is the count
-            of bytes that were evicted from the ring buffer between
-            peeks (non-zero when a command produces bursty output
-            that overflows the 1 MB ring). Returns ``None`` if the
-            task is unknown (completed, never started, or shell
-            closed).
+        :returns: A :class:`TaskStdoutDelta` with the ANSI-stripped
+            delta text and the count of evicted-before-peek bytes
+            (non-zero when the ring buffer overflowed between peeks).
+            Returns ``None`` if the task is unknown (completed,
+            never started, or its shell was closed).
         """
         with self._lock:
             shell_name = self._task_shells.get(task_id)
@@ -488,4 +509,7 @@ class TerminalManager:
             # is stale.
             if task_id in self._task_cursors:
                 self._task_cursors[task_id] = partial.new_cursor
-        return partial.text, partial.lost_bytes
+        return TaskStdoutDelta(
+            text=partial.text,
+            lost_bytes=partial.lost_bytes,
+        )

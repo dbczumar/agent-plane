@@ -206,6 +206,5 @@ class Tool(abc.ABC):
             didn't override this method.
         """
         raise NotImplementedError(
-            f"{type(self).__name__} declared is_async() true "
-            f"but did not override dispatch_async()"
+            f"{type(self).__name__} declared is_async() true but did not override dispatch_async()"
         )

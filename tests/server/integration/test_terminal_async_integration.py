@@ -73,9 +73,7 @@ async def _create_async_terminal_agent(client: httpx.AsyncClient) -> None:
         "/api/agents",
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
     )
-    assert resp.status_code == 201, (
-        f"Agent creation failed: {resp.status_code} {resp.text}"
-    )
+    assert resp.status_code == 201, f"Agent creation failed: {resp.status_code} {resp.text}"
 
 
 def _tool_outputs(body: dict[str, Any]) -> list[dict[str, Any]]:
@@ -109,7 +107,10 @@ def _tool_outputs(body: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 @pytest.fixture(autouse=True)
-def _force_unsandboxed_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+def _force_unsandboxed_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    task_store: Any,
+) -> None:
     """Force the terminal registry to spawn unsandboxed shells.
 
     Same rationale as the sync-path integration tests: this file
@@ -118,6 +119,11 @@ def _force_unsandboxed_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     every test environment.
 
     :param monkeypatch: Pytest's monkeypatch fixture.
+    :param task_store: Ordering dependency. The ``task_store``
+        fixture calls ``init_runtime()``, which installs a fresh
+        sandbox-enabled ``TerminalManagerRegistry`` into
+        ``_globals``. This fixture must run *after* that so the
+        unsandboxed monkeypatch is not overwritten.
     """
     from agent_plane.runtime import _globals
     from agent_plane.terminals import TerminalManagerRegistry
@@ -184,9 +190,7 @@ async def test_terminal_run_async_returns_handle_immediately(
     )
     assert result.status_code == 200
     body = await _wait_for_completion(client, result.body["id"])
-    assert body["status"] == "completed", (
-        f"Task failed: {body.get('error')}"
-    )
+    assert body["status"] == "completed", f"Task failed: {body.get('error')}"
 
     outputs = _tool_outputs(body)
     assert len(outputs) == 1, (
@@ -284,9 +288,7 @@ async def test_completed_async_terminal_command_auto_delivers(
             text = block.get("text") or ""
             if text.startswith("[System: task"):
                 system_messages.append(text)
-    assert any(
-        "(terminal) completed" in m for m in system_messages
-    ), (
+    assert any("(terminal) completed" in m for m in system_messages), (
         f"Expected a '[System: task X (terminal) completed]' user "
         f"message after the async drain ran. Got system messages: "
         f"{system_messages}"
@@ -421,9 +423,7 @@ async def test_async_terminal_child_task_has_terminal_kind(
     # task_store.get_sync reads from DBOS which requires the async
     # variant when inside an event loop; use get_task instead.
     child_task = await task_store.get(child_task_id)
-    assert child_task is not None, (
-        f"Child task {child_task_id!r} not found in task store."
-    )
+    assert child_task is not None, f"Child task {child_task_id!r} not found in task store."
     assert child_task.kind == "terminal", (
         f"Expected child task kind='terminal' (so check/cancel "
         f"dispatch terminal-specific logic), got {child_task.kind!r}."
@@ -459,9 +459,7 @@ async def test_terminal_agent_has_task_lifecycle_tools_registered(
             {
                 "call_id": "call_sync_warmup",
                 "name": "terminal_run",
-                "arguments": json.dumps(
-                    {"command": "echo warmup", "shell": "default"}
-                ),
+                "arguments": json.dumps({"command": "echo warmup", "shell": "default"}),
             },
         ],
     )
@@ -629,9 +627,7 @@ async def test_cancel_task_interrupts_async_terminal(
             if body_["status"] in ("completed", "failed", "cancelled"):
                 return body_
             await _asyncio.sleep(0.1)
-        raise AssertionError(
-            f"Response {response_id} did not reach terminal status in 60s"
-        )
+        raise AssertionError(f"Response {response_id} did not reach terminal status in 60s")
 
     body = await _wait_long(response_id)
     assert body["status"] == "completed", (
@@ -658,9 +654,7 @@ async def test_cancel_task_interrupts_async_terminal(
             if text.startswith("[System: task"):
                 system_messages.append(text)
 
-    assert any(
-        "(terminal) cancelled" in m for m in system_messages
-    ), (
+    assert any("(terminal) cancelled" in m for m in system_messages), (
         f"Expected a '[System: task X (terminal) cancelled]' "
         f"message, got {system_messages!r}. If the message says "
         f"'completed' instead, the SIGINT path didn't flip status "

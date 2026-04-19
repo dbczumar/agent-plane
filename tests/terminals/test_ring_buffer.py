@@ -219,8 +219,7 @@ def test_slice_since_reports_lost_bytes_on_eviction() -> None:
     # Buffer now has only last 5 bytes, and 1 was lost before cursor.
     p = buf.slice_since(0)
     assert p.lost_bytes == 1, (
-        f"Expected 1 lost byte (buffer capacity 5, appended 6, "
-        f"cursor at 0), got {p.lost_bytes}."
+        f"Expected 1 lost byte (buffer capacity 5, appended 6, cursor at 0), got {p.lost_bytes}."
     )
     assert p.data == b"irst_"
     assert p.new_cursor == 6
