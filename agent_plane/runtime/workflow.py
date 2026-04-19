@@ -132,7 +132,7 @@ from agent_plane.spec.types import LLMConfig, RetryConfig, ToolsConfig
 from agent_plane.stores import ConversationStore, TaskStore
 from agent_plane.tools import ToolManager
 from agent_plane.tools.base import ToolContext
-from agent_plane.tools.builtins import SpawnTool
+from agent_plane.tools.builtins import SpawnSubAgentTool
 from agent_plane.tools.client_specified import (
     ClientSideToolSpec,
     parse_client_side_tool_specs,
@@ -1451,7 +1451,7 @@ async def _call_tool(
         # Inject client-side tool schemas into spawn arguments so
         # sub-agents know which client tools are available.
         effective_args = arguments
-        if tool_name == SpawnTool.name():
+        if tool_name == SpawnSubAgentTool.name():
             effective_args = _inject_client_tools(
                 arguments,
                 mgr.get_client_tool_schemas(),
@@ -2456,68 +2456,6 @@ async def _handle_tool_calls(
     return last_seen
 
 
-def _recover_spawn_ids_from_history(
-    history: list[ConversationItem],
-) -> tuple[set[str], set[str]]:
-    """
-    Recover spawned and collected sub-agent IDs from conversation history.
-
-    When a client-tool round-trip creates a new response (workflow),
-    sub-agents spawned in the previous response need to be recovered
-    so auto-collect runs. The task store query (``list_tasks`` with
-    ``root_task_id``) only finds children of the CURRENT task. This
-    function scans history for ``spawn_sub_agents`` results from
-    ANY prior response in the conversation.
-
-    :param history: The loaded conversation history.
-    :returns: ``(spawned_ids, collected_ids)`` — spawned IDs from
-        ``spawn_sub_agents`` results, collected IDs from
-        auto-collected system messages.
-    """
-    call_names: dict[str, str] = {}
-    for item in history:
-        if item.type == "function_call" and isinstance(item.data, FunctionCallData):
-            call_names[item.data.call_id] = _strip_mcp_tool_prefix(item.data.name)
-
-    spawned: set[str] = set()
-    collected: set[str] = set()
-
-    for item in history:
-        if item.type == "function_call_output" and isinstance(item.data, FunctionCallOutputData):
-            name = call_names.get(item.data.call_id, "")
-            if name != SpawnTool.name():
-                continue
-            try:
-                parsed = json.loads(item.data.output)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            for rid in parsed.get("response_ids", []):
-                spawned.add(rid)
-
-        # Auto-collected results are persisted as user messages
-        # with "[System: auto-collected sub-agent results]".
-        if item.type == "message" and isinstance(item.data, MessageData):
-            for block in item.data.content:
-                if not isinstance(block, dict):
-                    continue
-                text = block.get("text", "")
-                if not text.startswith("[System: auto-collected"):
-                    continue
-                json_part = text.split("\n", 1)
-                if len(json_part) < 2:
-                    continue
-                try:
-                    payload = json.loads(json_part[1])
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                for r in payload.get("results", []):
-                    rid = r.get("response_id", "")
-                    if rid:
-                        collected.add(rid)
-
-    return spawned, collected
-
-
 def _strip_mcp_tool_prefix(name: str) -> str:
     """
     Strip the Claude SDK MCP tool prefix from a tool name.
@@ -2536,309 +2474,6 @@ def _strip_mcp_tool_prefix(name: str) -> str:
         return name.rsplit("__", 1)[-1]
     return name
 
-
-@dataclass
-class _AutoCollectResult:
-    """
-    Result of :func:`_auto_collect_sub_agents`.
-
-    :param last_seen: The **original** store cursor (unchanged
-        from the input). Not advanced past the injected system
-        message so that ``_sync_history`` on the next loop
-        iteration picks up both the message and any steering
-        that arrived during the poll, e.g. ``"msg_abc123"``.
-    :param collected_ids: The set of sub-agent response IDs
-        that actually reached a terminal status and were
-        collected. May be a subset of the requested IDs if
-        a steering message interrupted the wait.
-    """
-
-    last_seen: str
-    collected_ids: set[str]
-
-
-# Interval between polls when waiting for sub-agents during
-# auto-collect. Short enough to detect steering promptly.
-_COLLECT_POLL_S = 0.5
-
-
-async def _persist_text_before_auto_collect(
-    task_id: str,
-    conversation_id: str,
-    llm_resp: dict[str, Any],
-    agent_name: str,
-    uncollected_ids: list[str],
-    history: list[ConversationItem],
-    output_items: list[dict[str, Any]],
-    conv_store: ConversationStore,
-) -> _AutoCollectResult:
-    """
-    Persist the LLM text then run auto-collect.
-
-    Without this, the LLM's text is streamed to SSE but never
-    persisted (ghost tokens). Subsequent LLM calls do not see
-    the text in the conversation, causing the LLM to re-generate
-    or ignore it. This is especially damaging for steering:
-    the LLM's response to a steering message is lost, so
-    the next LLM call sees only the auto-collect results and
-    ignores the steering instruction.
-
-    :param task_id: The parent task ID, e.g. ``"task_abc123"``.
-    :param conversation_id: The conversation ID.
-    :param llm_resp: The LLM response dict with text content.
-    :param agent_name: The agent's registered name, e.g.
-        ``"research-agent"``.
-    :param uncollected_ids: Sub-agent response IDs to collect.
-    :param history: Mutable conversation history list.
-    :param output_items: Mutable output items list.
-    :param conv_store: ConversationStore for persistence.
-    :returns: An :class:`_AutoCollectResult` from auto-collect.
-    """
-    text = _get_text_content(llm_resp)
-    file_annotations = _collect_file_annotations(output_items)
-    _emit_file_annotations(task_id, file_annotations)
-    item = _build_assistant_item(
-        task_id,
-        agent_name,
-        text,
-        annotations=file_annotations or None,
-    )
-    persisted = _persist_and_stream(
-        task_id,
-        conv_store,
-        conversation_id,
-        [item],
-        output_items,
-    )
-    history.extend(persisted)
-    return await _auto_collect_sub_agents(
-        task_id,
-        conversation_id,
-        uncollected_ids,
-        # Cursor after the persisted text — steering detection
-        # starts here so only messages arriving DURING
-        # auto-collect are detected.
-        persisted[-1].id,
-        output_items,
-        conv_store,
-    )
-
-
-async def _auto_collect_sub_agents(
-    task_id: str,
-    conversation_id: str,
-    response_ids: list[str],
-    last_seen: str,
-    output_items: list[dict[str, Any]],
-    conv_store: ConversationStore,
-) -> _AutoCollectResult:
-    """
-    Auto-collect outstanding sub-agents before turn completion.
-
-    Polls sub-agents with short timeouts, checking for steering
-    messages between each poll. If all sub-agents finish, injects
-    their results as a synthetic message. If a steering message
-    arrives first, injects partial results (for any sub-agents
-    that completed so far) and returns early so the agent loop
-    can process the steering.
-
-    Does NOT modify ``history`` — the caller re-enters the loop
-    with ``continue``, and ``_sync_history`` picks up both the
-    injected results and any steering messages from the store.
-
-    :param task_id: The parent task ID.
-    :param conversation_id: The parent's conversation ID.
-    :param response_ids: Sub-agent response IDs to collect.
-    :param last_seen: The current store cursor for detecting
-        new items (steering), e.g. ``"msg_abc123"``.
-    :param output_items: Mutable output items list.
-    :param conv_store: ConversationStore for persistence.
-    :returns: An :class:`_AutoCollectResult` with the
-        **original** cursor and the set of actually-collected
-        IDs.
-    """
-    results, collected = await _poll_subagents_with_steering_check(
-        response_ids,
-        conversation_id,
-        last_seen,
-        conv_store,
-    )
-    return _inject_collect_results(
-        task_id,
-        conversation_id,
-        last_seen,
-        results,
-        collected,
-        output_items,
-        conv_store,
-    )
-
-
-async def _poll_subagents_with_steering_check(
-    response_ids: list[str],
-    conversation_id: str,
-    last_seen: str,
-    conv_store: ConversationStore,
-) -> tuple[list[dict[str, str]], set[str]]:
-    """
-    Poll sub-agents for terminal status, checking for steering
-    between each poll cycle.
-
-    :param response_ids: Sub-agent response IDs to wait for.
-    :param conversation_id: Parent's conversation ID for
-        steering detection.
-    :param last_seen: Store cursor for detecting new items.
-    :param conv_store: ConversationStore for steering checks.
-    :returns: ``(results, collected_ids)`` — results dicts for
-        sub-agents that finished, and their IDs.
-    """
-
-    task_store = get_task_store()
-    pending = set(response_ids)
-    results: list[dict[str, str]] = []
-    collected: set[str] = set()
-
-    poll_count = 0
-    while pending:
-        newly_done = await _check_terminal(
-            pending,
-            task_store,
-            results,
-        )
-        collected.update(newly_done)
-        pending -= newly_done
-
-        if not pending:
-            _logger.debug(
-                "auto-collect: all sub-agents terminal after %d polls",
-                poll_count,
-            )
-            break
-
-        # Check for steering messages before sleeping.
-        new_items = fetch_all_items(
-            conv_store,
-            conversation_id,
-            after=last_seen,
-        )
-        _logger.debug(
-            "auto-collect poll %d: pending=%s, new_items=%d, last_seen=%s",
-            poll_count,
-            pending,
-            len(new_items),
-            last_seen,
-        )
-        if new_items:
-            _logger.debug(
-                "steering detected during auto-collect, returning %d partial results",
-                len(results),
-            )
-            break
-
-        poll_count += 1
-        await asyncio.sleep(_COLLECT_POLL_S)
-
-    return results, collected
-
-
-async def _check_terminal(
-    pending: set[str],
-    task_store: TaskStore,
-    results: list[dict[str, str]],
-) -> set[str]:
-    """
-    Check for sub-agents that reached terminal status.
-
-    :param pending: Set of sub-agent IDs still being waited on.
-    :param task_store: For fetching current task status.
-    :param results: Mutable list — appends a result dict for
-        each newly-terminal sub-agent.
-    :returns: Set of IDs that became terminal this poll cycle.
-    """
-    from agent_plane.tools.builtins.spawn import _task_to_result
-
-    newly_done: set[str] = set()
-    for rid in list(pending):
-
-        def _get(task_id: str = rid) -> Any:
-            return task_store.get_sync(task_id)
-
-        task = await _to_thread(_get)
-        if task is not None and task.status in TERMINAL_STATUSES:
-            results.append(_task_to_result(task))
-            newly_done.add(rid)
-    return newly_done
-
-
-def _inject_collect_results(
-    task_id: str,
-    conversation_id: str,
-    last_seen: str,
-    results: list[dict[str, str]],
-    collected: set[str],
-    output_items: list[dict[str, Any]],
-    conv_store: ConversationStore,
-) -> _AutoCollectResult:
-    """
-    Persist collected sub-agent results as a system message.
-
-    If no sub-agents completed, returns the original cursor
-    without persisting anything.
-
-    Returns the **original** ``last_seen`` (not the newly
-    persisted item's ID) so that ``_sync_history`` on the next
-    loop iteration picks up both the collected-results message
-    AND any steering messages that arrived during the poll.
-    Advancing the cursor here would skip steering messages
-    whose positions fall between the original cursor and the
-    injected system message.
-
-    :param task_id: The parent task ID.
-    :param conversation_id: The parent's conversation ID.
-    :param last_seen: Current store cursor — returned as-is.
-    :param results: Result dicts from completed sub-agents.
-    :param collected: IDs of completed sub-agents.
-    :param output_items: Mutable output items list.
-    :param conv_store: ConversationStore for persistence.
-    :returns: An :class:`_AutoCollectResult` with the
-        **original** cursor.
-    """
-    if not results:
-        return _AutoCollectResult(
-            last_seen=last_seen,
-            collected_ids=collected,
-        )
-
-    result_json = json.dumps({"results": results})
-    new_items = [
-        NewConversationItem(
-            type="message",
-            response_id=task_id,
-            data=MessageData(
-                role="user",
-                content=[
-                    {
-                        "type": "input_text",
-                        "text": ("[System: auto-collected sub-agent results]\n" + result_json),
-                    },
-                ],
-            ),
-        ),
-    ]
-    # Persist and stream to SSE/output_items, but do NOT add
-    # to history — _sync_history handles that on the next
-    # iteration, which also picks up any steering messages.
-    _persist_and_stream(
-        task_id,
-        conv_store,
-        conversation_id,
-        new_items,
-        output_items,
-    )
-    return _AutoCollectResult(
-        last_seen=last_seen,
-        collected_ids=collected,
-    )
 
 
 # ─── Async tool dispatch ───────────────────────────────────
@@ -3204,11 +2839,11 @@ def _build_async_completion_item(
     """
     Build the ``user``-role conversation item for one drained payload.
 
-    Mirrors the ``[System: auto-collected sub-agent results]``
-    pattern in :func:`_inject_collect_results` — the LLM receives
-    these as user messages because OpenAI-style chat formats don't
-    have a first-class "system event" role for mid-conversation
-    notifications.
+    The LLM receives these as user messages because OpenAI-style
+    chat formats don't have a first-class "system event" role for
+    mid-conversation notifications. The leading ``[System: task ...]``
+    marker is the convention every drain-based completion uses
+    (matches the @tool path in this same module).
 
     :param task_id: The PARENT task_id (the conversation owner),
         not the completed child's task_id.
@@ -4670,8 +4305,11 @@ async def _run_agent_loop(
                         )
                     if pending_tool_tasks or late_drained:
                         # Persist the LLM text first so it isn't
-                        # lost (ghost-token rationale matches
-                        # _persist_text_before_auto_collect).
+                        # lost — without this, the streamed
+                        # tokens would be ghost text (visible in
+                        # SSE but never committed), and the next
+                        # LLM call wouldn't see what the model
+                        # said in this turn.
                         text = _get_text_content(llm_resp)
                         file_annotations = _collect_file_annotations(output_items)
                         _emit_file_annotations(task_id, file_annotations)

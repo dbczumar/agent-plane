@@ -1109,13 +1109,13 @@ async def test_steering_during_auto_collect(
 
     # Call 1 (parent): spawn the worker sub-agent.
     spawn_args = json.dumps(
-        {"agents": [{"name": "worker", "input": "Do work"}]},
+        {"type": "worker", "input": "Do work"},
     )
     mock_llm.add_call(
         tool_calls=[
             {
                 "call_id": "call_spawn",
-                "name": "spawn_sub_agents",
+                "name": "spawn_sub_agent",
                 "arguments": spawn_args,
             },
         ],
@@ -1273,13 +1273,13 @@ async def test_ghost_text_persisted_before_auto_collect(
 
     # Call 1 (parent): spawn the sub-agent.
     spawn_args = json.dumps(
-        {"agents": [{"name": "bg-worker", "input": "Do work"}]},
+        {"type": "bg-worker", "input": "Do work"},
     )
     mock_llm.add_call(
         tool_calls=[
             {
                 "call_id": "call_spawn_ghost",
-                "name": "spawn_sub_agents",
+                "name": "spawn_sub_agent",
                 "arguments": spawn_args,
             },
         ],
