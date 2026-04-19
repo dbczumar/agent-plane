@@ -212,7 +212,7 @@ def record_llm_usage(span: LiveSpan, usage: dict[str, Any]) -> None:
     span.set_attribute(SpanAttributeKey.CHAT_USAGE, payload)
 
 
-def record_error(span: LiveSpan, exc: BaseException) -> None:
+def record_error(span: LiveSpan, exc: Exception) -> None:
     """
     Mark a span as failed with an ``error.type`` attribute.
 
@@ -220,6 +220,11 @@ def record_error(span: LiveSpan, exc: BaseException) -> None:
     trace and message; this helper adds the ``error.type``
     attribute (exception class name) so operators can filter by
     class in the trace backend without reading the exception event.
+
+    ``exc`` is typed ``Exception`` (not ``BaseException``) to match
+    MLflow's ``record_exception`` signature and because every
+    in-tree caller catches ``Exception`` or a subclass; we don't
+    report telemetry for ``KeyboardInterrupt`` / ``SystemExit``.
 
     :param span: The span to mark as failed.
     :param exc: The exception that caused the failure.
