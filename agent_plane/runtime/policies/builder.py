@@ -21,6 +21,7 @@ from agent_plane.runtime.policies.base import Policy
 from agent_plane.runtime.policies.engine import PolicyEngine
 from agent_plane.runtime.policies.function import resolve_function_policy
 from agent_plane.runtime.policies.label import LabelPolicy
+from agent_plane.runtime.policies.prompt import resolve_prompt_policy
 from agent_plane.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     AgentSpec,
@@ -28,6 +29,7 @@ from agent_plane.spec.types import (
     LabelDef,
     LabelPolicySpec,
     PolicySpec,
+    PromptPolicySpec,
 )
 from agent_plane.stores.conversation_store import ConversationStore
 
@@ -105,10 +107,15 @@ def _instantiate_policy(spec: PolicySpec) -> Policy:
         return LabelPolicy(spec)
     if isinstance(spec, FunctionPolicySpec):
         return resolve_function_policy(spec)
+    if isinstance(spec, PromptPolicySpec):
+        # Production path — classifier wires to real LLM in a
+        # later executor-integration phase. Tests inject a
+        # stub directly via PromptPolicy(spec, classifier=fn).
+        return resolve_prompt_policy(spec)
     raise NotImplementedError(
         f"Policy type {type(spec).__name__} for {spec.name!r} is not "
-        f"yet implemented in this phase. ``PromptPolicy`` lands in "
-        f"Phase 7 (see designs/POLICIES_IMPLEMENTATION_PLAN.md).",
+        f"a known subclass of PolicySpec (LabelPolicySpec, "
+        f"FunctionPolicySpec, PromptPolicySpec).",
     )
 
 
