@@ -17,11 +17,15 @@ will start instantiating them as those phases ship.
 
 from __future__ import annotations
 
+from agent_plane.runtime.policies.base import Policy
 from agent_plane.runtime.policies.engine import PolicyEngine
+from agent_plane.runtime.policies.label import LabelPolicy
 from agent_plane.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     AgentSpec,
     LabelDef,
+    LabelPolicySpec,
+    PolicySpec,
 )
 from agent_plane.stores.conversation_store import ConversationStore
 
@@ -68,12 +72,40 @@ def build_policy_engine(
         conversation_store=conversation_store,
     )
     return PolicyEngine(
-        policies=list(guardrails.policies or []),
+        policies=[_instantiate_policy(s) for s in (guardrails.policies or [])],
         label_defs=label_defs,
         ask_timeout=guardrails.ask_timeout,
         conversation_id=conversation_id,
         initial_labels=initial_labels,
         conversation_store=conversation_store,
+    )
+
+
+def _instantiate_policy(spec: PolicySpec) -> Policy:
+    """
+    Dispatch a :class:`PolicySpec` to the matching runtime
+    :class:`Policy` subclass.
+
+    Phase 3: only :class:`LabelPolicySpec` is supported;
+    :class:`FunctionPolicySpec` and :class:`PromptPolicySpec`
+    raise a clear NotImplementedError until Phases 4 and 7
+    land. The error message names the missing phase so the
+    agent author can see why their spec's declaration was
+    rejected.
+
+    :param spec: The declarative spec.
+    :returns: A :class:`Policy` subclass instance bound to
+        the spec.
+    :raises NotImplementedError: For policy types whose
+        runtime class has not yet shipped.
+    """
+    if isinstance(spec, LabelPolicySpec):
+        return LabelPolicy(spec)
+    raise NotImplementedError(
+        f"Policy type {type(spec).__name__} for {spec.name!r} is not "
+        f"yet implemented in this phase. ``FunctionPolicy`` lands in "
+        f"Phase 4; ``PromptPolicy`` in Phase 7 (see "
+        f"designs/POLICIES_IMPLEMENTATION_PLAN.md).",
     )
 
 

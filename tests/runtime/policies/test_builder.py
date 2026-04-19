@@ -151,7 +151,7 @@ guardrails:
     )
     # Names in YAML order — regression would reorder alphabet
     # or reverse direction.
-    assert [p.name for p in engine.policies] == ["alpha", "bravo", "charlie"]
+    assert [p.spec.name for p in engine.policies] == ["alpha", "bravo", "charlie"]
 
 
 def test_build_seeds_initial_labels(
@@ -333,5 +333,5 @@ def test_build_from_programmatic_spec(
     )
     assert engine.ask_timeout == 45
     assert len(engine.policies) == 1
-    assert engine.policies[0].name == "taint_web"
+    assert engine.policies[0].spec.name == "taint_web"
     assert engine.labels == {"integrity": "1"}

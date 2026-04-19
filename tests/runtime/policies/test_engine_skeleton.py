@@ -207,6 +207,7 @@ def test_spec_for_finds_policy_by_name(
 ) -> None:
     """When a policy with the given name exists, spec_for
     returns its spec. Proves the YAML-order list lookup works."""
+    from agent_plane.runtime.policies.label import LabelPolicy
     from agent_plane.spec.types import LabelPolicySpec, PhaseSelector
 
     conv = conversation_store.create_conversation()
@@ -219,7 +220,7 @@ def test_spec_for_finds_policy_by_name(
         for i in range(3)
     ]
     eng = PolicyEngine(
-        policies=list(specs),
+        policies=[LabelPolicy(s) for s in specs],
         label_defs={},
         ask_timeout=30,
         conversation_id=conv.id,
@@ -230,7 +231,8 @@ def test_spec_for_finds_policy_by_name(
     got = eng.spec_for("policy_1")
     assert got is not None
     # Identity check: same object reference means the list
-    # lookup is the path (not recreation from scratch).
+    # lookup walked through Policy instances and returned
+    # each's `.spec` — not a recreated dummy spec.
     assert got is specs[1]
 
 
