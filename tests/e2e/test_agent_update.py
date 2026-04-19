@@ -26,7 +26,12 @@ import yaml
 from tests.e2e.conftest import poll_until_terminal
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_ARCHER_DIR = _REPO_ROOT / "examples" / "agents" / "archer"
+# Use compaction-test — a minimal agent (gpt-4o-mini, no tools, no
+# sub-agents) so the test runs fast and cheap. Archer-style research
+# agents make dozens of tool calls per request, which blows test
+# timeouts without exercising anything specific to the update path.
+_TEST_AGENT_DIR = _REPO_ROOT / "examples" / "agents" / "compaction-test"
+_TEST_AGENT_NAME = "compaction-test"
 
 # Marker phrase injected into v2 instructions so we can verify
 # the v2 response was produced by the updated spec.
@@ -175,8 +180,9 @@ def test_update_agent_zero_downtime(
       gives a false negative, not a false positive.
 
     Steps:
-    1. Upload archer agent (version 1).
-    2. Send a long-running background request (v1 instructions).
+    1. Upload compaction-test agent (version 1).
+    2. Send a background request that asks for verbose output so
+       the workflow stays in_progress long enough for us to PUT.
     3. While in_progress, PUT a new bundle with modified
        instructions containing a marker phrase (version 2).
     4. Send a second request — the marker must appear.
@@ -185,19 +191,25 @@ def test_update_agent_zero_downtime(
     7. V2 response DOES contain the marker.
     8. Agent metadata shows version=2 and updated_at is set.
     """
-    # Step 1: Upload archer (v1)
-    created = _upload_agent_with_id(http_client, _ARCHER_DIR)
+    # Step 1: Upload compaction-test (v1)
+    created = _upload_agent_with_id(http_client, _TEST_AGENT_DIR)
     agent_id = created["id"]
     assert created["version"] == 1
 
-    # Step 2: Long-running request on v1
+    # Step 2: Start a background request with a prompt that asks
+    # for verbose output. gpt-4o-mini streams ~100 tokens/sec, so
+    # a multi-paragraph response keeps the workflow in_progress for
+    # several seconds — long enough to PUT while it's still running.
     resp1 = http_client.post(
         "/v1/responses",
         json={
-            "model": "archer",
+            "model": _TEST_AGENT_NAME,
             "input": (
-                "Research the history of quantum computing. "
-                "Cover at least 5 major milestones. Be thorough."
+                "Generate verbose output: write a detailed, multi-"
+                "paragraph explanation of how photosynthesis works, "
+                "covering the light-dependent reactions, the Calvin "
+                "cycle, and the role of chlorophyll. At least 5 "
+                "paragraphs."
             ),
             "background": True,
         },
@@ -225,11 +237,10 @@ def test_update_agent_zero_downtime(
     )
 
     # Step 3: Update agent to v2 with marker in instructions.
-    # The inline instructions override the file-based AGENTS.md.
     v2_bundle = _build_updated_bundle(
-        _ARCHER_DIR,
+        _TEST_AGENT_DIR,
         {
-            "description": "Updated archer v2 for e2e test",
+            "description": "Updated compaction-test v2 for e2e test",
             "instructions": (
                 f"You MUST include the word '{_V2_MARKER}' "
                 f"somewhere in every response you give. This is "
@@ -245,7 +256,7 @@ def test_update_agent_zero_downtime(
     resp2 = http_client.post(
         "/v1/responses",
         json={
-            "model": "archer",
+            "model": _TEST_AGENT_NAME,
             "input": "What is 2+2? Answer briefly.",
             "background": True,
         },
@@ -253,9 +264,10 @@ def test_update_agent_zero_downtime(
     resp2.raise_for_status()
     response_id_2 = resp2.json()["id"]
 
-    # Step 5: Poll both to terminal state
-    body1 = poll_until_terminal(http_client, response_id_1, timeout=300)
-    body2 = poll_until_terminal(http_client, response_id_2, timeout=300)
+    # Step 5: Poll both to terminal state. 60s is ample for a
+    # single-turn gpt-4o-mini response with no tool calls.
+    body1 = poll_until_terminal(http_client, response_id_1, timeout=60)
+    body2 = poll_until_terminal(http_client, response_id_2, timeout=60)
 
     # Both requests completed — neither was disrupted
     assert body1["status"] == "completed", (

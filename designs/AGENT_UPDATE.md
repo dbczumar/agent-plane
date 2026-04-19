@@ -97,12 +97,14 @@ agent works. Orphan is harmless.
 - Add `bundle_location` String column to `SqlAgent` (NOT NULL)
 - Add `updated_at` nullable Integer column to `SqlAgent`
 
-### 3. Alembic migration: new file in `agent_plane/db/migrations/versions/`
-- `down_revision = "43fb65b29464"`
-- Add `version` Integer column (NOT NULL, server_default="1")
-- Add `bundle_location` String column (NOT NULL — for existing rows,
-  backfill with `agent_id` since that's the current artifact key format)
+### 3. Alembic migration: edit `43fb65b29464_initial_schema_agents_files_.py`
+- Add `version` Integer column to the initial `agents` table
+  (NOT NULL, server_default="1")
+- Add `bundle_location` String column (NOT NULL)
 - Add nullable `updated_at` Integer column
+
+Agent plane is not yet in production, so we fold these columns into
+the initial migration rather than adding a new revision.
 
 ### 4. API schema: `agent_plane/server/schemas.py`
 - Add `version: int = 1` to `AgentObject`

@@ -10,7 +10,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-
 from alembic import op
 
 # revision identifiers, used by Alembic.
@@ -27,7 +26,10 @@ def upgrade() -> None:
         sa.Column("id", sa.String(length=64), nullable=False),
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.Column("name", sa.String(length=256), nullable=False),
+        sa.Column("bundle_location", sa.String(length=512), nullable=False),
+        sa.Column("version", sa.Integer(), nullable=False, server_default="1"),
         sa.Column("description", sa.Text(), nullable=True),
+        sa.Column("updated_at", sa.Integer(), nullable=True),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("name"),
     )
