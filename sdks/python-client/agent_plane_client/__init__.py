@@ -1,9 +1,29 @@
-"""agent-plane UI SDK — Python client library for building frontends.
+"""agent-plane client SDK — Python client for the agent-plane server API.
+
+Headless HTTP/SSE client for invoking agents, tracking conversation
+state, and consuming the response stream as either raw events or
+semantic blocks. No UI or terminal dependencies — frontends layer
+on top of this.
 
 Usage::
 
-    from agent_plane_ui_sdk import AgentPlaneClient, StreamRenderer
-    from agent_plane_ui_sdk.terminal import RichBlockFormatter, TerminalHost
+    from agent_plane_client import AgentPlaneClient
+
+    async with AgentPlaneClient(base_url="http://localhost:8080") as client:
+        session = client.session(model="archer")
+        async for event in session.send("hello"):
+            ...
+
+Or consume semantic blocks via :class:`BlockStream`::
+
+    from agent_plane_client import BlockStream, pipe, skip_intermediate_ends
+
+    stream = BlockStream()
+    async for block in pipe(
+        stream.stream(session, "hello"),
+        skip_intermediate_ends(),
+    ):
+        ...
 """
 
 from ._blocks import (
@@ -15,10 +35,10 @@ from ._blocks import (
     NativeToolBlock,
     ReasoningBlock,
     ReasoningStartBlock,
-    RenderBlock,
     ResponseEndBlock,
     ResponseStartBlock,
     RetryBlock,
+    StreamBlock,
     TextChunk,
     TextDone,
     ToolExecution,
@@ -27,9 +47,9 @@ from ._blocks import (
 )
 from ._client import AgentPlaneClient
 from ._errors import AgentPlaneError, ToolCallDenied
-from ._renderer import StreamRenderer
 from ._server import LocalServer
 from ._session import Session
+from ._stream import BlockStream
 from ._tool_handler import StreamHooks, ToolCallInfo, ToolHandler
 from ._transforms import (
     merge_text_across_iterations,
@@ -44,6 +64,7 @@ __all__ = [
     "AgentPlaneError",
     "AnyBlock",
     "BlockContext",
+    "BlockStream",
     "CompactionBlock",
     "ErrorBlock",
     "FileBlock",
@@ -51,13 +72,12 @@ __all__ = [
     "NativeToolBlock",
     "ReasoningBlock",
     "ReasoningStartBlock",
-    "RenderBlock",
     "ResponseEndBlock",
     "ResponseStartBlock",
     "RetryBlock",
     "Session",
+    "StreamBlock",
     "StreamHooks",
-    "StreamRenderer",
     "TextChunk",
     "TextDone",
     "ToolCallDenied",

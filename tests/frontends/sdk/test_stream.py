@@ -1,4 +1,4 @@
-"""Unit tests for StreamRenderer — mock events → blocks."""
+"""Unit tests for BlockStream — mock events → blocks."""
 
 from __future__ import annotations
 
@@ -6,13 +6,13 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
-from agent_plane_ui_sdk._blocks import (
+from agent_plane_client._blocks import (
     ReasoningBlock,
     TextChunk,
     TextDone,
     ToolGroup,
 )
-from agent_plane_ui_sdk._events import (
+from agent_plane_client._events import (
     MessageDone,
     ReasoningDelta,
     ReasoningStarted,
@@ -24,8 +24,8 @@ from agent_plane_ui_sdk._events import (
     ToolCall,
     ToolResult,
 )
-from agent_plane_ui_sdk._renderer import StreamRenderer
-from agent_plane_ui_sdk._types import Response
+from agent_plane_client._stream import BlockStream
+from agent_plane_client._types import Response
 
 
 def _make_response(
@@ -58,12 +58,12 @@ class FakeSession:
 
 
 @pytest.fixture()
-def renderer() -> StreamRenderer:
-    return StreamRenderer(text_flush_threshold=10)
+def block_stream() -> BlockStream:
+    return BlockStream(text_flush_threshold=10)
 
 
 @pytest.mark.asyncio()
-async def test_simple_text_response(renderer: StreamRenderer) -> None:
+async def test_simple_text_response(block_stream: BlockStream) -> None:
     """Simple text → ResponseStart, TextChunks, TextDone, ResponseEnd."""
     session = FakeSession(
         [
@@ -76,7 +76,7 @@ async def test_simple_text_response(renderer: StreamRenderer) -> None:
         ]
     )
 
-    blocks = [b async for b in renderer.stream(session, "test")]  # type: ignore[arg-type]
+    blocks = [b async for b in block_stream.stream(session, "test")]  # type: ignore[arg-type]
     types = [type(b).__name__ for b in blocks]
 
     assert "ResponseStartBlock" in types
@@ -90,7 +90,7 @@ async def test_simple_text_response(renderer: StreamRenderer) -> None:
 
 
 @pytest.mark.asyncio()
-async def test_text_with_code_blocks(renderer: StreamRenderer) -> None:
+async def test_text_with_code_blocks(block_stream: BlockStream) -> None:
     """Code fences in text → has_code_blocks=True."""
     session = FakeSession(
         [
@@ -101,13 +101,13 @@ async def test_text_with_code_blocks(renderer: StreamRenderer) -> None:
         ]
     )
 
-    blocks = [b async for b in renderer.stream(session, "test")]  # type: ignore[arg-type]
+    blocks = [b async for b in block_stream.stream(session, "test")]  # type: ignore[arg-type]
     text_done = next(b for b in blocks if isinstance(b, TextDone))
     assert text_done.has_code_blocks
 
 
 @pytest.mark.asyncio()
-async def test_reasoning_block(renderer: StreamRenderer) -> None:
+async def test_reasoning_block(block_stream: BlockStream) -> None:
     """Reasoning events → ReasoningStartBlock + ReasoningBlock."""
     session = FakeSession(
         [
@@ -121,7 +121,7 @@ async def test_reasoning_block(renderer: StreamRenderer) -> None:
         ]
     )
 
-    blocks = [b async for b in renderer.stream(session, "test")]  # type: ignore[arg-type]
+    blocks = [b async for b in block_stream.stream(session, "test")]  # type: ignore[arg-type]
     types = [type(b).__name__ for b in blocks]
 
     assert "ReasoningStartBlock" in types
@@ -133,7 +133,7 @@ async def test_reasoning_block(renderer: StreamRenderer) -> None:
 
 
 @pytest.mark.asyncio()
-async def test_tool_group_with_results(renderer: StreamRenderer) -> None:
+async def test_tool_group_with_results(block_stream: BlockStream) -> None:
     """ToolCall + ToolResult + next ResponseCreated → ToolGroup with output."""
     session = FakeSession(
         [
@@ -156,7 +156,7 @@ async def test_tool_group_with_results(renderer: StreamRenderer) -> None:
         ]
     )
 
-    blocks = [b async for b in renderer.stream(session, "test")]  # type: ignore[arg-type]
+    blocks = [b async for b in block_stream.stream(session, "test")]  # type: ignore[arg-type]
     tool_groups = [b for b in blocks if isinstance(b, ToolGroup)]
 
     # First ToolGroup: emitted immediately with output=None (call line).
@@ -164,7 +164,7 @@ async def test_tool_group_with_results(renderer: StreamRenderer) -> None:
     assert tool_groups[0].executions[0].name == "Read"
 
     # ToolResultBlock: emitted when result arrives.
-    from agent_plane_ui_sdk._blocks import ToolResultBlock
+    from agent_plane_client._blocks import ToolResultBlock
 
     results = [b for b in blocks if isinstance(b, ToolResultBlock)]
     assert len(results) == 1
@@ -172,7 +172,7 @@ async def test_tool_group_with_results(renderer: StreamRenderer) -> None:
 
 
 @pytest.mark.asyncio()
-async def test_block_context_agent_name(renderer: StreamRenderer) -> None:
+async def test_block_context_agent_name(block_stream: BlockStream) -> None:
     """Blocks carry the agent name from the response."""
     session = FakeSession(
         [
@@ -183,16 +183,16 @@ async def test_block_context_agent_name(renderer: StreamRenderer) -> None:
         ]
     )
 
-    blocks = [b async for b in renderer.stream(session, "test")]  # type: ignore[arg-type]
+    blocks = [b async for b in block_stream.stream(session, "test")]  # type: ignore[arg-type]
 
     for block in blocks:
         assert block.ctx.agent == "my-agent"
 
 
 @pytest.mark.asyncio()
-async def test_text_chunk_flushing(renderer: StreamRenderer) -> None:
+async def test_text_chunk_flushing(block_stream: BlockStream) -> None:
     """Text chunks flush on newlines and word boundaries."""
-    # renderer has threshold=10
+    # block_stream has threshold=10
     session = FakeSession(
         [
             ResponseCreated(response=_make_response()),
@@ -202,7 +202,7 @@ async def test_text_chunk_flushing(renderer: StreamRenderer) -> None:
         ]
     )
 
-    blocks = [b async for b in renderer.stream(session, "test")]  # type: ignore[arg-type]
+    blocks = [b async for b in block_stream.stream(session, "test")]  # type: ignore[arg-type]
     chunks = [b for b in blocks if isinstance(b, TextChunk)]
 
     # At least one chunk from the newline split.
@@ -212,7 +212,7 @@ async def test_text_chunk_flushing(renderer: StreamRenderer) -> None:
 
 
 @pytest.mark.asyncio()
-async def test_empty_response(renderer: StreamRenderer) -> None:
+async def test_empty_response(block_stream: BlockStream) -> None:
     """Response with no text or tools → just start + end blocks."""
     session = FakeSession(
         [
@@ -221,7 +221,7 @@ async def test_empty_response(renderer: StreamRenderer) -> None:
         ]
     )
 
-    blocks = [b async for b in renderer.stream(session, "test")]  # type: ignore[arg-type]
+    blocks = [b async for b in block_stream.stream(session, "test")]  # type: ignore[arg-type]
     types = [type(b).__name__ for b in blocks]
 
     assert types == ["ResponseStartBlock", "ResponseEndBlock"]

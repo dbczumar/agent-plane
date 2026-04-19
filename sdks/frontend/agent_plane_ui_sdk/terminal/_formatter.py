@@ -1,4 +1,4 @@
-"""RichBlockFormatter — converts render blocks to Rich renderables.
+"""RichBlockFormatter — converts stream blocks to Rich renderables.
 
 Each block type has a ``format_*`` method. Override any method to
 customize rendering. The base class provides a polished terminal
@@ -16,7 +16,7 @@ from rich.padding import Padding
 from rich.panel import Panel
 from rich.text import Text
 
-from .._blocks import (
+from agent_plane_client import (
     AnyBlock,
     CompactionBlock,
     ErrorBlock,
@@ -47,7 +47,7 @@ FormattedItem = RenderableType | StreamingText
 
 
 class RichBlockFormatter:
-    """Converts render blocks to Rich renderables.
+    """Converts stream blocks to Rich renderables.
 
     :param accent_color: Warm accent for branding (default orange).
     :param code_theme: Pygments theme for code blocks.

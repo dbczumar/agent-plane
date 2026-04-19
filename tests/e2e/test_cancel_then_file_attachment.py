@@ -148,7 +148,7 @@ async def test_cancel_send_file_cancel_send_file_succeeds(
     :param live_server: Base URL of the running test server.
     :param archer_agent: Name of the registered archer agent.
     """
-    from agent_plane_ui_sdk import AgentPlaneClient
+    from agent_plane_client import AgentPlaneClient
 
     async with AgentPlaneClient(base_url=live_server) as client:
         session = client.session(model=archer_agent)

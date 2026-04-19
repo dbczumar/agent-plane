@@ -22,7 +22,7 @@ from pathlib import Path
 import click
 import httpx
 import yaml
-from agent_plane_ui_sdk import AgentPlaneClient, ToolCallInfo, ToolHandler
+from agent_plane_client import AgentPlaneClient, ToolCallInfo, ToolHandler
 
 
 def run_chat(target: str, client_tools: str | None) -> None:

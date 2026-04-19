@@ -1,4 +1,4 @@
-"""Integration tests — StreamRenderer against a real agent-plane server.
+"""Integration tests — BlockStream against a real agent-plane server.
 
 These require an LLM API key. Run with:
     pytest tests/frontends/sdk/test_integration.py --llm-api-key $LLM_API_KEY -v
@@ -11,9 +11,9 @@ from __future__ import annotations
 import os
 
 import pytest
-from agent_plane_ui_sdk import (
+from agent_plane_client import (
+    BlockStream,
     LocalServer,
-    StreamRenderer,
     TextDone,
     pipe,
     skip_intermediate_ends,
@@ -33,15 +33,15 @@ def api_key() -> str:
 
 @pytest.mark.asyncio()
 async def test_simple_streaming(api_key: str) -> None:
-    """Basic text response streams correctly through renderer."""
+    """Basic text response streams correctly through the block stream."""
     async with LocalServer(agent_path="examples/agents/coder/") as server:
         client = server.client
         session = client.session(model="coder")
-        renderer = StreamRenderer()
+        block_stream = BlockStream()
 
         blocks = []
         async for block in pipe(
-            renderer.stream(session, "Say hello in one word. No tools."),
+            block_stream.stream(session, "Say hello in one word. No tools."),
             skip_intermediate_ends(),
         ):
             blocks.append(block)
@@ -62,11 +62,11 @@ async def test_reasoning_appears(api_key: str) -> None:
     async with LocalServer(agent_path="examples/agents/coder/") as server:
         client = server.client
         session = client.session(model="coder")
-        renderer = StreamRenderer()
+        block_stream = BlockStream()
 
         blocks = []
         async for block in pipe(
-            renderer.stream(session, "What is 2+2? Think carefully. No tools."),
+            block_stream.stream(session, "What is 2+2? Think carefully. No tools."),
             skip_intermediate_ends(),
         ):
             blocks.append(block)
@@ -82,11 +82,11 @@ async def test_block_context_populated(api_key: str) -> None:
     async with LocalServer(agent_path="examples/agents/coder/") as server:
         client = server.client
         session = client.session(model="coder")
-        renderer = StreamRenderer()
+        block_stream = BlockStream()
 
         blocks = []
         async for block in pipe(
-            renderer.stream(session, "Say hi. No tools."),
+            block_stream.stream(session, "Say hi. No tools."),
             skip_intermediate_ends(),
         ):
             blocks.append(block)
@@ -103,12 +103,12 @@ async def test_multi_turn_session(api_key: str) -> None:
     async with LocalServer(agent_path="examples/agents/coder/") as server:
         client = server.client
         session = client.session(model="coder")
-        renderer = StreamRenderer()
+        block_stream = BlockStream()
 
         # Turn 1.
         blocks1 = []
         async for block in pipe(
-            renderer.stream(session, "Say hello. No tools."),
+            block_stream.stream(session, "Say hello. No tools."),
             skip_intermediate_ends(),
         ):
             blocks1.append(block)
@@ -119,7 +119,7 @@ async def test_multi_turn_session(api_key: str) -> None:
         # Turn 2 — should continue the conversation.
         blocks2 = []
         async for block in pipe(
-            renderer.stream(session, "Say goodbye. No tools."),
+            block_stream.stream(session, "Say goodbye. No tools."),
             skip_intermediate_ends(),
         ):
             blocks2.append(block)

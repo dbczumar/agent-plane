@@ -1,10 +1,10 @@
-"""Composable stream transforms for render blocks.
+"""Composable stream transforms for stream blocks.
 
 Each transform is an async generator function that wraps a block
 stream. Compose with ``pipe()``:
 
     stream = pipe(
-        renderer.stream(session, text),
+        block_stream.stream(session, text),
         skip_blocks(ReasoningBlock),
         skip_intermediate_ends(),
     )

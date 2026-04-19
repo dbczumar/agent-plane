@@ -1,8 +1,8 @@
-"""Render block types with context.
+"""Stream block types with context.
 
 Every block carries a ``BlockContext`` describing which agent produced
 it, at what depth, and in which turn. The simple case ignores context.
-Multi-agent UIs route by ``block.ctx.agent``.
+Multi-agent frontends route by ``block.ctx.agent``.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from ._types import Response
 
 @dataclass
 class BlockContext:
-    """Metadata attached to every render block.
+    """Metadata attached to every stream block.
 
     :param agent: Name of the agent that produced this block, e.g.
         ``"coder.researcher"``. ``None`` for the root agent.
@@ -32,8 +32,8 @@ class BlockContext:
 
 
 @dataclass(kw_only=True)
-class RenderBlock:
-    """Base for all render blocks."""
+class StreamBlock:
+    """Base for all stream blocks."""
 
     ctx: BlockContext = field(default_factory=BlockContext)
 
@@ -42,7 +42,7 @@ class RenderBlock:
 
 
 @dataclass(kw_only=True)
-class ResponseStartBlock(RenderBlock):
+class ResponseStartBlock(StreamBlock):
     """The response has started.
 
     :param model: Agent model name, e.g. ``"coder"``.
@@ -79,7 +79,7 @@ class ToolExecution:
 
 
 @dataclass(kw_only=True)
-class ToolGroup(RenderBlock):
+class ToolGroup(StreamBlock):
     """A batch of tool calls from one iteration.
 
     :param executions: The tool calls in this group.
@@ -91,7 +91,7 @@ class ToolGroup(RenderBlock):
 
 
 @dataclass(kw_only=True)
-class ToolResultBlock(RenderBlock):
+class ToolResultBlock(StreamBlock):
     """A tool result, emitted after the tool executes.
 
     :param name: Tool name, e.g. ``"Read"``.
@@ -107,7 +107,7 @@ class ToolResultBlock(RenderBlock):
 
 
 @dataclass(kw_only=True)
-class NativeToolBlock(RenderBlock):
+class NativeToolBlock(StreamBlock):
     """A provider-native tool output (web_search, mcp, etc.).
 
     :param tool_type: Provider tool type, e.g. ``"web_search_call"``.
@@ -124,7 +124,7 @@ class NativeToolBlock(RenderBlock):
 
 
 @dataclass(kw_only=True)
-class TextChunk(RenderBlock):
+class TextChunk(StreamBlock):
     """A flushed chunk of streamed text.
 
     :param text: The text content of this chunk.
@@ -134,7 +134,7 @@ class TextChunk(RenderBlock):
 
 
 @dataclass(kw_only=True)
-class TextDone(RenderBlock):
+class TextDone(StreamBlock):
     """Complete text from a text-streaming section.
 
     :param full_text: The complete accumulated text.
@@ -149,14 +149,14 @@ class TextDone(RenderBlock):
 
 
 @dataclass(kw_only=True)
-class ReasoningStartBlock(RenderBlock):
+class ReasoningStartBlock(StreamBlock):
     """Reasoning has started — show a thinking indicator."""
 
     pass
 
 
 @dataclass(kw_only=True)
-class ReasoningBlock(RenderBlock):
+class ReasoningBlock(StreamBlock):
     """A completed reasoning/thinking block.
 
     :param reasoning_text: The raw reasoning text.
@@ -171,7 +171,7 @@ class ReasoningBlock(RenderBlock):
 
 
 @dataclass(kw_only=True)
-class ErrorBlock(RenderBlock):
+class ErrorBlock(StreamBlock):
     """An error during the response.
 
     :param message: The error message.
@@ -183,7 +183,7 @@ class ErrorBlock(RenderBlock):
 
 
 @dataclass(kw_only=True)
-class RetryBlock(RenderBlock):
+class RetryBlock(StreamBlock):
     """The server is retrying.
 
     :param source: What is being retried, e.g. ``"tool"``.
@@ -199,14 +199,14 @@ class RetryBlock(RenderBlock):
 
 
 @dataclass(kw_only=True)
-class CompactionBlock(RenderBlock):
+class CompactionBlock(StreamBlock):
     """Conversation is being compacted."""
 
     pass
 
 
 @dataclass(kw_only=True)
-class FileBlock(RenderBlock):
+class FileBlock(StreamBlock):
     """A file artifact produced by the agent.
 
     :param file_id: Server-assigned file ID.
@@ -218,7 +218,7 @@ class FileBlock(RenderBlock):
 
 
 @dataclass(kw_only=True)
-class ResponseEndBlock(RenderBlock):
+class ResponseEndBlock(StreamBlock):
     """The response reached a terminal state.
 
     :param status: Terminal status, e.g. ``"completed"`` or ``"failed"``.

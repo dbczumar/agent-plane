@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from agent_plane_ui_sdk._blocks import (
+from agent_plane_client._blocks import (
     BlockContext,
     ReasoningBlock,
     ResponseEndBlock,
@@ -11,7 +11,7 @@ from agent_plane_ui_sdk._blocks import (
     TextChunk,
     TextDone,
 )
-from agent_plane_ui_sdk._transforms import (
+from agent_plane_client._transforms import (
     merge_text_across_iterations,
     only_agent,
     pipe,

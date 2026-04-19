@@ -1,4 +1,4 @@
-"""StreamRenderer — event dispatch state machine that emits semantic blocks.
+"""BlockStream — event dispatch state machine that emits semantic blocks.
 
 Consumes the raw event stream from ``session.send()`` and produces
 a stream of typed blocks with context. Each block carries a
@@ -98,8 +98,8 @@ def _format_native_label(tool_type: str, data: dict[str, object]) -> str:
     return tool_type.replace("_", " ")
 
 
-class StreamRenderer:
-    """Consumes a session event stream and emits semantic render blocks.
+class BlockStream:
+    """Consumes a session event stream and emits semantic stream blocks.
 
     :param text_flush_threshold: Min chars to buffer before flushing
         on a word boundary. Default 30.
@@ -115,7 +115,16 @@ class StreamRenderer:
         *,
         files: list[str] | None = None,
     ) -> AsyncIterator[AnyBlock]:
-        """Stream render blocks for one turn."""
+        """Stream semantic blocks for one turn.
+
+        :param session: The :class:`Session` whose event stream to fold.
+            The session's ``send()`` method is invoked internally.
+        :param input: User text or a list of content-block dicts,
+            e.g. ``"hello"`` or ``[{"type": "input_text", "text": "hi"}]``.
+        :param files: Optional list of file paths to upload and attach
+            to the turn, e.g. ``["./data.csv"]``.
+        :returns: Async iterator of :class:`AnyBlock` values in order.
+        """
         in_reasoning = False
         reasoning_text = ""
         summary_text = ""

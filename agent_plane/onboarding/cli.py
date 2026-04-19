@@ -372,7 +372,7 @@ def _run_interactive(
     """
     import asyncio
 
-    from agent_plane_ui_sdk import AgentPlaneClient
+    from agent_plane_client import AgentPlaneClient
 
     from agent_plane.repl import run_repl
 
@@ -535,7 +535,7 @@ def _execute_tool_calls(
 def _load_coding_tool_handler() -> Any:
     """Load the coder tool set as a ToolHandler for client-side tools."""
 
-    from agent_plane_ui_sdk import ToolCallInfo, ToolHandler
+    from agent_plane_client import ToolCallInfo, ToolHandler
 
     from agent_plane.client_tools import get_tool_set
 
