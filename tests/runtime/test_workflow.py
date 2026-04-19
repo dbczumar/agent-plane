@@ -343,6 +343,18 @@ def _patch_agent_loop_deps(
         lambda store, conv_id: [],
     )
 
+    # Stub the async-work drain — calling DBOS.recv_async outside a
+    # workflow context raises. The drain returning [] keeps
+    # _run_agent_loop's iteration path identical to pre-Phase-2
+    # for these isolated unit tests.
+    async def _no_drain(*, block_for_one: bool) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._drain_async_completions",
+        _no_drain,
+    )
+
     return emitted_events
 
 

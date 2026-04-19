@@ -590,6 +590,10 @@ def _spawn_one(
         agent_id=agent_id,
         agent_name=agent_name,
         root_task_id=root_task_id,
+        # G74: explicitly mark spawned tasks so the parent loop's
+        # auto-collect path can distinguish sub-agents from
+        # top-level user turns and from async @tool work items.
+        kind="sub_agent",
     )
 
     # Append user input as the first message in the sub-agent's

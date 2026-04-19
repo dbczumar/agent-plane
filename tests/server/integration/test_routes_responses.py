@@ -335,6 +335,7 @@ async def test_agent_reasoning_effort_reaches_llm(
         "llm": {
             "model": "reasoning-agent",
             "reasoning_effort": "medium",
+            "connection": {"api_key": "test-key"},
         },
     }
     config_bytes = yaml.dump(config).encode()
