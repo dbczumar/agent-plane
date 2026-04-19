@@ -28,6 +28,7 @@ from agent_plane.runtime.live_stream import register as _live_register
 from agent_plane.runtime.live_stream import subscribe as _live_subscribe
 from agent_plane.runtime.live_stream import unregister as _live_unregister
 from agent_plane.server.schemas import (
+    AsyncToolResult,
     ConversationRef,
     CreateResponseRequest,
     ErrorDetail,
@@ -210,6 +211,90 @@ def _apply_tool_results(
                 )
 
 
+async def _lookup_client_tool_task(
+    async_result: AsyncToolResult,
+    task_store: TaskStore,
+) -> Task | None:
+    """
+    Look up and validate a single ``async_tool_result``'s task.
+
+    :param async_result: One entry from the PATCH request body.
+    :param task_store: Task store for the lookup.
+    :returns: The :class:`Task` if it is a non-terminal
+        ``kind="client_tool"`` row that still needs finalization;
+        ``None`` if it is already terminal (G3 no-op).
+    :raises AgentPlaneError: NOT_FOUND when the task_id is
+        unknown; CONFLICT when the task is not ``client_tool``.
+    """
+    from agent_plane.entities.task import TERMINAL_STATUSES
+
+    task = await task_store.get(async_result.task_id)
+    if task is None:
+        raise AgentPlaneError(
+            f"Async client-tool task {async_result.task_id!r} not found.",
+            code=ErrorCode.NOT_FOUND,
+        )
+    if task.kind != "client_tool":
+        raise AgentPlaneError(
+            f"Task {async_result.task_id!r} is not a client_tool "
+            f"task (kind={task.kind!r}); use tool_results for sync "
+            f"client tools or check_task for other kinds.",
+            code=ErrorCode.CONFLICT,
+        )
+    if task.status in TERMINAL_STATUSES:
+        # G3: first-write-wins. The task was already cancelled
+        # or completed (probably via cancel_task racing the
+        # PATCH); silently accept the late PATCH without
+        # changing terminal status. Don't re-signal the parent
+        # — the original terminal write already did that.
+        return None
+    return task
+
+
+async def _finalize_and_signal(
+    async_result: AsyncToolResult,
+    task: Task,
+    task_store: TaskStore,
+) -> None:
+    """
+    Persist a finalized async client-tool result and signal the parent.
+
+    Writes the manual_* columns on the task row, then sends the
+    ``async_work_complete`` payload to the parent so its drain
+    auto-delivers a system message on the next iteration.
+
+    :param async_result: The PATCH entry being applied.
+    :param task: The looked-up :class:`Task` row (already
+        validated as a non-terminal client_tool by
+        :func:`_lookup_client_tool_task`).
+    :param task_store: Task store for the finalization write.
+    """
+    from agent_plane.runtime.background_tool_workflow import (
+        ASYNC_WORK_COMPLETE_TOPIC,
+    )
+    from agent_plane.runtime.durability import dbos_send_async
+
+    await task_store.finalize_async_task(
+        task_id=async_result.task_id,
+        status=async_result.status,
+        output=async_result.output,
+        error=async_result.error,
+    )
+    parent_task_id = task.root_task_id or task.id
+    payload: dict[str, Any] = {
+        "task_id": async_result.task_id,
+        "kind": "client_tool",
+        "status": async_result.status,
+        "output": async_result.output,
+        "error": async_result.error,
+    }
+    await dbos_send_async(
+        parent_task_id,
+        payload,
+        topic=ASYNC_WORK_COMPLETE_TOPIC,
+    )
+
+
 async def _apply_async_tool_results(
     req: PatchResponseRequest,
     task_store: TaskStore,
@@ -217,76 +302,23 @@ async def _apply_async_tool_results(
     """
     Apply Phase 5 async client-tool results from a PATCH request.
 
-    For each ``async_tool_result`` entry:
-    1. Look up the task by ``task_id``; 404 if not found.
-    2. If the task is already terminal (e.g. server-side cancel
-       beat the client's PATCH), keep the prior terminal status
-       — late "completed" PATCHes do NOT override an earlier
-       "cancelled" (G3 first-write-wins).
-    3. Otherwise, mark the task terminal in ``task_store`` via
-       ``finalize_async_task`` and signal the parent on the
-       unified ``async_work_complete`` topic so the parent's
-       drain auto-delivers the result.
+    For each ``async_tool_result`` entry: look it up via
+    :func:`_lookup_client_tool_task`, then (if non-terminal)
+    finalize and signal via :func:`_finalize_and_signal`.
 
     Idempotent — a second PATCH with the same ``task_id`` after
-    a terminal status hits step 2 (no-op).
+    a terminal status takes the no-op branch in the lookup.
 
     :param req: The PATCH request with async tool results.
     :param task_store: Task store for the lookup + finalization.
-    :raises AgentPlaneError: NOT_FOUND if the task_id is unknown.
+    :raises AgentPlaneError: NOT_FOUND if a task_id is unknown,
+        or CONFLICT if a task_id refers to a non-client_tool kind.
     """
-    from agent_plane.entities.task import TERMINAL_STATUSES
-    from agent_plane.runtime.background_tool_workflow import (
-        ASYNC_WORK_COMPLETE_TOPIC,
-    )
-    from agent_plane.runtime.durability import dbos_send_async
-
     for async_result in req.async_tool_results:
-        task = await task_store.get(async_result.task_id)
+        task = await _lookup_client_tool_task(async_result, task_store)
         if task is None:
-            raise AgentPlaneError(
-                f"Async client-tool task {async_result.task_id!r} not found.",
-                code=ErrorCode.NOT_FOUND,
-            )
-        if task.kind != "client_tool":
-            raise AgentPlaneError(
-                f"Task {async_result.task_id!r} is not a client_tool "
-                f"task (kind={task.kind!r}); use tool_results for sync "
-                f"client tools or check_task for other kinds.",
-                code=ErrorCode.CONFLICT,
-            )
-        if task.status in TERMINAL_STATUSES:
-            # G3: first-write-wins. The task was already
-            # cancelled or completed (probably via cancel_task
-            # racing the PATCH); silently accept the late PATCH
-            # without changing terminal status. Don't re-signal
-            # the parent — the original terminal write already
-            # did that.
             continue
-
-        # Mark terminal in the task_store and signal the parent.
-        await task_store.finalize_async_task(
-            task_id=async_result.task_id,
-            status=async_result.status,
-            output=async_result.output or "",
-            error=async_result.error,
-        )
-        # Resolve the parent task for the signal target. The
-        # task row carries root_task_id, which is the
-        # async_work_complete recipient.
-        parent_task_id = task.root_task_id or task.id
-        payload: dict[str, Any] = {
-            "task_id": async_result.task_id,
-            "kind": "client_tool",
-            "status": async_result.status,
-            "output": async_result.output or "",
-            "error": async_result.error,
-        }
-        await dbos_send_async(
-            parent_task_id,
-            payload,
-            topic=ASYNC_WORK_COMPLETE_TOPIC,
-        )
+        await _finalize_and_signal(async_result, task, task_store)
 
 
 def _normalize_input(

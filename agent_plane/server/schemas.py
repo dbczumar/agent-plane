@@ -443,5 +443,5 @@ class PatchResponseRequest(BaseModel):
         optional output/error.
     """
 
-    tool_results: list[ToolResult] = []
-    async_tool_results: list[AsyncToolResult] = []
+    tool_results: list[ToolResult] = Field(default_factory=list)
+    async_tool_results: list[AsyncToolResult] = Field(default_factory=list)

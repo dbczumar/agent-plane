@@ -397,7 +397,7 @@ class TaskStore(ABC):
         *,
         task_id: str,
         status: str,
-        output: str = "",
+        output: str | None = None,
         error: dict[str, str] | None = None,
     ) -> None:
         """
@@ -413,8 +413,11 @@ class TaskStore(ABC):
         :param status: Terminal status — one of ``"completed"``,
             ``"failed"``, ``"cancelled"``.
         :param output: The string output for ``"completed"``.
+            ``None`` when the client did not produce a result
+            (failure / cancellation).
         :param error: For ``"failed"`` only — dict with
-            ``message`` and ``traceback`` keys.
+            ``message`` and optional ``traceback`` keys.
+            ``None`` when status is not ``"failed"``.
         :raises LookupError: If the task does not exist.
         """
         ...

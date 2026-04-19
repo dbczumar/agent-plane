@@ -199,16 +199,10 @@ class SqlTask(Base):
     # For tasks WITH a DBOS workflow, these stay NULL and the
     # store's ``_enrich_from_dbos`` overlay supplies the live
     # values from DBOS instead.
-    manual_status: Mapped[str | None] = mapped_column(
-        String(32), nullable=True
-    )
+    manual_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     manual_output: Mapped[str | None] = mapped_column(Text, nullable=True)
-    manual_error_message: Mapped[str | None] = mapped_column(
-        Text, nullable=True
-    )
-    manual_error_traceback: Mapped[str | None] = mapped_column(
-        Text, nullable=True
-    )
+    manual_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    manual_error_traceback: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         Index("ix_tasks_conversation_id", "conversation_id"),

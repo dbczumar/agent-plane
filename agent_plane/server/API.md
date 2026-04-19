@@ -695,6 +695,52 @@ response still works, but conversation history is truncated at the gap (the serv
 stops resolving context at the missing link). Attempting to create a new response
 with `previous_response_id` pointing to a deleted response returns 400.
 
+### Submit Tool Results (Client-Side Tools)
+
+```
+PATCH /v1/responses/{response_id}
+Content-Type: application/json
+
+{
+  "tool_results": [
+    {"call_id": "call_abc", "output": "..."}
+  ],
+  "async_tool_results": [
+    {"task_id": "task_xyz", "status": "completed", "output": "..."},
+    {"task_id": "task_qrs", "status": "failed",
+     "error": {"message": "...", "traceback": "..."}}
+  ]
+}
+
+200 OK   — body unspecified
+404 Not Found  — unknown response_id, call_id, or task_id
+409 Conflict   — task_id is not a client_tool kind
+```
+
+Submits results for client-side tool calls. A single PATCH may carry both
+arrays; both are optional and processed independently.
+
+- **`tool_results`** — synchronous client tools (`synchronous: true`, the
+  default). Each entry maps a `call_id` from a parked `function_call` with
+  `status: "action_required"` to its output string. The server unparks the
+  parent's tool loop and the next iteration starts immediately.
+- **`async_tool_results`** — asynchronous client tools (`synchronous: false`).
+  Each entry carries a server-issued `task_id` from the handle JSON the
+  parent already saw in its `function_call_output`, plus a terminal `status`
+  (`"completed"`, `"failed"`, or `"cancelled"`) and an optional `output`
+  string or `error` dict. The server marks the `kind="client_tool"` task
+  terminal in-store and signals the parent on the unified
+  `async_work_complete` topic so its drain auto-delivers a system message.
+
+Idempotent: repeating an `async_tool_results` PATCH after the task is
+terminal is a no-op (G3 first-write-wins — a late "completed" PATCH does
+not override an earlier "cancelled").
+
+When the parent is cancelled while async client tools are in flight, the
+SSE stream emits a `response.client_task.cancel` event with the
+`task_id` for each non-terminal child so the client can cancel its
+background work and (optionally) PATCH the cancellation back.
+
 
 ---
 

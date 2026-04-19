@@ -32,7 +32,7 @@ import httpx
 import pytest
 
 from tests.server.conftest import ControllableMockClient
-from tests.server.helpers import create_test_agent, create_test_response
+from tests.server.helpers import create_test_agent
 
 pytestmark = [pytest.mark.asyncio]
 
@@ -283,9 +283,7 @@ async def test_async_client_tool_completion_via_patch_auto_delivers(
     # output. The LLM's next iteration uses one of the queued
     # "working" calls and finishes the workflow.
     completed = await _wait_for_completion(client, response_id)
-    assert completed["status"] == "completed", (
-        f"Parent did not complete: {completed}"
-    )
+    assert completed["status"] == "completed", f"Parent did not complete: {completed}"
 
     items = await _get_items(client, conv_id)
     user_texts = [
@@ -294,15 +292,18 @@ async def test_async_client_tool_completion_via_patch_auto_delivers(
         if i.get("role") == "user" and i["content"][0].get("type") == "input_text"
     ]
     completion_messages = [t for t in user_texts if t.startswith("[System: task ")]
-    assert len(completion_messages) >= 1, (
-        f"Expected an auto-delivered [System: ...] message; "
-        f"got user_texts={user_texts}. The PATCH-driven signal "
-        f"may not be reaching the parent's drain."
+    # Exactly one async tool was dispatched and PATCHed completed,
+    # so the drain must auto-deliver exactly one system message.
+    # If 0: the PATCH-driven signal isn't reaching the drain.
+    # If 2+: the drain is duplicating completions.
+    assert len(completion_messages) == 1, (
+        f"Expected exactly one auto-delivered [System: ...] message "
+        f"for the single async tool; got {len(completion_messages)} "
+        f"(user_texts={user_texts})."
     )
-    blob = "\n".join(completion_messages)
-    assert "CLIENT_TOOL_RESULT_MARKER_99" in blob, (
-        f"The PATCH'd output must reach the auto-delivered "
-        f"system message verbatim. Got: {blob!r}"
+    assert "CLIENT_TOOL_RESULT_MARKER_99" in completion_messages[0], (
+        f"The PATCH'd output must reach the auto-delivered system "
+        f"message verbatim. Got: {completion_messages[0]!r}"
     )
 
     # Cross-check: the task row is now terminal with the
@@ -502,8 +503,7 @@ async def test_unknown_task_id_in_async_patch_returns_404(
         },
     )
     assert patch_resp.status_code == 404, (
-        f"Unknown task_id must return 404; got {patch_resp.status_code}: "
-        f"{patch_resp.text}"
+        f"Unknown task_id must return 404; got {patch_resp.status_code}: {patch_resp.text}"
     )
 
 
@@ -617,9 +617,23 @@ async def test_mixed_tool_results_and_async_tool_results_in_one_patch(
         for i in items
         if i.get("role") == "user" and i["content"][0].get("type") == "input_text"
     ]
-    assert any("MIXED_PATCH_OK" in t for t in user_texts), (
-        f"Expected the PATCH'd output in an auto-delivered system "
-        f"message. Got user_texts={user_texts}"
+    completion_messages = [t for t in user_texts if t.startswith("[System: task ")]
+    # One async tool was dispatched and PATCHed, so the drain must
+    # deliver exactly one system completion message. The mixed
+    # nature of the PATCH is the empty tool_results: [] coexisting
+    # with a single async_tool_results entry — both legs must be
+    # accepted by the handler.
+    # If 0: PATCH async_tool_results didn't signal the parent.
+    # If 2+: a duplicate signal escaped or the empty tool_results
+    # leg accidentally produced a system message.
+    assert len(completion_messages) == 1, (
+        f"Expected exactly one auto-delivered [System: ...] message "
+        f"for the single async tool; got {len(completion_messages)} "
+        f"(user_texts={user_texts})."
+    )
+    assert "MIXED_PATCH_OK" in completion_messages[0], (
+        f"The PATCH'd output must reach the auto-delivered system "
+        f"message verbatim. Got: {completion_messages[0]!r}"
     )
 
 
@@ -695,14 +709,11 @@ async def test_parent_cancel_emits_response_client_task_cancel_sse(
             ],
         },
     )
-    assert patch_resp.status_code == 200, (
-        "Late PATCH should be accepted (200) but no-op."
-    )
+    assert patch_resp.status_code == 200, "Late PATCH should be accepted (200) but no-op."
     task_row_after = await get_task_store().get(task_id)
     assert task_row_after is not None
     assert task_row_after.status == "cancelled", (
-        f"Late PATCH must NOT override the cancelled status (G3); "
-        f"got {task_row_after.status!r}"
+        f"Late PATCH must NOT override the cancelled status (G3); got {task_row_after.status!r}"
     )
 
 
@@ -747,11 +758,8 @@ async def test_list_tasks_includes_client_tool_kind(
     from agent_plane.runtime import get_task_store
 
     children = await get_task_store().list_tasks(root_task_id=response_id)
-    iter_children = children.data if hasattr(children, "data") else children
-    kinds = [c.kind for c in iter_children]
-    assert "client_tool" in kinds, (
-        f"Expected a client_tool child in list_tasks; got kinds={kinds}"
-    )
+    kinds = [c.kind for c in children]
+    assert "client_tool" in kinds, f"Expected a client_tool child in list_tasks; got kinds={kinds}"
 
     # Tear down.
     await client.post(f"/v1/responses/{response_id}/cancel")

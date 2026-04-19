@@ -137,10 +137,11 @@ def _to_entity(row: SqlTask) -> Task:
     if row.manual_output:
         initial_output = [{"text": row.manual_output}]
     if row.manual_error_message:
-        initial_error = {
-            "message": row.manual_error_message,
-            "traceback": row.manual_error_traceback or "",
-        }
+        initial_error = {"message": row.manual_error_message}
+        # Only include traceback when the client actually sent
+        # one — preserves "no traceback" vs "empty traceback".
+        if row.manual_error_traceback is not None:
+            initial_error["traceback"] = row.manual_error_traceback
     return Task(
         id=row.id,
         conversation_id=row.conversation_id,
@@ -683,7 +684,7 @@ class SqlAlchemyTaskStore(TaskStore):
         *,
         task_id: str,
         status: str,
-        output: str = "",
+        output: str | None = None,
         error: dict[str, str] | None = None,
     ) -> None:
         """
@@ -698,29 +699,27 @@ class SqlAlchemyTaskStore(TaskStore):
         :param task_id: The task's id.
         :param status: Terminal status — one of ``"completed"``,
             ``"failed"``, ``"cancelled"``.
-        :param output: The string output for ``"completed"``
-            (empty string otherwise).
+        :param output: The string output for ``"completed"``.
+            ``None`` when the client did not produce a result
+            (failure / cancellation).
         :param error: For ``"failed"`` only — dict with
-            ``message`` and ``traceback`` keys.
+            ``message`` and optional ``traceback`` keys.
+            ``None`` when status is not ``"failed"``.
         :raises LookupError: If the task does not exist.
         """
-        from sqlalchemy import update
 
         def _do_update() -> None:
             with self._session() as session:
-                stmt = (
-                    update(SqlTask)
-                    .where(SqlTask.id == task_id)
-                    .values(
-                        manual_status=status,
-                        manual_output=output,
-                        manual_error_message=(error or {}).get("message"),
-                        manual_error_traceback=(error or {}).get("traceback"),
-                    )
-                )
-                result = session.execute(stmt)
-                if result.rowcount == 0:
+                # Read-then-write: SQLAlchemy's Result.rowcount is
+                # not statically typed across dialects, so detect a
+                # missing row via .get() rather than .rowcount.
+                row = session.get(SqlTask, task_id)
+                if row is None:
                     raise LookupError(f"task {task_id!r} not found")
+                row.manual_status = status
+                row.manual_output = output
+                row.manual_error_message = (error or {}).get("message")
+                row.manual_error_traceback = (error or {}).get("traceback")
 
         await asyncio.to_thread(_do_update)
 
