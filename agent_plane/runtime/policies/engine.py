@@ -139,9 +139,13 @@ class PolicyEngine:
         for policy in self.policies:
             if not self._should_fire(policy.spec, ctx):
                 continue
-            result = await policy.evaluate(ctx, context)
-            if result.set_labels:
-                accumulated.update(result.set_labels)
+            result = await _dispatch_policy(policy, ctx, context)
+            # Filter set_labels through the spec's whitelist
+            # (when declared) — keys outside the whitelist
+            # silently dropped per POLICIES.md §9.
+            filtered_labels = _filter_writable_labels(result.set_labels, policy.spec)
+            if filtered_labels:
+                accumulated.update(filtered_labels)
             if result.action == PolicyAction.DENY:
                 return self._compose_deny(policy.spec.name, result.reason, accumulated)
             if result.action == PolicyAction.ASK:
@@ -291,6 +295,131 @@ class PolicyEngine:
             "labels": dict(self._labels),
             "conversation_id": self._conversation_id,
         }
+
+
+async def _dispatch_policy(
+    policy: Policy,
+    ctx: EvaluationContext,
+    context: dict[str, Any],
+) -> PolicyResult:
+    """
+    Run a single policy's ``evaluate`` with full safety net.
+
+    Applies the POLICIES.md §4 / §13 contract:
+
+    - Any exception raised by the policy is converted to a
+      result. Default: fail-closed DENY. Under the
+      classifier-only carve-out (``action: [allow]``-only
+      specs): substitute ALLOW to honor the author's
+      declared "this policy never blocks" intent.
+    - Returned actions are validated against the spec's
+      declared ``action`` list (when present). Mismatch →
+      same fail-closed path with the same carve-out.
+    - ``set_labels`` from a failing evaluation are dropped;
+      a partial/broken policy does not get to write labels.
+
+    :param policy: The concrete :class:`Policy` instance.
+    :param ctx: Current evaluation context.
+    :param context: Engine-provided context bundle.
+    :returns: A normalized result — safe for the engine to
+        compose without further validation.
+    """
+    try:
+        result = await policy.evaluate(ctx, context)
+    except Exception as exc:
+        return _fail_closed(policy.spec, reason=f"policy {policy.spec.name!r} failed: {exc}")
+    if _action_permitted(policy.spec, result.action):
+        return result
+    return _fail_closed(
+        policy.spec,
+        reason=(
+            f"policy {policy.spec.name!r} returned {result.action.value!r} "
+            f"which is not in its declared action list"
+        ),
+    )
+
+
+def _action_permitted(spec: PolicySpec, action: PolicyAction) -> bool:
+    """
+    Check whether *action* is allowed by *spec*'s declared
+    action whitelist.
+
+    Specs with no declared whitelist (LabelPolicySpec.action
+    is a single value; FunctionPolicySpec.action may be
+    ``None``) accept any action. Specs that declare a list
+    restrict to that list.
+
+    :param spec: The policy's spec.
+    :param action: The action the policy returned.
+    :returns: ``True`` if the action is permitted.
+    """
+    declared = getattr(spec, "action", None)
+    if not isinstance(declared, list):
+        # LabelPolicySpec stores a single action; no
+        # whitelist semantics. FunctionPolicySpec may be
+        # None = accept any.
+        return True
+    return action in declared
+
+
+def _fail_closed(spec: PolicySpec, *, reason: str) -> PolicyResult:
+    """
+    Build the fail-closed result for a broken policy.
+
+    By default emits DENY with the caller-supplied reason
+    and drops any set_labels. Under the classifier-only
+    carve-out (POLICIES.md §13) — when the spec's declared
+    action whitelist contains no DENY — substitutes ALLOW
+    instead, on the grounds that inventing a DENY violates
+    the author's declared "this policy never blocks" intent.
+
+    :param spec: The policy's spec — used to check the
+        carve-out condition.
+    :param reason: Human-readable explanation for DENY;
+        discarded on the ALLOW substitution path since ALLOW
+        results carry no reason.
+    :returns: A :class:`PolicyResult` safe for composition.
+    """
+    declared = getattr(spec, "action", None)
+    is_classifier_only = isinstance(declared, list) and PolicyAction.DENY not in declared
+    if is_classifier_only:
+        return PolicyResult(
+            action=PolicyAction.ALLOW,
+            reason=None,
+            set_labels=None,
+        )
+    return PolicyResult(
+        action=PolicyAction.DENY,
+        reason=reason,
+        set_labels=None,
+    )
+
+
+def _filter_writable_labels(
+    set_labels: dict[str, str] | None,
+    spec: PolicySpec,
+) -> dict[str, str] | None:
+    """
+    Filter a policy's label writes through its whitelist.
+
+    When ``spec.set_labels`` is a list (FunctionPolicy /
+    PromptPolicy), any key in the returned dict that is NOT
+    in the list is silently dropped. When ``spec.set_labels``
+    is absent or not a list (LabelPolicy, which uses a dict
+    as the fixed writes — validated at spec load), every key
+    passes through.
+
+    :param set_labels: The label writes the policy returned.
+    :param spec: The policy's spec.
+    :returns: Filtered mapping, or ``None`` / empty if all
+        writes were dropped.
+    """
+    if not set_labels:
+        return None
+    whitelist = getattr(spec, "set_labels", None)
+    if not isinstance(whitelist, list):
+        return dict(set_labels)
+    return {k: v for k, v in set_labels.items() if k in whitelist}
 
 
 def _condition_matches(

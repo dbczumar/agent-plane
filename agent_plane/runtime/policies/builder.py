@@ -19,10 +19,12 @@ from __future__ import annotations
 
 from agent_plane.runtime.policies.base import Policy
 from agent_plane.runtime.policies.engine import PolicyEngine
+from agent_plane.runtime.policies.function import resolve_function_policy
 from agent_plane.runtime.policies.label import LabelPolicy
 from agent_plane.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     AgentSpec,
+    FunctionPolicySpec,
     LabelDef,
     LabelPolicySpec,
     PolicySpec,
@@ -101,11 +103,12 @@ def _instantiate_policy(spec: PolicySpec) -> Policy:
     """
     if isinstance(spec, LabelPolicySpec):
         return LabelPolicy(spec)
+    if isinstance(spec, FunctionPolicySpec):
+        return resolve_function_policy(spec)
     raise NotImplementedError(
         f"Policy type {type(spec).__name__} for {spec.name!r} is not "
-        f"yet implemented in this phase. ``FunctionPolicy`` lands in "
-        f"Phase 4; ``PromptPolicy`` in Phase 7 (see "
-        f"designs/POLICIES_IMPLEMENTATION_PLAN.md).",
+        f"yet implemented in this phase. ``PromptPolicy`` lands in "
+        f"Phase 7 (see designs/POLICIES_IMPLEMENTATION_PLAN.md).",
     )
 
 
