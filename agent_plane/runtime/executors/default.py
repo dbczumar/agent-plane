@@ -546,7 +546,10 @@ async def _open_stream_with_retry(
                     from mlflow.entities import SpanEvent
 
                     chat_span.add_event(
-                        SpanEvent(
+                        # mypy flags SpanEvent as abstract due to a
+                        # stale stub for from_proto, but the class
+                        # is concrete at runtime.
+                        SpanEvent(  # type: ignore[abstract]
                             name="gen_ai.retry",
                             attributes={
                                 "attempt": attempt + 1,

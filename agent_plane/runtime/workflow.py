@@ -50,6 +50,34 @@ _SUB_AGENT_OUTPUT_BUDGET = 10_000
 # proxies that close idle connections at 30 s safely under their
 # threshold without flooding the channel with pings.
 _HEARTBEAT_INTERVAL_S = 15.0
+
+# Generic type variable used by ``_to_thread`` (pure helper).
+_T = TypeVar("_T")
+
+# Hard upper bound on LLM turns per execution. Prevents runaway
+# loops. See designs/AGENTLOOP.md "Not Yet" for making this
+# configurable.
+_MAX_ITERATIONS = 1000
+
+# SSE event types emitted for reasoning content (set by the
+# streaming accumulator and consumed by the terminal frontend).
+_REASONING_TEXT_EVENT = "response.reasoning_text.delta"
+_REASONING_SUMMARY_EVENT = "response.reasoning_summary_text.delta"
+_REASONING_STARTED_EVENT = "response.reasoning.started"
+
+# Executor storage layout — each (conversation, agent) gets a
+# stable subdir under ``_EXECUTOR_STORAGE_BASE`` that persists
+# across tasks. The artifact-store key prefix mirrors the disk
+# layout so snapshots round-trip cleanly.
+_EXECUTOR_STORAGE_KEY_PREFIX = "executor_storage"
+_EXECUTOR_STORAGE_BASE = Path.home() / ".agent-plane" / "executor_storage"
+
+# Client-side tool result polling — used by
+# ``_build_await_tool_output`` while waiting for a PATCH'd
+# function_call_output to arrive.
+_TOOL_POLL_INTERVAL_SECONDS = 0.5
+_TOOL_POLL_TIMEOUT_SECONDS = 600
+
 from agent_plane.llms import Client as LLMClient
 from agent_plane.llms.errors import (
     ContextWindowExceededError,
@@ -154,9 +182,6 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
-_T = TypeVar("_T")
-
-
 async def _to_thread(fn: Callable[[], _T]) -> _T:
     """
     Run a sync callable in the thread pool, propagating ``ContextVar`` values.
@@ -173,10 +198,6 @@ async def _to_thread(fn: Callable[[], _T]) -> _T:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, ctx.run, fn)
 
-
-# Hard upper bound on LLM turns per execution. Prevents runaway loops.
-# See designs/AGENTLOOP.md "Not Yet" for making this configurable.
-_MAX_ITERATIONS = 1000
 
 # Lazy singleton — created on first LLM call so import doesn't
 # fail when provider API keys are not yet set.
@@ -708,12 +729,6 @@ async def _call_llm_streaming(
         effective_retry,
         on_retry=lambda event: _write_output(task_id, event),
     )
-
-
-# SSE event types emitted for reasoning content
-_REASONING_TEXT_EVENT = "response.reasoning_text.delta"
-_REASONING_SUMMARY_EVENT = "response.reasoning_summary_text.delta"
-_REASONING_STARTED_EVENT = "response.reasoning.started"
 
 
 def _accumulate_stream(
@@ -2475,7 +2490,6 @@ def _strip_mcp_tool_prefix(name: str) -> str:
     return name
 
 
-
 # ─── Async tool dispatch ───────────────────────────────────
 
 
@@ -3639,13 +3653,6 @@ def _handle_execution_timeout(
     )
 
 
-_EXECUTOR_STORAGE_KEY_PREFIX = "executor_storage"
-
-# Base directory for executor storage on disk. Each (conversation, agent)
-# pair gets a stable subdirectory that persists across tasks.
-_EXECUTOR_STORAGE_BASE = Path.home() / ".agent-plane" / "executor_storage"
-
-
 def _storage_artifact_key(
     conversation_id: str,
     agent_name: str,
@@ -3840,12 +3847,6 @@ def _build_executor_context(
 
 
 # ── await_tool_output implementation ───────────────────────
-
-
-# Polling interval for client tool result delivery.
-_TOOL_POLL_INTERVAL_SECONDS = 0.5
-# Maximum time to wait for a client tool result.
-_TOOL_POLL_TIMEOUT_SECONDS = 600
 
 
 def _build_await_tool_output(
