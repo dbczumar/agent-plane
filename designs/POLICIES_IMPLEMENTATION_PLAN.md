@@ -13,34 +13,52 @@ system is only feature-complete after Phase 11.
 | 1 — conversation_labels + store API | ✅ landed | `policies-phase-0-spec-types` (continued) | 15 |
 | 2 — PolicyEngine skeleton + unified builtin registry | ✅ landed | `policies-phase-2-engine-skeleton` | 20 + 8 + 2 validator |
 | 3 — LabelPolicy runtime + engine composition | ✅ landed | `policies-phase-3-label-policy` | 19 |
+| 3+ — LabelDef schema validation (values + monotonic) | ✅ landed | `policies-phase-8-ask-flow` | 9 |
 | 4 — FunctionPolicy + engine safety net | ✅ landed | `policies-phase-4-function-policy` | 19 |
 | 5 — `_enforce_policy` API + 3 fixture agents | ✅ landed | `policies-phase-5-input-output-enforcement` | 14 |
 | 5b — Combined-policies integration tests | ✅ landed | `policies-phase-5b-combined-integration` | 9 |
 | 6 — Workflow enforcement-site wiring | ⏳ pending | — | — |
 | 7 — PromptPolicy runtime | ✅ landed | `policies-phase-7-prompt-policy` | 20 |
-| 8 — ASK flow (synthetic `request_approval`) | ⏳ pending | — | — |
-| 9 — Executor integration (Claude SDK, AgentsSdk) | ⏳ pending | — | — |
+| 7b — PromptPolicy integration tests | ✅ landed | `policies-phase-5b-combined-integration` | 6 |
+| 8 — ASK flow helper (`_await_policy_approval`) | ✅ landed | `policies-phase-8-ask-flow` | 25 |
+| 8b — ASK-cycle e2e composition | ✅ landed | `policies-phase-8-ask-flow` | 8 |
+| 8c — Multi-turn engine-rebuild e2e | ✅ landed | `policies-phase-8-ask-flow` | 5 |
+| 9 — Executor integration (Claude SDK, AgentsSdk, LLM wiring) | ⏳ pending | — | — |
 | 10 — Client-side (REPL + Python UI SDK) | ⏳ pending | — | — |
 | 11 — Observability spans + polish | ⏳ pending | — | — |
 
-**Total new tests so far: ~186** covering spec parsing + validation,
-store persistence, engine composition, all three policy
-subclasses, and multi-type integration through ported
-omniagents example fixtures. Full non-e2e suite: 807 passing.
+**Total new tests so far: ~240+** covering spec parsing +
+validation, store persistence, engine composition, all three
+policy subclasses, schema-validated label writes, ASK-flow
+round-trip, multi-turn engine rebuild, and multi-type
+integration through 4 ported / built fixtures (agent_with_policies,
+rate_limited_search, secure_research, combined-policies,
+prompt-policy-demo). Full non-e2e suite: 850+ passing.
 
-**All three policy types (Label, Function, Prompt) are
-feature-complete at the spec + runtime level.** The system
-evaluates real YAML specs through parse → build → evaluate →
-persist against real SQLAlchemy stores; the remaining phases
-are workflow wiring (consume the engine from
-`_run_agent_loop`), ASK-flow plumbing (synthetic
-`request_approval` over the existing PATCH endpoint), and
-executor / client surface work.
+**The policy system is feature-complete at the engine +
+persistence + approval-helper level.** Real YAML specs flow
+through parse → validate → build → evaluate → persist →
+(optional approval round-trip) against real SQLAlchemy stores
+with schema-validated label writes, strict verdict parsing,
+and per-policy ask_timeout overrides. Every ported omniagents
+example agent executes to the asserted behavior.
 
-Phase 6 is the immediate next step to unlock live e2e runs;
-Phase 7's PromptPolicy classifier is testable via stub
-injection today (production LLM wiring lands alongside
-Phase 9 executor integration).
+What remains to unlock a LIVE e2e run with a real agent
+workflow:
+
+- **Phase 6** — wire `_enforce_policy` into `_run_agent_loop`'s
+  4 sites + wire `_await_policy_approval`'s register / emit /
+  park seams to the real DBOS + SSE stack.
+- **Phase 9** — wire `PromptPolicy._default_classifier` to the
+  real LLM executor; wire Claude SDK `PreToolUse` / `PostToolUse`
+  hooks + AgentsSdk MCP subclass to call `_enforce_policy`.
+- **Phase 10** — REPL + Python UI SDK handle the
+  `request_approval` reserved name.
+- **Phase 11** — observability spans (policy_phase /
+  policy_eval) + span events for dropped label writes.
+
+Phases 6-11 are all additive — no changes needed to the
+shipped engine, approval helper, spec types, or store layer.
 
 ---
 
