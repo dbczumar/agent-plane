@@ -16,9 +16,11 @@ internal and may change between phases.
 from __future__ import annotations
 
 from agent_plane.runtime.policies.builder import build_policy_engine
+from agent_plane.runtime.policies.enforcement import _enforce_policy
 from agent_plane.runtime.policies.engine import PolicyEngine
 
 __all__ = [
     "PolicyEngine",
+    "_enforce_policy",
     "build_policy_engine",
 ]

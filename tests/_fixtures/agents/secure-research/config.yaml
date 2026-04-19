@@ -1,0 +1,73 @@
+spec_version: 1
+name: secure-research
+description: |
+  Ported from omniagents `examples/secure_research_agent.yaml`.
+  Full IFC scenario — labels + label policies + enforcement.
+
+llm:
+  model: openai/gpt-4o
+
+guardrails:
+  ask_timeout: 30
+
+  labels:
+    confidentiality:
+      initial: "0"
+      values: ["0", "1"]
+      monotonic: increasing
+    integrity:
+      initial: "1"
+      values: ["0", "1"]
+      monotonic: decreasing
+
+  policies:
+    # ── Label-setting policies (ALLOW + set_labels). ──
+
+    taint_web_search:
+      type: label
+      on: [tool_call:web_search]
+      action: allow
+      set_labels:
+        integrity: "0"
+
+    taint_confidential_read:
+      type: label
+      on: [tool_call:read_internal_doc]
+      action: allow
+      set_labels:
+        confidentiality: "1"
+
+    # ── Enforcement policies (order matters; stricter first). ──
+
+    deny_contaminated_shell:
+      type: label
+      on: [tool_call:run_shell, tool_call:write_file]
+      condition:
+        confidentiality: "1"
+        integrity: "0"
+      action: deny
+      reason: |
+        Agent has both confidential data AND untrusted content.
+        Shell and file operations are denied to prevent data
+        exfiltration via prompt injection.
+
+    ask_high_confidentiality:
+      type: label
+      on: [tool_call:run_shell]
+      condition:
+        confidentiality: "1"
+      action: ask
+      reason: |
+        Agent has accessed confidential data. Shell command
+        requires explicit user approval.
+
+    ask_low_integrity:
+      type: label
+      on: [tool_call:run_shell, tool_call:write_file]
+      condition:
+        integrity: "0"
+      action: ask
+      reason: |
+        Agent has consumed untrusted web content. This action
+        requires explicit user approval to mitigate potential
+        prompt-injection risks.
