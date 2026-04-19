@@ -153,3 +153,66 @@ guardrails:
     )
     result = validate(parse(agent_dir))
     assert result.errors == []
+
+
+def test_validate_rejects_local_tool_colliding_with_builtin(
+    tmp_path: Path,
+) -> None:
+    """A user-authored local tool cannot use a name that
+    collides with a reserved builtin (POLICIES.md §15.8).
+    Verifies `request_approval` specifically — the ASK-flow
+    name. Without this check, user-declared tools could
+    shadow the synthetic function_call the policy engine
+    emits, and approvals would route to the wrong handler."""
+    (tmp_path / "config.yaml").write_text(
+        """
+spec_version: 1
+name: shadows-builtin
+""",
+    )
+    # Create a local tool file that would be discovered as
+    # "request_approval". The parser picks its name from the
+    # filename stem, so a file `request_approval.py` tries
+    # to register a tool under the reserved name.
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "python").mkdir()
+    (tmp_path / "tools" / "python" / "request_approval.py").write_text(
+        "def handler(args): return 'hi'\n",
+    )
+    spec = parse(tmp_path)
+    result = validate(spec)
+    assert not result.valid
+    # Exactly ONE collision error — not "at least one", which
+    # would let a runaway rule firing N times pass silently.
+    # If more errors appear, either another rule is also
+    # flagging or our check is too eager.
+    matching = [
+        e for e in result.errors if "request_approval" in e.message and "reserved" in e.message
+    ]
+    assert len(matching) == 1, (
+        f"Expected exactly 1 reserved-name collision error for "
+        f"request_approval; got {len(matching)}: {matching}"
+    )
+
+
+def test_validate_accepts_non_colliding_local_tool(
+    tmp_path: Path,
+) -> None:
+    """Control for the above — a uniquely-named local tool
+    passes. Without this, a bug that flagged every local
+    tool as a collision would be undetectable from the
+    positive test alone."""
+    (tmp_path / "config.yaml").write_text(
+        """
+spec_version: 1
+name: safe-local-tool
+""",
+    )
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "python").mkdir()
+    (tmp_path / "tools" / "python" / "my_custom_tool.py").write_text(
+        "def handler(args): return 'hi'\n",
+    )
+    spec = parse(tmp_path)
+    result = validate(spec)
+    assert result.errors == []
