@@ -1,0 +1,23 @@
+spec_version: 1
+
+name: decorator-signatures-test
+description: |
+  Test-only agent that exercises the breadth of the @tool decorator's
+  signature handling — primitive args, Pydantic BaseModel args,
+  Annotated descriptions, and defaults. Used by the Phase 1 E2E test
+  to verify schema derivation works end-to-end against a real LLM.
+
+llm:
+  model: gpt-5.4
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  timeout: 60
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

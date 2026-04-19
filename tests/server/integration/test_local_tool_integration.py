@@ -28,28 +28,18 @@ _AGENT_NAME = "local-tool-test-agent"
 
 _WORD_COUNT_SOURCE = '''\
 """Count words in text."""
-from typing import Any
+from agent_plane.tools import tool
 
-SCHEMA: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "word_count",
-        "description": "Count words in text.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "Text to count."},
-            },
-            "required": ["text"],
-        },
-    },
-}
 
-async def run(arguments: dict[str, Any]) -> str:
-    """Count words and return JSON."""
-    import json as _json
-    text = arguments.get("text", "")
-    return _json.dumps({"word_count": len(text.split())})
+@tool
+def word_count(text: str) -> dict[str, int]:
+    """
+    Count words in text.
+
+    Args:
+        text: Text to count.
+    """
+    return {"word_count": len(text.split())}
 '''
 
 
@@ -63,10 +53,16 @@ def _build_local_tool_agent_bundle() -> bytes:
     :returns: Raw tar.gz bytes with config.yaml and
         tools/python/word_count.py.
     """
+    # llm.connection is required by the spec validator; the value
+    # is irrelevant at runtime because the mock_llm fixture
+    # monkeypatches the actual client.
     config: dict[str, Any] = {
         "spec_version": 1,
         "name": _AGENT_NAME,
-        "llm": {"model": _AGENT_NAME},
+        "llm": {
+            "model": _AGENT_NAME,
+            "connection": {"api_key": "test-key"},
+        },
     }
 
     buf = io.BytesIO()
@@ -236,25 +232,27 @@ async def test_local_tool_crash_does_not_kill_server(
     **What breaks if wrong**: in-process execution would kill the
     server and this test would hang or error on the health check.
     """
-    # Build a bundle with a crashing tool
+    # Build a bundle with a crashing tool. llm.connection is
+    # required by the validator; mock_llm patches the runtime call.
     config: dict[str, Any] = {
         "spec_version": 1,
         "name": _AGENT_NAME,
-        "llm": {"model": _AGENT_NAME},
+        "llm": {
+            "model": _AGENT_NAME,
+            "connection": {"api_key": "test-key"},
+        },
     }
-    crash_source = """\
-from typing import Any
-SCHEMA: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "crasher",
-        "description": "A tool that crashes.",
-        "parameters": {"type": "object", "properties": {}},
-    },
-}
-async def run(arguments: dict[str, Any]) -> str:
-    import os; os._exit(1)
-"""
+    crash_source = '''\
+"""A tool that crashes."""
+from agent_plane.tools import tool
+
+
+@tool
+def crasher() -> str:
+    """A tool that crashes."""
+    import os
+    os._exit(1)
+'''
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         _add_text(tf, "config.yaml", yaml.dump(config))
@@ -295,4 +293,178 @@ async def run(arguments: dict[str, Any]) -> str:
     # The response should have completed (LLM recovered from the error)
     assert completed["status"] == "completed", (
         f"Expected completed (LLM handles tool error gracefully), got {completed['status']}"
+    )
+
+
+# ── New @tool decorator integration tests ────────────────
+
+
+_MULTI_TOOL_SOURCE = '''\
+"""A file exporting two @tool functions (G16)."""
+from agent_plane.tools import tool
+
+
+@tool
+def first_tool(value: str) -> str:
+    """Return value with first prefix."""
+    return f"first:{value}"
+
+
+@tool
+def second_tool(value: str) -> str:
+    """Return value with second prefix."""
+    return f"second:{value}"
+'''
+
+
+_NO_DECORATOR_SOURCE = '''\
+"""Tool file that does NOT use @tool — must fail loud at agent load."""
+from typing import Any
+
+
+def some_function(arguments: dict[str, Any]) -> str:
+    """A regular function with no @tool decorator."""
+    return "ok"
+'''
+
+
+def _build_agent_bundle_with_files(files: dict[str, str]) -> bytes:
+    """
+    Build an agent bundle with arbitrary tool files.
+
+    :param files: Mapping from in-bundle path (e.g.
+        ``"tools/python/multi.py"``) to source text.
+    :returns: tar.gz bytes ready to POST as an agent bundle.
+    """
+    # llm.connection is required by the validator; mock_llm patches
+    # the runtime call so the value is unused.
+    config: dict[str, Any] = {
+        "spec_version": 1,
+        "name": _AGENT_NAME,
+        "llm": {
+            "model": _AGENT_NAME,
+            "connection": {"api_key": "test-key"},
+        },
+    }
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        _add_text(tf, "config.yaml", yaml.dump(config))
+        for path, source in files.items():
+            _add_text(tf, path, source)
+    return buf.getvalue()
+
+
+async def test_multiple_tools_in_one_file_invoked_via_server(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """G16: A file with multiple ``@tool`` functions exposes each as a separate tool."""
+    bundle = _build_agent_bundle_with_files({"tools/python/multi.py": _MULTI_TOOL_SOURCE})
+    resp = await client.post(
+        "/api/agents",
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert resp.status_code == 201, f"Agent creation failed: {resp.status_code} {resp.text}"
+
+    # LLM call 1: invoke first_tool
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_first",
+                "name": "first_tool",
+                "arguments": json.dumps({"value": "hello"}),
+            },
+        ],
+    )
+    # LLM call 2: invoke second_tool
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_second",
+                "name": "second_tool",
+                "arguments": json.dumps({"value": "world"}),
+            },
+        ],
+    )
+    # LLM call 3: final text
+    mock_llm.add_call(text="Done.")
+
+    result = await create_test_response(
+        client,
+        model=_AGENT_NAME,
+        input_text="Call both tools",
+    )
+    assert result.status_code == 200
+    response_id = result.body["id"]
+    conv_id = result.body["conversation"]["id"]
+
+    completed = await _wait_for_completion(client, response_id)
+    assert completed["status"] == "completed"
+
+    items = await _get_items(client, conv_id)
+
+    # Both tools' results should appear in the conversation.
+    fco_items = [i for i in items if i.get("type") == "function_call_output"]
+    assert len(fco_items) == 2, (
+        f"Expected 2 function_call_outputs (one per tool), got "
+        f"{len(fco_items)}. If 1, only one of the two @tool functions "
+        f"was registered, indicating G16 is broken."
+    )
+
+    outputs_by_call_id = {i["call_id"]: i["output"] for i in fco_items}
+    # Each tool's output should reflect the values passed and the tool's
+    # own prefix — proving the runner dispatched to the right function
+    # (G17) for each call.
+    assert "first:hello" in outputs_by_call_id["call_first"]
+    assert "second:world" in outputs_by_call_id["call_second"]
+
+
+async def test_tool_file_without_decorator_fails_at_agent_load(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """A tool file that exports no ``@tool`` functions fails at agent load.
+
+    Agent bundles are stored at upload time; the image is loaded on
+    first use. The "no @tool functions" check fires at load time,
+    so we provoke a load by POSTing a response and assert the task
+    surfaces an error mentioning the missing decorator.
+    """
+    bundle = _build_agent_bundle_with_files({"tools/python/no_decorator.py": _NO_DECORATOR_SOURCE})
+    resp = await client.post(
+        "/api/agents",
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    # Bundle upload succeeds — validation is byte-level + spec only.
+    assert resp.status_code == 201, (
+        f"Bundle upload should succeed; load happens later. Got {resp.status_code} {resp.text}"
+    )
+
+    # Attempting to use the agent triggers image load, which must fail.
+    result = await create_test_response(
+        client,
+        model=_AGENT_NAME,
+        input_text="Trigger agent load",
+    )
+    # Either the create call returns an error, or the task transitions
+    # to failed status. Both are acceptable signals; we verify whichever
+    # the framework chose.
+    if result.status_code >= 400:
+        body_text = result.body.get("error", {}).get("message", str(result.body)).lower()
+        assert "@tool" in body_text, (
+            f"Error should reference the missing @tool decorator, got: {result.body!r}"
+        )
+        return
+
+    # Task was created successfully but should fail during execution.
+    response_id = result.body["id"]
+    completed = await _wait_for_completion(client, response_id)
+    assert completed["status"] == "failed", (
+        f"Expected task to fail loading the no-decorator tool, got "
+        f"status {completed['status']}. Error: {completed.get('error')}"
+    )
+    error_msg = str(completed.get("error", {})).lower()
+    assert "@tool" in error_msg, (
+        f"Failure error should reference the missing @tool decorator, "
+        f"got: {completed.get('error')!r}"
     )

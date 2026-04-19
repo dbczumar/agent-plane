@@ -207,34 +207,45 @@ expose tools via HTTP. The user needs to run the MCP server separately
 
 ### Local tools (custom Python/TypeScript)
 
-Python or TypeScript files in `tools/python/` or `tools/typescript/` are
-auto-discovered and registered as tools. Each file must export:
-
-- `SCHEMA`: OpenAI function-format dict
-- `async def run(arguments: dict) -> str`: the tool implementation
+Python files in `tools/python/` are auto-discovered. Each
+`@tool`-decorated module-level function in those files becomes a
+separate tool — one file may export many tools. The decorator
+derives the JSON schema from the function's type hints and
+Google-style docstring.
 
 ```python
-# tools/python/my_tool.py
-from typing import Any
+# tools/python/my_tools.py
+from agent_plane.tools import tool
 
-SCHEMA: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "my_tool",
-        "description": "Does something useful.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "input": {"type": "string", "description": "The input."},
-            },
-            "required": ["input"],
-        },
-    },
-}
 
-async def run(arguments: dict[str, Any]) -> str:
-    return f"Result: {arguments['input']}"
+@tool
+def my_tool(text: str, count: int = 1) -> str:
+    """
+    Repeat the text count times.
+
+    Args:
+        text: The text to repeat.
+        count: Number of repetitions (default 1).
+    """
+    return text * count
 ```
+
+Authoring rules:
+
+- Decorate a **module-level** function — not a class method,
+  lambda, or nested function (the decorator rejects those at
+  decoration time with a clear error).
+- Type hints on parameters drive the LLM-facing JSON schema. Use
+  concrete types — `Any` and `object` produce permissive schemas
+  with no validation.
+- The function name becomes the LLM-facing tool name. Names must
+  not collide with built-in tools or with other custom tools in
+  the same agent (collisions fail loud at agent load).
+- Both `def` and `async def` are supported. Sync `def` bodies are
+  wrapped in `asyncio.to_thread` automatically so they don't
+  block the event loop.
+- Pydantic `BaseModel` arguments are first-class — they get
+  expanded into the schema correctly with full validation.
 
 **When to recommend local tools:** When the user needs custom logic that
 isn't covered by builtins or MCP servers.

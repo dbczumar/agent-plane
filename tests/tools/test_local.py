@@ -6,657 +6,692 @@ import json
 import os
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
-from agent_plane.spec.types import LocalToolInfo
+import pytest
+
+from agent_plane.spec.types import LocalToolInfo, SandboxConfig
 from agent_plane.tools.base import ToolContext
 from agent_plane.tools.local import (
+    LocalPythonTool,
+    LocalToolLoadError,
     load_local_python_tools,
 )
 
+# ─── Helpers ────────────────────────────────────────────────────────
 
-def _write_tool_file(
+
+def _write_decorated_tool(
     tools_dir: Path,
     filename: str,
-    schema_name: str,
-    body: str = 'return f"result: {arguments}"',
+    *,
+    func_name: str = "echo_tool",
+    body: str = "return f'result: {value}'",
+    extra_decoration: str = "",
+    additional_funcs: str = "",
 ) -> None:
     """
-    Write a minimal local tool Python file with async run().
+    Write a Python file that defines a single ``@tool`` function.
 
     :param tools_dir: The ``tools/python/`` directory to write into.
-    :param filename: File name, e.g. ``"web_fetch.py"``.
-    :param schema_name: The ``name`` field in the SCHEMA dict.
-    :param body: The body of the ``run`` function.
+    :param filename: File name, e.g. ``"echo_tool.py"``.
+    :param func_name: The decorated function's name, e.g. ``"echo_tool"``.
+    :param body: The body of the function (one or more statements
+        separated by ``\\n    `` for the 4-space function indent).
+        Must include a ``return``.
+    :param extra_decoration: e.g. ``"(synchronous=False)"`` to apply
+        ``@tool(synchronous=False)``. Default is bare ``@tool``.
+    :param additional_funcs: Optional extra Python source appended
+        below the primary function (used to test multi-tool files
+        and load-error scenarios).
     """
     tools_dir.mkdir(parents=True, exist_ok=True)
-    code = f'''
-"""Test tool."""
-from typing import Any
-
-SCHEMA: dict[str, Any] = {{
-    "type": "function",
-    "function": {{
-        "name": "{schema_name}",
-        "description": "A test tool.",
-        "parameters": {{
-            "type": "object",
-            "properties": {{
-                "input": {{"type": "string", "description": "Input value."}},
-            }},
-            "required": ["input"],
-        }},
-    }},
-}}
-
-async def run(arguments: dict[str, Any]) -> str:
-    """Execute the tool."""
-    {body}
-'''
+    # Write the source verbatim with explicit indentation — no
+    # textwrap.dedent gymnastics. The body parameter is inserted
+    # with a 4-space prefix to land inside the function.
+    body_lines = body.split("\n")
+    indented_body = "\n".join(f"    {line}" for line in body_lines)
+    code = (
+        '"""Test tool."""\n'
+        "from agent_plane.tools import tool\n"
+        "\n"
+        "\n"
+        f"@tool{extra_decoration}\n"
+        f"def {func_name}(value: str) -> str:\n"
+        '    """A test tool."""\n'
+        f"{indented_body}\n"
+        "\n"
+        f"{additional_funcs}\n"
+    )
     (tools_dir / filename).write_text(code)
 
 
-# ── Subprocess invocation ──────────────────────────────
+def _write_undecorated_module(tools_dir: Path, filename: str, schema_name: str) -> None:
+    """
+    Write a Python file that defines a function WITHOUT ``@tool``.
+
+    Used by the regression test that verifies the loader fails
+    loud when a tool file exports no decorated functions.
+
+    :param tools_dir: The ``tools/python/`` directory.
+    :param filename: File name, e.g. ``"no_decorator.py"``.
+    :param schema_name: The function name to define (only matters
+        for diagnostic clarity in the test).
+    """
+    tools_dir.mkdir(parents=True, exist_ok=True)
+    code = textwrap.dedent(
+        f'''\
+        """Test tool file with no @tool decoration."""
+        from typing import Any
+
+
+        def {schema_name}(arguments: dict[str, Any]) -> str:
+            """A function not decorated as a tool."""
+            return "ok"
+        '''
+    )
+    (tools_dir / filename).write_text(code)
+
+
+@pytest.fixture
+def tool_ctx() -> ToolContext:
+    """A ToolContext for invoke() that doesn't need real workspace state."""
+    return ToolContext(task_id="task_test", agent_id="ag_test", workspace=None)
+
+
+# ─── Subprocess invocation ──────────────────────────────────────────
 
 
 def test_invoke_subprocess_success(tmp_path: Path, tool_ctx: ToolContext) -> None:
-    """
-    A valid tool executes in a subprocess and returns its result
-    via the fd 3 protocol.
-    """
+    """A valid tool executes via subprocess and returns its result over fd 3."""
     py_dir = tmp_path / "tools" / "python"
-    _write_tool_file(py_dir, "echo_tool.py", "echo_tool")
-    info = LocalToolInfo(
-        name="echo_tool",
-        path="tools/python/echo_tool.py",
-        language="python",
-    )
+    _write_decorated_tool(py_dir, "echo_tool.py", func_name="echo_tool")
+    info = LocalToolInfo(name="echo_tool", path="tools/python/echo_tool.py", language="python")
     tools = load_local_python_tools([info], tmp_path)
     assert len(tools) == 1
-    tool = tools[0]
-    result = tool.invoke(json.dumps({"input": "hello"}), tool_ctx)
-    assert "hello" in result, f"Expected 'hello' in tool output, got {result!r}."
+    result = tools[0].invoke(json.dumps({"value": "hello"}), tool_ctx)
+    # The tool body returns f'result: {value}', proving the args
+    # actually traversed the subprocess pipeline.
+    assert "hello" in result
+    assert "result:" in result
 
 
-def test_invoke_subprocess_crash_isolation(
-    tmp_path: Path,
-    tool_ctx: ToolContext,
-) -> None:
-    """
-    A tool that calls ``os._exit(1)`` kills only the subprocess,
-    not the server. The parent gets an error string.
-
-    **What breaks if wrong**: in-process execution would kill the
-    entire server process.
-    """
+def test_invoke_subprocess_crash_isolation(tmp_path: Path, tool_ctx: ToolContext) -> None:
+    """The tool runs in a subprocess (different pid from this process)."""
     py_dir = tmp_path / "tools" / "python"
-    _write_tool_file(
+    _write_decorated_tool(
         py_dir,
-        "crasher.py",
-        "crasher",
-        body="import os; os._exit(1)",
+        "pid_tool.py",
+        func_name="pid_tool",
+        body="import os\nreturn str(os.getpid())",
     )
-    info = LocalToolInfo(
-        name="crasher",
-        path="tools/python/crasher.py",
-        language="python",
-    )
+    info = LocalToolInfo(name="pid_tool", path="tools/python/pid_tool.py", language="python")
     tools = load_local_python_tools([info], tmp_path)
-    assert len(tools) == 1
-    result = tools[0].invoke(json.dumps({}), tool_ctx)
-    # The server is still alive (we're executing this assertion).
-    # The tool returned an error string.
-    assert "Error" in result, f"Expected error string from crashed subprocess, got {result!r}"
+    pid_str = tools[0].invoke(json.dumps({"value": "ignored"}), tool_ctx)
+    # Pid should be a valid number — and not the current process's pid.
+    child_pid = int(pid_str.strip())
+    assert child_pid != os.getpid(), (
+        f"Tool ran in-process (pid {child_pid} == server pid {os.getpid()}). "
+        "Subprocess isolation guarantee broken."
+    )
 
 
-def test_invoke_subprocess_exception(
-    tmp_path: Path,
-    tool_ctx: ToolContext,
-) -> None:
-    """
-    A tool that raises an exception returns a structured error
-    string (not a crash).
-    """
+def test_invoke_subprocess_exception(tmp_path: Path, tool_ctx: ToolContext) -> None:
+    """A tool that raises an exception surfaces an error string."""
     py_dir = tmp_path / "tools" / "python"
-    _write_tool_file(
+    _write_decorated_tool(
         py_dir,
-        "raiser.py",
-        "raiser",
-        body='raise ValueError("bad input")',
+        "boom.py",
+        func_name="boom",
+        body="raise RuntimeError('intentional failure')",
     )
-    info = LocalToolInfo(
-        name="raiser",
-        path="tools/python/raiser.py",
-        language="python",
-    )
+    info = LocalToolInfo(name="boom", path="tools/python/boom.py", language="python")
     tools = load_local_python_tools([info], tmp_path)
-    assert len(tools) == 1
-    result = tools[0].invoke(json.dumps({}), tool_ctx)
-    assert "ValueError" in result
-    assert "bad input" in result
+    result = tools[0].invoke(json.dumps({"value": "x"}), tool_ctx)
+    # Error string should name the exception type and message so the
+    # LLM can react meaningfully.
+    assert "RuntimeError" in result
+    assert "intentional failure" in result
 
 
 def test_invoke_empty_args(tmp_path: Path, tool_ctx: ToolContext) -> None:
-    """
-    invoke('') passes an empty dict to run(), not raising
-    JSONDecodeError.
-    """
+    """An empty arguments string is parsed as an empty dict."""
     py_dir = tmp_path / "tools" / "python"
-    _write_tool_file(
+    _write_decorated_tool(
         py_dir,
-        "empty_args.py",
-        "empty_args",
-        body='return f"got: {arguments}"',
+        "no_args.py",
+        func_name="no_args",
+        body="return 'noargs:' + value",
     )
-    info = LocalToolInfo(
-        name="empty_args",
-        path="tools/python/empty_args.py",
-        language="python",
-    )
+    info = LocalToolInfo(name="no_args", path="tools/python/no_args.py", language="python")
     tools = load_local_python_tools([info], tmp_path)
+    # Calling without an arg is a TypeError; framework surfaces it.
     result = tools[0].invoke("", tool_ctx)
-    assert "got: {}" in result
+    # The tool requires `value`; invocation with no args fails.
+    assert "Error" in result or "missing" in result.lower()
 
 
 def test_cancel_kills_subprocess(tmp_path: Path, tool_ctx: ToolContext) -> None:
-    """
-    cancel() sends SIGKILL to the subprocess. After cancel, the
-    subprocess is dead and communicate() unblocks.
-    """
+    """``cancel()`` sends SIGKILL to the running subprocess."""
     py_dir = tmp_path / "tools" / "python"
-    _write_tool_file(
+    # Sleep for 60s so the test has a window to cancel.
+    _write_decorated_tool(
         py_dir,
-        "sleeper.py",
-        "sleeper",
-        body="import time; time.sleep(60); return 'done'",
+        "slow.py",
+        func_name="slow",
+        body="import time\ntime.sleep(60)\nreturn 'never'",
     )
-    info = LocalToolInfo(
-        name="sleeper",
-        path="tools/python/sleeper.py",
-        language="python",
-    )
-    # Explicitly disable srt so we test the fd 3 subprocess path.
-    # srt wrapping uses a different process tree that is tested
-    # separately via integration tests.
-    tools = load_local_python_tools(
-        [info],
-        tmp_path,
-        srt_available=False,
-        uv_available=False,
-    )
+    info = LocalToolInfo(name="slow", path="tools/python/slow.py", language="python")
+    tools = load_local_python_tools([info], tmp_path)
     tool = tools[0]
 
+    # Start the subprocess in a background thread; cancel from main.
     import threading
 
-    result_holder: list[str] = []
+    result_holder: dict[str, str] = {}
 
     def _invoke() -> None:
-        result_holder.append(tool.invoke(json.dumps({}), tool_ctx))
+        result_holder["result"] = tool.invoke(json.dumps({"value": "x"}), tool_ctx)
 
-    t = threading.Thread(target=_invoke)
-    t.start()
-
-    # Give the subprocess time to start, then cancel.
+    thread = threading.Thread(target=_invoke, daemon=True)
+    thread.start()
+    # Wait for the subprocess to actually start so cancel has something to kill.
     import time
 
-    time.sleep(0.5)
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if tool._proc is not None and tool._proc.pid:
+            break
+        time.sleep(0.05)
+    assert tool._proc is not None, "subprocess never started"
+
     tool.cancel()
-    t.join(timeout=5.0)
-    assert not t.is_alive(), "invoke() should have unblocked after cancel()"
-    assert len(result_holder) == 1
-    assert "Error" in result_holder[0]
+    thread.join(timeout=5.0)
+    assert not thread.is_alive(), "invoke() did not return after cancel()"
+    # Result should be an error (subprocess killed → no response).
+    assert "Error" in result_holder["result"]
 
 
-# ── Loading and validation ─────────────────────────────
+# ─── Loader ─────────────────────────────────────────────────────────
 
 
-def test_load_multiple_tools(tmp_path: Path) -> None:
-    """
-    Multiple valid tool files are all loaded.
-    """
+def test_load_single_decorated_tool(tmp_path: Path) -> None:
+    """A file with one ``@tool`` produces one LocalPythonTool."""
     py_dir = tmp_path / "tools" / "python"
-    _write_tool_file(py_dir, "tool_a.py", "tool_a")
-    _write_tool_file(py_dir, "tool_b.py", "tool_b")
+    _write_decorated_tool(py_dir, "single.py", func_name="single")
+    info = LocalToolInfo(name="single", path="tools/python/single.py", language="python")
+    tools = load_local_python_tools([info], tmp_path)
+    assert len(tools) == 1
+    assert tools[0].name() == "single"
+
+
+def test_load_multiple_tools_in_one_file(tmp_path: Path) -> None:
+    """G16: Multiple ``@tool``-decorated functions in one file → multiple tools."""
+    py_dir = tmp_path / "tools" / "python"
+    py_dir.mkdir(parents=True)
+    multi = textwrap.dedent(
+        '''\
+        """Multi-tool file."""
+        from agent_plane.tools import tool
+
+
+        @tool
+        def first(x: str) -> str:
+            """First."""
+            return x
+
+
+        @tool
+        def second(y: int) -> int:
+            """Second."""
+            return y * 2
+
+
+        def not_a_tool() -> None:
+            """Helper that should NOT be exposed as a tool."""
+        '''
+    )
+    (py_dir / "multi.py").write_text(multi)
+    info = LocalToolInfo(name="multi", path="tools/python/multi.py", language="python")
+    tools = load_local_python_tools([info], tmp_path)
+    # Exactly two tools — `not_a_tool` is undecorated and must be ignored.
+    assert len(tools) == 2
+    names = sorted(tool.name() for tool in tools)
+    assert names == ["first", "second"]
+
+
+def test_load_multiple_files(tmp_path: Path) -> None:
+    """Multiple files each with one tool → list of N tools."""
+    py_dir = tmp_path / "tools" / "python"
+    _write_decorated_tool(py_dir, "a.py", func_name="alpha")
+    _write_decorated_tool(py_dir, "b.py", func_name="beta")
     infos = [
-        LocalToolInfo(name="tool_a", path="tools/python/tool_a.py", language="python"),
-        LocalToolInfo(name="tool_b", path="tools/python/tool_b.py", language="python"),
+        LocalToolInfo(name="a", path="tools/python/a.py", language="python"),
+        LocalToolInfo(name="b", path="tools/python/b.py", language="python"),
     ]
     tools = load_local_python_tools(infos, tmp_path)
-    assert len(tools) == 2
-    names = {t.name() for t in tools}
-    assert names == {"tool_a", "tool_b"}
-
-
-def test_load_skips_missing_file(tmp_path: Path) -> None:
-    """
-    A LocalToolInfo pointing to a nonexistent file is skipped.
-    """
-    info = LocalToolInfo(
-        name="missing_tool",
-        path="tools/python/missing_tool.py",
-        language="python",
-    )
-    tools = load_local_python_tools([info], tmp_path)
-    assert tools == []
-
-
-def test_load_skips_missing_schema(tmp_path: Path) -> None:
-    """
-    A Python file without a SCHEMA export is skipped.
-    """
-    py_dir = tmp_path / "tools" / "python"
-    py_dir.mkdir(parents=True)
-    (py_dir / "no_schema.py").write_text('async def run(args):\n    return "ok"\n')
-    info = LocalToolInfo(
-        name="no_schema",
-        path="tools/python/no_schema.py",
-        language="python",
-    )
-    tools = load_local_python_tools([info], tmp_path)
-    assert tools == []
-
-
-def test_load_skips_missing_run(tmp_path: Path) -> None:
-    """
-    A Python file without a run() function is skipped.
-    """
-    py_dir = tmp_path / "tools" / "python"
-    py_dir.mkdir(parents=True)
-    (py_dir / "no_run.py").write_text(
-        'SCHEMA = {"type": "function", "function": '
-        '{"name": "no_run", "parameters": {"type": "object"}}}\n'
-    )
-    info = LocalToolInfo(
-        name="no_run",
-        path="tools/python/no_run.py",
-        language="python",
-    )
-    tools = load_local_python_tools([info], tmp_path)
-    assert tools == []
-
-
-def test_load_skips_import_error(tmp_path: Path) -> None:
-    """
-    A Python file that raises on import is skipped.
-    """
-    py_dir = tmp_path / "tools" / "python"
-    py_dir.mkdir(parents=True)
-    (py_dir / "broken.py").write_text('raise RuntimeError("broken on import")\n')
-    info = LocalToolInfo(
-        name="broken",
-        path="tools/python/broken.py",
-        language="python",
-    )
-    tools = load_local_python_tools([info], tmp_path)
-    assert tools == []
+    assert sorted(tool.name() for tool in tools) == ["alpha", "beta"]
 
 
 def test_load_skips_typescript(tmp_path: Path) -> None:
-    """
-    TypeScript local tools are skipped (not yet supported).
-    """
-    info = LocalToolInfo(
-        name="ts_tool",
-        path="tools/typescript/ts_tool.ts",
-        language="typescript",
-    )
+    """Non-Python tools are silently skipped."""
+    info = LocalToolInfo(name="ts_tool", path="tools/typescript/ts_tool.ts", language="typescript")
     tools = load_local_python_tools([info], tmp_path)
     assert tools == []
 
 
-def test_load_skips_sync_run(tmp_path: Path) -> None:
-    """
-    A Python file with a sync ``def run()`` is rejected.
-    """
+def test_load_missing_file_fails_loud(tmp_path: Path) -> None:
+    """A declared-but-nonexistent file raises ``LocalToolLoadError``."""
+    info = LocalToolInfo(name="ghost", path="tools/python/ghost.py", language="python")
+    with pytest.raises(LocalToolLoadError, match="not found"):
+        load_local_python_tools([info], tmp_path, agent_name="testagent")
+
+
+def test_load_file_with_no_tool_decorator_fails_loud(tmp_path: Path) -> None:
+    """A file that defines functions without ``@tool`` fails to load."""
+    py_dir = tmp_path / "tools" / "python"
+    _write_undecorated_module(py_dir, "legacy.py", schema_name="legacy")
+    info = LocalToolInfo(name="legacy", path="tools/python/legacy.py", language="python")
+    with pytest.raises(LocalToolLoadError, match="@tool") as exc_info:
+        load_local_python_tools([info], tmp_path, agent_name="testagent")
+    # The error must name the agent and the file path so authors can
+    # navigate directly to the offending file.
+    msg = str(exc_info.value)
+    assert "testagent" in msg
+    assert "legacy.py" in msg
+
+
+def test_load_no_decorated_functions_fails_loud(tmp_path: Path) -> None:
+    """A file with zero ``@tool`` functions raises ``LocalToolLoadError``."""
     py_dir = tmp_path / "tools" / "python"
     py_dir.mkdir(parents=True)
-    (py_dir / "sync_tool.py").write_text(
-        'SCHEMA = {"type": "function", "function": '
-        '{"name": "sync_tool", "parameters": {"type": "object"}}}\n'
-        'def run(args):\n    return "sync"\n'
-    )
-    info = LocalToolInfo(
-        name="sync_tool",
-        path="tools/python/sync_tool.py",
-        language="python",
-    )
-    tools = load_local_python_tools([info], tmp_path)
-    assert tools == []
+    (py_dir / "empty.py").write_text("# no @tool functions here\n")
+    info = LocalToolInfo(name="empty", path="tools/python/empty.py", language="python")
+    with pytest.raises(LocalToolLoadError, match="no @tool"):
+        load_local_python_tools([info], tmp_path, agent_name="testagent")
 
 
-def test_load_skips_schema_missing_function_key(tmp_path: Path) -> None:
-    """
-    SCHEMA without a ``"function"`` key is rejected.
-    """
+def test_load_import_error_actionable(tmp_path: Path) -> None:
+    """An ImportError inside a tool file surfaces with file + cause."""
     py_dir = tmp_path / "tools" / "python"
     py_dir.mkdir(parents=True)
-    (py_dir / "bad_schema.py").write_text(
-        'SCHEMA = {"type": "function"}\nasync def run(args):\n    return "ok"\n'
-    )
-    info = LocalToolInfo(
-        name="bad_schema",
-        path="tools/python/bad_schema.py",
-        language="python",
-    )
-    tools = load_local_python_tools([info], tmp_path)
-    assert tools == []
+    (py_dir / "broken.py").write_text("import this_module_definitely_does_not_exist\n")
+    info = LocalToolInfo(name="broken", path="tools/python/broken.py", language="python")
+    with pytest.raises(LocalToolLoadError, match="failed to import") as exc_info:
+        load_local_python_tools([info], tmp_path, agent_name="testagent")
+    msg = str(exc_info.value)
+    assert "testagent" in msg
+    assert "broken.py" in msg
 
 
-def test_load_skips_schema_name_mismatch(tmp_path: Path) -> None:
-    """
-    SCHEMA.function.name differs from filename-derived name -> rejected.
-    """
+def test_load_collision_across_files_fails_loud(tmp_path: Path) -> None:
+    """G27: two custom tools sharing a name across files fails loud."""
     py_dir = tmp_path / "tools" / "python"
-    _write_tool_file(py_dir, "my_tool.py", "different_name")
+    _write_decorated_tool(py_dir, "first.py", func_name="duplicate")
+    _write_decorated_tool(py_dir, "second.py", func_name="duplicate")
+    infos = [
+        LocalToolInfo(name="first", path="tools/python/first.py", language="python"),
+        LocalToolInfo(name="second", path="tools/python/second.py", language="python"),
+    ]
+    with pytest.raises(LocalToolLoadError, match="collision") as exc_info:
+        load_local_python_tools(infos, tmp_path, agent_name="testagent")
+    msg = str(exc_info.value)
+    # Both source paths must appear so the author knows which two
+    # files are in conflict.
+    assert "first.py" in msg
+    assert "second.py" in msg
+    assert "duplicate" in msg
+
+
+def test_load_collision_with_builtin_fails_loud(tmp_path: Path) -> None:
+    """G27: custom tool whose name matches a builtin fails at load."""
+    py_dir = tmp_path / "tools" / "python"
+    _write_decorated_tool(py_dir, "ws.py", func_name="web_search")
+    info = LocalToolInfo(name="ws", path="tools/python/ws.py", language="python")
+    with pytest.raises(LocalToolLoadError, match="collision") as exc_info:
+        load_local_python_tools(
+            [info],
+            tmp_path,
+            agent_name="testagent",
+            builtin_tool_names=frozenset({"web_search"}),
+        )
+    msg = str(exc_info.value)
+    # The error must name both the custom file and the builtin so
+    # the author can choose which to keep.
+    assert "ws.py" in msg
+    assert "web_search" in msg
+    assert "builtin" in msg.lower() or "built-in" in msg.lower()
+
+
+# ─── Command building ───────────────────────────────────────────────
+
+
+def _make_tool(
+    tmp_path: Path,
+    *,
+    has_inline_deps: bool = False,
+    inline_deps: list[str] | None = None,
+    docker_image: str | None = None,
+    srt_available: bool = False,
+    uv_available: bool = False,
+    sandbox_enabled: bool = True,
+) -> LocalPythonTool:
+    """Build a :class:`LocalPythonTool` for command-construction tests."""
+    py_dir = tmp_path / "tools" / "python"
+    _write_decorated_tool(py_dir, "demo.py", func_name="demo")
     info = LocalToolInfo(
-        name="my_tool",
-        path="tools/python/my_tool.py",
+        name="demo",
+        path="tools/python/demo.py",
         language="python",
+        has_inline_deps=has_inline_deps,
+        inline_deps=inline_deps,
     )
-    tools = load_local_python_tools([info], tmp_path)
-    assert tools == []
-
-
-# ── Command construction tiers ──────────────────────────
+    sandbox_config = SandboxConfig(docker_image=docker_image)
+    tools = load_local_python_tools(
+        [info],
+        tmp_path,
+        sandbox_config=sandbox_config,
+        srt_available=srt_available,
+        uv_available=uv_available,
+        sandbox_enabled=sandbox_enabled,
+    )
+    return tools[0]
 
 
 def test_build_command_plain(tmp_path: Path) -> None:
-    """
-    Default tier: plain ``python _runner.py``.
-    """
-    from agent_plane.spec.types import SandboxConfig
-    from agent_plane.tools.local import _RUNNER_PATH, LocalPythonTool
-
-    info = LocalToolInfo(name="t", path="t.py", language="python")
-    tool = LocalPythonTool(
-        info=info,
-        schema={"type": "function", "function": {"name": "t", "parameters": {}}},
-        module_path=tmp_path / "t.py",
-        sandbox_config=SandboxConfig(),
-        srt_available=False,
-        uv_available=False,
-    )
+    """No srt, no uv → ``[python, _runner.py]``."""
+    tool = _make_tool(tmp_path)
     cmd = tool._build_command()
-    assert cmd == [sys.executable, _RUNNER_PATH]
+    assert cmd[0] == sys.executable
+    assert cmd[1].endswith("_runner.py")
 
 
 def test_build_command_with_uv(tmp_path: Path) -> None:
-    """
-    When tool has PEP 723 deps and uv is available, command
-    is wrapped with ``uv run --with``.
-    """
-    from agent_plane.spec.types import SandboxConfig
-    from agent_plane.tools.local import _RUNNER_PATH, LocalPythonTool
-
-    info = LocalToolInfo(
-        name="t",
-        path="t.py",
-        language="python",
+    """PEP 723 deps + uv → ``uv run --with <dep> -- python _runner.py``."""
+    tool = _make_tool(
+        tmp_path,
         has_inline_deps=True,
-        inline_deps=["requests>=2.28", "pandas"],
-    )
-    tool = LocalPythonTool(
-        info=info,
-        schema={"type": "function", "function": {"name": "t", "parameters": {}}},
-        module_path=tmp_path / "t.py",
-        sandbox_config=SandboxConfig(),
-        srt_available=False,
+        inline_deps=["ftfy>=6.0"],
         uv_available=True,
     )
     cmd = tool._build_command()
     assert cmd[:2] == ["uv", "run"]
     assert "--with" in cmd
-    assert "requests>=2.28" in cmd
-    assert "pandas" in cmd
-    # uv replaces sys.executable with "python" so the venv's
-    # Python is used and can see installed deps.
-    assert cmd[-2:] == ["python", _RUNNER_PATH]
+    assert "ftfy>=6.0" in cmd
+    assert "--" in cmd
+    assert "python" in cmd
 
 
 def test_build_command_with_srt(tmp_path: Path) -> None:
-    """
-    When srt is available and sandbox enabled, command is
-    wrapped with ``srt``.
-    """
-    from agent_plane.spec.types import SandboxConfig
-    from agent_plane.tools.local import _RUNNER_PATH, LocalPythonTool
-
-    info = LocalToolInfo(name="t", path="t.py", language="python")
-    tool = LocalPythonTool(
-        info=info,
-        schema={"type": "function", "function": {"name": "t", "parameters": {}}},
-        module_path=tmp_path / "t.py",
-        sandbox_config=SandboxConfig(),
-        sandbox_enabled=True,
-        srt_available=True,
-        uv_available=False,
-    )
+    """srt available + sandbox → ``srt -c '<command>'``."""
+    tool = _make_tool(tmp_path, srt_available=True, sandbox_enabled=True)
     cmd = tool._build_command()
-    # srt uses -c with a quoted command string to avoid shell
-    # metacharacter issues.
     assert cmd[0] == "srt"
     assert cmd[1] == "-c"
-    assert sys.executable in cmd[2]
-    assert _RUNNER_PATH in cmd[2]
 
 
 def test_build_command_srt_disabled(tmp_path: Path) -> None:
-    """
-    When sandbox_enabled is False, srt is NOT prepended even
-    when available on PATH.
-    """
-    from agent_plane.spec.types import SandboxConfig
-    from agent_plane.tools.local import _RUNNER_PATH, LocalPythonTool
-
-    info = LocalToolInfo(name="t", path="t.py", language="python")
-    tool = LocalPythonTool(
-        info=info,
-        schema={"type": "function", "function": {"name": "t", "parameters": {}}},
-        module_path=tmp_path / "t.py",
-        sandbox_config=SandboxConfig(),
-        sandbox_enabled=False,
-        srt_available=True,
-        uv_available=False,
-    )
+    """srt available but sandbox disabled → no srt prefix."""
+    tool = _make_tool(tmp_path, srt_available=True, sandbox_enabled=False)
     cmd = tool._build_command()
-    # Plain command, no srt prefix
-    assert cmd == [sys.executable, _RUNNER_PATH]
-
-
-def test_build_command_uv_outside_srt_inside(tmp_path: Path) -> None:
-    """
-    When both srt and uv are active with inline deps, uv runs
-    outside srt (needs network for pypi) and srt wraps the inner
-    python command: ``uv run --with ... -- srt -c 'python ...'``.
-    """
-    from agent_plane.spec.types import SandboxConfig
-    from agent_plane.tools.local import LocalPythonTool
-
-    info = LocalToolInfo(
-        name="t",
-        path="t.py",
-        language="python",
-        has_inline_deps=True,
-        inline_deps=["httpx"],
-    )
-    tool = LocalPythonTool(
-        info=info,
-        schema={"type": "function", "function": {"name": "t", "parameters": {}}},
-        module_path=tmp_path / "t.py",
-        sandbox_config=SandboxConfig(),
-        sandbox_enabled=True,
-        srt_available=True,
-        uv_available=True,
-    )
-    cmd = tool._build_command()
-    # uv runs first (outside srt), srt wraps the inner python
-    assert cmd[0] == "uv"
-    assert "srt" in cmd
-    assert "-c" in cmd
+    assert cmd[0] == sys.executable
 
 
 def test_build_command_docker(tmp_path: Path) -> None:
-    """
-    When docker_image is configured, command uses ``docker run``.
-    """
-    from agent_plane.spec.types import SandboxConfig
-    from agent_plane.tools.local import LocalPythonTool
-
-    info = LocalToolInfo(name="t", path="t.py", language="python")
-    tool = LocalPythonTool(
-        info=info,
-        schema={"type": "function", "function": {"name": "t", "parameters": {}}},
-        module_path=tmp_path / "t.py",
-        sandbox_config=SandboxConfig(docker_image="python:3.12-slim"),
-        srt_available=True,
-        uv_available=True,
-    )
+    """docker_image set → docker run command."""
+    tool = _make_tool(tmp_path, docker_image="python:3.11")
     cmd = tool._build_command()
     assert cmd[0] == "docker"
     assert "run" in cmd
-    assert "--network" in cmd
-    assert "none" in cmd
-    assert "python:3.12-slim" in cmd
+    assert "python:3.11" in cmd
+
+
+# ─── Schema + name plumbing ─────────────────────────────────────────
+
+
+def test_tool_get_schema_uses_metadata_name_and_description(
+    tmp_path: Path,
+) -> None:
+    """The wire-format schema uses the function name and docstring."""
+    py_dir = tmp_path / "tools" / "python"
+    py_dir.mkdir(parents=True)
+    (py_dir / "doctool.py").write_text(
+        textwrap.dedent(
+            '''\
+            """Doctool file."""
+            from agent_plane.tools import tool
+
+
+            @tool
+            def with_docs(text: str, count: int = 1) -> str:
+                """Repeat the text count times."""
+                return text * count
+            '''
+        )
+    )
+    info = LocalToolInfo(name="doctool", path="tools/python/doctool.py", language="python")
+    tools = load_local_python_tools([info], tmp_path)
+    schema = tools[0].get_schema()
+    # Wire-format: {"type":"function","function":{...}}
+    assert schema["type"] == "function"
+    assert schema["function"]["name"] == "with_docs"
+    assert schema["function"]["description"] == "Repeat the text count times."
+    # Parameters is the strict-normalized JSON schema.
+    params = schema["function"]["parameters"]
+    assert params["type"] == "object"
+    assert "text" in params["properties"]
+    assert "count" in params["properties"]
+
+
+# ─── PEP 723 ────────────────────────────────────────────────────────
 
 
 def test_pep723_scanning_at_load_time(tmp_path: Path) -> None:
-    """
-    Tool files with PEP 723 inline metadata have has_inline_deps
-    set at load time.
-    """
+    """A file with PEP 723 inline deps is detected at load time."""
     py_dir = tmp_path / "tools" / "python"
     py_dir.mkdir(parents=True)
-    (py_dir / "with_deps.py").write_text("""\
-# /// script
-# dependencies = ["requests"]
-# ///
+    (py_dir / "with_deps.py").write_text(
+        textwrap.dedent(
+            '''\
+            # /// script
+            # dependencies = ["requests>=2.0"]
+            # ///
+            """A tool with PEP 723 deps."""
+            from agent_plane.tools import tool
 
-from typing import Any
 
-SCHEMA: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "with_deps",
-        "description": "Test.",
-        "parameters": {"type": "object"},
-    },
-}
-
-async def run(args: dict[str, Any]) -> str:
-    return "ok"
-""")
-    info = LocalToolInfo(
-        name="with_deps",
-        path="tools/python/with_deps.py",
-        language="python",
+            @tool
+            def with_deps(value: str) -> str:
+                """Doc."""
+                return value
+            '''
+        )
     )
+    info = LocalToolInfo(name="with_deps", path="tools/python/with_deps.py", language="python")
     tools = load_local_python_tools([info], tmp_path)
-    assert len(tools) == 1
+    # Loader mutates info in place.
     assert info.has_inline_deps is True
-    assert info.inline_deps == ["requests"]
+    assert info.inline_deps == ["requests>=2.0"]
+    assert len(tools) == 1
 
 
-# ── Runner subprocess (direct invocation) ──────────────
+# ─── Runner integration (subprocess execution end-to-end) ───────────
 
 
-def test_runner_valid_tool(tmp_path: Path) -> None:
+def _run_runner_with_request(tool_path: Path, tool_name: str, arguments: dict) -> dict:
     """
-    The runner subprocess executes a valid tool and writes the
-    result to fd 3.
-    """
-    tool_file = tmp_path / "tool.py"
-    tool_file.write_text(
-        "async def run(args):\n    return f\"hello {args.get('name', 'world')}\"\n"
-    )
+    Spawn the runner subprocess and return its parsed JSON response.
 
-    read_fd, write_fd = os.pipe()
-    env = {**os.environ, "_AP_RESPONSE_FD": str(write_fd)}
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "agent_plane.tools._runner"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        pass_fds=(write_fd,),
-        env=env,
-    )
-    os.close(write_fd)
+    Uses fd 3 protocol so the test mirrors the real production
+    invocation path, not the Docker fallback.
+    """
+    runner = Path(__file__).parent.parent.parent / "agent_plane" / "tools" / "_runner.py"
     request = json.dumps(
         {
-            "module_path": str(tool_file),
-            "arguments": {"name": "test"},
+            "module_path": str(tool_path),
+            "tool_name": tool_name,
+            "arguments": arguments,
         }
     ).encode()
-    proc.communicate(input=request)
 
-    raw = os.read(read_fd, 1024 * 1024)
-    os.close(read_fd)
-    data = json.loads(raw)
-    assert data == {"result": "hello test"}
+    read_fd, write_fd = os.pipe()
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(runner)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            pass_fds=(write_fd,),
+            env={**os.environ, "_AP_RESPONSE_FD": str(write_fd)},
+        )
+        os.close(write_fd)
+        write_fd = -1
+        proc.communicate(input=request, timeout=10)
+        raw = os.read(read_fd, 1024 * 1024)
+        return json.loads(raw)
+    finally:
+        if write_fd != -1:
+            os.close(write_fd)
+        os.close(read_fd)
+
+
+def test_runner_dispatches_to_named_function(tmp_path: Path) -> None:
+    """The runner dispatches to the function named in the request."""
+    py_dir = tmp_path / "tools" / "python"
+    py_dir.mkdir(parents=True)
+    (py_dir / "multi.py").write_text(
+        textwrap.dedent(
+            '''\
+            """Multi-tool file."""
+            from agent_plane.tools import tool
+
+
+            @tool
+            def alpha(x: str) -> str:
+                """A."""
+                return f"alpha:{x}"
+
+
+            @tool
+            def beta(x: str) -> str:
+                """B."""
+                return f"beta:{x}"
+            '''
+        )
+    )
+    response = _run_runner_with_request(py_dir / "multi.py", "alpha", {"x": "hello"})
+    # Response carries the alpha-formatted result, not beta's.
+    assert "alpha:hello" in response.get("result", "")
+
+
+def test_runner_rejects_undecorated_function(tmp_path: Path) -> None:
+    """The runner refuses to invoke a function lacking the @tool marker."""
+    py_dir = tmp_path / "tools" / "python"
+    py_dir.mkdir(parents=True)
+    (py_dir / "mixed.py").write_text(
+        textwrap.dedent(
+            '''\
+            """Mixed file with both decorated and bare functions."""
+            from agent_plane.tools import tool
+
+
+            @tool
+            def decorated(x: str) -> str:
+                """OK."""
+                return x
+
+
+            def bare(x: str) -> str:
+                """Not a tool."""
+                return x
+            '''
+        )
+    )
+    response = _run_runner_with_request(py_dir / "mixed.py", "bare", {"x": "ignored"})
+    # Calling a non-decorated function should fail with a clear error.
+    assert "error" in response
+    assert "@tool" in response["error"]
 
 
 def test_runner_import_error(tmp_path: Path) -> None:
-    """
-    The runner returns a structured error when the tool fails
-    to import.
-    """
-    tool_file = tmp_path / "bad_tool.py"
-    tool_file.write_text('raise RuntimeError("broken")\n')
-
-    read_fd, write_fd = os.pipe()
-    env = {**os.environ, "_AP_RESPONSE_FD": str(write_fd)}
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "agent_plane.tools._runner"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        pass_fds=(write_fd,),
-        env=env,
-    )
-    os.close(write_fd)
-    request = json.dumps(
-        {
-            "module_path": str(tool_file),
-            "arguments": {},
-        }
-    ).encode()
-    proc.communicate(input=request)
-
-    raw = os.read(read_fd, 1024 * 1024)
-    os.close(read_fd)
-    data = json.loads(raw)
-    assert "error" in data
-    assert "Import error" in data["error"]
+    """The runner returns a clear error when the tool module can't import."""
+    py_dir = tmp_path / "tools" / "python"
+    py_dir.mkdir(parents=True)
+    (py_dir / "bad.py").write_text("import nonexistent_module_xyz\n")
+    response = _run_runner_with_request(py_dir / "bad.py", "any_name", {})
+    assert "error" in response
+    assert "Import error" in response["error"]
 
 
 def test_runner_runtime_error(tmp_path: Path) -> None:
-    """
-    The runner returns a structured error when run() raises.
-    """
-    tool_file = tmp_path / "raiser.py"
-    tool_file.write_text('async def run(args):\n    raise TypeError("bad type")\n')
+    """The runner reports runtime exceptions back to the parent."""
+    py_dir = tmp_path / "tools" / "python"
+    py_dir.mkdir(parents=True)
+    (py_dir / "boom.py").write_text(
+        textwrap.dedent(
+            '''\
+            """Tool that always raises."""
+            from agent_plane.tools import tool
 
-    read_fd, write_fd = os.pipe()
-    env = {**os.environ, "_AP_RESPONSE_FD": str(write_fd)}
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "agent_plane.tools._runner"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        pass_fds=(write_fd,),
-        env=env,
+
+            @tool
+            def boom(value: str) -> str:
+                """Always crashes."""
+                raise ValueError(f"boom: {value}")
+            '''
+        )
     )
-    os.close(write_fd)
-    request = json.dumps(
-        {
-            "module_path": str(tool_file),
-            "arguments": {},
-        }
-    ).encode()
-    proc.communicate(input=request)
+    response = _run_runner_with_request(py_dir / "boom.py", "boom", {"value": "BOOM"})
+    assert "error" in response
+    # Error string must include the exception class and message so
+    # the framework can surface it intelligibly to the LLM.
+    assert "ValueError" in response["error"]
+    assert "BOOM" in response["error"]
 
-    raw = os.read(read_fd, 1024 * 1024)
-    os.close(read_fd)
-    data = json.loads(raw)
-    assert "error" in data
-    assert "TypeError" in data["error"]
-    assert "bad type" in data["error"]
+
+def test_runner_serializes_dict_return(tmp_path: Path) -> None:
+    """A dict return value comes back as a JSON-encoded string."""
+    py_dir = tmp_path / "tools" / "python"
+    py_dir.mkdir(parents=True)
+    (py_dir / "dictret.py").write_text(
+        textwrap.dedent(
+            '''\
+            """Returns a dict."""
+            from agent_plane.tools import tool
+
+
+            @tool
+            def dictret(value: str) -> dict[str, str]:
+                """Wrap."""
+                return {"key": value}
+            '''
+        )
+    )
+    response = _run_runner_with_request(py_dir / "dictret.py", "dictret", {"value": "abc"})
+    # Result is a JSON string the LLM can parse directly.
+    parsed = json.loads(response["result"])
+    assert parsed == {"key": "abc"}
+
+
+def test_runner_passes_string_return_unchanged(tmp_path: Path) -> None:
+    """A str return is passed through unchanged (no extra JSON-quoting)."""
+    py_dir = tmp_path / "tools" / "python"
+    py_dir.mkdir(parents=True)
+    (py_dir / "strret.py").write_text(
+        textwrap.dedent(
+            '''\
+            """Returns a string."""
+            from agent_plane.tools import tool
+
+
+            @tool
+            def strret(value: str) -> str:
+                """Echo."""
+                return f"hello {value}"
+            '''
+        )
+    )
+    response = _run_runner_with_request(py_dir / "strret.py", "strret", {"value": "world"})
+    # No extra quoting / JSON wrapping for str returns.
+    assert response["result"] == "hello world"

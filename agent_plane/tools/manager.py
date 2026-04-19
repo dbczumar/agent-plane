@@ -241,11 +241,15 @@ class ToolManager:
         """
         Load and register local Python tools from the agent image.
 
-        Tools with invalid names are skipped with a warning.
-        If ``workdir`` is ``None`` or the spec has no local tools,
-        this is a no-op.
+        Each ``@tool``-decorated function in ``tools/python/*.py``
+        becomes one tool. Name collisions with already-registered
+        tools (built-ins or earlier local tools) fail loud at load
+        time per G27. If ``workdir`` is ``None`` or the spec has
+        no local tools, this is a no-op.
 
         :param workdir: The agent image directory, or ``None``.
+        :raises LocalToolLoadError: If any tool file fails to load
+            or any name collides with a built-in.
         """
         if workdir is None or not self._spec.local_tools:
             return
@@ -256,6 +260,11 @@ class ToolManager:
             srt_available=self._srt_available,
             uv_available=self._uv_available,
             sandbox_enabled=self._sandbox_enabled,
+            agent_name=self._spec.name,
+            # Pass the names of already-registered tools (builtins
+            # at this point) so the loader can detect collisions
+            # at G27 strictness — fail loud, not silent shadowing.
+            builtin_tool_names=frozenset(self._tools.keys()),
         ):
             if not is_valid_tool_name(tool.name()):
                 _logger.warning(
@@ -263,11 +272,6 @@ class ToolManager:
                     tool.name(),
                 )
                 continue
-            if tool.name() in self._tools:
-                _logger.warning(
-                    "Local tool %r shadows existing tool — overwriting",
-                    tool.name(),
-                )
             self._tools[tool.name()] = tool
 
     def _register_client_tools(

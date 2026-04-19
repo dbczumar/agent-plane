@@ -1,18 +1,17 @@
 """Local Python tool execution via subprocess.
 
-Loads Python tool files from the agent's ``tools/python/`` directory
-and exposes them as :class:`Tool` instances. Each Python file must
-export:
-
-- ``SCHEMA``: An OpenAI function-format dict with ``"type": "function"``
-  and a ``"function"`` sub-dict containing ``name``, ``description``,
-  and ``parameters``.
-- ``async def run(arguments: dict) -> str``: The async callable that
-  executes the tool.
+Loads ``@tool``-decorated functions from the agent's
+``tools/python/`` directory and exposes each as a
+:class:`LocalPythonTool` instance. A single Python file may
+export multiple tools (one per ``@tool`` function); the loader
+expands one :class:`LocalToolInfo` (file-level) into N
+``LocalPythonTool`` instances.
 
 Tool code runs in a **subprocess** (not in-process) for crash
 isolation. Communication uses the fd 3 pipe protocol — see
-``_runner.py`` for the child side.
+``_runner.py`` for the child side. The subprocess invocation
+identifies the target ``@tool`` function by name, since one
+file may host several.
 
 Execution tiers (in priority order):
 
@@ -31,7 +30,6 @@ Execution tiers (in priority order):
 from __future__ import annotations
 
 import importlib.util
-import inspect
 import json
 import logging
 import os
@@ -48,6 +46,7 @@ from typing import Any
 from agent_plane.spec.types import LocalToolInfo, SandboxConfig
 from agent_plane.tools._pep723 import parse_inline_metadata
 from agent_plane.tools.base import Tool, ToolContext
+from agent_plane.tools.decorator import ToolMetadata, get_tool_metadata
 
 _logger = logging.getLogger(__name__)
 
@@ -62,26 +61,41 @@ _MAX_RESPONSE_BYTES = 1024 * 1024
 _STDOUT_RESPONSE_PREFIX = "__AP_RESPONSE__:"
 
 
+class LocalToolLoadError(Exception):
+    """
+    Raised when an agent image's local tool files fail to load.
+
+    Surfaces a single actionable error per agent image. Carries
+    enough context (agent name, file path, function name, cause)
+    that authors can fix the offending file without further
+    debugging.
+    """
+
+
 class LocalPythonTool(Tool):
     """
-    A tool backed by a local Python file, executed in a subprocess.
+    A tool backed by a ``@tool``-decorated function in a local Python file.
 
-    The Python file must export ``SCHEMA`` (OpenAI function schema
-    dict) and ``async def run(arguments: dict) -> str``.
+    One file may export multiple tools; the framework instantiates
+    one :class:`LocalPythonTool` per decorated function. The
+    subprocess runner re-imports the file and dispatches to the
+    named function.
 
-    :param info: The discovered :class:`LocalToolInfo` from the
-        agent spec parser.
-    :param schema: The validated SCHEMA dict from the module.
+    :param info: The discovered :class:`LocalToolInfo` for the
+        file this tool lives in.
+    :param metadata: The :class:`ToolMetadata` extracted from the
+        ``@tool``-decorated function at agent-image load time.
     :param module_path: Absolute path to the tool Python file.
     :param sandbox_config: Sandbox settings from the agent spec.
     :param srt_available: Whether ``srt`` is on PATH.
     :param uv_available: Whether ``uv`` is on PATH.
+    :param sandbox_enabled: Runtime policy for srt sandboxing.
     """
 
     def __init__(
         self,
         info: LocalToolInfo,
-        schema: dict[str, Any],
+        metadata: ToolMetadata,
         module_path: Path,
         sandbox_config: SandboxConfig,
         srt_available: bool,
@@ -89,12 +103,13 @@ class LocalPythonTool(Tool):
         sandbox_enabled: bool = True,
     ) -> None:
         """
-        Initialize from a validated tool file.
+        Initialize from a discovered ``@tool`` function.
 
-        :param info: The :class:`LocalToolInfo` with name and path.
-        :param schema: The validated SCHEMA dict.
+        :param info: The :class:`LocalToolInfo` for the source file.
+        :param metadata: The :class:`ToolMetadata` produced by
+            ``@tool`` at decoration time.
         :param module_path: Absolute path to the tool file, e.g.
-            ``Path("/tmp/cache/ag_abc/tools/python/my_tool.py")``.
+            ``Path("/tmp/cache/ag_abc/tools/python/my_tools.py")``.
         :param sandbox_config: Agent-level sandbox settings
             (docker_image).
         :param srt_available: Whether ``srt`` is on PATH.
@@ -102,38 +117,51 @@ class LocalPythonTool(Tool):
         :param sandbox_enabled: Runtime policy for srt sandboxing.
         """
         self._info = info
-        self._schema = schema
-        self._name: str = info.name
+        self._metadata = metadata
         self._module_path = module_path
         self._sandbox_config = sandbox_config
         self._sandbox_enabled = sandbox_enabled
         self._srt_available = srt_available
         self._uv_available = uv_available
         self._proc: subprocess.Popen[bytes] | None = None
+        self._workspace: Path | None = None
 
     def name(self) -> str:  # type: ignore[override]
         """
-        Tool name derived from the filename.
+        Tool name derived from the ``@tool``-decorated function's ``__name__``.
 
-        :returns: The tool name, e.g. ``"arxiv_search"``.
+        :returns: The tool name as the LLM sees it, e.g. ``"word_count"``.
         """
-        return self._name
+        return self._metadata.name
 
     @classmethod
     def description(cls) -> str:
         """
-        :returns: Human-readable description of the tool.
+        :returns: Generic class-level description; per-instance
+            descriptions come from each function's docstring via
+            :meth:`get_schema`.
         """
         return "Custom local Python tool."
 
     def get_schema(self) -> dict[str, Any]:
         """
-        Return the OpenAI function schema from the module's ``SCHEMA``.
+        Return the OpenAI function-format tool schema.
 
-        :returns: The schema dict, e.g.
-            ``{"type": "function", "function": {...}}``.
+        Composes the metadata's name + description + JSON schema
+        into the wire-format the framework's tool-dispatch layer
+        expects.
+
+        :returns: A dict with ``"type": "function"`` and a
+            ``"function"`` sub-dict.
         """
-        return self._schema
+        return {
+            "type": "function",
+            "function": {
+                "name": self._metadata.name,
+                "description": self._metadata.description,
+                "parameters": self._metadata.json_schema,
+            },
+        }
 
     def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
@@ -141,7 +169,9 @@ class LocalPythonTool(Tool):
 
         Builds the command via :meth:`_build_command`, spawns the
         subprocess, sends the request on stdin, and reads the JSON
-        response from fd 3 (or stdout in Docker mode).
+        response from fd 3 (or stdout in Docker mode). The request
+        carries the target function name so the runner knows which
+        ``@tool`` to dispatch (one file may export several).
 
         :param arguments: JSON-encoded arguments string from the LLM.
         :param ctx: Server-side execution context (unused by
@@ -153,6 +183,7 @@ class LocalPythonTool(Tool):
         request = json.dumps(
             {
                 "module_path": str(self._module_path),
+                "tool_name": self._metadata.name,
                 "arguments": parsed,
             }
         ).encode()
@@ -401,25 +432,30 @@ def _read_stdout_response(
     :param stderr: Captured stderr bytes for error reporting.
     :returns: The tool's result string, or an error string.
     """
-    for line in stdout.decode(errors="replace").splitlines():
+    if not stdout:
+        stderr_text = stderr.decode(errors="replace").strip()
+        if returncode != 0:
+            return f"Error: tool subprocess exited with code {returncode}: {stderr_text}"
+        return f"Error: tool produced no stdout. stderr: {stderr_text}"
+
+    text = stdout.decode(errors="replace")
+    for line in text.splitlines():
         if line.startswith(_STDOUT_RESPONSE_PREFIX):
             payload = line[len(_STDOUT_RESPONSE_PREFIX) :]
             try:
                 data = json.loads(payload)
             except json.JSONDecodeError as exc:
-                return f"Error: invalid JSON in stdout response: {exc}"
+                return f"Error: invalid JSON response from tool: {exc}"
             if "error" in data:
                 return f"Error: {data['error']}"
-            result: str = data.get("result", "")
-            return result
+            return str(data.get("result", ""))
 
     stderr_text = stderr.decode(errors="replace").strip()
-    if returncode != 0:
-        return f"Error: tool subprocess exited with code {returncode}: {stderr_text}"
-    return f"Error: tool produced no response. stderr: {stderr_text}"
-
-
-# ── Module loading and validation (for SCHEMA extraction) ───
+    return (
+        f"Error: tool produced no recognized response (no "
+        f"{_STDOUT_RESPONSE_PREFIX} prefix found). "
+        f"exit={returncode} stderr={stderr_text!r}"
+    )
 
 
 def load_local_python_tools(
@@ -429,17 +465,22 @@ def load_local_python_tools(
     srt_available: bool | None = None,
     uv_available: bool | None = None,
     sandbox_enabled: bool = True,
+    *,
+    agent_name: str | None = None,
+    builtin_tool_names: frozenset[str] | None = None,
 ) -> list[LocalPythonTool]:
     """
     Load and validate local Python tools from the agent image.
 
-    Each tool file is imported to extract and validate its ``SCHEMA``.
-    The module is NOT stored — tool execution happens in a subprocess
-    via ``_runner.py``, not in-process. Tool source is scanned for
-    PEP 723 inline metadata to detect dependencies.
+    Each file is imported once at agent-image load time. Every
+    ``@tool``-decorated function in the module produces one
+    :class:`LocalPythonTool`. Names are validated against any
+    builtin names provided (collisions fail loud per G27) and
+    against each other (two custom tools sharing a name across
+    files fail loud).
 
     :param local_tools: Discovered :class:`LocalToolInfo` entries
-        from the agent spec.
+        from the agent spec parser (one per file).
     :param workdir: The agent image's extracted directory on disk,
         e.g. ``Path("/tmp/agent-cache/ag_abc123")``.
     :param sandbox_config: Sandbox settings. ``None`` uses defaults.
@@ -447,46 +488,114 @@ def load_local_python_tools(
         auto-detects.
     :param uv_available: Whether ``uv`` is on PATH. ``None``
         auto-detects.
-    :returns: List of successfully validated :class:`LocalPythonTool`
-        instances.
+    :param sandbox_enabled: Runtime policy for srt sandboxing.
+    :param agent_name: The agent's name, used in error messages.
+        ``None`` falls back to the workdir basename.
+    :param builtin_tool_names: Names of framework-provided built-in
+        tools enabled for this agent. Used for collision detection
+        (G27). ``None`` means skip the builtin-collision check
+        (caller already validated, or no builtins active).
+    :returns: List of successfully loaded :class:`LocalPythonTool`
+        instances, one per ``@tool`` function across all files.
+    :raises LocalToolLoadError: If any file fails to load (import
+        error, no decorated functions, name collision).
     """
     effective_sandbox = sandbox_config or SandboxConfig()
     effective_srt = srt_available if srt_available is not None else shutil.which("srt") is not None
     effective_uv = uv_available if uv_available is not None else shutil.which("uv") is not None
+    effective_agent_name = agent_name or workdir.name
 
-    tools: list[LocalPythonTool] = []
+    # Discover decorated functions per file. Track tool name -> source so
+    # we can detect cross-file collisions and surface them with both paths.
+    discovered: dict[str, _DiscoveredTool] = {}
+
     for info in local_tools:
         if info.language != "python":
             continue
         tool_path = workdir / info.path
         if not tool_path.is_file():
-            _logger.warning(
-                "Local tool %r: file not found at %s — skipping",
-                info.name,
-                tool_path,
+            raise LocalToolLoadError(
+                f"Agent {effective_agent_name!r}: tool file declared at "
+                f"{info.path!r} but not found on disk."
             )
-            continue
 
         # Scan for PEP 723 inline metadata before loading the module.
         _scan_inline_metadata(info, tool_path)
 
-        module = _load_module(info.name, tool_path)
-        if module is None:
-            continue
-        if not _validate_module(info.name, module):
-            continue
-        tools.append(
-            LocalPythonTool(
-                info=info,
-                schema=module.SCHEMA,
-                module_path=tool_path.resolve(),
-                sandbox_config=effective_sandbox,
-                srt_available=effective_srt,
-                uv_available=effective_uv,
-                sandbox_enabled=sandbox_enabled,
-            )
+        module = _import_tool_module(
+            agent_name=effective_agent_name,
+            tool_path=tool_path,
         )
-    return tools
+        functions = _extract_decorated_functions(
+            agent_name=effective_agent_name,
+            tool_path=tool_path,
+            module=module,
+        )
+
+        for tool_name, metadata in functions:
+            # Detect collision with another custom tool already discovered.
+            existing = discovered.get(tool_name)
+            if existing is not None:
+                raise LocalToolLoadError(
+                    f"Tool name collision in agent {effective_agent_name!r}: "
+                    f"'{tool_name}' is defined in both "
+                    f"{existing.info.path!r} and {info.path!r}. "
+                    f"Rename one of the @tool functions so each name is unique."
+                )
+            # Detect collision with a builtin.
+            if builtin_tool_names is not None and tool_name in builtin_tool_names:
+                raise LocalToolLoadError(
+                    f"Tool name collision in agent {effective_agent_name!r}: "
+                    f"custom tool '{tool_name}' (defined in {info.path!r}) "
+                    f"conflicts with built-in tool '{tool_name}'. "
+                    f"Rename the custom tool or remove the conflicting builtin "
+                    f"from config.yaml's tools.builtins list."
+                )
+            discovered[tool_name] = _DiscoveredTool(
+                info=info,
+                metadata=metadata,
+                module_path=tool_path.resolve(),
+            )
+
+    return [
+        LocalPythonTool(
+            info=disc.info,
+            metadata=disc.metadata,
+            module_path=disc.module_path,
+            sandbox_config=effective_sandbox,
+            srt_available=effective_srt,
+            uv_available=effective_uv,
+            sandbox_enabled=sandbox_enabled,
+        )
+        for disc in discovered.values()
+    ]
+
+
+class _DiscoveredTool:
+    """
+    Internal record produced during loader discovery, before the
+    final :class:`LocalPythonTool` instances are constructed.
+
+    Lives only inside :func:`load_local_python_tools`; not part
+    of the public API.
+
+    :param info: The :class:`LocalToolInfo` for the source file.
+    :param metadata: The :class:`ToolMetadata` from the ``@tool``
+        decoration.
+    :param module_path: Resolved absolute path to the source file.
+    """
+
+    __slots__ = ("info", "metadata", "module_path")
+
+    def __init__(
+        self,
+        info: LocalToolInfo,
+        metadata: ToolMetadata,
+        module_path: Path,
+    ) -> None:
+        self.info = info
+        self.metadata = metadata
+        self.module_path = module_path
 
 
 def _scan_inline_metadata(info: LocalToolInfo, path: Path) -> None:
@@ -509,126 +618,86 @@ def _scan_inline_metadata(info: LocalToolInfo, path: Path) -> None:
         info.inline_deps = metadata.dependencies
 
 
-def _load_module(tool_name: str, path: Path) -> ModuleType | None:
+def _import_tool_module(
+    *,
+    agent_name: str,
+    tool_path: Path,
+) -> ModuleType:
     """
-    Import a Python file as a standalone module.
+    Import a tool file as a standalone module.
 
-    Used only for SCHEMA extraction and validation at load time.
-    The module is not stored — execution happens in a subprocess.
+    The module is held only long enough to discover decorated
+    functions; subsequent invocations re-import in the subprocess
+    runner. Failures raise :class:`LocalToolLoadError` with full
+    context (agent name, file path, cause).
 
-    :param tool_name: The tool name for error messages.
-    :param path: Absolute path to the Python file.
-    :returns: The loaded module, or ``None`` on import error.
+    :param agent_name: The agent's name, for error messages.
+    :param tool_path: Absolute path to the Python file.
+    :returns: The loaded module.
+    :raises LocalToolLoadError: If the module fails to import.
     """
-    module_name = f"_agent_tool_{tool_name}"
-    spec = importlib.util.spec_from_file_location(module_name, path)
+    module_name = f"_agent_tool_{tool_path.stem}"
+    spec = importlib.util.spec_from_file_location(module_name, tool_path)
     if spec is None or spec.loader is None:
-        _logger.warning(
-            "Local tool %r: failed to create module spec from %s — skipping",
-            tool_name,
-            path,
+        raise LocalToolLoadError(
+            f"Agent {agent_name!r}: cannot create module spec for {tool_path}."
         )
-        return None
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-    except Exception:
-        _logger.exception(
-            "Local tool %r: import error from %s — skipping",
-            tool_name,
-            path,
-        )
-        return None
+    except Exception as exc:
+        raise LocalToolLoadError(
+            f"Agent {agent_name!r}: failed to import tool file {tool_path}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     return module
 
 
-def _validate_schema(tool_name: str, schema: Any) -> bool:
+def _extract_decorated_functions(
+    *,
+    agent_name: str,
+    tool_path: Path,
+    module: ModuleType,
+) -> list[tuple[str, ToolMetadata]]:
     """
-    Validate the structure of a local tool's ``SCHEMA`` export.
+    Find every ``@tool``-decorated function defined in ``module``.
 
-    Must be a dict with a ``"function"`` key containing at least
-    ``"name"`` (str) and ``"parameters"`` (dict).
+    Iterates ``module.__dict__`` looking for callables carrying
+    the ``TOOL_MARKER_ATTR`` attribute. Filters to functions
+    actually defined IN the module (not re-imported from elsewhere)
+    by checking ``__module__`` matches the loaded module's name.
 
-    :param tool_name: The tool name for error messages.
-    :param schema: The ``SCHEMA`` value from the module.
-    :returns: ``True`` if the schema is well-formed.
+    :param agent_name: The agent's name, for error messages.
+    :param tool_path: Path to the tool file (used in errors).
+    :param module: The loaded Python module to scan.
+    :returns: List of ``(tool_name, ToolMetadata)`` tuples, one
+        per decorated function. Empty if none found, in which case
+        this function raises (a tool file with no decorated
+        functions is a load error).
+    :raises LocalToolLoadError: If the module exports no
+        ``@tool``-decorated functions.
     """
-    if not isinstance(schema, dict):
-        _logger.warning(
-            "Local tool %r: SCHEMA must be a dict, got %s — skipping",
-            tool_name,
-            type(schema).__name__,
-        )
-        return False
-    func = schema.get("function")
-    if not isinstance(func, dict):
-        _logger.warning(
-            "Local tool %r: SCHEMA missing 'function' dict — skipping",
-            tool_name,
-        )
-        return False
-    if not isinstance(func.get("name"), str):
-        _logger.warning(
-            "Local tool %r: SCHEMA.function.name must be a string — skipping",
-            tool_name,
-        )
-        return False
-    if not isinstance(func.get("parameters"), dict):
-        _logger.warning(
-            "Local tool %r: SCHEMA.function.parameters must be a dict — skipping",
-            tool_name,
-        )
-        return False
-    return True
+    found: list[tuple[str, ToolMetadata]] = []
+    for value in module.__dict__.values():
+        # Only consider objects defined in THIS module (not imports).
+        # Re-imported decorated functions would otherwise be doubly
+        # registered.
+        if not callable(value):
+            continue
+        if getattr(value, "__module__", None) != module.__name__:
+            continue
+        metadata = get_tool_metadata(value)
+        if metadata is None:
+            continue
+        found.append((metadata.name, metadata))
 
+    if found:
+        return found
 
-def _validate_module(tool_name: str, module: ModuleType) -> bool:
-    """
-    Validate that a loaded module has the required exports.
-
-    Checks for ``SCHEMA`` (dict with ``"function"`` key containing
-    ``"name"`` and ``"parameters"``) and ``run`` (must be
-    ``async def``).
-
-    :param tool_name: The tool name for error messages.
-    :param module: The loaded Python module.
-    :returns: ``True`` if the module passes all checks.
-    """
-    if not hasattr(module, "SCHEMA"):
-        _logger.warning(
-            "Local tool %r: module missing SCHEMA — skipping",
-            tool_name,
-        )
-        return False
-    if not _validate_schema(tool_name, module.SCHEMA):
-        return False
-    schema_name = module.SCHEMA["function"]["name"]
-    if schema_name != tool_name:
-        _logger.warning(
-            "Local tool %r: SCHEMA.function.name is %r but filename "
-            "derives %r — the LLM calls the schema name, so these "
-            "must match. Skipping",
-            tool_name,
-            schema_name,
-            tool_name,
-        )
-        return False
-    if not hasattr(module, "run"):
-        _logger.warning(
-            "Local tool %r: module missing run() function — skipping",
-            tool_name,
-        )
-        return False
-    if not callable(module.run):
-        _logger.warning(
-            "Local tool %r: run is not callable — skipping",
-            tool_name,
-        )
-        return False
-    if not inspect.iscoroutinefunction(module.run):
-        _logger.warning(
-            "Local tool %r: run() must be async def — skipping",
-            tool_name,
-        )
-        return False
-    return True
+    # No decorated functions found. Surface an actionable error so the
+    # author knows the file needs to use @tool from agent_plane.tools.
+    raise LocalToolLoadError(
+        f"Agent {agent_name!r}: tool file {tool_path} exports no "
+        f"@tool-decorated functions. Decorate at least one module-level "
+        f"function with @tool from agent_plane.tools."
+    )
