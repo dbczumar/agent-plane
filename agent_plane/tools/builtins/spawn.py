@@ -759,9 +759,18 @@ def _send_to_one(
     # Otherwise the new task would race with the in-flight one,
     # both producing assistant responses on the same conversation
     # and confusing the LLM.
-    existing_tasks = task_store.list_tasks_sync(conversation_id=match.id)
-    iter_existing = existing_tasks.data if hasattr(existing_tasks, "data") else existing_tasks
-    for t in iter_existing:
+    #
+    # KNOWN GAP: this check + create + start sequence is NOT
+    # atomic. Two parallel send_to_sub_agent invocations from
+    # different agents (or the same agent on different turns
+    # racing each other) could each see the busy-check pass and
+    # both create+start tasks. In practice the LLM serializes
+    # its own tool calls within a turn, so the only realistic
+    # racing case is two top-level conversations targeting the
+    # same child — which the cross-parent name isolation
+    # already prevents. A per-child lock would close the gap
+    # fully; deferred until a real workload demands it.
+    for t in task_store.list_tasks_sync(conversation_id=match.id):
         if t.status not in TERMINAL_STATUSES:
             raise _SubAgentBusyError(
                 f"sub-agent {agent_name}:{sa_name} is busy with task {t.id!r}; "

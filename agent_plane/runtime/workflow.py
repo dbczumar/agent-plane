@@ -1254,6 +1254,14 @@ async def _executor_turn_with_compaction(
         compaction_state,
         content_cache,
     )
+    # Phase 4 D6: refresh the ambient sub-agent / running-task
+    # hint on every iteration so the LLM remembers what it has
+    # available across multi-iteration turns. Cheap query (one
+    # list_conversations + one list_tasks_sync) so it's
+    # tolerable per-iteration.
+    hint = _build_ambient_hint(context.conversation_id, context.task_id)
+    if hint:
+        sys_instructions = f"{sys_instructions}\n\n{hint}"
     messages = await _proactive_compact_if_needed(
         messages,
         history,
@@ -1298,6 +1306,64 @@ async def _executor_turn_with_compaction(
             code="context_length_exceeded",
         )
     return retry_result
+
+
+def _build_ambient_hint(conversation_id: str, task_id: str) -> str:
+    """
+    Render the Phase 4 ambient-hint block for the current LLM iteration.
+
+    Two compact lists prepended to the LLM's system context so it
+    knows which named sub-agents already exist (call
+    ``send_to_sub_agent`` to continue) and which tasks are still
+    in flight (so it doesn't redundantly check status). Empty
+    string when neither list has any entries — keeps the prompt
+    lean for trivial conversations.
+
+    :param conversation_id: The current task's conversation id —
+        scopes the sub-agent list to this conversation tree.
+    :param task_id: The current task's id — scopes the running-
+        task list via ``root_task_id`` so the hint only mentions
+        children of THIS turn, not unrelated work the same
+        agent might be doing in another conversation.
+    :returns: Formatted hint block (markdown-ish bullets) ready
+        to append to ``sys_instructions``. Empty string when
+        nothing to report.
+    """
+    conv_store = get_conversation_store()
+    task_store = get_task_store()
+
+    children = conv_store.list_conversations(
+        kind="sub_agent",
+        parent_conversation_id=conversation_id,
+        limit=100,
+    )
+    sub_agent_lines: list[str] = []
+    for child in children.data:
+        if child.title is None or ":" not in child.title:
+            continue
+        sa_type, _, sa_name = child.title.partition(":")
+        sub_agent_lines.append(f"  - {sa_type}:{sa_name}")
+
+    pending_lines: list[str] = []
+    try:
+        for t in task_store.list_tasks_sync(root_task_id=task_id):
+            if t.status not in TERMINAL_STATUSES:
+                pending_lines.append(f"  - {t.id} (kind={t.kind})")
+    except Exception:
+        # Best-effort: if task_store enrichment hits a transient
+        # DBOS state issue, skip the running-tasks section
+        # rather than failing the whole LLM call.
+        pass
+
+    if not sub_agent_lines and not pending_lines:
+        return ""
+
+    sections: list[str] = []
+    if sub_agent_lines:
+        sections.append("Open sub-agents:\n" + "\n".join(sub_agent_lines))
+    if pending_lines:
+        sections.append("Running tasks:\n" + "\n".join(pending_lines))
+    return "\n\n".join(sections)
 
 
 def _prepare_messages(
