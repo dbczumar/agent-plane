@@ -117,3 +117,20 @@ class Tool(abc.ABC):
         expires. Subprocess-based tools override this to kill
         the child process. Default is a no-op.
         """
+
+    def is_async(self) -> bool:
+        """
+        Return ``True`` if this tool runs in a background workflow.
+
+        Built-in and synchronous tools return ``False`` (the
+        default) — the runtime calls ``invoke()`` inline and
+        passes the string result back to the LLM in the same
+        iteration. Tools that override this to return ``True``
+        signal the runtime to start a
+        :func:`~agent_plane.runtime.background_tool_workflow.background_tool_workflow`,
+        return a task handle to the LLM immediately, and deliver
+        the eventual result via the ``async_work_complete`` topic.
+
+        :returns: ``False`` by default.
+        """
+        return False

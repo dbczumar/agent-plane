@@ -134,6 +134,36 @@ class LocalPythonTool(Tool):
         """
         return self._metadata.name
 
+    def is_async(self) -> bool:
+        """
+        Return ``True`` for ``@tool(synchronous=False)`` functions.
+
+        Reads the flag captured at decoration time. Async tools
+        bypass the inline ``invoke()`` path entirely — the runtime
+        starts a background workflow and returns a handle to the
+        LLM (D2/D3); the actual tool body still runs in a
+        subprocess, just inside the background workflow's
+        ``@step`` rather than the parent workflow.
+
+        :returns: ``True`` if the tool was decorated with
+            ``synchronous=False``.
+        """
+        return not self._metadata.synchronous
+
+    def module_path(self) -> str:
+        """
+        Return the absolute path to the tool's source file.
+
+        Used by the background-tool-workflow dispatch path so the
+        runner subprocess knows which file to import. Exposed here
+        rather than reading ``_module_path`` directly from outside
+        the class.
+
+        :returns: Absolute path string, e.g.
+            ``"/tmp/cache/ag_abc/tools/python/my_tools.py"``.
+        """
+        return str(self._module_path)
+
     @classmethod
     def description(cls) -> str:
         """

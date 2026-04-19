@@ -1463,6 +1463,22 @@ async def _call_tool(
             span.set_attribute("tool.type", _classify_tool_type(tool))
         if telemetry.should_capture_content():
             span.set_inputs({"tool_name": tool_name, "arguments": arguments})
+        # @tool(synchronous=False) dispatches to a background DBOS
+        # workflow and returns a handle immediately (D2/D3). The
+        # parent loop later auto-delivers the result via the
+        # async_work_complete drain. Sync tools fall through.
+        if tool is not None and tool.is_async():
+            handle = await _dispatch_async_tool(
+                parent_task_id=task_id,
+                conversation_id_for_handle=None,
+                agent_id=agent_id,
+                agent_name=tool_name,
+                tool=tool,
+                arguments=arguments,
+            )
+            span.set_attribute("tool.status", "dispatched_async")
+            span.set_attribute("tool.async_task_id", handle.task_id)
+            return handle.to_handle_json()
         try:
             result = await _to_thread(_blocking_call)
             span.set_attribute("tool.status", "success")
@@ -2800,6 +2816,184 @@ def _inject_collect_results(
     return _AutoCollectResult(
         last_seen=last_seen,
         collected_ids=collected,
+    )
+
+
+# ─── Async tool dispatch ───────────────────────────────────
+
+
+@dataclass
+class _AsyncToolHandle:
+    """
+    Handle returned to the LLM when an async tool is dispatched.
+
+    Replaces the inline tool result string from a sync invocation.
+    The LLM gets back a structured task handle so it can call
+    ``check_task`` later or wait for auto-delivery (D7/G12).
+
+    :param task_id: The newly created task's ID, e.g.
+        ``"tsk_async_xyz"``. Identical to the
+        ``background_tool_workflow``'s DBOS workflow_id (G56).
+    :param tool_name: The dispatched tool's name, included in the
+        handle so the LLM can correlate the handle to its own
+        tool_calls field.
+    :param status: Always ``"in_progress"`` at handle-creation
+        time — terminal status arrives via the
+        ``async_work_complete`` signal.
+    :param message: A self-explanatory instruction for the LLM
+        (G12). Names the task_id explicitly so the LLM can
+        copy-paste it into ``check_task`` / ``cancel_task``.
+    """
+
+    task_id: str
+    tool_name: str
+    status: str
+    message: str
+
+    def to_handle_json(self) -> str:
+        """
+        Serialize the handle as JSON for the tool-call return path.
+
+        The runner contract returns strings, so the handle ships
+        as a JSON-encoded dict. The LLM treats the result like
+        any other tool output.
+
+        :returns: JSON string with ``task_id``, ``tool_name``,
+            ``status``, and ``message`` keys.
+        """
+        return json.dumps(
+            {
+                "task_id": self.task_id,
+                "tool_name": self.tool_name,
+                "status": self.status,
+                "message": self.message,
+            }
+        )
+
+
+def _async_handle_message(task_id: str, tool_name: str) -> str:
+    """
+    Build the LLM-facing instruction text on a fresh async handle.
+
+    Every word here is load-bearing — the message is the LLM's
+    only signal that the result is NOT in this string. Without
+    "asynchronous" + "auto-deliver" + the literal task_id, the
+    LLM tends to either treat the handle as the result and
+    hallucinate completion, or repeatedly call ``check_task``
+    in a polling loop.
+
+    :param task_id: The async task's ID, included verbatim so
+        the LLM can pass it to ``check_task`` / ``cancel_task``.
+    :param tool_name: The dispatched tool's name.
+    :returns: A compact instruction string.
+    """
+    return (
+        f"Tool {tool_name!r} dispatched asynchronously. "
+        f"The result will be auto-delivered as a system message "
+        f"when ready. To poll proactively call check_task with "
+        f"task_id={task_id!r}; to abort call cancel_task."
+    )
+
+
+async def _dispatch_async_tool(
+    *,
+    parent_task_id: str,
+    conversation_id_for_handle: str | None,
+    agent_id: str,
+    agent_name: str,
+    tool: Any,
+    arguments: str,
+) -> _AsyncToolHandle:
+    """
+    Create a child task row and start its background workflow.
+
+    Implements D2/D3 dispatch: pins the new DBOS workflow_uuid to
+    the freshly minted task_id (G56) so callers can later look up
+    workflow state by task_id, then returns the handle to the
+    parent ``_call_tool`` for serialization back to the LLM.
+
+    The created task row carries ``kind="tool"`` so the parent's
+    end-of-turn auto-collect (D5) groups it correctly with other
+    async work. ``root_task_id`` is set to the parent so
+    ``task_store.list_tasks(root_task_id=...)`` finds it.
+
+    :param parent_task_id: The currently-executing parent
+        workflow's task_id. The new task points at it via
+        ``root_task_id``; the background workflow signals it via
+        the ``async_work_complete`` topic.
+    :param conversation_id_for_handle: Optional conversation_id
+        override for the new task row. Defaults to the parent
+        task's conversation_id (looked up from task_store).
+    :param agent_id: The owning agent's ID.
+    :param agent_name: The tool's name (recorded as ``agent_name``
+        on the task so ``list_tasks`` results show what produced
+        the work).
+    :param tool: The :class:`Tool` instance to dispatch — must be
+        a :class:`~agent_plane.tools.local.LocalPythonTool`. The
+        function pulls ``module_path`` and ``name()`` off the
+        instance.
+    :param arguments: JSON-encoded arguments string from the LLM.
+    :returns: An :class:`_AsyncToolHandle` ready to be serialized
+        back to the LLM as a tool-call result.
+    :raises RuntimeError: If the parent task row cannot be found
+        (this would mean the framework's invariants are broken
+        and the parent isn't a real workflow execution).
+    """
+    from agent_plane.runtime.background_tool_workflow import (
+        background_tool_workflow,
+    )
+    from agent_plane.runtime.durability import (
+        SetWorkflowID,
+        start_workflow,
+    )
+    from agent_plane.tools.local import LocalPythonTool
+
+    if not isinstance(tool, LocalPythonTool):
+        raise RuntimeError(
+            f"async dispatch only supported for LocalPythonTool, got {type(tool).__name__}"
+        )
+
+    task_store = get_task_store()
+    parent_row = await _to_thread(lambda: task_store.get_sync(parent_task_id))
+    if parent_row is None:
+        raise RuntimeError(
+            f"parent task {parent_task_id!r} not found — async dispatch invariant broken"
+        )
+    conv_id = conversation_id_for_handle or parent_row.conversation_id
+
+    def _create_row() -> Any:
+        return task_store.create(
+            conversation_id=conv_id,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            root_task_id=parent_task_id,
+            kind=_TOOL_KIND,
+        )
+
+    new_task = await _to_thread(_create_row)
+
+    parsed_args: dict[str, Any] = json.loads(arguments) if arguments else {}
+
+    def _start() -> None:
+        # Pin the DBOS workflow_uuid to the new task_id (G56) so
+        # check_task / cancel_task can look up the workflow by
+        # task_id later.
+        with SetWorkflowID(new_task.id):
+            start_workflow(
+                background_tool_workflow,
+                parent_task_id,
+                tool.module_path(),
+                tool.name(),
+                parsed_args,
+            )
+
+    await _to_thread(_start)
+
+    return _AsyncToolHandle(
+        task_id=new_task.id,
+        tool_name=tool.name(),
+        status="in_progress",
+        message=_async_handle_message(new_task.id, tool.name()),
     )
 
 
