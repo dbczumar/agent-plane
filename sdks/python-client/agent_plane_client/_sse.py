@@ -13,6 +13,7 @@ from typing import Any
 
 from ._events import (
     NATIVE_TOOL_TYPES,
+    ClientTaskCancel,
     CompactionInProgress,
     ErrorEvent,
     MessageDone,
@@ -175,6 +176,14 @@ def _parse_event(event_type: str, data: dict[str, Any]) -> StreamEvent | None:
     # Compaction
     if event_type == "response.compaction.in_progress":
         return CompactionInProgress()
+
+    # Phase 5 — async client-tool cancel notification
+    if event_type == "response.client_task.cancel":
+        task_id = data.get("task_id")
+        if isinstance(task_id, str) and task_id:
+            return ClientTaskCancel(task_id=task_id)
+        _log.warning("response.client_task.cancel missing task_id: %r", data)
+        return None
 
     # Unknown event — skip gracefully for forward-compatibility
     _log.debug("Skipping unknown SSE event type: %s", event_type)

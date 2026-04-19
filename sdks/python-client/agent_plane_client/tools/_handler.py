@@ -65,16 +65,21 @@ def build_tool_handler(functions: list[Callable[..., Any]]) -> ToolHandler:
                 f"{fn.__qualname__} both export the same name."
             )
         funcs_by_name[meta.name] = fn
-        schemas.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": meta.name,
-                    "description": meta.description,
-                    "parameters": meta.json_schema,
-                },
-            }
-        )
+        schema: dict[str, object] = {
+            "type": "function",
+            "function": {
+                "name": meta.name,
+                "description": meta.description,
+                "parameters": meta.json_schema,
+            },
+        }
+        # Phase 5: only emit the ``synchronous`` flag when it
+        # diverges from the server-side default (True) — keeps
+        # the wire shape minimal for ordinary tools and forces
+        # the server's parser to recognize the explicit opt-out.
+        if not meta.synchronous:
+            schema["synchronous"] = False
+        schemas.append(schema)
 
     async def execute(call: ToolCallInfo) -> str:
         """Dispatch ``call`` to the matching ``@tool`` function.

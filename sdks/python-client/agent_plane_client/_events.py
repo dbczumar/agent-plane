@@ -195,6 +195,30 @@ class CompactionInProgress:
     pass
 
 
+# ── Async client-tool cancel (Phase 5) ───────────────────
+
+
+@dataclass
+class ClientTaskCancel:
+    """
+    ``response.client_task.cancel`` — Phase 5.
+
+    Emitted by the server when an async client tool task
+    (``kind="client_tool"``) was cancelled mid-flight, either
+    via direct ``cancel_task`` or via parent-cancel
+    propagation. The client should cancel the matching
+    background asyncio task and (optionally) PATCH back
+    ``async_tool_results`` with ``status="cancelled"`` so the
+    parent's drain sees the terminal state.
+
+    :param task_id: The server-issued client-tool task id from
+        the original ``function_call_output`` handle, e.g.
+        ``"resp_async_xyz"``.
+    """
+
+    task_id: str
+
+
 # ── Union type for all events ────────────────────────────
 
 StreamEvent = (
@@ -217,4 +241,5 @@ StreamEvent = (
     | RetryEvent
     | ErrorEvent
     | CompactionInProgress
+    | ClientTaskCancel
 )
