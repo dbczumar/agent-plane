@@ -1,0 +1,26 @@
+spec_version: 1
+
+name: named-sub-agent-test
+
+description: |
+  Test-only parent agent for the Phase 4 named-sub-agent E2E
+  suite. Has two named sub-agents (researcher, summarizer) that
+  return distinctive marker substrings, plus instructions that
+  steer the LLM toward the spawn_sub_agent / send_to_sub_agent /
+  list_sub_agents idioms.
+
+llm:
+  model: gpt-5.4
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  agents: [researcher, summarizer]
+  timeout: 60
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

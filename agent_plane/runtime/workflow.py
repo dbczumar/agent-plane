@@ -1312,25 +1312,30 @@ def _build_ambient_hint(conversation_id: str, task_id: str) -> str:
     """
     Render the Phase 4 ambient-hint block for the current LLM iteration.
 
-    Two compact lists prepended to the LLM's system context so it
-    knows which named sub-agents already exist (call
-    ``send_to_sub_agent`` to continue) and which tasks are still
-    in flight (so it doesn't redundantly check status). Empty
-    string when neither list has any entries — keeps the prompt
-    lean for trivial conversations.
+    Lists the named sub-agents already created under this
+    conversation so the LLM remembers them across turns and
+    can call ``send_to_sub_agent`` instead of re-spawning
+    duplicates. Empty string when no named sub-agents exist —
+    keeps the prompt lean for trivial conversations.
+
+    NOTE: an earlier version also surfaced "Running tasks" via
+    ``task_store.list_tasks_sync(root_task_id=task_id)`` but
+    that path hits DBOS's sync workflow-status API from inside
+    an async workflow context — DBOS blocks on this and the
+    parent loop hangs indefinitely. Dropped per E2E timeout
+    diagnosis. Running-task awareness is a nice-to-have; named-
+    sub-agent recall is the load-bearing piece of D6.
 
     :param conversation_id: The current task's conversation id —
         scopes the sub-agent list to this conversation tree.
-    :param task_id: The current task's id — scopes the running-
-        task list via ``root_task_id`` so the hint only mentions
-        children of THIS turn, not unrelated work the same
-        agent might be doing in another conversation.
-    :returns: Formatted hint block (markdown-ish bullets) ready
-        to append to ``sys_instructions``. Empty string when
-        nothing to report.
+    :param task_id: Reserved for future use (e.g. an async
+        running-tasks variant).
+    :returns: Formatted hint block ready to append to
+        ``sys_instructions``. Empty string when nothing to
+        report.
     """
+    del task_id  # see docstring — running-tasks section was removed
     conv_store = get_conversation_store()
-    task_store = get_task_store()
 
     children = conv_store.list_conversations(
         kind="sub_agent",
@@ -1344,26 +1349,10 @@ def _build_ambient_hint(conversation_id: str, task_id: str) -> str:
         sa_type, _, sa_name = child.title.partition(":")
         sub_agent_lines.append(f"  - {sa_type}:{sa_name}")
 
-    pending_lines: list[str] = []
-    try:
-        for t in task_store.list_tasks_sync(root_task_id=task_id):
-            if t.status not in TERMINAL_STATUSES:
-                pending_lines.append(f"  - {t.id} (kind={t.kind})")
-    except Exception:
-        # Best-effort: if task_store enrichment hits a transient
-        # DBOS state issue, skip the running-tasks section
-        # rather than failing the whole LLM call.
-        pass
-
-    if not sub_agent_lines and not pending_lines:
+    if not sub_agent_lines:
         return ""
 
-    sections: list[str] = []
-    if sub_agent_lines:
-        sections.append("Open sub-agents:\n" + "\n".join(sub_agent_lines))
-    if pending_lines:
-        sections.append("Running tasks:\n" + "\n".join(pending_lines))
-    return "\n\n".join(sections)
+    return "Open sub-agents:\n" + "\n".join(sub_agent_lines)
 
 
 def _prepare_messages(

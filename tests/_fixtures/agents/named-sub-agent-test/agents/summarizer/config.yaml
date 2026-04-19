@@ -1,0 +1,22 @@
+spec_version: 1
+
+name: summarizer
+description: |
+  Test-fixture sub-agent for the Phase 4 E2E suite. Returns a
+  fixed marker substring per response so assertions are
+  unambiguous.
+
+llm:
+  model: gpt-5.4
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  timeout: 60
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md
