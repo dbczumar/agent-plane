@@ -65,6 +65,209 @@ def _extract_output_text(output: list[dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
+class SpawnSubAgentTool(Tool):
+    """
+    Launch one sub-agent as an asynchronous background task.
+
+    Phase 3 replacement for ``SpawnTool`` (the old
+    batch-spawn tool). The LLM calls ``spawn_sub_agent`` once
+    per sub-agent it wants to dispatch — multiple parallel
+    sub-agents come from the LLM emitting multiple tool_calls
+    in one response, exactly like ``@tool(synchronous=False)``
+    dispatch in Phase 2.
+
+    Returns a JSON handle in the same shape as
+    :class:`agent_plane.runtime.workflow._AsyncToolHandle`:
+    ``{task_id, kind: "sub_agent", type, status, message}``.
+    The result eventually auto-delivers via the unified
+    ``async_work_complete`` topic — the LLM can also poll with
+    ``check_task`` or abort with ``cancel_task``.
+
+    :param sub_specs: Name-to-AgentSpec mapping for available
+        sub-agents, e.g. ``{"researcher": AgentSpec(...)}``.
+    """
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"spawn_sub_agent"`` (singular)."""
+        return "spawn_sub_agent"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Launch ONE sub-agent as an asynchronous background "
+            "task. Returns a handle immediately; the result "
+            "auto-delivers as a system message when ready. To "
+            "spawn multiple sub-agents in parallel, emit "
+            "multiple spawn_sub_agent tool_calls in the same "
+            "response — they dispatch concurrently."
+        )
+
+    def __init__(self, sub_specs: dict[str, AgentSpec]) -> None:
+        """
+        Initialize with the agent's available sub-agent specs.
+
+        :param sub_specs: Name-to-AgentSpec mapping, e.g.
+            ``{"researcher": AgentSpec(...)}``.
+        """
+        self._sub_specs = sub_specs
+
+    def get_schema(self) -> dict[str, Any]:
+        """
+        Return the OpenAI-format tool schema with dynamic ``type`` enum.
+
+        The ``type`` enum is the list of sub-agent names the
+        agent declares; the LLM can only dispatch declared
+        types.
+
+        :returns: Dict with ``"type": "function"`` and a
+            ``"function"`` sub-dict.
+        """
+        return _build_spawn_sub_agent_schema(self._sub_specs)
+
+    def invoke(self, arguments: str, ctx: ToolContext) -> str:
+        """
+        Spawn a single sub-agent and return its handle.
+
+        :param arguments: JSON-encoded arguments string, e.g.
+            ``'{"type": "researcher", "input": "find X"}'``.
+        :param ctx: Server-side execution context with task and
+            agent identity.
+        :returns: JSON handle string with ``task_id``, ``kind``,
+            ``type``, ``status``, and ``message`` keys.
+        """
+        args = _parse_spawn_sub_agent_args(arguments)
+        if isinstance(args, str):
+            return args
+        sa_type: str = args["type"]
+        sa_input: str = args["input"]
+        if sa_type not in self._sub_specs:
+            return json.dumps(
+                {"error": f"unknown sub-agent type: {sa_type!r}"},
+            )
+
+        # _call_tool injects client_tools into the arguments JSON
+        # before invoke — extract and remove (same convention as
+        # the old SpawnTool).
+        client_tools: list[dict[str, Any]] = args.get("client_tools", []) or []
+
+        root_task_id = _resolve_root_task_id(ctx.task_id)
+        task_id = _spawn_one(
+            agent_id=ctx.agent_id,
+            agent_name=sa_type,
+            user_input=sa_input,
+            root_task_id=root_task_id,
+            client_tools=client_tools,
+        )
+        return json.dumps(
+            {
+                "task_id": task_id,
+                "kind": "sub_agent",
+                "type": sa_type,
+                "status": "in_progress",
+                "message": _spawn_handle_message(task_id, sa_type),
+            }
+        )
+
+
+def _build_spawn_sub_agent_schema(
+    sub_specs: dict[str, AgentSpec],
+) -> dict[str, Any]:
+    """
+    Build the OpenAI function schema for ``spawn_sub_agent``.
+
+    The ``type`` parameter's enum is dynamic — derived from the
+    keys of ``sub_specs`` so the LLM only sees the sub-agents
+    the parent agent actually declares.
+
+    :param sub_specs: Name-to-AgentSpec mapping.
+    :returns: OpenAI function-format schema dict.
+    """
+    type_enum = sorted(sub_specs.keys())
+    type_descriptions = {
+        name: (spec.description or f"Sub-agent {name!r}.") for name, spec in sub_specs.items()
+    }
+    type_desc_text = "\n".join(f"  {name}: {desc}" for name, desc in type_descriptions.items())
+    return {
+        "type": "function",
+        "function": {
+            "name": SpawnSubAgentTool.name(),
+            "description": SpawnSubAgentTool.description(),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": type_enum,
+                        "description": (
+                            "The sub-agent type to dispatch. "
+                            "Must be one of the declared "
+                            "sub-agent names. Available "
+                            f"types:\n{type_desc_text}"
+                        ),
+                    },
+                    "input": {
+                        "type": "string",
+                        "description": (
+                            "The user-input message to send "
+                            "to the sub-agent. The sub-agent "
+                            "treats this as the first user "
+                            "turn in its conversation."
+                        ),
+                    },
+                },
+                "required": ["type", "input"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _parse_spawn_sub_agent_args(
+    arguments: str,
+) -> dict[str, Any] | str:
+    """
+    Parse and validate ``SpawnSubAgentTool`` arguments.
+
+    :param arguments: Raw JSON string from the LLM.
+    :returns: Parsed dict on success, or a JSON error string
+        on failure (returned verbatim to the LLM so it can
+        correct and retry).
+    """
+    try:
+        args = json.loads(arguments) if arguments else {}
+    except (json.JSONDecodeError, TypeError) as exc:
+        return json.dumps({"error": f"invalid arguments: {exc}"})
+    if not isinstance(args, dict):
+        return json.dumps({"error": "arguments must be a JSON object"})
+    for required in ("type", "input"):
+        if required not in args:
+            return json.dumps({"error": f"missing required field: {required}"})
+    return args
+
+
+def _spawn_handle_message(task_id: str, sa_type: str) -> str:
+    """
+    Build the LLM-facing instruction text on a fresh sub-agent handle.
+
+    Mirrors ``_async_handle_message`` in workflow.py — the LLM
+    needs the literal task_id and a pointer at check_task /
+    cancel_task so it knows the result is not in this string.
+
+    :param task_id: The new sub-agent task's ID, e.g.
+        ``"resp_abc..."``.
+    :param sa_type: The dispatched sub-agent's type name.
+    :returns: A compact instruction string.
+    """
+    return (
+        f"Sub-agent of type {sa_type!r} dispatched. "
+        f"The result will be auto-delivered as a system message "
+        f"when ready. To poll proactively call check_task with "
+        f"task_id={task_id!r}; to abort call cancel_task."
+    )
+
+
 class SpawnTool(Tool):
     """
     Launch sub-agents as independent tasks via the TaskStore.

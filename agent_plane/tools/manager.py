@@ -20,6 +20,7 @@ from agent_plane.tools.base import Tool, ToolContext, is_valid_tool_name
 from agent_plane.tools.builtins import (
     CancelSubAgentTool,
     CheckSubAgentsTool,
+    SpawnSubAgentTool,
     LoadSkillTool,
     ReadSkillFileTool,
     SpawnTool,
@@ -232,6 +233,14 @@ class ToolManager:
             return
 
         sub_specs = {sa.name: sa for sa in self._spec.sub_agents if sa.name is not None}
+        # Phase 3: register the unified singular spawn_sub_agent
+        # tool (kind="sub_agent" handles flow through Phase 2's
+        # async_work_complete drain). The old batch tools
+        # (spawn_sub_agents / check_sub_agents / cancel_sub_agent)
+        # still register too — Phase 3 part 3 deletes them.
+        self._tools[SpawnSubAgentTool.name()] = SpawnSubAgentTool(
+            sub_specs=sub_specs,
+        )
         spawn = SpawnTool(sub_specs=sub_specs)
         self._tools[SpawnTool.name()] = spawn
         self._tools[CheckSubAgentsTool.name()] = CheckSubAgentsTool()
