@@ -253,7 +253,7 @@ agent-name/
   agents via `executor.type: agents_sdk`.
 
 - **Security sandboxing** — when `srt` (Anthropic's Sandbox Runtime) is on
-  PATH, `code_sandbox` and local Python tools run inside an OS-level sandbox
+  PATH, `terminal_run` shells and local Python tools run inside an OS-level sandbox
   with filesystem and network restrictions. Writes are restricted to the
   per-conversation workspace. Reads are denied outside the workspace and
   system directories. Network access is limited to package registries

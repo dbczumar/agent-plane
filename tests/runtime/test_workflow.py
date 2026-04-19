@@ -15,6 +15,7 @@ import pytest
 
 from agent_plane.entities import (
     CompactionData,
+    ConversationItem,
     MessageData,
     NewConversationItem,
 )
@@ -26,6 +27,7 @@ from agent_plane.runtime.prompt import _strip_output_annotations
 from agent_plane.runtime.workflow import (
     _build_assistant_item,
     _build_await_tool_output,
+    _call_tool,
     _collect_file_annotations,
     _get_or_restore_executor_storage,
     _load_initial_history,
@@ -35,6 +37,7 @@ from agent_plane.runtime.workflow import (
     _proactive_compact_if_needed,
     _publish_client_tool_call,
     _reactive_compact,
+    _recover_spawn_ids_from_history,
     _register_client_tool_call,
     _run_agent_loop,
     _split_tool_calls,
@@ -2060,7 +2063,7 @@ def test_collect_file_annotations_ignores_non_upload_tools() -> None:
         {
             "type": "function_call",
             "call_id": "call_1",
-            "name": "code_sandbox",
+            "name": "terminal_run",
             "arguments": '{"command": "ls"}',
         },
         {
@@ -2167,3 +2170,258 @@ def test_build_assistant_item_without_annotations() -> None:
     assert "annotations" not in block, (
         f"output_text should not have annotations key when none provided: {block}"
     )
+
+
+def test_build_assistant_item_coerces_none_text_to_empty_string() -> None:
+    """
+    When the LLM produces no text (pure tool-call response), the
+    persisted ``output_text`` block's ``text`` field must be an
+    empty string, not ``None``.
+
+    **Why this matters**: the persisted history is re-sent to the
+    LLM on the next turn. The OpenAI Responses API rejects input
+    items whose ``content[].text`` is ``null`` with
+    ``{"code": "invalid_type", "message": "expected a string,
+    but got null instead"}``. Empty string is accepted. Prior
+    tools usually accompanied tool calls with text so this path
+    was rarely exercised; the persistent-terminal tool's cleaner
+    output first surfaced it.
+
+    **If this regresses** (remove the ``if text is not None else ""``
+    coercion), this test catches the null persistence immediately
+    rather than waiting for the e2e suite to fail on the second
+    turn of a multi-turn run.
+    """
+    item = _build_assistant_item("task_1", "my-agent", None)
+
+    block = item.data.content[0]
+    assert block["text"] == "", (
+        f"None text must be coerced to empty string for safe "
+        f"round-tripping through the LLM input path, got: "
+        f"{block['text']!r}"
+    )
+    # Belt and suspenders: even if the value compares equal to "",
+    # it must NOT be the None singleton (could happen if someone
+    # replaced "" with NaN or similar truthiness-matching sentinel).
+    assert block["text"] is not None
+
+
+# ── _recover_spawn_ids_from_history ─────────────────────────────
+
+
+def test_recover_spawn_ids_tolerates_null_text_blocks() -> None:
+    """
+    ``_recover_spawn_ids_from_history`` must survive assistant
+    messages whose ``output_text`` block has ``text: null``.
+
+    **Why this matters**: LLMs can produce pure tool-call responses
+    with no accompanying text. The persisted message then has
+    ``{"type": "output_text", "text": null}``. If the recovery
+    scanner does ``block.get("text", "").startswith(...)``, the
+    ``.get`` returns ``None`` (not ``""``) because the key IS
+    present, and ``None.startswith`` raises ``AttributeError``.
+
+    This was a latent bug that only surfaced once the terminal tool
+    started producing tool-call-only assistant turns at scale.
+
+    **If this regresses** (e.g. someone reverts the ``or ""``
+    guard in ``_recover_spawn_ids_from_history``), this test
+    raises ``AttributeError`` from inside the scanner. A null-text
+    history should be scanned cleanly — the two returned sets are
+    empty because there are no spawn/collect markers in null text.
+    """
+    history = [
+        ConversationItem(
+            id="msg_null_text",
+            type="message",
+            status="completed",
+            response_id="resp_null",
+            created_at=0,
+            data=MessageData(
+                role="assistant",
+                agent="test-agent",
+                # The key fixture: text is explicitly None, not
+                # missing and not empty.
+                content=[{"type": "output_text", "text": None}],
+            ),
+        ),
+    ]
+
+    spawned, collected = _recover_spawn_ids_from_history(history)
+
+    # No spawn/collect markers in null text → both sets empty.
+    assert spawned == set()
+    assert collected == set()
+
+
+def test_recover_spawn_ids_still_finds_auto_collected_markers() -> None:
+    """
+    The null-text guard doesn't break the happy path: auto-collected
+    sub-agent results are still detected.
+
+    **Why this matters alongside the null-text test**: a naive fix
+    that replaced ``text.startswith(...)`` with something like
+    ``(text or "") == ""`` could silently drop real markers. This
+    test ensures the guard only neutralizes null, not actual content.
+    """
+    auto_collected_text = (
+        "[System: auto-collected sub-agent results]\n"
+        '{"results": [{"response_id": "resp_child_123"}]}'
+    )
+    history = [
+        ConversationItem(
+            id="msg_collected",
+            type="message",
+            status="completed",
+            response_id="resp_parent",
+            created_at=0,
+            data=MessageData(
+                role="user",
+                content=[{"type": "input_text", "text": auto_collected_text}],
+            ),
+        ),
+    ]
+
+    _spawned, collected = _recover_spawn_ids_from_history(history)
+
+    # The marker's response_id was found even through the null-text
+    # guard — proves the guard's ``or ""`` only affects None, not
+    # legitimate strings.
+    assert "resp_child_123" in collected
+
+
+# ── conversation_id propagation into ToolContext ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_call_tool_populates_conversation_id_on_tool_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_call_tool`` threads ``conversation_id`` into the ToolContext.
+
+    Regression guard for a bug found manually via TUI: the terminal
+    tool looks up its per-conversation ``TerminalManager`` by
+    ``ctx.conversation_id``, and returns an error if it's ``None``.
+    Before the fix, the workflow built the context without this
+    field, so every ``terminal_run`` invocation returned
+    ``{"status": "error", "error": "terminal tools require a
+    conversation_id on the ToolContext..."}``.
+
+    The test monkeypatches the tool manager so we can observe the
+    ``ToolContext`` the tool actually sees, then verifies the
+    expected conversation_id was present. If the workflow forgets
+    to pass ``conversation_id`` through, the captured context's
+    field is ``None`` and this fails.
+    """
+    from agent_plane.runtime import _globals
+    from agent_plane.tools.base import Tool, ToolContext
+
+    captured: dict[str, ToolContext | None] = {"ctx": None}
+
+    class _CaptureTool(Tool):
+        """Tool that records the ToolContext it was called with."""
+
+        @classmethod
+        def name(cls) -> str:
+            """:returns: ``"capture"`` — the registered tool name."""
+            return "capture"
+
+        @classmethod
+        def description(cls) -> str:
+            """:returns: Tool description (unused in this test)."""
+            return "Capture the ToolContext for assertion."
+
+        def get_schema(self) -> dict[str, Any]:
+            """:returns: Minimal function schema."""
+            return {
+                "type": "function",
+                "function": {
+                    "name": "capture",
+                    "description": "capture",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+
+        def invoke(self, arguments: str, ctx: ToolContext) -> str:
+            """Record ``ctx`` for the test to inspect.
+
+            :param arguments: Unused.
+            :param ctx: The context the workflow built.
+            :returns: A stub string result.
+            """
+            captured["ctx"] = ctx
+            return "captured"
+
+    tool = _CaptureTool()
+
+    class _StubToolManager:
+        """Minimal ToolManager stub with just the methods _call_tool uses."""
+
+        def get_tool(self, name: str) -> Tool | None:
+            """Return the capture tool for any name.
+
+            :param name: Requested tool name (ignored).
+            :returns: The single capture tool.
+            """
+            return tool
+
+        def get_client_tool_schemas(self) -> list[dict[str, Any]]:
+            """:returns: Empty list (no client tools)."""
+            return []
+
+        def call_tool(self, name: str, arguments: str, ctx: ToolContext) -> str:
+            """Forward straight to the tool's invoke.
+
+            :param name: Tool name (unused — one tool registered).
+            :param arguments: JSON args string forwarded to invoke.
+            :param ctx: The context built by the workflow.
+            :returns: The tool's string output.
+            """
+            return tool.invoke(arguments, ctx)
+
+    monkeypatch.setattr(
+        _globals,
+        "_tool_manager_var",
+        _globals.ContextVar("_tool_manager", default=_StubToolManager()),
+    )
+    # Quiet the event-writer side effect — we only care about ctx
+    # capture here, not the SSE stream.
+    monkeypatch.setattr(
+        "agent_plane.runtime.workflow._write_output",
+        lambda task_id, event: None,
+    )
+
+    # Use a RetryConfig with zero retries so a single call captures
+    # the context and returns.
+    from agent_plane.spec.types import RetryConfig
+
+    await _call_tool(
+        task_id="task_test_conv_id",
+        agent_id="ag_test",
+        tool_name="capture",
+        arguments="{}",
+        timeout=10,
+        retry_config=RetryConfig(max_attempts=1),
+        workspace_path=None,
+        call_id="call_1",
+        conversation_id="conv_expected_id_123",
+    )
+
+    assert captured["ctx"] is not None, (
+        "Tool was never invoked — the workflow's tool dispatch "
+        "didn't route to our stubbed manager."
+    )
+    # The only assertion that matters: conversation_id flowed
+    # through. If None, the workflow dropped it somewhere between
+    # the signature and ``ToolContext(...)``.
+    assert captured["ctx"].conversation_id == "conv_expected_id_123", (
+        f"Expected conversation_id='conv_expected_id_123' on "
+        f"ToolContext, got {captured['ctx'].conversation_id!r}. "
+        f"The terminal tool relies on this field; dropping it "
+        f"breaks every terminal_run invocation with a "
+        f"'terminal tools require a conversation_id' error."
+    )
+    # Sanity: the other threaded fields made it through too, so we
+    # know the test isn't passing because ALL fields are wrong.
+    assert captured["ctx"].task_id == "task_test_conv_id"
+    assert captured["ctx"].agent_id == "ag_test"

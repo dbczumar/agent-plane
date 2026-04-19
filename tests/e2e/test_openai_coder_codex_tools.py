@@ -2,12 +2,12 @@
 
 The openai-coder agent has ``codex:Shell`` and ``codex:ApplyPatch`` as
 server-side builtins routed through the Codex MCP server — a subprocess
-running ``codex mcp-server``.  These are NOT ``code_sandbox``; they are
+running ``codex mcp-server``.  These are NOT ``terminal_run``; they are
 independent MCP tools that manage their own workspace.
 
 This test verifies that the agent can use the ``codex`` MCP tool to run
 shell commands and create files, proving the Codex MCP integration works
-end-to-end without any client-side tools or code_sandbox.
+end-to-end without any client-side tools or terminal_run.
 
 Usage::
 
@@ -106,7 +106,7 @@ def test_openai_coder_uses_codex_shell(
     """
     The openai-coder agent uses the codex MCP tool to run a shell
     command, proving codex:Shell works as a server-side MCP tool
-    independent of code_sandbox.
+    independent of terminal_run.
 
     No client-side tools are passed — the agent can ONLY use its
     built-in codex MCP tools and web search.

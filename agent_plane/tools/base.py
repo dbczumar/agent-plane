@@ -40,14 +40,22 @@ class ToolContext:
     :param agent_id: The registered agent ID,
         e.g. ``"ag_xyz789"``.
     :param workspace: Per-conversation persistent working
-        directory. ``code_sandbox`` uses it as subprocess cwd,
-        ``upload_file`` resolves paths against it. ``None``
-        when no workspace is available (e.g. tests).
+        directory. ``terminal_run`` uses it as its shells' cwd
+        (and writable sandbox root); ``upload_file`` resolves
+        paths against it. ``None`` when no workspace is
+        available (e.g. tests).
+    :param conversation_id: The current conversation's ID,
+        e.g. ``"conv_abc123"``. Used by conversation-scoped
+        tools (e.g. the terminal tool, which looks up its
+        per-conversation ``TerminalManager`` by this id).
+        ``None`` when not available (older workflow paths,
+        unit tests) — tools that require it should fail loud.
     """
 
     task_id: str
     agent_id: str
     workspace: Path | None = None
+    conversation_id: str | None = None
 
 
 class Tool(abc.ABC):

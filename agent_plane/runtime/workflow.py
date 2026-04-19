@@ -1375,6 +1375,7 @@ async def _call_tool(
     retry_config: RetryConfig,
     workspace_path: str | None = None,
     call_id: str | None = None,
+    conversation_id: str | None = None,
 ) -> str:
     """
     Route a tool call to the current workflow's ToolManager
@@ -1414,6 +1415,13 @@ async def _call_tool(
         invocation, recorded on the span as ``tool.call_id``.
         ``None`` when called from code paths that don't track
         call IDs (legacy callers).
+    :param conversation_id: The conversation that owns this
+        tool call. Populated on the :class:`ToolContext` so
+        conversation-scoped tools (e.g. the terminal tool,
+        which looks up its per-conversation
+        ``TerminalManager`` by id) can function. ``None`` for
+        legacy callers that don't track it; tools requiring it
+        must fail loud in that case.
     :returns: The tool's string result, or an error string
         if all retries are exhausted.
     """
@@ -1424,7 +1432,12 @@ async def _call_tool(
         """Execute the tool call in a thread."""
         mgr = get_tool_manager()
         ws = Path(workspace_path) if workspace_path else None
-        ctx = ToolContext(task_id=task_id, agent_id=agent_id, workspace=ws)
+        ctx = ToolContext(
+            task_id=task_id,
+            agent_id=agent_id,
+            workspace=ws,
+            conversation_id=conversation_id,
+        )
         tool = mgr.get_tool(tool_name)
         # Inject client-side tool schemas into spawn arguments so
         # sub-agents know which client tools are available.
@@ -1950,9 +1963,13 @@ def _build_assistant_item(
         "filename": "chart.png", "content_type": "image/png"}]``.
     :returns: A NewConversationItem ready for persistence.
     """
+    # Coerce None → "" here so we never persist null text on an
+    # assistant message. Null text breaks the next turn's input
+    # because OpenAI's Responses API rejects input messages whose
+    # content blocks have null text. Empty string is accepted.
     output_text_block: dict[str, Any] = {
         "type": "output_text",
-        "text": text,
+        "text": text if text is not None else "",
     }
     if annotations:
         output_text_block["annotations"] = annotations
@@ -2210,6 +2227,7 @@ async def _execute_tools(
                 tools_config.timeout,
                 tools_config.retry,
                 workspace_path=workspace_path,
+                conversation_id=conversation_id,
             )
         )
         for tc in tool_calls
@@ -2457,7 +2475,11 @@ def _recover_spawn_ids_from_history(
             for block in item.data.content:
                 if not isinstance(block, dict):
                     continue
-                text = block.get("text", "")
+                # `.get("text", "")` returns None (not "") if the key
+                # is present but null — common when the LLM produces a
+                # pure tool-call response with no accompanying text. The
+                # `or ""` coerces None to "" for the startswith check.
+                text = block.get("text") or ""
                 if not text.startswith("[System: auto-collected"):
                     continue
                 json_part = text.split("\n", 1)
@@ -3622,6 +3644,7 @@ def _build_executor_context(
         task_id=task_id,
         agent_id=agent_id,
         workspace=workspace,
+        conversation_id=conversation_id,
     )
     server_names = frozenset(tool_mgr.get_tool_names())
 

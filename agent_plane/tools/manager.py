@@ -125,17 +125,20 @@ class ToolManager:
         Register built-in tools declared in ``tools.builtins``.
 
         Most tools are looked up in the built-in registry and
-        instantiated with spec-level config. ``code_sandbox`` and
-        ``upload_file`` are handled specially — they need sandbox
-        capability flags from ToolManager.
+        instantiated with spec-level config. Some (``web_search``,
+        ``web_fetch``, ``introspect``, ``upload_file``) need
+        runtime context the registry doesn't have and are
+        dispatched through :meth:`_create_builtin` instead.
         """
         for entry in self._spec.tools.builtins:
             tool = self._create_builtin(entry.name, entry.config)
             if tool is None:
                 _logger.warning(
                     "Unknown built-in tool %r — skipping. "
-                    "Available: web_search, code_sandbox, upload_file, "
-                    "search_conversations, list_files, download_file",
+                    "Available: web_search, web_fetch, introspect, "
+                    "terminal_run, terminal_list, terminal_close, "
+                    "upload_file, list_files, download_file, "
+                    "search_conversations, export_agent",
                     entry.name,
                 )
                 continue
@@ -159,8 +162,6 @@ class ToolManager:
             return self._create_web_fetch()
         if name == "introspect":
             return self._create_introspect()
-        if name == "code_sandbox":
-            return self._create_code_sandbox()
         if name == "upload_file":
             from agent_plane.tools.builtins.upload_file import UploadFileTool
 
@@ -205,19 +206,6 @@ class ToolManager:
         from agent_plane.tools.builtins.introspect import IntrospectTool
 
         return IntrospectTool(spec=self._spec)
-
-    def _create_code_sandbox(self) -> Tool:
-        """
-        Build a CodeSandboxTool with runtime capability flags.
-
-        :returns: A CodeSandboxTool with srt/sandbox settings.
-        """
-        from agent_plane.tools.builtins.code_sandbox import CodeSandboxTool
-
-        return CodeSandboxTool(
-            srt_available=self._srt_available,
-            sandbox_enabled=self._sandbox_enabled,
-        )
 
     def _register_sub_agent_tools(self) -> None:
         """

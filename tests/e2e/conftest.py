@@ -31,6 +31,7 @@ _CODER_DIR = _REPO_ROOT / "examples" / "agents" / "coder"
 _ARCHER_DIR = _REPO_ROOT / "examples" / "agents" / "archer"
 _CLAUDE_CODER_DIR = _REPO_ROOT / "examples" / "agents" / "claude-coder"
 _OPENAI_CODER_DIR = _REPO_ROOT / "examples" / "agents" / "openai-coder"
+_TERMINAL_TEST_DIR = _REPO_ROOT / "examples" / "agents" / "terminal_test"
 
 
 def find_free_port() -> int:
@@ -213,6 +214,22 @@ def archer_agent(http_client: httpx.Client) -> str:
     :returns: The agent name, e.g. ``"archer"``.
     """
     return _upload_agent(http_client, _ARCHER_DIR)
+
+
+@pytest.fixture(scope="session")
+def terminal_test_agent(http_client: httpx.Client) -> str:
+    """
+    Upload the terminal-test agent and return its name.
+
+    The terminal-test agent has only the three persistent-terminal
+    builtins (``terminal_run``, ``terminal_list``, ``terminal_close``)
+    — nothing else that could do shell-like work. Used to e2e-test
+    those tools without LLM ambiguity over which tool to pick.
+
+    :param http_client: HTTP client pointed at the server.
+    :returns: The agent name, ``"terminal_test"``.
+    """
+    return _upload_agent(http_client, _TERMINAL_TEST_DIR)
 
 
 @pytest.fixture(scope="session")

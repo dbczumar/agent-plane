@@ -82,17 +82,17 @@ def test_researcher_inherits_parent_model() -> None:
     )
 
 
-def test_researcher_has_code_sandbox() -> None:
+def test_researcher_has_terminal_run() -> None:
     """
-    The researcher must have code_sandbox as its tool — without it,
+    The researcher must have terminal_run as its tool — without it,
     the sub-agent can't execute scripts to fetch web content.
     """
     parent = _make_parent_spec()
     tool = WebFetchTool(parent_spec=parent)
     researcher = tool.researcher_spec
     builtin_names = [b.name for b in researcher.tools.builtins]
-    assert "code_sandbox" in builtin_names, (
-        f"Researcher must have code_sandbox, got {builtin_names}."
+    assert "terminal_run" in builtin_names, (
+        f"Researcher must have terminal_run, got {builtin_names}."
     )
 
 

@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from agent_plane.entities import Conversation, ConversationItem
 from agent_plane.errors import AgentPlaneError, ErrorCode
+from agent_plane.runtime import get_terminal_registry
 from agent_plane.server.schemas import (
     ConversationDeleted,
     ConversationObject,
@@ -233,6 +234,11 @@ def create_conversations_router(
         if conv is None:
             raise AgentPlaneError("Conversation not found", code=ErrorCode.NOT_FOUND)
         await task_store.delete_all(conversation_id=conversation_id)
+        # Terminal cleanup: kill any bash subprocesses this conversation
+        # spawned so they don't outlive the conversation row. Synchronous
+        # direct call — agent-plane has no hook/event system; this is
+        # the documented wiring point from §6.9.
+        get_terminal_registry().cleanup_conversation(conversation_id)
         deleted = await conversation_store.delete_conversation(conversation_id)
         if not deleted:
             raise AgentPlaneError("Conversation not found", code=ErrorCode.NOT_FOUND)

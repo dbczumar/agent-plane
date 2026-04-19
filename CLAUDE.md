@@ -1,5 +1,55 @@
 # Agent-Plane Project Instructions
 
+## 🚨 CRITICAL: Project Skills — MUST BE LOADED AND USED
+
+**Before writing ANY code or tests in this repo, you MUST load the relevant
+project skills. This is NOT optional. Skills are where project-specific
+conventions, antipatterns, and battle-tested rules live — the review
+subagents check against them, and failing to load them ahead of time
+means your work WILL be flagged in review and will need rework.**
+
+### When to load which skill
+
+| Activity | Skill to load |
+|---|---|
+| Writing ANY production code | `agent-plane-dev` |
+| Writing or modifying ANY test | `agent-plane-testing` |
+| Debugging the TUI | `tui-debug` |
+| Setting up Claude API / SDK code | `claude-api` |
+
+**Loading is mandatory at the START of the task, not after the review
+catches a violation.** The skills contain rules that don't appear in
+this CLAUDE.md file (e.g. concrete examples of fake tests, the three-
+level docstring requirements, the MagicMock-ban exceptions). Running
+review subagents without having read the skills first is strictly
+backwards — the skills tell you how to write the code right the first
+time.
+
+### How to load a skill
+
+Invoke it via the Skill tool at the start of the relevant work:
+
+```
+Skill(skill="agent-plane-dev")
+Skill(skill="agent-plane-testing")
+```
+
+The skill's contents come back as context. Read them. Then do the work.
+
+### Why this matters
+
+Historical evidence: tests written without loading `agent-plane-testing`
+first were flagged by review for fake concurrency tests, duplicate
+coverage, MagicMock-where-real-types-exist, and missing assertion
+documentation. All of these are explicitly called out in the skill. If
+the skill had been loaded first, the flags would not have happened.
+
+**The mandatory review subagents run AFTER implementation to catch what
+you missed. The skills tell you what to write so there's nothing to
+catch. Load first, write second, review last.**
+
+---
+
 ## Design Principles — MUST ADHERE
 
 **🚨 CRITICAL: Read and follow [designs/DESIGN_PRINCIPLES.md](designs/DESIGN_PRINCIPLES.md)

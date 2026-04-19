@@ -1,0 +1,27 @@
+spec_version: 1
+
+name: terminal_test
+description: >
+  Minimal agent for e2e-testing the persistent-terminal builtins
+  (terminal_run, terminal_list, terminal_close). Has no other
+  shell-family tools so tests can be sure which tool the LLM used.
+
+llm:
+  model: gpt-5.4
+  reasoning_effort: low
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  timeout: 120
+  builtins:
+    - terminal_run
+    - terminal_list
+    - terminal_close
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md
