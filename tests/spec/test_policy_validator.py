@@ -40,10 +40,13 @@ def _write_config(agent_dir: Path, config_yaml: str) -> Path:
 def test_validate_passes_without_guardrails(agent_dir: Path) -> None:
     """Existing validator path still green when `guardrails:`
     is absent — regression guard for the AgentSpec extension."""
-    _write_config(agent_dir, """
+    _write_config(
+        agent_dir,
+        """
 spec_version: 1
 name: no-guardrails
-""")
+""",
+    )
     result = validate(parse(agent_dir))
     # Empty errors list means valid; no assertion-depth
     # concerns here because ``.errors`` IS the value under
@@ -55,7 +58,9 @@ name: no-guardrails
 def test_validate_passes_with_full_guardrails(agent_dir: Path) -> None:
     """Full guardrails block with labels + all three policy
     types parses AND validates cleanly."""
-    _write_config(agent_dir, """
+    _write_config(
+        agent_dir,
+        """
 spec_version: 1
 name: full-guardrails
 guardrails:
@@ -82,7 +87,8 @@ guardrails:
         path: myorg.policies.rate_limit
         arguments: {limit: 10}
   ask_timeout: 30
-""")
+""",
+    )
     spec = parse(agent_dir)
     # Sanity: the parse produced the guardrails we expect —
     # if this assertion fails, the validator failure below
@@ -96,8 +102,7 @@ guardrails:
     # which rule, and decide whether to reject earlier (in
     # the parser) or relax the validator.
     assert result.errors == [], (
-        f"Expected validate() to pass on a spec that parsed "
-        f"cleanly. Errors: {result.errors}"
+        f"Expected validate() to pass on a spec that parsed cleanly. Errors: {result.errors}"
     )
 
 
@@ -105,11 +110,14 @@ def test_validate_passes_with_empty_guardrails_block(agent_dir: Path) -> None:
     """``guardrails: {}`` → validator still green. The block
     is allowed to be empty (no labels / no policies) —
     agents may opt into guardrails incrementally."""
-    _write_config(agent_dir, """
+    _write_config(
+        agent_dir,
+        """
 spec_version: 1
 name: empty-guardrails
 guardrails: {}
-""")
+""",
+    )
     spec = parse(agent_dir)
     assert spec.guardrails is not None
     # ask_timeout defaulted, labels/policies absent.
@@ -126,7 +134,9 @@ def test_validate_does_not_create_errors_on_policy_names(agent_dir: Path) -> Non
     tied to names; if this test starts failing, someone added
     a names-related validator rule without updating the
     parser to reject duplicates first."""
-    _write_config(agent_dir, """
+    _write_config(
+        agent_dir,
+        """
 spec_version: 1
 name: named-policies
 guardrails:
@@ -139,6 +149,7 @@ guardrails:
       type: label
       on: [input]
       action: allow
-""")
+""",
+    )
     result = validate(parse(agent_dir))
     assert result.errors == []

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -24,6 +24,13 @@ class Conversation:
     :param kind: Conversation type. ``"default"`` for
         user-initiated, ``"sub_agent"`` for sub-agent
         execution conversations.
+    :param labels: Session-scoped guardrails labels persisted
+        in ``conversation_labels``. Populated by
+        :meth:`ConversationStore.get_conversation` via a JOIN;
+        empty dict when no labels have been written yet. Labels
+        survive conversation_items compaction by design
+        (POLICIES.md §6.3) — the two tables are
+        independent.
     """
 
     id: str
@@ -31,6 +38,7 @@ class Conversation:
     updated_at: int
     title: str | None = None
     kind: str = "default"
+    labels: dict[str, str] = field(default_factory=dict)
 
 
 # ── Conversation item data types ───────────────────────

@@ -219,6 +219,51 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def set_labels(
+        self,
+        conversation_id: str,
+        updates: dict[str, str],
+        updated_at: int | None = None,
+    ) -> None:
+        """
+        Upsert guardrails labels on a conversation.
+
+        Atomic batched UPSERT: either every key in *updates*
+        lands, or none of them do (matches POLICIES.md §6.3).
+        Overwrites existing rows for the same keys;
+        non-mentioned keys are left untouched. The caller is
+        responsible for schema validation (``values`` /
+        ``monotonic``) — the store persists whatever it's
+        given (see POLICIES.md §9.2 + §13 where that
+        validation lives in ``PolicyEngine.apply_label_writes``).
+
+        Callers that need "insert only if missing" semantics
+        (initial-value seeding — POLICIES.md §10) should check
+        ``conversation.labels`` first and filter the updates
+        to keys not already present; this method always
+        overwrites.
+
+        :param conversation_id: The conversation to update,
+            e.g. ``"conv_abc123"``. If the conversation does
+            not exist, behavior is implementation-defined
+            (typically raises via the FK constraint).
+        :param updates: Mapping from label key to new value.
+            Both keys and values must already be strings
+            (string coercion happens upstream at spec load).
+            Example: ``{"integrity": "0", "sensitivity": "confidential"}``.
+            Empty dict is a no-op.
+        :param updated_at: Unix epoch seconds to stamp on the
+            affected rows. ``None`` (default) → the store
+            records the current time. The caller-supplied form
+            is there for the policy engine to pass its
+            evaluation timestamp (POLICIES.md §6.3), keeping
+            audit trails aligned with the enforcement site
+            rather than wall-clock drift between evaluate()
+            and the actual DB write.
+        """
+        ...
+
+    @abstractmethod
     async def delete_conversation(self, conversation_id: str) -> bool:
         """
         Delete a conversation and all its items.

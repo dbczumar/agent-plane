@@ -271,3 +271,45 @@ class SqlPendingToolCall(Base):
         Index("ix_pending_tool_calls_root_task_id", "root_task_id"),
         Index("ix_pending_tool_calls_task_id", "task_id"),
     )
+
+
+class SqlConversationLabel(Base):
+    """
+    SQLAlchemy model for the ``conversation_labels`` table.
+
+    One row per (conversation, label-key) pair. Labels live in
+    a dedicated table rather than a JSON column on
+    ``conversations`` so per-key UPDATEs are atomic without
+    read-modify-write (see POLICIES.md §6). The table is keyed
+    only by ``conversation_id`` + ``key``, so it is untouched
+    by compaction (which rewrites ``conversation_items``) —
+    labels set turn 3 still exist turn 20 even after the
+    earlier turns have been folded into a summary.
+
+    :param conversation_id: The conversation this label belongs
+        to. Composite PK member. Deleted with the conversation
+        via ``ON DELETE CASCADE``.
+    :param key: The label key, e.g. ``"integrity"``,
+        ``"sensitivity"``. Composite PK member.
+    :param value: The label value as a string, e.g. ``"0"``,
+        ``"confidential"``. All label values are string-typed
+        regardless of what the YAML author wrote — the parser
+        coerces scalar / list values during spec load
+        (POLICIES.md §14).
+    :param updated_at: Unix epoch seconds of the last write.
+        Single timestamp for each row; on UPSERT the row's
+        timestamp is refreshed even when the value is
+        unchanged (matches omniagents parity and keeps
+        debugging timelines accurate).
+    """
+
+    __tablename__ = "conversation_labels"
+
+    conversation_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[str] = mapped_column(String(256))
+    updated_at: Mapped[int] = mapped_column(Integer)

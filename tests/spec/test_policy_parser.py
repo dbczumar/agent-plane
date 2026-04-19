@@ -108,7 +108,7 @@ def test_parse_guardrails_ask_timeout_non_integer_rejected() -> None:
 
 def test_parse_labels_bare_string_shorthand() -> None:
     """`integrity: "1"` → LabelDef(initial="1", values=None)."""
-    spec = _parse_guardrails(_yaml("labels: {integrity: \"1\"}"))
+    spec = _parse_guardrails(_yaml('labels: {integrity: "1"}'))
     assert spec is not None and spec.labels is not None
     d = spec.labels["integrity"]
     # Bare-string shorthand sets only `initial`; no schema declared.
@@ -119,13 +119,15 @@ def test_parse_labels_bare_string_shorthand() -> None:
 
 def test_parse_labels_schema_with_initial() -> None:
     """Full-schema dict: initial + values + monotonic all land."""
-    spec = _parse_guardrails(_yaml("""
+    spec = _parse_guardrails(
+        _yaml("""
 labels:
   sensitivity:
     initial: public
     values: [public, internal, confidential]
     monotonic: increasing
-"""))
+""")
+    )
     assert spec is not None and spec.labels is not None
     d = spec.labels["sensitivity"]
     assert d.initial == "public"
@@ -136,11 +138,13 @@ labels:
 def test_parse_labels_schema_without_initial() -> None:
     """`{values: [...], monotonic: ...}` without initial —
     label is unset until a policy writes it (§10)."""
-    spec = _parse_guardrails(_yaml("""
+    spec = _parse_guardrails(
+        _yaml("""
 labels:
   role:
     values: [admin, user]
-"""))
+""")
+    )
     assert spec is not None and spec.labels is not None
     d = spec.labels["role"]
     assert d.initial is None
@@ -160,43 +164,51 @@ def test_parse_labels_empty_dict_rejected() -> None:
 def test_parse_labels_monotonic_without_values_rejected() -> None:
     """`monotonic` without `values` has no positions to order."""
     with pytest.raises(AgentPlaneError, match="monotonic.*requires a .values. list"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 labels:
   bad:
     monotonic: increasing
-"""))
+""")
+        )
 
 
 def test_parse_labels_initial_not_in_values_rejected() -> None:
     """`initial: "5"` with `values: ["1", "2"]` → fail at load."""
     with pytest.raises(AgentPlaneError, match="initial.*not in declared .values."):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 labels:
   level:
     initial: "5"
     values: ["1", "2"]
-"""))
+""")
+        )
 
 
 def test_parse_labels_monotonic_unknown_direction_rejected() -> None:
     """`monotonic: up` → clear error listing the two valid values."""
     with pytest.raises(AgentPlaneError, match="must be 'increasing' or 'decreasing'"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 labels:
   x:
     values: ["0", "1"]
     monotonic: up
-"""))
+""")
+        )
 
 
 def test_parse_labels_values_non_list_rejected() -> None:
     """`values: 1` → clear error (must be a list)."""
     with pytest.raises(AgentPlaneError, match="values. must be a list"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 labels:
   x:
     values: 1
-"""))
+""")
+        )
 
 
 # ── Policy types — FunctionPolicy ──────────────────────────
@@ -204,13 +216,15 @@ labels:
 
 def test_parse_function_policy_short_form() -> None:
     """Bare-string `function:` path → FunctionRef with no arguments."""
-    spec = _parse_guardrails(_yaml("""
+    spec = _parse_guardrails(
+        _yaml("""
 policies:
   simple:
     type: function
     on: [input]
     function: myorg.policies.check
-"""))
+""")
+    )
     assert spec is not None and spec.policies is not None
     p = spec.policies[0]
     assert isinstance(p, FunctionPolicySpec)
@@ -222,7 +236,8 @@ policies:
 
 def test_parse_function_policy_dict_form_with_arguments() -> None:
     """`function: {path, arguments}` → factory form."""
-    spec = _parse_guardrails(_yaml("""
+    spec = _parse_guardrails(
+        _yaml("""
 policies:
   rate:
     type: function
@@ -231,7 +246,8 @@ policies:
       path: myorg.policies.rate_limit
       arguments:
         limit: 10
-"""))
+""")
+    )
     assert spec is not None and spec.policies is not None
     p = spec.policies[0]
     assert isinstance(p, FunctionPolicySpec)
@@ -244,31 +260,36 @@ policies:
 def test_parse_function_policy_missing_function_rejected() -> None:
     """Function policy without `function:` field → loud error."""
     with pytest.raises(AgentPlaneError, match="function. policies require"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 policies:
   broken:
     type: function
     on: [input]
-"""))
+""")
+        )
 
 
 def test_parse_function_policy_dict_missing_path_rejected() -> None:
     """`function: {arguments: {...}}` (no path) → loud error."""
     with pytest.raises(AgentPlaneError, match="function.path. must be a"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 policies:
   broken:
     type: function
     on: [input]
     function:
       arguments: {limit: 1}
-"""))
+""")
+        )
 
 
 def test_parse_function_policy_arguments_non_dict_rejected() -> None:
     """`function.arguments: [1, 2]` → loud error."""
     with pytest.raises(AgentPlaneError, match="function.arguments. must be a mapping"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 policies:
   broken:
     type: function
@@ -276,19 +297,22 @@ policies:
     function:
       path: myorg.x
       arguments: [1, 2]
-"""))
+""")
+        )
 
 
 def test_parse_function_policy_optional_action_list() -> None:
     """`action: [allow, deny]` declares the whitelist."""
-    spec = _parse_guardrails(_yaml("""
+    spec = _parse_guardrails(
+        _yaml("""
 policies:
   p:
     type: function
     on: [tool_call]
     function: myorg.p.check
     action: [allow, deny]
-"""))
+""")
+    )
     assert spec is not None and spec.policies is not None
     p = spec.policies[0]
     assert isinstance(p, FunctionPolicySpec)
@@ -297,13 +321,15 @@ policies:
 
 def test_parse_function_policy_action_omitted_is_none() -> None:
     """No `action:` → `None` (accept any action)."""
-    spec = _parse_guardrails(_yaml("""
+    spec = _parse_guardrails(
+        _yaml("""
 policies:
   p:
     type: function
     on: [input]
     function: myorg.p.check
-"""))
+""")
+    )
     assert spec is not None and spec.policies is not None
     p = spec.policies[0]
     assert isinstance(p, FunctionPolicySpec)
@@ -315,13 +341,15 @@ policies:
 
 def test_parse_prompt_policy_minimal() -> None:
     """Default action list is [allow, deny] per §9.2 default."""
-    spec = _parse_guardrails(_yaml("""
+    spec = _parse_guardrails(
+        _yaml("""
 policies:
   canada:
     type: prompt
     on: [input]
     prompt: Deny if user mentions Canada.
-"""))
+""")
+    )
     assert spec is not None and spec.policies is not None
     p = spec.policies[0]
     assert isinstance(p, PromptPolicySpec)
@@ -335,7 +363,8 @@ policies:
 def test_parse_prompt_policy_classifier_only() -> None:
     """`action: [allow]` declares a classifier that never blocks
     (carve-out in §13 — LLM failures substitute ALLOW)."""
-    spec = _parse_guardrails(_yaml("""
+    spec = _parse_guardrails(
+        _yaml("""
 policies:
   classify:
     type: prompt
@@ -343,7 +372,8 @@ policies:
     action: [allow]
     set_labels: [sensitivity]
     prompt: Classify document sensitivity.
-"""))
+""")
+    )
     assert spec is not None and spec.policies is not None
     p = spec.policies[0]
     assert isinstance(p, PromptPolicySpec)
@@ -353,7 +383,8 @@ policies:
 
 def test_parse_prompt_policy_with_llm_override() -> None:
     """Per-policy `llm:` override parses into nested LLMConfig."""
-    spec = _parse_guardrails(_yaml("""
+    spec = _parse_guardrails(
+        _yaml("""
 policies:
   p:
     type: prompt
@@ -362,7 +393,8 @@ policies:
     llm:
       model: anthropic/claude-haiku-4-5
       request_timeout: 10
-"""))
+""")
+    )
     assert spec is not None and spec.policies is not None
     p = spec.policies[0]
     assert isinstance(p, PromptPolicySpec)
@@ -375,24 +407,28 @@ policies:
 def test_parse_prompt_policy_missing_prompt_rejected() -> None:
     """PromptPolicy without a prompt is meaningless → loud error."""
     with pytest.raises(AgentPlaneError, match="prompt. policies require a non-empty"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 policies:
   p:
     type: prompt
     on: [input]
-"""))
+""")
+        )
 
 
 def test_parse_prompt_policy_empty_prompt_rejected() -> None:
     """Whitespace-only prompt also rejected."""
     with pytest.raises(AgentPlaneError, match="non-empty"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 policies:
   p:
     type: prompt
     on: [input]
     prompt: "   "
-"""))
+""")
+        )
 
 
 # ── Policy types — LabelPolicy ─────────────────────────────
@@ -400,7 +436,8 @@ policies:
 
 def test_parse_label_policy_minimal_deny() -> None:
     """Label policy with action=deny + reason."""
-    spec = _parse_guardrails(_yaml("""
+    spec = _parse_guardrails(
+        _yaml("""
 policies:
   block_shell:
     type: label
@@ -409,7 +446,8 @@ policies:
       integrity: "0"
     action: deny
     reason: Untrusted content plus shell is disallowed.
-"""))
+""")
+    )
     assert spec is not None and spec.policies is not None
     p = spec.policies[0]
     assert isinstance(p, LabelPolicySpec)
@@ -421,7 +459,8 @@ policies:
 def test_parse_label_policy_sets_labels() -> None:
     """`type: label` with `set_labels:` — the canonical
     taint pattern from §9.3."""
-    spec = _parse_guardrails(_yaml("""
+    spec = _parse_guardrails(
+        _yaml("""
 policies:
   taint_web:
     type: label
@@ -429,7 +468,8 @@ policies:
     action: allow
     set_labels:
       integrity: "0"
-"""))
+""")
+    )
     assert spec is not None and spec.policies is not None
     p = spec.policies[0]
     assert isinstance(p, LabelPolicySpec)
@@ -444,12 +484,14 @@ def test_parse_label_policy_missing_action_rejected() -> None:
     Without this rejection, a label policy would silently
     never fire."""
     with pytest.raises(AgentPlaneError, match="label. policies require an .action"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 policies:
   bad:
     type: label
     on: [input]
-"""))
+""")
+        )
 
 
 def test_parse_label_policy_invalid_action_rejected() -> None:
@@ -457,26 +499,30 @@ def test_parse_label_policy_invalid_action_rejected() -> None:
     coercion (defaulting to ALLOW, etc.) would make typos
     invisible and let broken specs reach runtime."""
     with pytest.raises(AgentPlaneError, match="must be one of"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 policies:
   bad:
     type: label
     on: [input]
     action: bogus
-"""))
+""")
+        )
 
 
 def test_parse_label_policy_set_labels_non_mapping_rejected() -> None:
     """Label policy `set_labels` must be a dict, not a list."""
     with pytest.raises(AgentPlaneError, match="set_labels. must be a mapping"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 policies:
   bad:
     type: label
     on: [input]
     action: allow
     set_labels: [integrity]
-"""))
+""")
+        )
 
 
 # ── `on:` selector parsing ─────────────────────────────────
@@ -484,13 +530,15 @@ policies:
 
 def test_parse_on_wildcard() -> None:
     """`on: [tool_call]` → wildcard for the phase."""
-    spec = _parse_guardrails(_yaml("""
+    spec = _parse_guardrails(
+        _yaml("""
 policies:
   p:
     type: label
     on: [tool_call]
     action: allow
-"""))
+""")
+    )
     p = spec.policies[0]
     assert len(p.on) == 1
     # Wildcard selector — no tool_name narrows.
@@ -500,13 +548,15 @@ policies:
 
 def test_parse_on_narrowed_by_tool_name() -> None:
     """`tool_call:web_search` → narrowed selector."""
-    spec = _parse_guardrails(_yaml("""
+    spec = _parse_guardrails(
+        _yaml("""
 policies:
   p:
     type: label
     on: [tool_call:web_search]
     action: allow
-"""))
+""")
+    )
     sel = spec.policies[0].on[0]
     assert sel.phase == Phase.TOOL_CALL
     assert sel.tool_name == "web_search"
@@ -514,13 +564,15 @@ policies:
 
 def test_parse_on_multi_phase() -> None:
     """Multiple entries produce one selector each."""
-    spec = _parse_guardrails(_yaml("""
+    spec = _parse_guardrails(
+        _yaml("""
 policies:
   p:
     type: label
     on: [input, output]
     action: allow
-"""))
+""")
+    )
     phases = [s.phase for s in spec.policies[0].on]
     assert phases == [Phase.INPUT, Phase.OUTPUT]
 
@@ -528,61 +580,71 @@ policies:
 def test_parse_on_empty_list_rejected() -> None:
     """`on: []` → rejected at spec load (§13 — never fires)."""
     with pytest.raises(AgentPlaneError, match="must contain at least one"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 policies:
   p:
     type: label
     on: []
     action: allow
-"""))
+""")
+        )
 
 
 def test_parse_on_unknown_phase_rejected() -> None:
     """Unknown phase name → clear error naming the offender."""
     with pytest.raises(AgentPlaneError, match="unknown phase"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 policies:
   p:
     type: label
     on: [middle]
     action: allow
-"""))
+""")
+        )
 
 
 def test_parse_on_tool_narrowing_on_input_rejected() -> None:
     """`input:foo` is meaningless — tool filters only on tool_call / tool_result."""
     with pytest.raises(AgentPlaneError, match="cannot be narrowed by tool name"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 policies:
   p:
     type: label
     on: ["input:foo"]
     action: allow
-"""))
+""")
+        )
 
 
 def test_parse_on_empty_tool_name_rejected() -> None:
     """`tool_call:` (trailing colon, no name) → clear error."""
     with pytest.raises(AgentPlaneError, match="empty tool name"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 policies:
   p:
     type: label
     on: ["tool_call:"]
     action: allow
-"""))
+""")
+        )
 
 
 def test_parse_on_non_list_rejected() -> None:
     """`on: tool_call` (bare string, not list) → loud error."""
     with pytest.raises(AgentPlaneError, match="must be a list"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 policies:
   p:
     type: label
     on: tool_call
     action: allow
-"""))
+""")
+        )
 
 
 # ── Policy defaults + ordering ─────────────────────────────
@@ -591,12 +653,14 @@ policies:
 def test_parse_policy_default_on_is_input_and_output() -> None:
     """When `on:` is omitted, parser defaults to input + output
     (POLICIES.md §3.1)."""
-    spec = _parse_guardrails(_yaml("""
+    spec = _parse_guardrails(
+        _yaml("""
 policies:
   p:
     type: prompt
     prompt: Test.
-"""))
+""")
+    )
     phases = [s.phase for s in spec.policies[0].on]
     # §3.1 declared default — classifier phases.
     assert phases == [Phase.INPUT, Phase.OUTPUT]
@@ -607,7 +671,8 @@ def test_parse_policies_preserve_yaml_order() -> None:
     order — the engine iterates in this order per §4. If
     this breaks, DENY short-circuiting and ASK ordering
     would both silently reorder."""
-    spec = _parse_guardrails(_yaml("""
+    spec = _parse_guardrails(
+        _yaml("""
 policies:
   first:
     type: label
@@ -621,7 +686,8 @@ policies:
     type: label
     on: [input]
     action: allow
-"""))
+""")
+    )
     names = [p.name for p in spec.policies]
     assert names == ["first", "second", "third"]
 
@@ -629,12 +695,14 @@ policies:
 def test_parse_policy_unknown_type_rejected() -> None:
     """`type: weird` → clear error listing the three accepted values."""
     with pytest.raises(AgentPlaneError, match="must be 'function', 'prompt', or 'label'"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 policies:
   p:
     type: weird
     on: [input]
-"""))
+""")
+        )
 
 
 def test_parse_policy_missing_type_rejected() -> None:
@@ -642,11 +710,13 @@ def test_parse_policy_missing_type_rejected() -> None:
     uses it to pick the concrete `PolicySpec` subclass. A
     missing type is an unfinished edit, not a default."""
     with pytest.raises(AgentPlaneError, match="missing required field .type"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 policies:
   p:
     on: [input]
-"""))
+""")
+        )
 
 
 # ── Per-policy `ask_timeout` override ──────────────────────
@@ -657,14 +727,16 @@ def test_parse_per_policy_ask_timeout() -> None:
     its own field — validates the per-policy override wiring
     lands on `PolicySpec.ask_timeout`. Needed so `_await_policy_approval`
     can read the override off the deciding policy's spec."""
-    spec = _parse_guardrails(_yaml("""
+    spec = _parse_guardrails(
+        _yaml("""
 policies:
   long_review:
     type: label
     on: [output]
     action: ask
     ask_timeout: 300
-"""))
+""")
+    )
     assert spec.policies[0].ask_timeout == 300
 
 
@@ -674,14 +746,16 @@ def test_parse_per_policy_ask_timeout_zero_rejected() -> None:
     layers. If only the spec-level check existed, authors
     could smuggle a broken `0` through a per-policy override."""
     with pytest.raises(AgentPlaneError, match="ask_timeout. must be > 0"):
-        _parse_guardrails(_yaml("""
+        _parse_guardrails(
+            _yaml("""
 policies:
   p:
     type: label
     on: [input]
     action: allow
     ask_timeout: 0
-"""))
+""")
+        )
 
 
 # ── Integration with top-level parse() ─────────────────────

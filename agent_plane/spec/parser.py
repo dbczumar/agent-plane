@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -76,8 +76,15 @@ for _ch in list(_ConfigYamlLoader.yaml_implicit_resolvers.keys()):
 # Re-register a narrowed bool resolver keyed on ``t`` / ``T`` /
 # ``f`` / ``F`` only (the YAML 1.1 aliases keyed on o/O/y/Y/n/N
 # are now gone, so those characters parse as plain strings).
-_ConfigYamlLoader.add_implicit_resolver(
-    _BOOL_TAG, _YAML_1_2_BOOL_RE, list("tTfF"),
+# mypy flags BaseResolver.add_implicit_resolver as untyped
+# (PyYAML lacks type stubs on this classmethod); the call
+# is the only way to register an implicit resolver, so the
+# ignore is narrowly scoped to this YAML-1.2 compatibility
+# override.
+_ConfigYamlLoader.add_implicit_resolver(  # type: ignore[no-untyped-call]
+    _BOOL_TAG,
+    _YAML_1_2_BOOL_RE,
+    list("tTfF"),
 )
 
 
@@ -757,8 +764,7 @@ def _parse_guardrails(
         return None
     if not isinstance(raw, dict):
         raise AgentPlaneError(
-            "guardrails: must be a mapping, got "
-            f"{type(raw).__name__}",
+            f"guardrails: must be a mapping, got {type(raw).__name__}",
             code=ErrorCode.INVALID_INPUT,
         )
     return GuardrailsSpec(
@@ -861,8 +867,7 @@ def _parse_single_label_def(key: str, entry: Any) -> LabelDef:
         return LabelDef(initial=str(entry) if entry is not None else None)
     if not isinstance(entry, dict):
         raise AgentPlaneError(
-            f"label {key!r} must be a string or mapping, got "
-            f"{type(entry).__name__}",
+            f"label {key!r} must be a string or mapping, got {type(entry).__name__}",
             code=ErrorCode.INVALID_INPUT,
         )
     if not entry:
@@ -921,13 +926,14 @@ def _coerce_label_monotonic(
     """
     if raw is None:
         return None
-    if raw not in ("increasing", "decreasing"):
-        raise AgentPlaneError(
-            f"label {key!r}: `monotonic` must be 'increasing' or "
-            f"'decreasing', got {raw!r}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return raw
+    if raw == "increasing":
+        return "increasing"
+    if raw == "decreasing":
+        return "decreasing"
+    raise AgentPlaneError(
+        f"label {key!r}: `monotonic` must be 'increasing' or 'decreasing', got {raw!r}",
+        code=ErrorCode.INVALID_INPUT,
+    )
 
 
 def _validate_label_def_cross_fields(
@@ -954,14 +960,12 @@ def _validate_label_def_cross_fields(
     """
     if monotonic is not None and values is None:
         raise AgentPlaneError(
-            f"label {key!r}: `monotonic` requires a `values` list "
-            f"to order against",
+            f"label {key!r}: `monotonic` requires a `values` list to order against",
             code=ErrorCode.INVALID_INPUT,
         )
     if initial is not None and values is not None and initial not in values:
         raise AgentPlaneError(
-            f"label {key!r}: `initial` value {initial!r} is not in "
-            f"declared `values` {values!r}",
+            f"label {key!r}: `initial` value {initial!r} is not in declared `values` {values!r}",
             code=ErrorCode.INVALID_INPUT,
         )
 
@@ -1073,7 +1077,8 @@ def _parse_policy_base_fields(
         "on": _parse_on(data.get("on", ["input", "output"]), policy_name=name),
         "condition": _parse_condition(data.get("condition"), policy_name=name),
         "ask_timeout": _parse_policy_ask_timeout(
-            data.get("ask_timeout"), policy_name=name,
+            data.get("ask_timeout"),
+            policy_name=name,
         ),
     }
 
@@ -1102,11 +1107,7 @@ def _parse_function_policy(
             f"policy {name!r}: `function` policies require a `function:` field",
             code=ErrorCode.INVALID_INPUT,
         )
-    action = (
-        _parse_action_list(data["action"], policy_name=name)
-        if "action" in data
-        else None
-    )
+    action = _parse_action_list(data["action"], policy_name=name) if "action" in data else None
     set_labels = (
         _parse_writable_labels(data["set_labels"], policy_name=name)
         if "set_labels" in data
@@ -1191,8 +1192,7 @@ def _parse_label_policy(
         action = PolicyAction(str(action_raw))
     except ValueError:
         raise AgentPlaneError(
-            f"policy {name!r}: action must be one of "
-            f"'allow', 'ask', 'deny', got {action_raw!r}",
+            f"policy {name!r}: action must be one of 'allow', 'ask', 'deny', got {action_raw!r}",
             code=ErrorCode.INVALID_INPUT,
         )
     set_labels_raw = data.get("set_labels")
@@ -1278,8 +1278,7 @@ def _parse_on_entry(
     """
     if not isinstance(entry, str):
         raise AgentPlaneError(
-            f"policy {policy_name!r}: `on:` entries must be "
-            f"strings, got {type(entry).__name__}",
+            f"policy {policy_name!r}: `on:` entries must be strings, got {type(entry).__name__}",
             code=ErrorCode.INVALID_INPUT,
         )
     if ":" not in entry:
@@ -1287,8 +1286,7 @@ def _parse_on_entry(
     phase_str, tool_name = entry.split(":", 1)
     if not tool_name:
         raise AgentPlaneError(
-            f"policy {policy_name!r}: empty tool name in "
-            f"on-selector {entry!r}",
+            f"policy {policy_name!r}: empty tool name in on-selector {entry!r}",
             code=ErrorCode.INVALID_INPUT,
         )
     phase = _resolve_phase(phase_str, entry, policy_name=policy_name)
@@ -1326,8 +1324,7 @@ def _resolve_phase(
         return Phase(phase_str)
     except ValueError:
         raise AgentPlaneError(
-            f"policy {policy_name!r}: unknown phase "
-            f"{phase_str!r} in {context!r}"
+            f"policy {policy_name!r}: unknown phase {phase_str!r} in {context!r}"
             if context != phase_str
             else f"policy {policy_name!r}: unknown phase {phase_str!r}",
             code=ErrorCode.INVALID_INPUT,
@@ -1362,8 +1359,7 @@ def _parse_condition(
         return None
     if not isinstance(raw, dict):
         raise AgentPlaneError(
-            f"policy {policy_name!r}: `condition:` must be a "
-            f"mapping, got {type(raw).__name__}",
+            f"policy {policy_name!r}: `condition:` must be a mapping, got {type(raw).__name__}",
             code=ErrorCode.INVALID_INPUT,
         )
     if not raw:
@@ -1500,8 +1496,7 @@ def _parse_function_ref(
     path = raw.get("path")
     if not isinstance(path, str) or not path:
         raise AgentPlaneError(
-            f"policy {policy_name!r}: `function.path` must be a "
-            f"non-empty dotted-path string",
+            f"policy {policy_name!r}: `function.path` must be a non-empty dotted-path string",
             code=ErrorCode.INVALID_INPUT,
         )
     args = raw.get("arguments")
@@ -1539,8 +1534,7 @@ def _parse_policy_ask_timeout(
         value = int(raw)
     except (TypeError, ValueError):
         raise AgentPlaneError(
-            f"policy {policy_name!r}: `ask_timeout` must be an integer, "
-            f"got {raw!r}",
+            f"policy {policy_name!r}: `ask_timeout` must be an integer, got {raw!r}",
             code=ErrorCode.INVALID_INPUT,
         )
     if value <= 0:
