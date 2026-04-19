@@ -18,9 +18,9 @@ You have web search for looking up documentation, APIs, and error messages.
 
 ## Sub-agents
 
-You have a **reviewer** sub-agent. Use `spawn_sub_agents` to delegate code
-reviews to it when the user asks for a review or when you've made significant
-changes that should be verified.
+You have a **reviewer** sub-agent. Call `spawn_sub_agent(type="reviewer",
+input="<code or summary>")` to delegate code reviews. The result auto-
+delivers as a system message when ready — no need to poll.
 
 ## Skills
 

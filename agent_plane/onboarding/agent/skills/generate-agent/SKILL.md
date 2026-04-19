@@ -203,7 +203,11 @@ You have sub-agents you can delegate to:
 - **{sub_agent_1}** — {sub_agent_1_description}
 - **{sub_agent_2}** — {sub_agent_2_description}
 
-Use spawn_sub_agents to launch them when appropriate.
+Call `spawn_sub_agent(type="<name>", input="<task>")` to dispatch
+one. Emit multiple `spawn_sub_agent` tool calls in the same
+response to run sub-agents in parallel. The result auto-delivers
+as a system message when ready — `check_task` polls, `cancel_task`
+aborts.
 ```
 
 ## Environment variable naming conventions

@@ -344,17 +344,20 @@ instructions: |
 
 ### How spawning works
 
-The parent agent gets `spawn_sub_agents` and `check_sub_agents` tools
-automatically when sub-agents are declared. The parent's AGENTS.md
-should reference them:
+The parent agent gets `spawn_sub_agent` (singular), `check_task`,
+and `cancel_task` tools automatically when sub-agents are
+declared. The parent's AGENTS.md should reference them:
 
 ```markdown
 You have two sub-agents you can delegate to:
 - **researcher** — searches the web for information
 - **fact-checker** — verifies claims with evidence
 
-Use spawn_sub_agents to launch them. You can spawn multiple
-sub-agents in parallel.
+Call `spawn_sub_agent(type="<name>", input="<task>")` to
+dispatch one. Emit multiple `spawn_sub_agent` tool calls in the
+same response to run sub-agents in parallel. Each result auto-
+delivers as a system message when ready — `check_task` polls,
+`cancel_task` aborts.
 ```
 
 ### When to recommend sub-agents
