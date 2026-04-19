@@ -3,11 +3,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 # Default HTTP status codes considered transient and retryable.
 _DEFAULT_RETRYABLE_STATUS_CODES = [429, 500, 502, 503]
+
+# Default classifier timeout for PromptPolicy evaluations. 30 s
+# balances classifier latency against the cost of blocking the
+# agent loop for every evaluated phase. The agent-level LLM
+# default (300 s) is tuned for generation; using it for a
+# blocking classifier stalls the loop for minutes on each tool
+# call — see POLICIES.md §9.2. Overrideable via
+# ``policy.llm.request_timeout`` on individual policies.
+DEFAULT_POLICY_CLASSIFIER_TIMEOUT = 30
+
+# Default timeout (seconds) for user approval on an ASK policy.
+# 30 s matches omniagents parity. Overrideable per-policy via
+# ``PolicySpec.ask_timeout`` or spec-wide via
+# ``GuardrailsSpec.ask_timeout``. See POLICIES.md §7, §13.
+DEFAULT_ASK_TIMEOUT = 30
 
 
 @dataclass
@@ -360,6 +376,376 @@ class LocalToolInfo:
     inline_deps: list[str] | None = None
 
 
+# ── Guardrails / Policies (POLICIES.md §3, §4) ──────────────
+#
+# Spec-level types for the policy system. These are pure data
+# containers — no runtime behavior here. Runtime policy classes
+# (LabelPolicy, FunctionPolicy, PromptPolicy) and the
+# PolicyEngine live under agent_plane.runtime.policies in later
+# phases.
+
+
+class Phase(str, Enum):
+    """
+    The four points in the agent loop where policies fire.
+
+    ``str`` mix-in keeps YAML parsing trivial
+    (``Phase("tool_call")``) and preserves the string form in
+    logs / JSON serialization.
+
+    - ``INPUT``: after a new user message arrives, before the
+      LLM turn.
+    - ``TOOL_CALL``: before dispatching a tool call emitted by
+      the LLM.
+    - ``TOOL_RESULT``: after a tool returns, before the result
+      is surfaced back to the LLM.
+    - ``OUTPUT``: after the LLM's final assistant message,
+      before persistence.
+    """
+
+    INPUT = "input"
+    TOOL_CALL = "tool_call"
+    TOOL_RESULT = "tool_result"
+    OUTPUT = "output"
+
+
+class PolicyAction(str, Enum):
+    """
+    The three decisions a policy can emit.
+
+    - ``ALLOW``: the phase proceeds normally.
+    - ``ASK``: park for user approval; on approve → ALLOW, on
+      refuse/timeout → DENY.
+    - ``DENY``: short-circuit the phase; replace content with a
+      sentinel so downstream steps cannot act on it.
+    """
+
+    ALLOW = "allow"
+    ASK = "ask"
+    DENY = "deny"
+
+
+@dataclass(frozen=True)
+class EvaluationContext:
+    """
+    Everything the engine needs to evaluate one phase.
+
+    Filled by the caller (workflow or executor hook) BEFORE
+    calling ``engine.evaluate(ctx)``. The engine never has to
+    introspect ``content`` to answer "which tool was this?" —
+    the caller resolves ``tool_name`` because only it has the
+    local state to do so cheaply (on ``TOOL_RESULT`` the
+    ``function_call_output`` payload carries ``call_id`` but no
+    ``name``; the caller knows the name from the earlier
+    dispatch).
+
+    :param phase: The enforcement point.
+    :param content: Phase-specific payload — shape depends on
+        ``phase``: ``INPUT`` / ``OUTPUT`` carry ``str`` (raw
+        user / assistant text); ``TOOL_CALL`` / ``TOOL_RESULT``
+        carry ``dict[str, Any]`` (the function_call or
+        function_call_output dict, which includes
+        ``call_id``). Policies know which shape to expect from
+        their declared ``on:`` phases — the engine never
+        introspects this field itself.
+    :param tool_name: Resolved tool name. Populated on
+        ``TOOL_CALL`` and ``TOOL_RESULT``; ``None`` on
+        ``INPUT`` and ``OUTPUT``.
+    """
+
+    phase: Phase
+    content: Any
+    tool_name: str | None = None
+
+
+@dataclass(frozen=True)
+class PolicyResult:
+    """
+    One policy's decision (or the engine's composed decision).
+
+    Returned by ``Policy.evaluate()`` and by
+    ``PolicyEngine.evaluate()``. The same shape is used at
+    both layers: individual policies return a single-policy
+    decision, the engine composes them and returns the
+    aggregate.
+
+    :param action: The decision (``ALLOW``, ``ASK``, or
+        ``DENY``), e.g. ``PolicyAction.DENY``.
+    :param reason: Human-readable reason string. Shown to the
+        user on ASK, included in logs / spans on DENY, ``None``
+        on ALLOW, e.g. ``"Canada-related topics are denied."``.
+    :param set_labels: Labels the policy wants to write. For
+        a single-policy result: the raw writes the policy
+        requested (before whitelist filtering). For an
+        engine-composed result: the writes the engine has
+        accumulated and intends to apply on this decision
+        (filtering already done). ``None`` when the policy
+        wrote no labels, e.g. ``{"integrity": "0"}``.
+    :param deciding_policy: Name of the policy whose action
+        drove the composed result. Engine-set only —
+        single-policy results leave it ``None``. On DENY: the
+        first short-circuiting policy. On ASK: the first
+        ASKing policy in YAML order. On ALLOW: ``None``.
+        Powers the ``deciding_policy`` outer-span attribute
+        (POLICIES.md §11.5) and the per-policy ``ask_timeout``
+        lookup (§7.2).
+    """
+
+    action: PolicyAction
+    reason: str | None = None
+    set_labels: dict[str, str] | None = None
+    deciding_policy: str | None = None
+
+
+@dataclass(frozen=True)
+class PhaseSelector:
+    """
+    One entry in a policy's ``on:`` list.
+
+    YAML shapes:
+
+    - ``"tool_call"`` →
+      ``PhaseSelector(phase=Phase.TOOL_CALL, tool_name=None)``
+      (wildcard — matches every tool call).
+    - ``"tool_call:code_sandbox"`` →
+      ``PhaseSelector(Phase.TOOL_CALL, "code_sandbox")``
+      (narrows to one tool by name).
+
+    Tool-name narrowing is only valid on ``TOOL_CALL`` and
+    ``TOOL_RESULT`` phases — the parser rejects it on
+    ``INPUT`` / ``OUTPUT``.
+
+    :param phase: Which enforcement point this selector fires
+        on.
+    :param tool_name: When set, only matches that tool. When
+        ``None``, matches any tool in the phase (wildcard).
+    """
+
+    phase: Phase
+    tool_name: str | None = None
+
+    def matches(self, ctx: EvaluationContext) -> bool:
+        """
+        Test whether this selector matches an evaluation
+        context.
+
+        :param ctx: The current evaluation context
+            (phase + resolved tool name).
+        :returns: ``True`` if the selector's phase matches and
+            (when ``tool_name`` is set) the context's
+            ``tool_name`` matches.
+        """
+        if ctx.phase != self.phase:
+            return False
+        if self.tool_name is None:
+            return True
+        return ctx.tool_name == self.tool_name
+
+
+@dataclass(frozen=True)
+class LabelDef:
+    """
+    Schema for one label key.
+
+    Declared statically in
+    ``spec.guardrails.labels[key]``. Controls what values the
+    label can take and how it can change over the course of a
+    conversation (see POLICIES.md §10).
+
+    :param initial: Seed value written at conversation start.
+        ``None`` means the label is unset until a policy
+        writes it for the first time, e.g. ``"0"``.
+    :param values: Ordered list of allowed values. Position
+        defines ranking when ``monotonic`` is set. ``None``
+        means schemaless — writes are unconstrained, e.g.
+        ``["0", "1"]`` or
+        ``["public", "internal", "confidential"]``.
+    :param monotonic: Update constraint when ``values`` is
+        declared. ``"increasing"`` means new index must be
+        ``>=`` current; ``"decreasing"`` means ``<=``.
+        ``None`` means free transitions between declared
+        values.
+    """
+
+    initial: str | None = None
+    values: list[str] | None = None
+    monotonic: Literal["increasing", "decreasing"] | None = None
+
+
+@dataclass(frozen=True)
+class FunctionRef:
+    """
+    Reference to a policy callable, with optional factory
+    kwargs.
+
+    Two YAML shapes parse into this:
+
+    - Bare string: ``function: myorg.policies.simple_check`` →
+      ``FunctionRef(path="myorg.policies.simple_check",
+      arguments=None)``. The resolved callable is the
+      evaluator itself.
+    - Dict: ``function: {path: myorg.policies.rate_limit,
+      arguments: {limit: 10}}`` →
+      ``FunctionRef(path="...", arguments={"limit": 10})``.
+      The resolved callable is a factory called once at
+      workflow start; its return value is the evaluator.
+
+    :param path: Dotted import path to the callable or
+        factory, e.g.
+        ``"myorg.policies.search_rate_limit"``.
+    :param arguments: Factory kwargs (present = factory form;
+        absent = direct callable form). ``None`` when the
+        YAML used the short string form.
+    """
+
+    path: str
+    arguments: dict[str, Any] | None = None
+
+
+@dataclass
+class PolicySpec:
+    """
+    Base class for all policy specs.
+
+    Concrete subtypes (``FunctionPolicySpec``,
+    ``PromptPolicySpec``, ``LabelPolicySpec``) carry
+    type-specific fields. The class itself *is* the
+    discriminator — no separate ``type`` field at runtime.
+
+    ``condition`` is a label-gate: if declared, the engine
+    checks current label values against it BEFORE dispatching
+    to the policy's ``evaluate()``. Non-matching policies are
+    skipped entirely (no action emitted, no LLM call, no
+    Python call) — cheap way to gate expensive policies on
+    session state (POLICIES.md §4, §10).
+
+    :param name: YAML key this policy was declared under,
+        e.g. ``"block_canada_input"``.
+    :param on: Phases this policy fires on, e.g.
+        ``[PhaseSelector(Phase.TOOL_CALL, "web_search")]``.
+    :param condition: Label-gate. Empty / absent =
+        always-match; values coerced to strings at spec load,
+        e.g. ``{"integrity": "0"}`` or
+        ``{"role": ["admin", "ops"]}``.
+    :param ask_timeout: Per-policy approval timeout override
+        (seconds). ``None`` falls back to
+        ``GuardrailsSpec.ask_timeout``. Useful when some ASKs
+        are cheap (yes/no) and some expensive (review a 50 KB
+        document).
+    """
+
+    name: str
+    on: list[PhaseSelector]
+    condition: dict[str, str | list[str]] | None = None
+    ask_timeout: int | None = None
+
+
+@dataclass
+class FunctionPolicySpec(PolicySpec):
+    """
+    A policy backed by a Python callable (see POLICIES.md §9.1).
+
+    :param function: Where the callable lives + optional
+        factory kwargs.
+    :param action: Allowed actions the callable may return.
+        Returns outside this list → fail-closed DENY (or
+        substituted ALLOW when the list contains no DENY, per
+        the classifier-only carve-out in §13). ``None`` means
+        accept any action.
+    :param set_labels: Whitelist of label keys the callable
+        may write. Keys outside dropped silently. ``None``
+        means no writes declared (any key the callable emits
+        that has a ``LabelDef`` will still validate against
+        that LabelDef, but keys without a LabelDef are set
+        freely per omniagents parity).
+    """
+
+    function: FunctionRef | None = None
+    action: list[PolicyAction] | None = None
+    set_labels: list[str] | None = None
+
+
+@dataclass
+class PromptPolicySpec(PolicySpec):
+    """
+    A policy backed by an LLM classifier (see POLICIES.md §9.2).
+
+    :param prompt: Author-supplied domain logic, e.g. "Deny
+        requests mentioning Canada." The framework generates
+        the JSON-schema envelope; authors do NOT write JSON
+        instructions.
+    :param llm: Optional model override for this policy's
+        classifier call. Omit to inherit the agent's
+        top-level ``llm:`` **except for ``request_timeout``**,
+        which defaults to
+        :data:`DEFAULT_POLICY_CLASSIFIER_TIMEOUT` (30 s) for
+        policies regardless of the agent's generation
+        timeout. See POLICIES.md §9.2.
+    :param action: Allowed actions the LLM may emit.
+        Validation is strict — LLM output outside this list →
+        fail-closed DENY (or substituted ALLOW when this list
+        contains no DENY, per the classifier-only carve-out).
+        Defaults to ``[ALLOW, DENY]``.
+    :param set_labels: Whitelist of label keys the LLM may
+        write. Keys outside dropped silently. ``None`` means
+        the LLM cannot write labels at all.
+    """
+
+    prompt: str | None = None
+    llm: LLMConfig | None = None
+    action: list[PolicyAction] = field(
+        default_factory=lambda: [PolicyAction.ALLOW, PolicyAction.DENY],
+    )
+    set_labels: list[str] | None = None
+
+
+@dataclass
+class LabelPolicySpec(PolicySpec):
+    """
+    A YAML-declared label policy (see POLICIES.md §9.3).
+
+    Fires its declared action and emits its declared
+    ``set_labels`` whenever selector + condition match. No
+    Python, no LLM.
+
+    :param action: The fixed action to emit — one of
+        ``ALLOW``, ``ASK``, ``DENY``.
+    :param reason: Human-readable reason — shown to users on
+        ASK, included in logs on DENY. ``None`` on ALLOW.
+    :param set_labels: Fixed label writes to emit. Applied
+        through the standard validation path (``values`` +
+        ``monotonic`` checks per ``LabelDef``).
+    """
+
+    action: PolicyAction | None = None
+    reason: str | None = None
+    set_labels: dict[str, str] | None = None
+
+
+@dataclass
+class GuardrailsSpec:
+    """
+    Top-level guardrails block from config.yaml.
+
+    Bundles label definitions, policies, and the spec-wide
+    ASK timeout default (POLICIES.md §3.2).
+
+    :param labels: Per-key ``LabelDef`` schemas. ``None``
+        means no labels declared — all label writes go
+        through the schemaless-set-freely path.
+    :param policies: Policies in YAML declaration order (the
+        engine iterates in this order).
+    :param ask_timeout: Spec-wide default approval timeout in
+        seconds. Individual policies may override via
+        ``PolicySpec.ask_timeout``. Defaults to
+        :data:`DEFAULT_ASK_TIMEOUT` (30 s).
+    """
+
+    labels: dict[str, LabelDef] | None = None
+    policies: list[PolicySpec] | None = None
+    ask_timeout: int = DEFAULT_ASK_TIMEOUT
+
+
 @dataclass
 class AgentSpec:
     """
@@ -395,6 +781,11 @@ class AgentSpec:
     :param compaction: Compaction configuration for context management.
         ``None`` means use defaults (trigger at 80%, protect last 5
         iterations).
+    :param guardrails: Guardrails configuration (labels + policies
+        + ASK timeout). ``None`` means the agent declared no
+        ``guardrails:`` block — runtime builds a no-op engine
+        with zero policies and an empty label cache. See
+        POLICIES.md §3, §4.
     """
 
     spec_version: int
@@ -414,3 +805,4 @@ class AgentSpec:
     sub_agents: list[AgentSpec] = field(default_factory=list)
     executor: ExecutorSpec = field(default_factory=ExecutorSpec)
     compaction: CompactionConfig | None = None
+    guardrails: GuardrailsSpec | None = None
