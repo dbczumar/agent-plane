@@ -24,9 +24,10 @@ from agent_plane.terminals.manager import (
     TerminalManager,
 )
 from agent_plane.terminals.registry import TerminalManagerRegistry
-from agent_plane.terminals.shell import RunResult, Shell
+from agent_plane.terminals.shell import PartialReadResult, RunResult, Shell
 
 __all__ = [
+    "PartialReadResult",
     "RunResult",
     "Shell",
     "ShellCapExceeded",

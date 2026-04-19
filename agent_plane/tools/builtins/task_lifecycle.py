@@ -41,8 +41,10 @@ _ACTIVITY_MAX_CHARS = 2000
 
 # G57 — kinds the LLM is allowed to inspect/cancel via the
 # unified lifecycle. agent_task (the parent turn) is excluded
-# so the LLM can't accidentally cancel itself.
-_LLM_VISIBLE_KINDS = frozenset({"tool", "sub_agent", "client_tool"})
+# so the LLM can't accidentally cancel itself. ``terminal`` is
+# included so ``terminal_run(synchronous=False)`` tasks work
+# through the same surface as @tool and sub-agent tasks.
+_LLM_VISIBLE_KINDS = frozenset({"tool", "sub_agent", "client_tool", "terminal"})
 
 
 # ── Helpers shared by all three tools ───────────────────────
@@ -99,6 +101,56 @@ def _get_recent_activity_for_task(task: Task) -> list[dict[str, Any]] | None:
     return [_truncate_content_field(item) for item in page.data]
 
 
+def _get_recent_terminal_activity(task: Task) -> str | None:
+    """
+    Fetch the stdout delta for a running ``kind="terminal"`` task.
+
+    Reads from the :class:`TerminalManager`'s per-task cursor,
+    advancing it so successive ``check_task`` calls see only new
+    bytes. The returned string is ANSI-stripped and bounded by the
+    ring buffer size (1 MB) minus whatever bytes remain unread.
+
+    Returns ``None`` when:
+    - The task isn't a terminal task.
+    - The task is registered nowhere (completed and unregistered, or
+      never registered — the latter shouldn't happen with the
+      current dispatch path).
+    - The task's shell was closed between the registration and now.
+
+    :param task: The task whose terminal shell to peek.
+    :returns: ANSI-stripped stdout delta since the last call, or
+        ``None`` when no live cursor exists.
+    """
+    if task.kind != "terminal":
+        return None
+
+    from agent_plane.runtime import get_terminal_registry
+
+    registry = get_terminal_registry()
+    # active_conversation_ids is the only public "does this
+    # conversation have a manager?" check — if the conversation
+    # was reaped or the server restarted, we have no shell to
+    # poll and the delta is unavailable.
+    if task.conversation_id not in registry.active_conversation_ids():
+        return None
+    # The workspace arg is only used on cache miss; the manager
+    # already exists since active_conversation_ids saw it. Pass a
+    # sentinel PurePath to satisfy the type. Reaching into the
+    # registry's internal map would be cleaner but the public API
+    # requires the arg — accept the minor awkwardness.
+    from pathlib import Path as _Path
+
+    manager = registry.for_conversation(task.conversation_id, _Path("."))
+    peek = manager.peek_task_stdout(task.id)
+    if peek is None:
+        return None
+    text, lost_bytes = peek
+    if lost_bytes > 0:
+        # Surface the gap so the agent knows stdout was dropped.
+        text = f"[... {lost_bytes} bytes evicted before this poll ...]\n{text}"
+    return text
+
+
 def _build_check_payload(task: Task) -> dict[str, Any]:
     """
     Build the ``check_task`` response payload for one task.
@@ -128,12 +180,19 @@ def _build_check_payload(task: Task) -> dict[str, Any]:
         if task.error is not None:
             payload["error"] = task.error
     else:
-        # Still running — recent_activity is the per-step view for
-        # sub-agents (G50). Tool / client_tool kinds have no
-        # per-step visibility; drop the field.
-        activity = _get_recent_activity_for_task(task)
-        if activity is not None:
-            payload["recent_activity"] = activity
+        # Still running — recent_activity is kind-specific:
+        # - sub_agent: the last few items from the child's conversation.
+        # - terminal: stdout delta since the last check_task call
+        #   (tail -f semantics; see §6.11 of the terminal research doc).
+        # - tool / client_tool: no per-step visibility; field dropped.
+        if task.kind == "terminal":
+            terminal_activity = _get_recent_terminal_activity(task)
+            if terminal_activity is not None:
+                payload["recent_activity"] = terminal_activity
+        else:
+            activity = _get_recent_activity_for_task(task)
+            if activity is not None:
+                payload["recent_activity"] = activity
 
     return payload
 
@@ -353,12 +412,103 @@ class CancelTaskTool(Tool):
                 }
             )
 
+        # Terminal-kind tasks have their own cancel primitive: send
+        # SIGINT to the running shell via the TerminalManager. This
+        # is NOT the same as DBOS cancel_workflow — the background
+        # workflow is parked on a blocking ``run_sync`` in a thread
+        # pool and doesn't respond to asyncio cancellation. SIGINT
+        # unblocks bash (D marker fires with exit 130), run_sync
+        # returns with status="killed", and the workflow completes
+        # normally with payload status="cancelled" (auto-delivered
+        # to the parent via the async_work_complete drain).
+        if task.kind == "terminal":
+            return self._cancel_terminal_task(task, prior_status)
+
         task_store.cancel(task_id)
         return json.dumps(
             {
                 "cancelled": True,
                 "prior_status": prior_status,
                 "task_id": task_id,
+            }
+        )
+
+    def _cancel_terminal_task(
+        self, task: Task, prior_status: str
+    ) -> str:
+        """Send SIGINT to the shell running ``task`` and return the result.
+
+        Looks up the :class:`TerminalManager` via the terminal
+        registry, finds the :class:`Shell` assigned to ``task.id``,
+        and calls ``shell.interrupt()``. Idempotent: if the task
+        already finished (shell is idle) or the shell was closed,
+        the interrupt is a no-op and we return a clear reason.
+
+        :param task: The terminal task being cancelled.
+        :param prior_status: The task's status at inspection time
+            (echoed back in the response for LLM diagnostics).
+        :returns: JSON string with ``{cancelled, task_id,
+            prior_status, reason?}``.
+        """
+        from agent_plane.runtime import get_terminal_registry
+
+        registry = get_terminal_registry()
+        if task.conversation_id not in registry.active_conversation_ids():
+            # No manager for this conversation — either server
+            # restarted after the task was started (shell state
+            # lost) or the manager was reaped.
+            return json.dumps(
+                {
+                    "cancelled": False,
+                    "prior_status": prior_status,
+                    "task_id": task.id,
+                    "reason": "shell_unavailable",
+                }
+            )
+        from pathlib import Path as _Path
+
+        # workspace arg is unused on cache hit; manager already exists.
+        manager = registry.for_conversation(task.conversation_id, _Path("."))
+        # Mark the cancel intent FIRST so the background workflow's
+        # step picks it up even if the SIGINT races the command's
+        # initialization (e.g. shell exists and is registered but
+        # run_sync hasn't entered its read loop yet). Must happen
+        # before shell.interrupt() to avoid a pure race:
+        #
+        #   1. is_cancel_requested checked → False
+        #   2. run_sync starts, sends command
+        #   3. cancel_task runs → interrupt → SIGINT arrives AFTER
+        #      command starts (good — bash kills it)
+        #
+        # With request_cancel before interrupt:
+        #
+        #   1. request_cancel → flag set
+        #   2. shell.interrupt → SIGINT sent
+        #   3. EITHER the step hasn't started run_sync yet (step
+        #      sees the flag, returns killed without running), OR
+        #      run_sync is already in flight (SIGINT kills the
+        #      command via the PTY).
+        # Set the cancel flag on the manager. The background
+        # terminal workflow's step is polling this flag on its
+        # own event loop and will call ``shell.interrupt()`` from
+        # its own thread when it sees the flip — avoids the
+        # cross-thread pexpect races that an interrupt-from-
+        # anywhere approach would trigger.
+        registered = manager.request_cancel(task.id)
+        if not registered:
+            return json.dumps(
+                {
+                    "cancelled": False,
+                    "prior_status": prior_status,
+                    "task_id": task.id,
+                    "reason": "task_no_longer_running",
+                }
+            )
+        return json.dumps(
+            {
+                "cancelled": True,
+                "prior_status": prior_status,
+                "task_id": task.id,
             }
         )
 

@@ -120,3 +120,147 @@ def test_single_giant_append_fits_in_capacity() -> None:
     assert buf.bytes() == data[-100:]
     # 900 bytes were evicted: everything before the last 100.
     assert buf.evicted_bytes == 900
+
+
+# ── slice_since / PartialRead (delta reads) ────────────────────
+
+
+def test_slice_since_empty_buffer_returns_empty_delta() -> None:
+    """Fresh buffer: any cursor returns empty data with cursor unchanged.
+
+    Proves the no-new-bytes fast path. If ``slice_since`` returned
+    non-empty data here, ``check_task`` would echo stale / garbage
+    bytes on the first poll.
+    """
+    from agent_plane.terminals.ring_buffer import PartialRead, RingBuffer
+
+    buf = RingBuffer(capacity=10)
+    p = buf.slice_since(0)
+    assert isinstance(p, PartialRead)
+    assert p.data == b""
+    assert p.new_cursor == 0
+    assert p.lost_bytes == 0
+
+
+def test_slice_since_cursor_zero_returns_all() -> None:
+    """Cursor=0 returns everything appended so far.
+
+    First poll of a running command: caller has no prior cursor,
+    passes 0, expects all bytes produced so far.
+    """
+    from agent_plane.terminals.ring_buffer import RingBuffer
+
+    buf = RingBuffer(capacity=100)
+    buf.append(b"hello ")
+    buf.append(b"world")
+    p = buf.slice_since(0)
+    assert p.data == b"hello world"
+    assert p.new_cursor == 11
+    assert p.lost_bytes == 0
+
+
+def test_slice_since_advances_cursor_across_calls() -> None:
+    """Successive reads return only new bytes since the prior cursor.
+
+    Core "tail -f" property: caller stores new_cursor, passes it
+    next time, sees only the delta. If this broke (e.g. cursor
+    never advanced), consecutive check_tasks would return the
+    same bytes repeatedly.
+    """
+    from agent_plane.terminals.ring_buffer import RingBuffer
+
+    buf = RingBuffer(capacity=100)
+    buf.append(b"first ")
+    p1 = buf.slice_since(0)
+    assert p1.data == b"first "
+
+    buf.append(b"second ")
+    p2 = buf.slice_since(p1.new_cursor)
+    assert p2.data == b"second "
+    assert p2.new_cursor == p1.new_cursor + len(b"second ")
+
+    # Third call, no new data: empty delta, cursor unchanged.
+    p3 = buf.slice_since(p2.new_cursor)
+    assert p3.data == b""
+    assert p3.new_cursor == p2.new_cursor
+
+
+def test_slice_since_cursor_past_total_is_safe() -> None:
+    """A cursor beyond ``total_appended`` returns empty, not a slice bug.
+
+    Defensive: if the caller somehow passes a cursor larger than
+    total (shouldn't happen, but could on a crash + replay with
+    stale state), we must not return garbage or raise IndexError.
+    """
+    from agent_plane.terminals.ring_buffer import RingBuffer
+
+    buf = RingBuffer(capacity=100)
+    buf.append(b"hi")
+    p = buf.slice_since(1000)
+    assert p.data == b""
+    # new_cursor clamps to total — doesn't invent a value past it.
+    assert p.new_cursor == buf.total_appended
+
+
+def test_slice_since_reports_lost_bytes_on_eviction() -> None:
+    """When the buffer evicted bytes the caller hadn't read yet,
+    ``lost_bytes`` surfaces the count.
+
+    Scenario: small buffer, bursty writer. If we didn't track this,
+    the agent's recent_activity would look like a clean continuation
+    when in fact some bytes were dropped. lost_bytes is how check_task
+    tells the LLM "your stream has a gap."
+    """
+    from agent_plane.terminals.ring_buffer import RingBuffer
+
+    buf = RingBuffer(capacity=5)
+    buf.append(b"first_")  # 6 bytes → 1 evicted
+    # Caller is at cursor=0 (before any data appended).
+    # Buffer now has only last 5 bytes, and 1 was lost before cursor.
+    p = buf.slice_since(0)
+    assert p.lost_bytes == 1, (
+        f"Expected 1 lost byte (buffer capacity 5, appended 6, "
+        f"cursor at 0), got {p.lost_bytes}."
+    )
+    assert p.data == b"irst_"
+    assert p.new_cursor == 6
+
+
+def test_slice_since_reset_resets_total_appended() -> None:
+    """After ``reset``, ``total_appended`` drops to 0 and reads
+    behave as on a fresh buffer.
+
+    Critical for the sync terminal_run path which resets before
+    every command. Without this, a cursor retained from a prior
+    command would read wrong offsets into the next command's data.
+    """
+    from agent_plane.terminals.ring_buffer import RingBuffer
+
+    buf = RingBuffer(capacity=100)
+    buf.append(b"first command output")
+    assert buf.total_appended == 20
+    buf.reset()
+    assert buf.total_appended == 0
+    assert buf.bytes() == b""
+
+    buf.append(b"new")
+    p = buf.slice_since(0)
+    assert p.data == b"new"
+    assert p.new_cursor == 3
+
+
+def test_slice_since_negative_cursor_clamps_to_zero() -> None:
+    """Negative cursors are treated as 0 rather than crashing.
+
+    Guards against a caller bug (e.g. subtracting before they
+    have a prior cursor). Returning empty or raising IndexError
+    would surface the bug elsewhere; clamping to 0 is the
+    friendly, survivable choice.
+    """
+    from agent_plane.terminals.ring_buffer import RingBuffer
+
+    buf = RingBuffer(capacity=100)
+    buf.append(b"abc")
+    p = buf.slice_since(-5)
+    assert p.data == b"abc"
+    assert p.new_cursor == 3

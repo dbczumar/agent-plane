@@ -104,6 +104,13 @@ class ToolManager:
         self._register_sub_agent_tools()
         self._register_local_tools(workdir)
         self._register_client_tools(client_tool_specs or [])
+        # Task lifecycle builtins (check_task / cancel_task /
+        # list_tasks) are auto-enabled for any agent that can
+        # produce background work — matches task_lifecycle.py's
+        # "auto-enabled per §3.5 of the design" docstring. Runs
+        # last so all other tools are already registered and the
+        # detection can inspect them.
+        self._register_task_lifecycle_tools()
 
     def _register_skill_tools(self) -> None:
         """
@@ -237,6 +244,51 @@ class ToolManager:
         # caller's child conversations regardless of which types
         # the parent declared.
         self._tools[ListSubAgentsTool.name()] = ListSubAgentsTool()
+
+    def _register_task_lifecycle_tools(self) -> None:
+        """
+        Auto-register ``check_task``, ``cancel_task``, and
+        ``list_tasks`` when the agent has tools that can produce
+        background work.
+
+        Triggered by any of:
+
+        - Sub-agent declarations (``tools.agents``) — ``spawn_sub_agent``
+          returns handles.
+        - Async local Python tools (``@tool(synchronous=False)``) —
+          returns handles.
+        - ``terminal_run`` (supports ``synchronous=False`` per
+          designs/PERSISTENT_TERMINAL_RESEARCH.md §6.11).
+
+        Idempotent: if the LLM agent already declared them explicitly
+        in ``tools.builtins`` (currently not possible since they're
+        not in BUILTIN_NAMES, but future-proofing), the existing
+        registrations are left untouched.
+
+        See ``agent_plane/tools/builtins/task_lifecycle.py`` for the
+        three tools' docstrings.
+        """
+        # Detect whether any registered tool can produce background
+        # work. Cheap check — walks the already-built ``_tools`` map.
+        any_async = any(tool.is_async() for tool in self._tools.values())
+        has_sub_agents = bool(self._spec.tools.agents)
+        has_terminal_run = "terminal_run" in self._tools
+        if not (any_async or has_sub_agents or has_terminal_run):
+            return
+
+        from agent_plane.tools.builtins.task_lifecycle import (
+            CancelTaskTool,
+            CheckTaskTool,
+            ListTasksTool,
+        )
+
+        # Idempotent: explicit registration wins.
+        if CheckTaskTool.name() not in self._tools:
+            self._tools[CheckTaskTool.name()] = CheckTaskTool()
+        if CancelTaskTool.name() not in self._tools:
+            self._tools[CancelTaskTool.name()] = CancelTaskTool()
+        if ListTasksTool.name() not in self._tools:
+            self._tools[ListTasksTool.name()] = ListTasksTool()
 
     def _register_local_tools(self, workdir: Path | None) -> None:
         """

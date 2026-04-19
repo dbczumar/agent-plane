@@ -119,6 +119,27 @@ class TerminalManager:
         # Monotonic wall-clock (perf_counter equivalent) for the idle
         # reaper — set to "now" whenever any activity happens.
         self._last_activity = time.monotonic()
+        # Map of task_id → shell_name for async (``synchronous=False``)
+        # commands currently running. ``cancel_task`` uses this to
+        # find the shell to ``interrupt()``; ``check_task`` uses it
+        # plus ``_task_cursors`` to produce "tail -f" deltas. Cleared
+        # on command completion in ``unregister_running_task``.
+        #
+        # In-memory — lost on server crash. The task itself is durable
+        # via DBOS, but live command state is not. A crashed workflow
+        # re-executing the step will re-register (possibly on a new
+        # shell if the old shell was also lost).
+        self._task_shells: dict[str, str] = {}
+        self._task_cursors: dict[str, int] = {}
+        # Tasks for which ``cancel_task`` has been requested but the
+        # step hasn't yet started the bash command. Set by
+        # :meth:`request_cancel`; checked by
+        # ``background_terminal_workflow`` before invoking
+        # :meth:`run_sync`. Eliminates the race where a cancel
+        # arrives after ``register_running_task`` but before the
+        # child workflow's thread has actually sent the command
+        # into bash.
+        self._cancel_requested: set[str] = set()
 
     @property
     def conversation_id(self) -> str:
@@ -148,6 +169,7 @@ class TerminalManager:
         shell_name: str,
         command: str,
         timeout_ms: int | None = None,
+        cancel_predicate: Callable[[], bool] | None = None,
     ) -> RunResult:
         """Run a command in the named shell, creating the shell if needed.
 
@@ -175,7 +197,11 @@ class TerminalManager:
         """
         shell = self._get_or_create_shell(shell_name)
         self._last_activity = time.monotonic()
-        return shell.run_sync(command, timeout_ms=timeout_ms)
+        return shell.run_sync(
+            command,
+            timeout_ms=timeout_ms,
+            cancel_predicate=cancel_predicate,
+        )
 
     def _get_or_create_shell(self, shell_name: str) -> Shell:
         """Look up or create the named shell. Thread-safe.
@@ -301,3 +327,165 @@ class TerminalManager:
         """
         with self._lock:
             return bool(self._shells)
+
+    def ensure_shell(self, shell_name: str) -> None:
+        """Spawn ``shell_name`` if not already alive, without running
+        a command.
+
+        Used by ``TerminalRunTool.dispatch_async`` to pre-create the
+        shell before returning a handle, so a racing ``cancel_task``
+        can locate the shell via ``shell_for_task`` even if the
+        child workflow's first ``run_sync`` hasn't started yet.
+
+        Name validation and 10-shell cap enforcement run normally;
+        exceptions propagate exactly as for ``run_sync`` so async
+        dispatch fails loud if the agent tried to use a bad name
+        or exceeded the cap.
+
+        :param shell_name: The shell to spawn. Must pass the name
+            regex (see :data:`_SHELL_NAME_RE`).
+        :raises ShellNameInvalid: If the name fails the regex.
+        :raises ShellCapExceeded: If spawning would exceed the
+            per-conversation cap.
+        """
+        self._last_activity = time.monotonic()
+        # _get_or_create_shell is the same code run_sync uses; all
+        # validation and cap checks happen there.
+        self._get_or_create_shell(shell_name)
+
+    # ── Async task tracking (for synchronous=False commands) ─────
+
+    def register_running_task(self, task_id: str, shell_name: str) -> None:
+        """Record that ``task_id`` is running a command on ``shell_name``.
+
+        Used by ``background_terminal_workflow`` before it invokes
+        :meth:`run_sync` so subsequent ``cancel_task(task_id)`` calls
+        can find the right shell to ``interrupt()``, and ``check_task``
+        can read stdout deltas via :meth:`peek_task_stdout`.
+
+        Idempotent: overwriting an existing registration resets the
+        read cursor. The cursor position starts at 0 — the first
+        ``peek_task_stdout`` call returns everything produced since
+        the registration. Does NOT clear any prior cancel request —
+        a cancel racing in before register_running_task should still
+        be honored by the subsequent step.
+
+        :param task_id: The background task's id, e.g.
+            ``"resp_abc123"``.
+        :param shell_name: The name of the shell the command is
+            running on, e.g. ``"default"``.
+        """
+        with self._lock:
+            self._task_shells[task_id] = shell_name
+            self._task_cursors[task_id] = 0
+
+    def request_cancel(self, task_id: str) -> bool:
+        """Mark ``task_id`` as cancelled.
+
+        Used by ``cancel_task(kind="terminal")`` to signal the
+        background workflow even when the shell isn't running a
+        command yet (pre-registration cancel race). The background
+        workflow's step checks :meth:`is_cancel_requested` before
+        calling ``run_sync`` and short-circuits to a ``killed`` result
+        if set.
+
+        Independent of ``shell.interrupt()``: the interrupt sends
+        SIGINT to a currently-running command, this marks an
+        intent to cancel that's durable across the sync-vs-async
+        race.
+
+        :param task_id: The background task's id.
+        :returns: True iff the task was known (registered) at the
+            time of the call. False when the task id isn't
+            registered — the caller can use this to distinguish
+            "marked for cancel" from "nothing to cancel."
+        """
+        with self._lock:
+            if task_id not in self._task_shells:
+                return False
+            self._cancel_requested.add(task_id)
+            return True
+
+    def is_cancel_requested(self, task_id: str) -> bool:
+        """Check whether :meth:`request_cancel` has been called for
+        ``task_id``.
+
+        :param task_id: The background task's id.
+        :returns: True iff a cancel has been requested and not yet
+            unregistered.
+        """
+        with self._lock:
+            return task_id in self._cancel_requested
+
+    def unregister_running_task(self, task_id: str) -> None:
+        """Drop the task→shell mapping, cursor, and cancel flag for
+        ``task_id``.
+
+        Called by ``background_terminal_workflow`` in a ``finally``
+        after ``run_sync`` returns (success, timeout, or crash).
+        After this, ``cancel_task`` on the same id becomes a no-op —
+        the command is already gone.
+
+        :param task_id: The background task's id.
+        """
+        with self._lock:
+            self._task_shells.pop(task_id, None)
+            self._task_cursors.pop(task_id, None)
+            self._cancel_requested.discard(task_id)
+
+    def shell_for_task(self, task_id: str) -> Shell | None:
+        """Look up the :class:`Shell` currently running ``task_id``.
+
+        Used by ``cancel_task(kind="terminal")`` to find the shell
+        whose PTY should receive SIGINT. Returns ``None`` if the
+        task has already completed, was never registered, or targets
+        a shell that has since been closed.
+
+        :param task_id: The background task's id.
+        :returns: The :class:`Shell` instance, or ``None``.
+        """
+        with self._lock:
+            shell_name = self._task_shells.get(task_id)
+            if shell_name is None:
+                return None
+            return self._shells.get(shell_name)
+
+    def peek_task_stdout(
+        self, task_id: str
+    ) -> tuple[str, int] | None:
+        """Return the stdout delta for ``task_id`` since the last peek.
+
+        Used by ``check_task(kind="terminal")`` to produce
+        ``recent_activity``. Reads from the underlying shell's ring
+        buffer, ANSI-stripped, and advances the per-task cursor so
+        a subsequent call returns only newer bytes.
+
+        :param task_id: The background task's id.
+        :returns: A tuple ``(text, lost_bytes)`` where ``text`` is
+            the ANSI-stripped delta and ``lost_bytes`` is the count
+            of bytes that were evicted from the ring buffer between
+            peeks (non-zero when a command produces bursty output
+            that overflows the 1 MB ring). Returns ``None`` if the
+            task is unknown (completed, never started, or shell
+            closed).
+        """
+        with self._lock:
+            shell_name = self._task_shells.get(task_id)
+            if shell_name is None:
+                return None
+            shell = self._shells.get(shell_name)
+            if shell is None:
+                return None
+            cursor = self._task_cursors.get(task_id, 0)
+        # Peek outside the manager lock — the Shell's ring buffer has
+        # its own lock. Holding the manager lock during a potentially
+        # non-trivial read would block concurrent shell creation /
+        # close operations on the same conversation unnecessarily.
+        partial = shell.peek_partial_stdout(cursor)
+        with self._lock:
+            # Only advance if the task is still registered; otherwise
+            # we've raced with unregister_running_task and our read
+            # is stale.
+            if task_id in self._task_cursors:
+                self._task_cursors[task_id] = partial.new_cursor
+        return partial.text, partial.lost_bytes

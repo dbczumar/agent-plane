@@ -34,10 +34,12 @@ from agent_plane.errors import AgentPlaneError, ErrorCode
 # sub-agent path so each kind uses the right collection mechanism.
 _TOOL_KIND = "tool"
 _SUB_AGENT_KIND = "sub_agent"
+_TERMINAL_KIND = "terminal"
 # Kinds whose completion arrives via the async_work_complete drain
-# (Phase 2: tools; Phase 3: sub-agents). The legacy "agent_task"
-# kind is the top-level user turn — always tracked separately.
-_DRAIN_KINDS = frozenset({_TOOL_KIND, _SUB_AGENT_KIND})
+# (Phase 2: tools; Phase 3: sub-agents; Phase 2+ terminal: async
+# terminal_run commands). The legacy "agent_task" kind is the
+# top-level user turn — always tracked separately.
+_DRAIN_KINDS = frozenset({_TOOL_KIND, _SUB_AGENT_KIND, _TERMINAL_KIND})
 
 # Per-payload character cap for sub-agent output piggy-backed on
 # the async_work_complete signal (matches the @tool path's
@@ -2263,14 +2265,18 @@ async def _execute_tools(
     sync_calls: list[_ToolCall] = []
     for tc in tool_calls:
         tool = mgr.get_tool(tc.name) if mgr is not None else None
-        if tool is not None and tool.is_async():
-            handle = await _dispatch_async_tool(
+        # is_async is per-invocation — pass arguments so tools like
+        # ``TerminalRunTool`` can inspect the call-time ``synchronous``
+        # field. Tools whose async-ness is fixed at decoration
+        # (``LocalPythonTool``) ignore the argument.
+        if tool is not None and tool.is_async(tc.arguments):
+            handle = await tool.dispatch_async(
                 parent_task_id=task_id,
-                conversation_id_for_handle=None,
+                parent_conversation_id=conversation_id,
                 agent_id=agent_id,
                 agent_name=tc.name,
-                tool=tool,
                 arguments=tc.arguments,
+                workspace_path=workspace_path,
             )
             results[tc.call_id] = handle.to_handle_json()
             continue
@@ -2584,43 +2590,44 @@ def _async_handle_message(task_id: str, tool_name: str) -> str:
     )
 
 
-async def _dispatch_async_tool(
+async def _dispatch_local_python_tool_async(
     *,
+    tool: Any,
     parent_task_id: str,
-    conversation_id_for_handle: str | None,
+    parent_conversation_id: str,
     agent_id: str,
     agent_name: str,
-    tool: Any,
     arguments: str,
 ) -> _AsyncToolHandle:
     """
-    Create a child task row and start its background workflow.
+    Create a child task row and start ``background_tool_workflow``.
 
-    Implements D2/D3 dispatch: pins the new DBOS workflow_uuid to
-    the freshly minted task_id (G56) so callers can later look up
-    workflow state by task_id, then returns the handle to the
-    parent ``_call_tool`` for serialization back to the LLM.
+    Shared helper called by :meth:`LocalPythonTool.dispatch_async`.
+    Pins the new DBOS workflow_uuid to the freshly minted task_id
+    (G56) so callers can later look up workflow state by task_id,
+    then returns the handle to the parent ``_call_tool`` for
+    serialization back to the LLM.
 
     The created task row carries ``kind="tool"`` so the parent's
     end-of-turn auto-collect (D5) groups it correctly with other
     async work. ``root_task_id`` is set to the parent so
     ``task_store.list_tasks(root_task_id=...)`` finds it.
 
+    :param tool: The :class:`LocalPythonTool` instance to dispatch.
+        The function pulls ``module_path`` and ``name()`` off the
+        instance.
     :param parent_task_id: The currently-executing parent
         workflow's task_id. The new task points at it via
         ``root_task_id``; the background workflow signals it via
         the ``async_work_complete`` topic.
-    :param conversation_id_for_handle: Optional conversation_id
-        override for the new task row. Defaults to the parent
-        task's conversation_id (looked up from task_store).
+    :param parent_conversation_id: The parent's conversation id.
+        When non-empty, used as the child task's conversation id;
+        otherwise falls back to looking up the parent row to read
+        its conversation_id.
     :param agent_id: The owning agent's ID.
     :param agent_name: The tool's name (recorded as ``agent_name``
         on the task so ``list_tasks`` results show what produced
         the work).
-    :param tool: The :class:`Tool` instance to dispatch — must be
-        a :class:`~agent_plane.tools.local.LocalPythonTool`. The
-        function pulls ``module_path`` and ``name()`` off the
-        instance.
     :param arguments: JSON-encoded arguments string from the LLM.
     :returns: An :class:`_AsyncToolHandle` ready to be serialized
         back to the LLM as a tool-call result.
@@ -2639,16 +2646,26 @@ async def _dispatch_async_tool(
 
     if not isinstance(tool, LocalPythonTool):
         raise RuntimeError(
-            f"async dispatch only supported for LocalPythonTool, got {type(tool).__name__}"
+            f"local-python async dispatch requires LocalPythonTool, "
+            f"got {type(tool).__name__}"
         )
 
     task_store = get_task_store()
-    parent_row = await _to_thread(lambda: task_store.get_sync(parent_task_id))
-    if parent_row is None:
-        raise RuntimeError(
-            f"parent task {parent_task_id!r} not found — async dispatch invariant broken"
+    if parent_conversation_id:
+        conv_id = parent_conversation_id
+    else:
+        # Fall back to the parent row's conversation_id for legacy
+        # callers that don't pass it. Kept as a defensive path —
+        # the workflow body always has conversation_id available now.
+        parent_row = await _to_thread(
+            lambda: task_store.get_sync(parent_task_id)
         )
-    conv_id = conversation_id_for_handle or parent_row.conversation_id
+        if parent_row is None:
+            raise RuntimeError(
+                f"parent task {parent_task_id!r} not found — async "
+                f"dispatch invariant broken"
+            )
+        conv_id = parent_row.conversation_id
 
     def _create_row() -> Any:
         return task_store.create(

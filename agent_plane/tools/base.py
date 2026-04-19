@@ -126,19 +126,86 @@ class Tool(abc.ABC):
         the child process. Default is a no-op.
         """
 
-    def is_async(self) -> bool:
+    def is_async(self, arguments: str | None = None) -> bool:
         """
-        Return ``True`` if this tool runs in a background workflow.
+        Return ``True`` if this invocation runs in a background workflow.
 
-        Built-in and synchronous tools return ``False`` (the
-        default) — the runtime calls ``invoke()`` inline and
-        passes the string result back to the LLM in the same
-        iteration. Tools that override this to return ``True``
-        signal the runtime to start a
-        :func:`~agent_plane.runtime.background_tool_workflow.background_tool_workflow`,
-        return a task handle to the LLM immediately, and deliver
-        the eventual result via the ``async_work_complete`` topic.
+        Tools that NEVER run async (the common case) leave the
+        default. Tools whose async-ness is a property of the tool
+        itself (``LocalPythonTool`` with ``@tool(synchronous=False)``)
+        ignore ``arguments`` and return based on internal state.
+        Tools whose async-ness is a property of the *invocation*
+        (``TerminalRunTool`` with a ``synchronous`` argument) inspect
+        ``arguments`` to decide per-call.
 
-        :returns: ``False`` by default.
+        Async invocations bypass the inline ``invoke()`` path. Instead,
+        the runtime calls :meth:`dispatch_async` which starts a child
+        workflow and returns a handle immediately; the real result
+        arrives later via the ``async_work_complete`` drain.
+
+        :param arguments: JSON-encoded argument string from the LLM,
+            same shape as what ``invoke`` would receive. ``None``
+            means the caller only wants the tool-level default (used
+            by tool manifest generation that doesn't have call-time
+            arguments). Tools that ignore per-call semantics can
+            safely ignore this parameter.
+        :returns: ``True`` iff this invocation should dispatch as a
+            background workflow.
         """
         return False
+
+    async def dispatch_async(
+        self,
+        *,
+        parent_task_id: str,
+        parent_conversation_id: str,
+        agent_id: str,
+        agent_name: str,
+        arguments: str,
+        workspace_path: str | None,
+    ) -> Any:
+        """
+        Kick off the background workflow for an async invocation.
+
+        Called by the runtime (from an async workflow body) when
+        :meth:`is_async` returned True. The tool is responsible for:
+
+        - Creating the child ``task_store`` row (with its
+          tool-specific ``kind``).
+        - Starting the appropriate DBOS workflow pinned to that
+          task_id.
+        - Returning an ``_AsyncToolHandle`` (defined in
+          ``agent_plane.runtime.workflow``) ready to be serialized
+          to JSON as the tool-call result.
+
+        The default raises ``NotImplementedError`` — subclasses that
+        override :meth:`is_async` to return True MUST override this
+        as well. The split lets synchronous tools ignore the async
+        path entirely without import-cycle headaches around
+        ``_AsyncToolHandle``.
+
+        :param parent_task_id: The currently-executing parent
+            workflow's task_id. The new child task points at it via
+            ``root_task_id``; the background workflow signals it via
+            the ``async_work_complete`` topic.
+        :param parent_conversation_id: The owning conversation's id.
+            Recorded on the child task row for conversation-scoped
+            queries.
+        :param agent_id: The owning agent's id. Recorded on the
+            child task row.
+        :param agent_name: The tool's name (same as ``self.name()``
+            in most cases) — recorded as ``agent_name`` on the task
+            so ``list_tasks`` results show what produced the work.
+        :param arguments: JSON-encoded argument string from the LLM.
+        :param workspace_path: Per-conversation workspace directory
+            (or ``None`` if this tool doesn't need it).
+        :returns: An ``_AsyncToolHandle`` instance (the runtime's
+            shared handle shape). Typed as ``Any`` here to avoid
+            importing the runtime module from the tool base.
+        :raises NotImplementedError: When called on a tool that
+            didn't override this method.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} declared is_async() true "
+            f"but did not override dispatch_async()"
+        )

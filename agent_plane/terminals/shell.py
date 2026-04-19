@@ -19,8 +19,11 @@ import dataclasses
 import os
 import re
 import shutil
+import signal
+import subprocess
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pexpect
@@ -82,6 +85,29 @@ _TAIL_CHARS = 10_000
 # relative so the path shown in stdout markers is workspace-relative
 # and copy-pasteable into ``cat`` / ``Read``-style tools.
 _DISK_LOG_SUBDIR = Path(".agent_plane") / "terminal"
+
+
+@dataclasses.dataclass(frozen=True)
+class PartialReadResult:
+    """One delta read of a shell's stdout since a caller-supplied cursor.
+
+    Returned by :meth:`Shell.peek_partial_stdout`. The caller stores
+    ``new_cursor`` and passes it on the next call to resume cleanly.
+
+    :param text: ANSI-stripped UTF-8 text of the delta. Empty if no
+        new bytes since the cursor.
+    :param new_cursor: Byte offset the caller should pass next time.
+        Monotonically non-decreasing.
+    :param lost_bytes: Count of bytes that were written between the
+        caller's cursor and the retained bytes — i.e. evicted before
+        the caller could read them. Non-zero when the ring buffer
+        overflows between observations. Callers can surface this as
+        a ``[... N bytes lost ...]`` marker.
+    """
+
+    text: str
+    new_cursor: int
+    lost_bytes: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -157,6 +183,16 @@ class Shell:
         # too). File-existence check on write bumps past any
         # stale-log collisions from before a server restart.
         self._run_index = 0
+        # Flag: did ``interrupt()`` get called during the current
+        # command? Reset at the top of each ``_run_locked``. When
+        # set, the result builder returns status ``"killed"`` even
+        # though the command's D marker arrived normally — matches
+        # the ``timeout_ms`` path's status semantics.
+        #
+        # ``threading.Event`` rather than a bare bool so the
+        # interrupt-arrival signal is visible across threads without
+        # needing a separate lock.
+        self._interrupt_signal = threading.Event()
 
     @property
     def name(self) -> str:
@@ -338,7 +374,12 @@ class Shell:
             "npm_config_cache": f"{ws}/.cache/npm",
         }
 
-    def run_sync(self, command: str, timeout_ms: int | None = None) -> RunResult:
+    def run_sync(
+        self,
+        command: str,
+        timeout_ms: int | None = None,
+        cancel_predicate: Callable[[], bool] | None = None,
+    ) -> RunResult:
         """Run a command synchronously and return its captured output.
 
         Sends ``command`` to the bash subprocess and drives a read
@@ -372,6 +413,15 @@ class Shell:
         :param timeout_ms: Maximum milliseconds the command may run.
             ``None`` means no bound (command may run indefinitely).
             When it fires, the command is Ctrl-C'd, not the shell.
+        :param cancel_predicate: Optional callable returning True
+            when the caller wants the command cancelled mid-flight.
+            Checked from the shell's own thread (the read loop) so
+            there's no cross-thread pexpect race. When it flips
+            True, the read loop sends SIGINT to bash and keeps
+            reading until the D marker arrives with exit 130.
+            Result status will be ``"killed"``. Called at most once
+            per read-loop iteration (~4 Hz); side-effect-free
+            predicates are recommended.
         :returns: A :class:`RunResult` describing the outcome.
         """
         if not self.is_alive():
@@ -394,11 +444,16 @@ class Shell:
                 shell=self._name,
             )
         try:
-            return self._run_locked(command, timeout_ms)
+            return self._run_locked(command, timeout_ms, cancel_predicate)
         finally:
             self._cmd_lock.release()
 
-    def _run_locked(self, command: str, timeout_ms: int | None) -> RunResult:
+    def _run_locked(
+        self,
+        command: str,
+        timeout_ms: int | None,
+        cancel_predicate: Callable[[], bool] | None = None,
+    ) -> RunResult:
         """Execute one command while holding ``self._cmd_lock``.
 
         Drives :meth:`_read_until_done`, then dispatches to the
@@ -409,33 +464,87 @@ class Shell:
         :returns: See :meth:`run_sync`.
         """
         self._ring.reset()
+        # Clear any pending interrupt signal from a prior command.
+        # A new command starts cleanly: if interrupt() is called
+        # before the command's D marker arrives, the flag will be
+        # set again and we'll report "killed".
+        self._interrupt_signal.clear()
         self._proc.sendline(command)
 
         deadline = None
         if timeout_ms is not None:
             deadline = time.monotonic() + timeout_ms / 1000.0
 
-        outcome = self._read_until_done(deadline)
+        outcome = self._read_until_done(
+            deadline=deadline,
+            cancel_predicate=cancel_predicate,
+        )
         if outcome == "completed":
+            # If ``interrupt()`` was called during this command's
+            # execution, the D marker arrived because of the SIGINT
+            # (exit 130) — surface that as ``status="killed"`` so
+            # the caller can distinguish agent-requested cancel from
+            # clean completion. Without this, a cancel that races
+            # the command's own completion would show up as
+            # "completed" and hide the cancel semantics from
+            # check_task.
+            if self._interrupt_signal.is_set():
+                return self._build_completed_or_killed_result("killed")
             return self._build_completed_or_killed_result("completed")
         if outcome == "timeout":
             return self._handle_timeout()
         # outcome == "crashed"
         return self._build_crashed_result()
 
-    def _read_until_done(self, deadline: float | None) -> str:
+    def _read_until_done(
+        self,
+        deadline: float | None,
+        cancel_predicate: Callable[[], bool] | None = None,
+    ) -> str:
         """Read chunks into the ring buffer until D marker, deadline, or EOF.
 
         :param deadline: Absolute monotonic-time deadline after which
             the command is considered timed out. ``None`` means no
             deadline.
-        :returns: One of ``"completed"`` (D marker seen),
-            ``"timeout"`` (deadline reached), or ``"crashed"``
-            (bash EOF).
+        :param cancel_predicate: Optional callable polled between
+            read iterations. When it returns True we send SIGINT
+            (once — subsequent polls re-check but don't double-send)
+            and keep reading until D arrives (exit 130) so we can
+            classify the result as ``"killed"``. Called from this
+            thread, so it's safe to inspect shared state the caller
+            also mutates from another thread.
+        :returns: One of ``"completed"`` (D marker seen — caller
+            inspects :attr:`_interrupt_signal` to tell killed from
+            clean completion), ``"timeout"`` (deadline reached), or
+            ``"crashed"`` (bash EOF).
         """
+        interrupted_here = False
+        # Short grace so the cancel predicate is only polled after
+        # bash has had a moment to set up the child. 100 ms is
+        # sufficient in practice — the SIGINT path uses direct
+        # ``os.kill`` on bash's children (see
+        # :meth:`_interrupt_children`), not the PTY's VINTR, so
+        # there's no risk of killing bash itself.
+        cancel_grace_until = time.monotonic() + 0.1
         while True:
             if deadline is not None and time.monotonic() >= deadline:
                 return "timeout"
+            if (
+                cancel_predicate is not None
+                and not interrupted_here
+                and time.monotonic() >= cancel_grace_until
+                and cancel_predicate()
+            ):
+                # Caller requested cancel. Send SIGINT directly to
+                # bash's foreground child via ``_interrupt_children``
+                # (same reasoning as :meth:`interrupt`: PTY-level
+                # VINTR is flaky under non-interactive bash +
+                # pexpect, direct kill is reliable). Setting
+                # ``_interrupt_signal`` makes _run_locked classify
+                # the resulting D marker as ``"killed"``.
+                self._interrupt_signal.set()
+                self._interrupt_children()
+                interrupted_here = True
             try:
                 chunk = self._proc.read_nonblocking(
                     size=_READ_CHUNK_SIZE, timeout=_READ_POLL_INTERVAL_S
@@ -462,10 +571,10 @@ class Shell:
         :returns: ``RunResult`` with status ``"killed"`` if Ctrl-C
             worked, or ``"shell_crashed"`` if we had to SIGKILL.
         """
-        # pexpect.sendintr() writes the terminal's interrupt char
-        # (usually Ctrl-C) to the PTY master. Bash's foreground child
-        # receives SIGINT and exits; bash then emits D;130.
-        self._proc.sendintr()
+        # SIGINT bash's foreground child via os.kill. See
+        # :meth:`_interrupt_children` for why we don't use the
+        # PTY's VINTR path here. Child dies, bash emits D;130.
+        self._interrupt_children()
         grace_deadline = time.monotonic() + _TIMEOUT_GRACE_S
         outcome = self._read_until_done(grace_deadline)
         if outcome == "completed":
@@ -601,6 +710,122 @@ class Shell:
         path_ref = f", full output at {disk_path}" if disk_path else ""
         marker = f"\n[... {truncated} bytes truncated{path_ref} ...]\n"
         return head + marker + tail
+
+    def interrupt(self) -> None:
+        """Send SIGINT (Ctrl-C) to the bash subprocess.
+
+        Used by async-terminal ``cancel_task`` to stop a running
+        command without killing the shell itself. If a command is
+        currently executing inside ``run_sync``, bash delivers SIGINT
+        to the foreground process; the command dies, the OSC 633 ``D``
+        marker fires with exit code 130, and the in-flight ``run_sync``
+        returns with ``status="killed"``. Bash itself survives and
+        the shell can accept subsequent commands.
+
+        Thread-safe: callable from any thread. Internally writes a
+        single control byte to the PTY via ``pexpect.sendintr``,
+        which is atomic at the kernel level. The caller does not
+        need to hold the cmd lock — that's what makes this useful
+        for cancel, where the command-runner thread already owns
+        the lock.
+
+        No-op if the shell is not currently alive (already exited
+        or never spawned). Does not raise.
+        """
+        if self._proc.isalive():
+            # Mark the interrupt BEFORE sending the signal so the
+            # result builder can't race us: if the SIGINT reaches
+            # bash's child and the D marker is read before we set
+            # the flag, _run_locked would wrongly classify the
+            # result as "completed".
+            self._interrupt_signal.set()
+            # Send SIGINT directly to bash's foreground child via
+            # os.kill rather than via the PTY's VINTR. The PTY path
+            # (``pexpect.sendintr``) is theoretically equivalent
+            # (terminal driver sees VINTR → generates SIGINT for
+            # the foreground PGID), but in practice —
+            # specifically in non-interactive bash spawned under
+            # pexpect — SIGINT sometimes kills bash itself rather
+            # than the foreground child. Direct kill bypasses that
+            # quirk: we enumerate bash's direct children via
+            # ``pgrep -P`` and SIGINT each one. Bash sees the child
+            # exit with signal, emits its D marker with exit 130.
+            self._interrupt_children()
+
+    def _interrupt_children(self) -> None:
+        """SIGINT every direct child of the bash subprocess.
+
+        Helper for :meth:`interrupt`. Lists children via ``pgrep -P``
+        (portable across Linux and macOS), then sends SIGINT to each.
+        No-op if bash has no children (idle at prompt). Exceptions
+        from ``pgrep`` (e.g. not installed) or ``os.kill``
+        (e.g. child exited between listing and kill) are swallowed —
+        interrupt is best-effort; if the child is already gone,
+        there's nothing to interrupt.
+
+        Why not ``killpg``: bash spawned by pexpect doesn't always
+        create a new process group for each foreground command, so
+        killpg would go to bash's own group (including bash) and
+        kill the shell.
+        """
+        try:
+            result = subprocess.run(
+                ["pgrep", "-P", str(self._proc.pid)],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except (subprocess.SubprocessError, FileNotFoundError):
+            return
+        for token in result.stdout.split():
+            try:
+                child_pid = int(token)
+            except ValueError:
+                continue
+            try:
+                os.kill(child_pid, signal.SIGINT)
+            except (ProcessLookupError, PermissionError):
+                # Child exited between pgrep and kill, or we don't
+                # own it (shouldn't happen for our own bash). Either
+                # way, nothing to interrupt; ignore and continue.
+                continue
+
+    def peek_partial_stdout(self, cursor: int) -> PartialReadResult:
+        """Return stdout bytes produced since ``cursor``, ANSI-stripped.
+
+        Used by ``check_task`` on ``kind="terminal"`` tasks to show
+        the agent a "tail -f"-style delta of what the command has
+        produced since the last poll. Does NOT advance any persistent
+        cursor — the caller is responsible for storing the returned
+        ``new_cursor`` and passing it on the next call. This keeps
+        the Shell stateless with respect to observers and lets
+        multiple callers poll independently if that's ever needed.
+
+        Thread-safe: reads the ring buffer under its internal lock,
+        so concurrent reads and the writer (the read loop in
+        ``_read_until_done``) coexist safely. ANSI stripping happens
+        on the delta bytes only — consistent with the finished-output
+        path in ``_build_completed_or_killed_result``.
+
+        :param cursor: Byte offset returned by a prior
+            ``peek_partial_stdout`` call, or ``0`` on the first call.
+            Negative values are clamped to 0.
+        :returns: A :class:`PartialReadResult` with the ANSI-stripped
+            text, the new cursor to pass next time, and any
+            lost-byte count from eviction.
+        """
+        partial = self._ring.slice_since(cursor)
+        # strip_ansi takes bytes and returns a decoded str, matching
+        # the finished-output path in _build_completed_or_killed_result.
+        # Using the same helper keeps the decoding semantics (UTF-8
+        # with errors="replace" per the implementation) consistent
+        # between sync and async terminal reads.
+        text = strip_ansi(partial.data)
+        return PartialReadResult(
+            text=text,
+            new_cursor=partial.new_cursor,
+            lost_bytes=partial.lost_bytes,
+        )
 
     def close(self) -> None:
         """Terminate the bash subprocess.

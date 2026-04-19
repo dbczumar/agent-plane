@@ -401,3 +401,179 @@ def test_shell_busy_does_not_leave_shell_wedged(
     )
     assert "post" in r.stdout
     assert r.exit_code == 0
+
+
+# ── interrupt() — sends SIGINT to the running command ──────────
+
+
+def test_interrupt_kills_running_command_shell_survives(
+    shell: Shell, tmp_path: Path
+) -> None:
+    """``shell.interrupt()`` unblocks a sleeping command and returns
+    ``status="killed"``; the shell itself is still usable.
+
+    This is what ``cancel_task`` calls on a ``kind="terminal"`` task.
+    If interrupt failed to reach bash (wrong fd, wrong signal), the
+    sleep would time out instead of getting SIGINT, and exit_code
+    would be 0, not 130.
+    """
+    import threading
+    import time as _time
+
+    # Start a long sleep in a background thread so we can interrupt
+    # it from this thread.
+    result_holder: list[object] = []
+    started = threading.Event()
+
+    def _run() -> None:
+        started.set()
+        result_holder.append(shell.run_sync("sleep 10 && echo late"))
+
+    t = threading.Thread(target=_run)
+    t.start()
+    try:
+        assert started.wait(timeout=2.0)
+        # Give the sleep a moment to actually start. We need bash
+        # to be IN the sleep (holding the cmd lock) before interrupt
+        # arrives. 300 ms is >> sendline + read-loop entry time.
+        # This isn't time.sleep in test assertion territory — it's
+        # a deliberate small wait to cross a known setup barrier
+        # (no better primitive available without reaching into
+        # private Shell state).
+        _time.sleep(0.3)
+        shell.interrupt()
+    finally:
+        t.join(timeout=10.0)
+
+    assert len(result_holder) == 1
+    r = result_holder[0]
+    assert r.status == "killed", (  # type: ignore[attr-defined]
+        f"Expected 'killed' after SIGINT, got {r.status!r}. "  # type: ignore[attr-defined]
+        f"If 'completed', the SIGINT didn't reach bash — interrupt "
+        f"may be writing to the wrong fd or the PTY isn't wired up."
+    )
+    # SIGINT → exit 130 (128 + 2) per bash convention.
+    assert r.exit_code == 130  # type: ignore[attr-defined]
+
+    # Shell still works.
+    r2 = shell.run_sync("echo alive")
+    assert r2.status == "completed"
+    assert "alive" in r2.stdout
+
+
+def test_interrupt_on_dead_shell_is_noop(tmp_path: Path) -> None:
+    """Calling ``interrupt()`` after the shell has died doesn't raise.
+
+    Regression guard for a naive implementation that would call
+    ``proc.sendintr()`` unconditionally and blow up on a closed fd.
+    """
+    s = Shell.spawn("dead-test", tmp_path, sandbox_enabled=False)
+    s.close()
+    # Should be a silent no-op, not an exception.
+    s.interrupt()
+
+
+# ── peek_partial_stdout — delta reads during a running command ─
+
+
+def test_peek_partial_stdout_empty_before_command() -> None:
+    """Peeking before any command produces empty delta + cursor 0.
+
+    Establishes the baseline: a shell with no history returns
+    no bytes. If this produced junk, ``check_task`` on a brand-new
+    terminal task would show phantom output.
+    """
+    from pathlib import Path as _Path
+
+    from agent_plane.terminals import PartialReadResult, Shell as _Shell
+
+    with tempfile_dir() as d:
+        s = _Shell.spawn("peek-empty", _Path(d), sandbox_enabled=False)
+        try:
+            p = s.peek_partial_stdout(0)
+            assert isinstance(p, PartialReadResult)
+            assert p.text == ""
+            assert p.new_cursor == 0
+            assert p.lost_bytes == 0
+        finally:
+            s.close()
+
+
+def test_peek_partial_stdout_returns_delta_during_command(
+    shell: Shell,
+) -> None:
+    """During a running command, successive peeks return only new bytes.
+
+    Simulates check_task's polling. Uses a command that prints
+    two chunks ~0.5s apart, peeks between them, asserts:
+    - first peek sees chunk 1 but not chunk 2 (yet)
+    - second peek sees chunk 2 but not chunk 1 again
+    """
+    import threading
+
+    result_holder: list[object] = []
+    done = threading.Event()
+
+    def _run() -> None:
+        result_holder.append(
+            shell.run_sync(
+                "echo chunk-one; sleep 0.6; echo chunk-two; sleep 0.1"
+            )
+        )
+        done.set()
+
+    t = threading.Thread(target=_run)
+    t.start()
+    try:
+        # First peek: wait for chunk-one to appear in the buffer.
+        deadline = __import__("time").monotonic() + 3.0
+        first = shell.peek_partial_stdout(0)
+        while "chunk-one" not in first.text and __import__("time").monotonic() < deadline:
+            first = shell.peek_partial_stdout(0)
+        assert "chunk-one" in first.text, (
+            f"First peek didn't see chunk-one; got {first.text!r}."
+        )
+        assert "chunk-two" not in first.text, (
+            f"First peek already saw chunk-two — the sleep in the "
+            f"bash command didn't hold: {first.text!r}."
+        )
+
+        # Second peek: use the new cursor from first.
+        deadline2 = __import__("time").monotonic() + 3.0
+        second = shell.peek_partial_stdout(first.new_cursor)
+        while "chunk-two" not in second.text and __import__("time").monotonic() < deadline2:
+            second = shell.peek_partial_stdout(first.new_cursor)
+        assert "chunk-two" in second.text, (
+            f"Second peek didn't see chunk-two within 3s; got "
+            f"{second.text!r}."
+        )
+        # Crucially: chunk-one should NOT appear again — it was
+        # before the cursor.
+        assert "chunk-one" not in second.text, (
+            f"Second peek returned chunk-one again — cursor wasn't "
+            f"advancing: {second.text!r}."
+        )
+    finally:
+        done.wait(timeout=5.0)
+        t.join(timeout=5.0)
+
+    assert len(result_holder) == 1
+    r = result_holder[0]
+    assert r.status == "completed"  # type: ignore[attr-defined]
+
+
+# Helper for test_peek_partial_stdout_empty_before_command — builds
+# a tempdir context manager so we don't need a fixture. Kept local
+# to this file (not fixture-promotion territory) because it's used
+# in one test here.
+
+
+def tempfile_dir():
+    """Context manager for a throwaway tmp dir. Used by the empty-peek
+    test which needs its own shell independent of the shared fixture.
+
+    :returns: A tempfile.TemporaryDirectory instance.
+    """
+    import tempfile as _t
+
+    return _t.TemporaryDirectory()

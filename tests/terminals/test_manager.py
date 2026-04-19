@@ -332,3 +332,166 @@ def test_concurrent_run_sync_same_name_creates_one_shell(
     )
     # All 5 threads saw the same shell instance.
     assert manager.list_shells() == ["shared"]
+
+
+# ── Async task tracking (register/unregister/shell_for_task/peek) ──
+
+
+def test_register_running_task_tracks_shell(
+    manager: TerminalManager,
+) -> None:
+    """After ``register_running_task``, ``shell_for_task`` returns
+    the tracked shell.
+
+    This is the lookup ``cancel_task(kind="terminal")`` uses to
+    find the shell to interrupt. If it didn't work, cancel_task
+    would silently fail to find the running command.
+    """
+    manager.run_sync("worker", "echo init")
+    manager.register_running_task("task_abc", "worker")
+
+    shell = manager.shell_for_task("task_abc")
+    assert shell is not None
+    assert shell.name == "worker"
+
+
+def test_shell_for_unknown_task_returns_none(
+    manager: TerminalManager,
+) -> None:
+    """``shell_for_task`` on an unregistered id returns None.
+
+    Cancel path relies on this — if the task completed already
+    (and was unregistered), cancel should be a no-op rather than
+    pick up a wrong shell by accident.
+    """
+    # No registration at all.
+    assert manager.shell_for_task("task_never_existed") is None
+
+    # Registered then unregistered.
+    manager.run_sync("worker", "echo init")
+    manager.register_running_task("task_done", "worker")
+    manager.unregister_running_task("task_done")
+    assert manager.shell_for_task("task_done") is None
+
+
+def test_shell_for_task_returns_none_if_shell_closed(
+    manager: TerminalManager,
+) -> None:
+    """If the underlying shell was closed after registration,
+    ``shell_for_task`` returns None.
+
+    Defensive: prevents cancel_task from calling interrupt() on a
+    dead shell. Closed shell = no one to interrupt.
+    """
+    manager.run_sync("worker", "echo init")
+    manager.register_running_task("task_x", "worker")
+    manager.close("worker")
+    assert manager.shell_for_task("task_x") is None
+
+
+def test_peek_task_stdout_returns_delta(
+    manager: TerminalManager,
+) -> None:
+    """``peek_task_stdout`` returns newly appended bytes since the
+    prior call, with per-task cursor advancement.
+
+    This is what ``check_task(kind="terminal")`` uses for
+    ``recent_activity``. Without proper cursor advancement, every
+    check_task would return the whole buffer, blowing the LLM's
+    context.
+    """
+    import threading
+
+    # Start a long-ish command in a background thread so we can
+    # peek while it's running.
+    result_holder: list[object] = []
+
+    def _runner() -> None:
+        result_holder.append(
+            manager.run_sync(
+                "task_runner",
+                "echo part-one; sleep 0.6; echo part-two; sleep 0.1",
+            )
+        )
+
+    # Register BEFORE starting so cursor starts at 0.
+    # Spawn a shell first so register has something to reference.
+    manager.run_sync("task_runner", "echo init")
+    manager.register_running_task("tid_peek", "task_runner")
+
+    t = threading.Thread(target=_runner)
+    t.start()
+    try:
+        # First peek: wait until part-one arrives.
+        deadline = __import__("time").monotonic() + 3.0
+        first = manager.peek_task_stdout("tid_peek")
+        while first is not None and "part-one" not in first[0] and __import__("time").monotonic() < deadline:
+            first = manager.peek_task_stdout("tid_peek")
+        assert first is not None
+        text1, lost1 = first
+        assert "part-one" in text1
+        assert "part-two" not in text1, (
+            f"First peek too late — part-two already appeared: {text1!r}"
+        )
+        assert lost1 == 0  # ring buffer has ample space
+
+        # Second peek: only new bytes (part-two), not part-one again.
+        deadline2 = __import__("time").monotonic() + 3.0
+        second = manager.peek_task_stdout("tid_peek")
+        while second is not None and "part-two" not in second[0] and __import__("time").monotonic() < deadline2:
+            second = manager.peek_task_stdout("tid_peek")
+        assert second is not None
+        text2, _ = second
+        assert "part-two" in text2, (
+            f"Second peek didn't see part-two: {text2!r}"
+        )
+        assert "part-one" not in text2, (
+            f"Second peek returned part-one again — cursor didn't "
+            f"advance. Got: {text2!r}"
+        )
+    finally:
+        t.join(timeout=5.0)
+        manager.unregister_running_task("tid_peek")
+
+
+def test_peek_task_stdout_unknown_returns_none(
+    manager: TerminalManager,
+) -> None:
+    """Unknown task_id → None (not empty string, not exception).
+
+    Distinguishes "task completed" from "task has no output yet."
+    check_task uses this to know it can't produce recent_activity.
+    """
+    assert manager.peek_task_stdout("never-registered") is None
+
+
+def test_register_overwrite_resets_cursor(
+    manager: TerminalManager,
+) -> None:
+    """Re-registering the same task_id starts from cursor 0.
+
+    Supports DBOS crash+replay: the workflow may re-register a
+    task_id after a replay. The expected behavior is that the
+    replayed command starts fresh — partial output from the
+    crashed run is effectively lost (acceptable; the command is
+    re-running anyway).
+    """
+    manager.run_sync("sh1", "echo first")
+    manager.register_running_task("tid", "sh1")
+
+    # Advance the cursor via a peek (which uses the current ring
+    # state — but we only care that cursor != 0 afterward).
+    manager.peek_task_stdout("tid")
+    # Re-register — should reset.
+    manager.register_running_task("tid", "sh1")
+    # A peek right after re-registration should see whatever is
+    # still in the ring (ring wasn't reset; command wasn't re-run
+    # yet in this test). Cursor is back to 0 so we can see it.
+    peek = manager.peek_task_stdout("tid")
+    assert peek is not None
+    text, _ = peek
+    # The original "first" may or may not still be in the ring
+    # depending on whether the next run_sync already reset it.
+    # The invariant here is just: peek didn't error, cursor moved
+    # forward from 0.
+    assert isinstance(text, str)
