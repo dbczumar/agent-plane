@@ -10,9 +10,10 @@ of agent-plane:
 1. `client.query(...)` — ask, get the final text as a string.
 2. `client.query(..., stream=True)` — stream text chunks as they arrive.
 3. `session.query(...)` — multi-turn conversation, IDs threaded for you.
-4. Client-side tools — register a local function, the agent calls it.
-5. File attachments — multi-modal input (text files, images, PDFs).
-6. Pointer to `BlockStream` for cases where plain text isn't enough.
+4. Client-side tools — register an `@tool`-decorated function; agent calls it.
+5. Text file attachment — pass a text file via `files=[...]`.
+6. Image attachment — pass a PNG via `files=[...]`; archer describes it.
+7. Pointer to `BlockStream` for cases where plain text isn't enough.
 
 ### Run
 
