@@ -171,7 +171,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ) from exc
             raise
 
-
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """
         Fetch a conversation by its unique ID.

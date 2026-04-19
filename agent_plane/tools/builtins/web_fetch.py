@@ -291,17 +291,30 @@ def _spawn_and_wait(
     :returns: The sub-agent's text output, or an error message.
     """
     from agent_plane.tools.builtins.spawn import (
+        _resolve_parent_conversation_id,
         _resolve_root_task_id,
         _spawn_one,
     )
 
     root_task_id = _resolve_root_task_id(task_id)
+    parent_conversation_id = _resolve_parent_conversation_id(task_id)
 
+    # Phase 4 made name required. web_fetch is fire-and-forget
+    # (the parent doesn't address the researcher conversation
+    # later via send_to_sub_agent), but the partial unique
+    # index on (parent_conversation_id, title) means a fixed
+    # name would collide if the parent calls web_fetch more than
+    # once. Use the calling task_id as the unique discriminator
+    # so each web_fetch invocation gets a distinct child
+    # conversation.
+    sa_name = f"{RESEARCHER_NAME}_{task_id}"
     child_task_id = _spawn_one(
         agent_id=agent_id,
         agent_name=RESEARCHER_NAME,
+        sa_name=sa_name,
         user_input=prompt,
         root_task_id=root_task_id,
+        parent_conversation_id=parent_conversation_id,
     )
 
     return _poll_until_terminal(child_task_id)
