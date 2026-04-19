@@ -130,6 +130,15 @@ class SqlTask(Base):
     :param root_task_id: ID of the top-level task that initiated
         this sub-agent's spawn tree, or ``None`` for top-level
         tasks.
+    :param kind: Task kind discriminator. ``"agent_task"`` for
+        user-initiated turns; ``"tool"`` for background custom-tool
+        invocations spawned via ``@tool(synchronous=False)``;
+        ``"sub_agent"`` for sub-agent workflows (Phase 3);
+        ``"client_tool"`` for async client-side tools (Phase 5).
+        The unified task lifecycle (`check_task` / `cancel_task` /
+        `list_tasks`) uses this to classify and filter rows so the
+        LLM only sees the background work it spawned, not its own
+        parent turn.
     """
 
     __tablename__ = "tasks"
@@ -147,12 +156,22 @@ class SqlTask(Base):
     root_task_id: Mapped[str | None] = mapped_column(
         String(64), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=True
     )
+    # Server-side default backfills pre-existing rows to "agent_task";
+    # all new task creation paths set kind explicitly per G74.
+    kind: Mapped[str] = mapped_column(
+        String(32), default="agent_task", server_default="agent_task"
+    )
 
     __table_args__ = (
         Index("ix_tasks_conversation_id", "conversation_id"),
         Index("ix_tasks_agent_id", "agent_id"),
         Index("ix_tasks_created_at", "created_at"),
         Index("ix_tasks_root_task_id", "root_task_id"),
+        Index("ix_tasks_kind", "kind"),
+        CheckConstraint(
+            "kind IN ('agent_task', 'tool', 'sub_agent', 'client_tool')",
+            name="ck_tasks_kind",
+        ),
     )
 
 

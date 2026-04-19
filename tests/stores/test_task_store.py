@@ -92,8 +92,14 @@ def _make_mock_streaming_client() -> MagicMock:
 
 
 def _make_agent_bundle() -> bytes:
-    """Create a minimal valid agent tarball."""
-    config_yaml = b"spec_version: 1\nllm:\n  model: test-model\n"
+    """Create a minimal valid agent tarball.
+
+    llm.connection is required by the spec validator; the value is
+    irrelevant at runtime because the test mocks the actual client.
+    """
+    config_yaml = (
+        b"spec_version: 1\nllm:\n  model: test-model\n  connection:\n    api_key: test-key\n"
+    )
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         info = tarfile.TarInfo(name="config.yaml")

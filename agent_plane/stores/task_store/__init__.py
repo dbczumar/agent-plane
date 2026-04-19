@@ -47,6 +47,7 @@ class TaskStore(ABC):
         previous_response_id: str | None = None,
         background: bool = False,
         root_task_id: str | None = None,
+        kind: str = "agent_task",
     ) -> Task:
         """
         Create a new task for executing an agent in the given
@@ -77,6 +78,14 @@ class TaskStore(ABC):
         :param root_task_id: ID of the top-level task that
             initiated this sub-agent's spawn tree. ``None``
             for top-level tasks, e.g. ``"task_abc123"``.
+        :param kind: Task kind discriminator, one of
+            ``"agent_task"`` (default — user-initiated turn),
+            ``"tool"`` (background ``@tool(synchronous=False)``),
+            ``"sub_agent"`` (sub-agent workflow, Phase 3), or
+            ``"client_tool"`` (async client-side tool, Phase 5).
+            Set explicitly per G74 by every spawn site so
+            ``list_tasks`` / ``check_task`` can classify rows
+            correctly without relying on the default backfill.
         :returns: The newly created :class:`Task` with status
             ``"queued"``.
         """

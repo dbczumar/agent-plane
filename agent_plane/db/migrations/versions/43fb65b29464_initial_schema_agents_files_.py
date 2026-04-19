@@ -95,6 +95,21 @@ def upgrade() -> None:
         sa.Column("agent_name", sa.String(length=256), nullable=False),
         sa.Column("background", sa.Boolean(), nullable=False),
         sa.Column("root_task_id", sa.String(length=64), nullable=True),
+        # G74: kind discriminator for the unified task lifecycle.
+        # "agent_task" = user-initiated turn (default for fresh DBs);
+        # "tool" = @tool(synchronous=False) background invocation;
+        # "sub_agent" = sub-agent workflow (Phase 3);
+        # "client_tool" = async client-side tool (Phase 5).
+        sa.Column(
+            "kind",
+            sa.String(length=32),
+            nullable=False,
+            server_default="agent_task",
+        ),
+        sa.CheckConstraint(
+            "kind IN ('agent_task', 'tool', 'sub_agent', 'client_tool')",
+            name="ck_tasks_kind",
+        ),
         sa.ForeignKeyConstraint(
             ["agent_id"],
             ["agents.id"],
@@ -116,6 +131,7 @@ def upgrade() -> None:
     op.create_index("ix_tasks_conversation_id", "tasks", ["conversation_id"], unique=False)
     op.create_index("ix_tasks_created_at", "tasks", ["created_at"], unique=False)
     op.create_index("ix_tasks_root_task_id", "tasks", ["root_task_id"], unique=False)
+    op.create_index("ix_tasks_kind", "tasks", ["kind"], unique=False)
     op.create_table(
         "pending_tool_calls",
         sa.Column("call_id", sa.String(length=64), nullable=False),
@@ -157,6 +173,7 @@ def downgrade() -> None:
     op.drop_index("ix_pending_tool_calls_task_id", table_name="pending_tool_calls")
     op.drop_index("ix_pending_tool_calls_root_task_id", table_name="pending_tool_calls")
     op.drop_table("pending_tool_calls")
+    op.drop_index("ix_tasks_kind", table_name="tasks")
     op.drop_index("ix_tasks_root_task_id", table_name="tasks")
     op.drop_index("ix_tasks_created_at", table_name="tasks")
     op.drop_index("ix_tasks_conversation_id", table_name="tasks")

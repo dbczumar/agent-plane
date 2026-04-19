@@ -633,7 +633,11 @@ def _format_terminal_message(task: Task) -> str:
     :returns: A message like ``"Sub-agent 'X' failed:
         context_window_exceeded — Input too long."``.
     """
-    base = f"Sub-agent {task.agent_name!r} finished with status: {task.status}."
+    # task.status is typed str but some construction paths assign the
+    # TaskStatus enum directly; .value gives the lowercase form
+    # consistently for f-string interpolation.
+    status_str = task.status.value if hasattr(task.status, "value") else task.status
+    base = f"Sub-agent {task.agent_name!r} finished with status: {status_str}."
     if task.error:
         # Defensive: task.error is dict[str, str] but may come
         # from DB JSON — missing keys get readable fallbacks so

@@ -77,6 +77,14 @@ class Task:
         ``agent_plane`` extension) supplied at request time. Restored
         from DBOS workflow inputs on recovery. ``None`` means no
         client tools were supplied.
+    :param kind: Task kind discriminator. ``"agent_task"`` for
+        user-initiated parent turns; ``"tool"`` for background
+        custom-tool invocations spawned via ``@tool(synchronous=False)``;
+        ``"sub_agent"`` for sub-agent workflows (Phase 3);
+        ``"client_tool"`` for async client-side tools (Phase 5).
+        Drives the unified task lifecycle (`check_task` /
+        `cancel_task` / `list_tasks`) — the LLM only sees background
+        work it spawned, not its own parent turn (G57).
     """
 
     id: str
@@ -104,3 +112,6 @@ class Task:
     # Client-specified tool dicts (OpenAI format with agent_plane extension).
     # Restored from DBOS workflow inputs on recovery; None = no client tools.
     tools: list[dict[str, Any]] | None = None
+    # G74: kind defaults to "agent_task" for backward compatibility
+    # with existing call sites; new spawn paths set it explicitly.
+    kind: str = "agent_task"
