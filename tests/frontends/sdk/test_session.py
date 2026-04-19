@@ -36,8 +36,8 @@ def _make_response(
 class _ScriptedSession(Session):
     """A Session subclass whose ``send()`` replays a fixed event list.
 
-    ``Session.query()`` dispatches to ``self._collect_text`` /
-    ``self._stream_text``, which in turn use ``BlockStream`` to fold
+    ``Session.query()`` dispatches to ``self._collect_query`` /
+    ``self._stream_query``, which in turn use ``BlockStream`` to fold
     events from ``self.send(...)``. We subclass Session so those
     helpers are actually present; we override ``__init__`` to avoid
     needing a real client, and override ``send`` to replay a script.
@@ -48,7 +48,7 @@ class _ScriptedSession(Session):
     def __init__(self, events: list[StreamEvent]) -> None:
         # Deliberately skip Session.__init__ — we don't need a client
         # for these tests, and faking one would be more work than it's
-        # worth. query() only reads self._collect_text / self._stream_text
+        # worth. query() only reads self._collect_query / self._stream_query
         # (inherited) and the overridden self.send (below).
         self._events = events
 
@@ -68,7 +68,7 @@ class _ScriptedSession(Session):
 
 @pytest.mark.asyncio()
 async def test_query_returns_final_text_simple() -> None:
-    """A single text response → query() returns the joined text."""
+    """A single text response → query() returns QueryResult with joined text."""
     session = _ScriptedSession(
         events=[
             ResponseCreated(response=_make_response()),
@@ -80,21 +80,20 @@ async def test_query_returns_final_text_simple() -> None:
         ]
     )
 
-    # Use the real Session.query, bound to our scripted session instance.
-    # Session.query doesn't touch any other Session attribute, so a
-    # duck-typed object with send() is sufficient.
-    text = await session.query("hi")
+    # Session.query dispatches through BlockStream → TextDone, which
+    # query() collects into result.text. A wrong/empty value here
+    # means the wrapper dropped the text.
+    result = await session.query("hi")
 
-    # Exact content check — proves the TextDelta values traversed the
-    # BlockStream folding + TextDone accumulation inside query().
-    # If this returns "" or a MagicMock, the wrapper didn't collect
-    # the block's full_text correctly.
-    assert text == "Hello world"
+    assert result.text == "Hello world"
+    # No FileBlock events in the script → files list must be empty,
+    # not None (we guarantee a list for type stability).
+    assert result.files == []
 
 
 @pytest.mark.asyncio()
-async def test_query_empty_response_returns_empty_string() -> None:
-    """No text events → query() returns ''. Must not raise or return None."""
+async def test_query_empty_response_returns_empty_result() -> None:
+    """No text events → result.text is ''. Must not raise or return None."""
     session = _ScriptedSession(
         events=[
             ResponseCreated(response=_make_response()),
@@ -103,11 +102,12 @@ async def test_query_empty_response_returns_empty_string() -> None:
             ResponseCompleted(response=_make_response()),
         ]
     )
-    text = await session.query("hi")
+    result = await session.query("hi")
 
     # Empty string is the contract, not None — keeps the return type
-    # stable (`str`) regardless of whether the agent produced text.
-    assert text == ""
+    # stable (`QueryResult`) regardless of whether the agent produced text.
+    assert result.text == ""
+    assert result.files == []
 
 
 # ── query(stream=True) — yields text chunks as they arrive ──────────────
@@ -115,7 +115,7 @@ async def test_query_empty_response_returns_empty_string() -> None:
 
 @pytest.mark.asyncio()
 async def test_query_stream_yields_text_chunks() -> None:
-    """stream=True → AsyncIterator[str] of text, in order."""
+    """stream=True → QueryStream yielding str chunks, in order."""
     session = _ScriptedSession(
         events=[
             ResponseCreated(response=_make_response()),
@@ -127,8 +127,8 @@ async def test_query_stream_yields_text_chunks() -> None:
         ]
     )
 
-    result = await session.query("hi", stream=True)
-    chunks = [c async for c in result]
+    stream = await session.query("hi", stream=True)
+    chunks = [c async for c in stream]
 
     # Concatenating all yielded chunks must equal the full text.
     # A wrong result here means either TextChunk blocks weren't
@@ -140,3 +140,28 @@ async def test_query_stream_yields_text_chunks() -> None:
     # satisfy the join-equals-expected check above when that expected
     # value is also "").
     assert len(chunks) >= 1
+
+    # No FileBlock events in the script → files property is empty
+    # after exhaustion.
+    assert stream.files == []
+
+
+@pytest.mark.asyncio()
+async def test_query_stream_rejects_double_iteration() -> None:
+    """QueryStream is single-use — a second ``async for`` raises."""
+    session = _ScriptedSession(
+        events=[
+            ResponseCreated(response=_make_response()),
+            ResponseCompleted(response=_make_response()),
+        ]
+    )
+    stream = await session.query("hi", stream=True)
+    # First iteration is allowed and yields nothing meaningful here.
+    _ = [c async for c in stream]
+
+    # Second iteration must raise; single-use is the documented contract.
+    # Without this check, callers could silently replay a spent stream
+    # and get an empty result, masking bugs.
+    with pytest.raises(RuntimeError, match="single-use"):
+        async for _ in stream:
+            pass

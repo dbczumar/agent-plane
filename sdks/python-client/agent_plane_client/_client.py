@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import Callable
 from typing import Any, Literal, overload
 
 import httpx
@@ -10,6 +10,7 @@ import httpx
 from ._agents import AgentsNamespace
 from ._conversations import ConversationsNamespace
 from ._files import FilesNamespace
+from ._query import QueryResult, QueryStream
 from ._responses import ResponsesNamespace
 from ._session import Session
 from ._tool_handler import StreamHooks, ToolHandler
@@ -18,16 +19,19 @@ from ._tool_handler import StreamHooks, ToolHandler
 class AgentPlaneClient:
     """Typed Python client for the agent-plane server API.
 
-    One-shot text::
+    One-shot::
 
         async with AgentPlaneClient(base_url="http://localhost:8080") as client:
-            text = await client.query(model="archer", input="hello")
+            result = await client.query(model="archer", input="hello")
+            print(result.text)        # the assistant's reply
+            print(result.files)       # any files the agent produced
 
-    Streaming text::
+    Streaming::
 
         stream = await client.query(model="archer", input="hi", stream=True)
         async for chunk in stream:
             print(chunk, end="", flush=True)
+        print(stream.files)            # populated after the stream ends
 
     Multi-turn conversation::
 
@@ -105,7 +109,7 @@ class AgentPlaneClient:
         tool_handler: ToolHandler | None = ...,
         files: list[str] | None = ...,
         stream: Literal[False] = ...,
-    ) -> str: ...
+    ) -> QueryResult: ...
 
     @overload
     async def query(
@@ -117,7 +121,7 @@ class AgentPlaneClient:
         tool_handler: ToolHandler | None = ...,
         files: list[str] | None = ...,
         stream: Literal[True],
-    ) -> AsyncIterator[str]: ...
+    ) -> QueryStream: ...
 
     async def query(
         self,
@@ -128,19 +132,22 @@ class AgentPlaneClient:
         tool_handler: ToolHandler | None = None,
         files: list[str] | None = None,
         stream: bool = False,
-    ) -> str | AsyncIterator[str]:
-        """One-shot invocation: send a prompt, get text back.
+    ) -> QueryResult | QueryStream:
+        """One-shot invocation: send a prompt, get text (plus any files) back.
 
-        Default returns the final text::
+        Non-streaming (default) returns a :class:`QueryResult`::
 
-            text = await client.query(model="archer", input="hi")
+            result = await client.query(model="archer", input="hi")
+            print(result.text)
+            for f in result.files:
+                await client.files.download(f.id, f"./out/{f.filename}")
 
-        With ``stream=True`` returns an async iterator over text
-        chunks::
+        Streaming returns a :class:`QueryStream`::
 
-            it = await client.query(model="archer", input="hi", stream=True)
-            async for chunk in it:
+            stream = await client.query(model="archer", input="hi", stream=True)
+            async for chunk in stream:
                 print(chunk, end="", flush=True)
+            # After iteration, stream.files holds the produced files.
 
         With client-side tools, pass ``@tool``-decorated functions::
 
@@ -151,7 +158,7 @@ class AgentPlaneClient:
                 '''Return the current time.'''
                 return datetime.now().isoformat()
 
-            text = await client.query(
+            result = await client.query(
                 model="archer", input="what time?", tools=[get_time],
             )
 
@@ -166,10 +173,10 @@ class AgentPlaneClient:
             :class:`ToolHandler` with custom schemas/dispatch. Most
             callers should use ``tools=`` instead.
         :param files: Optional list of local file paths to attach.
-        :param stream: If True, return an ``AsyncIterator[str]``.
-            If False (default), return the final text as a string.
-        :returns: Final text (``stream=False``) or iterator of text
-            chunks (``stream=True``).
+        :param stream: If True, return a :class:`QueryStream`. If
+            False (default), return a :class:`QueryResult`.
+        :returns: :class:`QueryResult` (``stream=False``) or
+            :class:`QueryStream` (``stream=True``).
         :raises ValueError: If both ``tools`` and ``tool_handler``
             are provided.
         """

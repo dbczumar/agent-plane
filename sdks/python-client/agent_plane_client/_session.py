@@ -18,8 +18,9 @@ from ._events import (
     ResponseIncomplete,
     StreamEvent,
 )
+from ._query import QueryResult, QueryStream
 from ._tool_handler import StreamHooks, ToolHandler
-from ._types import Response
+from ._types import File, Response
 
 if TYPE_CHECKING:
     from ._client import AgentPlaneClient
@@ -183,7 +184,7 @@ class Session:
         files: list[str] | None = ...,
         tools: list[Callable[..., Any]] | None = ...,
         stream: Literal[False] = ...,
-    ) -> str: ...
+    ) -> QueryResult: ...
 
     @overload
     async def query(
@@ -193,7 +194,7 @@ class Session:
         files: list[str] | None = ...,
         tools: list[Callable[..., Any]] | None = ...,
         stream: Literal[True],
-    ) -> AsyncIterator[str]: ...
+    ) -> QueryStream: ...
 
     async def query(
         self,
@@ -202,19 +203,22 @@ class Session:
         files: list[str] | None = None,
         tools: list[Callable[..., Any]] | None = None,
         stream: bool = False,
-    ) -> str | AsyncIterator[str]:
-        """Send a prompt and get text back.
+    ) -> QueryResult | QueryStream:
+        """Send a prompt and get text (plus any files) back.
 
-        Default returns the final assistant text as a string::
+        Non-streaming (default) returns a :class:`QueryResult`::
 
-            text = await session.query("hello")
+            result = await session.query("make me a chart")
+            print(result.text)
+            for f in result.files:
+                await client.files.download(f.id, f"./out/{f.filename}")
 
-        With ``stream=True`` returns an async iterator over text
-        chunks in order::
+        Streaming returns a :class:`QueryStream`::
 
-            it = await session.query("hello", stream=True)
-            async for chunk in it:
+            stream = await session.query("hello", stream=True)
+            async for chunk in stream:
                 print(chunk, end="", flush=True)
+            # After iteration, stream.files holds the produced files.
 
         Client-side tools can be passed per-call via ``tools=``, or
         configured session-wide via ``client.session(tool_handler=...)``.
@@ -229,35 +233,34 @@ class Session:
         :param tools: Optional list of ``@tool``-decorated functions
             the agent may call on this turn. Overrides the session's
             configured ``tool_handler`` for this call only.
-        :param stream: If True, return an ``AsyncIterator[str]`` that
-            yields text chunks as they arrive. If False (default),
-            return the final text after the response completes.
-        :returns: The assistant's final text (``stream=False``) or an
-            async iterator of text chunks (``stream=True``). Empty
-            string / empty iterator if the agent produced no text.
+        :param stream: If True, return a :class:`QueryStream`. If
+            False (default), return a :class:`QueryResult`.
+        :returns: :class:`QueryResult` (``stream=False``) or
+            :class:`QueryStream` (``stream=True``).
         :raises AgentPlaneError: If the response ends in an error.
         """
         if stream:
-            return self._stream_text(input, files=files, tools=tools)
-        return await self._collect_text(input, files=files, tools=tools)
+            return self._stream_query(input, files=files, tools=tools)
+        return await self._collect_query(input, files=files, tools=tools)
 
-    async def _collect_text(
+    async def _collect_query(
         self,
         input: str | list[dict[str, object]],
         *,
         files: list[str] | None,
         tools: list[Callable[..., Any]] | None,
-    ) -> str:
-        """Run a turn and return the final assistant text."""
+    ) -> QueryResult:
+        """Run a turn; return final text + produced files as a QueryResult."""
         # Local imports avoid a circular dep at module load — _stream
         # imports _session under TYPE_CHECKING.
-        from ._blocks import TextDone
+        from ._blocks import FileBlock, TextDone
         from ._stream import BlockStream
         from ._transforms import merge_text_across_iterations, pipe, skip_intermediate_ends
 
         with _per_call_tool_override(self, tools):
             block_stream = BlockStream()
             final_text = ""
+            produced: list[File] = []
             async for block in pipe(
                 block_stream.stream(self, input, files=files),
                 # Merges per-iteration text into one TextDone per response,
@@ -267,17 +270,38 @@ class Session:
             ):
                 if isinstance(block, TextDone):
                     final_text = block.full_text
-            return final_text
+                elif isinstance(block, FileBlock):
+                    produced.append(await self._client.files.get(block.file_id))
+            return QueryResult(text=final_text, files=produced)
 
-    async def _stream_text(
+    def _stream_query(
         self,
         input: str | list[dict[str, object]],
         *,
         files: list[str] | None,
         tools: list[Callable[..., Any]] | None,
+    ) -> QueryStream:
+        """Build a QueryStream that yields text chunks and collects files."""
+        produced: list[File] = []
+        chunks = self._stream_chunks(input, files=files, tools=tools, produced=produced)
+        return QueryStream(chunks=chunks, files=produced)
+
+    async def _stream_chunks(
+        self,
+        input: str | list[dict[str, object]],
+        *,
+        files: list[str] | None,
+        tools: list[Callable[..., Any]] | None,
+        produced: list[File],
     ) -> AsyncIterator[str]:
-        """Run a turn and yield text chunks as they arrive."""
-        from ._blocks import TextChunk
+        """Async generator backing QueryStream.
+
+        Yields text chunks as they arrive. Appends produced files to
+        the shared ``produced`` list as :class:`FileBlock` events
+        surface, so the owning :class:`QueryStream` sees them through
+        its reference to the same list.
+        """
+        from ._blocks import FileBlock, TextChunk
         from ._stream import BlockStream
         from ._transforms import pipe, skip_intermediate_ends
 
@@ -289,6 +313,8 @@ class Session:
             ):
                 if isinstance(block, TextChunk):
                     yield block.text
+                elif isinstance(block, FileBlock):
+                    produced.append(await self._client.files.get(block.file_id))
 
     async def cancel(self) -> Response | None:
         """Cancel the current in-progress response.

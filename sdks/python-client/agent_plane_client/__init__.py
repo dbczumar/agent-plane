@@ -47,6 +47,7 @@ from ._blocks import (
 )
 from ._client import AgentPlaneClient
 from ._errors import AgentPlaneError, ToolCallDenied
+from ._query import QueryResult, QueryStream
 from ._server import LocalServer
 from ._session import Session
 from ._stream import BlockStream
@@ -58,6 +59,7 @@ from ._transforms import (
     skip_blocks,
     skip_intermediate_ends,
 )
+from ._types import File
 from .tools import ToolMetadata, tool
 
 __all__ = [
@@ -68,9 +70,12 @@ __all__ = [
     "BlockStream",
     "CompactionBlock",
     "ErrorBlock",
+    "File",
     "FileBlock",
     "LocalServer",
     "NativeToolBlock",
+    "QueryResult",
+    "QueryStream",
     "ReasoningBlock",
     "ReasoningStartBlock",
     "ResponseEndBlock",

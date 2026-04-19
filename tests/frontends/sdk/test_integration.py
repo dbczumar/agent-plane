@@ -134,9 +134,9 @@ async def test_multi_turn_session(api_key: str) -> None:
 
 @pytest.mark.asyncio()
 async def test_client_query_returns_text(api_key: str) -> None:
-    """client.query() returns the agent's response as a string."""
+    """client.query() returns a QueryResult with the agent's text."""
     async with LocalServer(agent_path="examples/agents/coder/") as server:
-        text = await server.client.query(
+        result = await server.client.query(
             model="coder",
             input="Reply with exactly the word 'pong'. No tools.",
         )
@@ -145,7 +145,11 @@ async def test_client_query_returns_text(api_key: str) -> None:
     # through BlockStream → TextDone → query() and the agent actually
     # followed the instruction. A failure here means either the
     # pipeline dropped the text or the prompt wasn't respected.
-    assert "pong" in text.lower(), f"Expected 'pong' in response, got {text!r}"
+    assert "pong" in result.text.lower(), f"Expected 'pong' in response, got {result.text!r}"
+    # No file-producing tools used → files list is empty. Catches a
+    # regression where we'd accidentally populate files from a random
+    # event.
+    assert result.files == [], f"Expected no files, got {result.files}"
 
 
 @pytest.mark.asyncio()
@@ -158,6 +162,10 @@ async def test_client_query_streaming_yields_chunks(api_key: str) -> None:
             stream=True,
         )
         chunks = [c async for c in stream]
+        # Must read .files BEFORE exiting the server context — the
+        # QueryStream's file lookups use client.files.get which needs
+        # the server alive.
+        streamed_files = stream.files
 
     joined = "".join(chunks)
 
@@ -174,6 +182,10 @@ async def test_client_query_streaming_yields_chunks(api_key: str) -> None:
         f"Expected 'alpha', 'beta', 'gamma' in streamed text, got {joined!r}"
     )
 
+    # No file-producing tools were invoked → files list must be empty
+    # after stream exhaustion.
+    assert streamed_files == [], f"Expected no files, got {streamed_files}"
+
 
 @pytest.mark.asyncio()
 async def test_session_query_multi_turn(api_key: str) -> None:
@@ -188,14 +200,14 @@ async def test_session_query_multi_turn(api_key: str) -> None:
         )
 
     # Turn 1 should contain the greeting.
-    assert "corey" in first.lower(), f"Turn 1 response: {first!r}"
+    assert "corey" in first.text.lower(), f"Turn 1 response: {first.text!r}"
 
     # Turn 2 should echo the name from turn 1 — proves the session
     # actually threaded previous_response_id. If the session didn't,
     # the agent would have no memory of "Corey" and turn 2 would say
     # "I don't know" or similar.
-    assert "corey" in second.lower(), (
-        f"Turn 2 should recall 'Corey' from turn 1 but got {second!r}. "
+    assert "corey" in second.text.lower(), (
+        f"Turn 2 should recall 'Corey' from turn 1 but got {second.text!r}. "
         f"If this fails, session.query didn't forward previous_response_id."
     )
 
@@ -220,7 +232,7 @@ async def test_query_with_client_tool(api_key: str) -> None:
     _secret_fruit_calls = 0
 
     async with LocalServer(agent_path="examples/agents/coder/") as server:
-        text = await server.client.query(
+        result = await server.client.query(
             model="coder",
             input=(
                 "Call the _get_secret_fruit tool and report the 'answer' "
@@ -242,6 +254,54 @@ async def test_query_with_client_tool(api_key: str) -> None:
 
     # Final text must contain the tool's answer — proves the result
     # flowed back to the LLM and the LLM incorporated it into its reply.
-    assert "banana" in text.lower(), (
-        f"Expected 'banana' (from tool result) in final text, got {text!r}"
+    assert "banana" in result.text.lower(), (
+        f"Expected 'banana' (from tool result) in final text, got {result.text!r}"
     )
+
+
+@pytest.mark.asyncio()
+async def test_query_collects_produced_files(api_key: str) -> None:
+    """Agent produces a file via upload_file → QueryResult.files is populated.
+
+    Exercises the full path: agent writes to the sandbox, calls the
+    ``upload_file`` builtin, which emits an ``output_file.done`` event
+    that BlockStream folds into a FileBlock, which ``_collect_query``
+    resolves to full File metadata via ``client.files.get()``.
+    Finally the content is downloaded to confirm the file ID is live.
+    """
+    import tempfile
+    from pathlib import Path
+
+    async with LocalServer(agent_path="examples/agents/archer/") as server:
+        session = server.client.session(model="archer")
+        result = await session.query(
+            "Write the exact string 'downloaded-ok' to a file called "
+            "proof.txt using code_sandbox, then call upload_file on "
+            "'proof.txt' so I can download it. Reply 'done' and nothing else."
+        )
+
+        # Exactly one file should be produced — the one the agent uploaded.
+        # If 0, the agent didn't call upload_file; if >1, it uploaded
+        # something extra (e.g. accidentally uploaded the source too).
+        assert len(result.files) == 1, (
+            f"Expected 1 produced file, got {len(result.files)}: "
+            f"{[(f.id, f.filename) for f in result.files]}"
+        )
+        produced = result.files[0]
+        assert produced.filename == "proof.txt", (
+            f"Expected filename 'proof.txt', got {produced.filename!r}"
+        )
+        assert produced.bytes > 0, "Produced file reported zero bytes"
+
+        # Round-trip the download to prove the file_id is retrievable
+        # and the content matches what the agent was asked to write.
+        dest = Path(tempfile.mkdtemp()) / produced.filename
+        written = await server.client.files.download(produced.id, dest)
+        assert written == dest
+        # Strip trailing newline — shells/editors often add one. The
+        # substring check proves the agent wrote what we asked for.
+        contents = written.read_text().strip()
+        assert "downloaded-ok" in contents, (
+            f"Downloaded file content {contents!r} doesn't match "
+            f"the requested string 'downloaded-ok'."
+        )

@@ -4,14 +4,15 @@
 Spins up a temporary agent-plane server, deploys the ``archer``
 research agent, and demonstrates the patterns most apps need:
 
-  1. query()                  — ask, get text back.
+  1. query()                  — ask, get text (+ any files) back.
   2. query(stream=True)       — stream text chunks as they arrive.
   3. multi-turn session       — conversation state handled for you.
   4. client-side tools        — register a local function the agent
                                 can call; your code runs it.
   5. text file attachment     — attach a local text file to the prompt.
   6. image attachment         — attach a PNG; archer describes it.
-  7. (advanced) BlockStream   — pointer for when text isn't enough.
+  7. agent-produced files     — agent writes a file; we download it.
+  8. (advanced) BlockStream   — pointer for when text isn't enough.
 
 Run from the agent-plane repo root::
 
@@ -54,21 +55,22 @@ def get_current_time() -> dict[str, str]:
 
 
 async def demo_query(client: AgentPlaneClient) -> None:
-    """Send a prompt, get the final text back as a string."""
-    print("\n─── 1. query() — blocking, returns str ───")
-    text = await client.query(
+    """Send a prompt, get a QueryResult with .text and .files."""
+    print("\n─── 1. query() — blocking, returns QueryResult ───")
+    result = await client.query(
         model=MODEL,
         input="Say hi in one short sentence. No tools.",
     )
-    print(f"  answer: {text!r}")
+    print(f"  answer: {result.text!r}")
+    print(f"  files:  {result.files}")
 
 
 # ── 2. Streaming query ─────────────────────────────────────────────────
 
 
 async def demo_streaming(client: AgentPlaneClient) -> None:
-    """Stream text chunks as they arrive."""
-    print("\n─── 2. query(stream=True) — AsyncIterator[str] ───")
+    """Stream text chunks as they arrive. After iteration, .files is populated."""
+    print("\n─── 2. query(stream=True) — QueryStream ───")
     stream = await client.query(
         model=MODEL,
         input="Count from one to five, one number per line. No tools.",
@@ -78,6 +80,7 @@ async def demo_streaming(client: AgentPlaneClient) -> None:
     async for chunk in stream:
         print(chunk, end="", flush=True)
     print()
+    print(f"  files:  {stream.files}")
 
 
 # ── 3. Multi-turn session ───────────────────────────────────────────────
@@ -88,10 +91,10 @@ async def demo_multi_turn(client: AgentPlaneClient) -> None:
     threaded automatically."""
     print("\n─── 3. Session — multi-turn ───")
     session = client.session(model=MODEL)
-    a = await session.query("My name is Jarvis. Reply 'Hi Jarvis' and nothing else. No tools.")
-    print(f"  turn 1: {a!r}")
+    a = await session.query("My name is Corey. Reply 'Hi Corey' and nothing else. No tools.")
+    print(f"  turn 1: {a.text!r}")
     b = await session.query("What name did I just tell you? One word, no tools.")
-    print(f"  turn 2: {b!r}")
+    print(f"  turn 2: {b.text!r}")
 
 
 # ── 4. Client-side tools ────────────────────────────────────────────────
@@ -105,12 +108,12 @@ async def demo_client_tools(client: AgentPlaneClient) -> None:
     # hints and docstring — no hand-rolled JSON. Tools work the same
     # with streaming and non-streaming; the SDK runs the tool loop
     # under the hood.
-    text = await client.query(
+    result = await client.query(
         model=MODEL,
         input="What's the current UTC time? Call get_current_time and report it.",
         tools=[get_current_time],
     )
-    print(f"  answer: {text!r}")
+    print(f"  answer: {result.text!r}")
 
 
 # ── 5. Text file attachment ─────────────────────────────────────────────
@@ -124,12 +127,12 @@ async def demo_text_file_attachment(client: AgentPlaneClient) -> None:
         tmp_path = pathlib.Path(f.name)
 
     try:
-        text = await client.query(
+        result = await client.query(
             model=MODEL,
             input="What secret word is in the attached file? Reply with just the word, no tools.",
             files=[str(tmp_path)],
         )
-        print(f"  answer: {text!r}")
+        print(f"  answer: {result.text!r}")
     finally:
         tmp_path.unlink()
 
@@ -178,7 +181,7 @@ async def demo_image_attachment(client: AgentPlaneClient) -> None:
     tmp_path = pathlib.Path(tempfile.mktemp(suffix=".png"))
     tmp_path.write_bytes(_synthesize_split_png())
     try:
-        text = await client.query(
+        result = await client.query(
             model=MODEL,
             input=(
                 "What two colors are in this image and how are they "
@@ -186,19 +189,40 @@ async def demo_image_attachment(client: AgentPlaneClient) -> None:
             ),
             files=[str(tmp_path)],
         )
-        print(f"  answer: {text!r}")
+        print(f"  answer: {result.text!r}")
     finally:
         tmp_path.unlink()
 
 
-# ── 7. Advanced: BlockStream for tool/reasoning display ─────────────────
+# ── 7. Agent-produced files ─────────────────────────────────────────────
+
+
+async def demo_agent_produced_files(client: AgentPlaneClient) -> None:
+    """Ask the agent to create a file; download it via result.files."""
+    print("\n─── 7. Agent-produced files ───")
+    session = client.session(model=MODEL)
+    result = await session.query(
+        "Write the exact text 'produced-by-archer' to a file called "
+        "greeting.txt using code_sandbox, then call upload_file on "
+        "'greeting.txt' so I can download it. Reply 'done' and nothing else."
+    )
+    print(f"  answer:       {result.text!r}")
+    print(f"  files.count:  {len(result.files)}")
+
+    out_dir = pathlib.Path(tempfile.mkdtemp(prefix="ap-quickstart-"))
+    for f in result.files:
+        dest = await client.files.download(f.id, out_dir / f.filename)
+        print(f"  downloaded:   {dest} ({dest.read_bytes()!r})")
+
+
+# ── 8. Advanced: BlockStream for tool/reasoning display ─────────────────
 
 
 async def demo_blockstream_pointer() -> None:
     """If you're building a UI that shows tool calls, reasoning, lifecycle,
     etc., you want ``BlockStream`` — see ``sdks/README.md`` or the repl-sdk
     skill. ``query()`` is the happy path for app code that just needs text."""
-    print("\n─── 7. BlockStream (advanced — not run here) ───")
+    print("\n─── 8. BlockStream (advanced — not run here) ───")
     print("  For UIs that display tool calls / reasoning / lifecycle,")
     print("  use `from agent_plane_client import BlockStream`.")
     print("  See `sdks/README.md` and the `repl-sdk` skill.")
@@ -220,6 +244,7 @@ async def main() -> None:
         await demo_client_tools(server.client)
         await demo_text_file_attachment(server.client)
         await demo_image_attachment(server.client)
+        await demo_agent_produced_files(server.client)
         await demo_blockstream_pointer()
     print("\nDone.")
 

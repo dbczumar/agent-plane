@@ -84,6 +84,25 @@ class FilesNamespace:
             raise_for_status(resp.status_code, resp.text)
         return resp.content
 
+    async def download(self, file_id: str, to_path: str | pathlib.Path) -> pathlib.Path:
+        """Download file content and write it to disk.
+
+        Convenience wrapper over :meth:`get_content`. Creates any
+        missing parent directories and returns the :class:`~pathlib.Path`
+        that was written.
+
+        :param file_id: The file ID, e.g. ``"file_abc123"``.
+        :param to_path: Local path to write to, e.g. ``"./out/chart.png"``
+            or ``pathlib.Path("/tmp/chart.png")``. Parent directories
+            are created if they don't exist.
+        :returns: The resolved path the bytes were written to.
+        """
+        content = await self.get_content(file_id)
+        path = pathlib.Path(to_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return path
+
     async def delete(self, file_id: str) -> None:
         """Delete a file.
 

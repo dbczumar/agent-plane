@@ -7,13 +7,16 @@ Examples for the [`agent_plane_client`](../../../sdks/python-client/) package.
 A tour of the patterns you'll actually use when building apps on top
 of agent-plane:
 
-1. `client.query(...)` — ask, get the final text as a string.
-2. `client.query(..., stream=True)` — stream text chunks as they arrive.
+1. `client.query(...)` — ask, get a `QueryResult(text, files)` back.
+2. `client.query(..., stream=True)` — stream `str` chunks; `.files`
+   after exhaustion.
 3. `session.query(...)` — multi-turn conversation, IDs threaded for you.
 4. Client-side tools — register an `@tool`-decorated function; agent calls it.
 5. Text file attachment — pass a text file via `files=[...]`.
 6. Image attachment — pass a PNG via `files=[...]`; archer describes it.
-7. Pointer to `BlockStream` for cases where plain text isn't enough.
+7. Agent-produced files — agent writes a file, we download via
+   `client.files.download(id, path)`.
+8. Pointer to `BlockStream` for cases where plain text isn't enough.
 
 ### Run
 
