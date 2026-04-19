@@ -5,6 +5,46 @@ is self-contained, independently testable, and leaves the
 codebase shippable. Phases may be merged individually; the
 system is only feature-complete after Phase 11.
 
+## Implementation progress
+
+| Phase | Status | Branch | Tests added |
+|---|---|---|---|
+| 0 — Spec types + parser | ✅ landed | `policies-phase-0-spec-types` | 59 |
+| 1 — conversation_labels + store API | ✅ landed | `policies-phase-0-spec-types` (continued) | 15 |
+| 2 — PolicyEngine skeleton + unified builtin registry | ✅ landed | `policies-phase-2-engine-skeleton` | 20 + 8 + 2 validator |
+| 3 — LabelPolicy runtime + engine composition | ✅ landed | `policies-phase-3-label-policy` | 19 |
+| 4 — FunctionPolicy + engine safety net | ✅ landed | `policies-phase-4-function-policy` | 19 |
+| 5 — `_enforce_policy` API + 3 fixture agents | ✅ landed | `policies-phase-5-input-output-enforcement` | 14 |
+| 5b — Combined-policies integration tests | ✅ landed | `policies-phase-5b-combined-integration` | 9 |
+| 6 — Workflow enforcement-site wiring | ⏳ pending | — | — |
+| 7 — PromptPolicy runtime | ✅ landed | `policies-phase-7-prompt-policy` | 20 |
+| 8 — ASK flow (synthetic `request_approval`) | ⏳ pending | — | — |
+| 9 — Executor integration (Claude SDK, AgentsSdk) | ⏳ pending | — | — |
+| 10 — Client-side (REPL + Python UI SDK) | ⏳ pending | — | — |
+| 11 — Observability spans + polish | ⏳ pending | — | — |
+
+**Total new tests so far: ~186** covering spec parsing + validation,
+store persistence, engine composition, all three policy
+subclasses, and multi-type integration through ported
+omniagents example fixtures. Full non-e2e suite: 807 passing.
+
+**All three policy types (Label, Function, Prompt) are
+feature-complete at the spec + runtime level.** The system
+evaluates real YAML specs through parse → build → evaluate →
+persist against real SQLAlchemy stores; the remaining phases
+are workflow wiring (consume the engine from
+`_run_agent_loop`), ASK-flow plumbing (synthetic
+`request_approval` over the existing PATCH endpoint), and
+executor / client surface work.
+
+Phase 6 is the immediate next step to unlock live e2e runs;
+Phase 7's PromptPolicy classifier is testable via stub
+injection today (production LLM wiring lands alongside
+Phase 9 executor integration).
+
+---
+
+
 ## Omniagents test + example parity — load-bearing assurance
 
 Agent-plane's policy system is a port of omniagents'. The
