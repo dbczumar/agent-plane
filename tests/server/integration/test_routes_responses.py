@@ -1707,7 +1707,7 @@ async def test_spawn_sub_agent_creates_child_task(
 
     # Mock call 1 (parent): spawn the researcher sub-agent
     spawn_args = json.dumps(
-        {"type": "researcher", "input": "What is Python 3.14?"},
+        {"type": "researcher", "name": "researcher", "input": "What is Python 3.14?"},
     )
     mock_llm.add_call(
         tool_calls=[
@@ -1818,7 +1818,7 @@ async def test_spawn_and_auto_collect_sub_agent(
 
     # Mock call 1 (parent): spawn researcher
     spawn_args = json.dumps(
-        {"type": "researcher", "input": "What is Rust?"},
+        {"type": "researcher", "name": "researcher", "input": "What is Rust?"},
     )
     mock_llm.add_call(
         tool_calls=[
@@ -1889,7 +1889,6 @@ async def test_spawn_and_auto_collect_sub_agent(
         f"{len(spawn_calls)}: "
         f"{[i.get('name') for i in output if i.get('type') == 'function_call']}"
     )
-
 
 
 # ── Sub-agent parking and tunneling tests ──────────────
@@ -2040,7 +2039,7 @@ async def test_park_patch_resume_end_to_end(
                 "call_id": "call_sp",
                 "name": "spawn_sub_agent",
                 "arguments": json.dumps(
-                    {"type": "reader", "input": "read file"},
+                    {"type": "reader", "name": "reader", "input": "read file"},
                 ),
             },
         ],
@@ -2160,7 +2159,7 @@ async def test_auto_collect_at_turn_end(
                 "call_id": "call_sp",
                 "name": "spawn_sub_agent",
                 "arguments": json.dumps(
-                    {"type": "worker", "input": "do work"},
+                    {"type": "worker", "name": "worker", "input": "do work"},
                 ),
             },
         ],
@@ -2473,14 +2472,14 @@ async def test_parallel_same_name_subagents_have_isolated_conversations(
                 "call_id": "call_spawn_python",
                 "name": "spawn_sub_agent",
                 "arguments": json.dumps(
-                    {"type": "researcher", "input": "Tell me about Python"},
+                    {"type": "researcher", "name": "python", "input": "Tell me about Python"},
                 ),
             },
             {
                 "call_id": "call_spawn_rust",
                 "name": "spawn_sub_agent",
                 "arguments": json.dumps(
-                    {"type": "researcher", "input": "Tell me about Rust"},
+                    {"type": "researcher", "name": "rust", "input": "Tell me about Rust"},
                 ),
             },
         ],
@@ -2552,14 +2551,14 @@ async def test_parallel_subagents_park_and_patch_independently(
                 "call_id": "call_sp_alpha",
                 "name": "spawn_sub_agent",
                 "arguments": json.dumps(
-                    {"type": "reader", "input": "read file alpha"},
+                    {"type": "reader", "name": "alpha", "input": "read file alpha"},
                 ),
             },
             {
                 "call_id": "call_sp_bravo",
                 "name": "spawn_sub_agent",
                 "arguments": json.dumps(
-                    {"type": "reader", "input": "read file bravo"},
+                    {"type": "reader", "name": "bravo", "input": "read file bravo"},
                 ),
             },
         ],

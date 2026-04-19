@@ -64,9 +64,7 @@ def in_memory_exporter() -> Iterator[InMemorySpanExporter]:
 
     from mlflow.tracing.trace_manager import InMemoryTraceManager
 
-    trace_manager_instance = getattr(
-        InMemoryTraceManager, "_instance", None
-    )
+    trace_manager_instance = getattr(InMemoryTraceManager, "_instance", None)
     if trace_manager_instance is not None:
         trace_manager_instance._traces.clear()  # type: ignore[attr-defined]
         trace_manager_instance._otel_id_to_mlflow_trace_id.clear()  # type: ignore[attr-defined]
@@ -234,9 +232,7 @@ async def test_run_turn_emits_chat_span_with_usage(
     provider, conversation ID, and token usage. This is the full
     path exercised on every LLM call.
     """
-    completed = _build_completed_response(
-        text="Hello world", input_tokens=123, output_tokens=45
-    )
+    completed = _build_completed_response(text="Hello world", input_tokens=123, output_tokens=45)
     events: list[ResponseStreamEvent] = [
         ResponseTextDeltaEvent(delta="Hello world"),
         ResponseCompletedEvent(response=completed),
@@ -279,11 +275,7 @@ async def test_run_turn_emits_chat_span_with_usage(
     )
 
     # Exactly one chat span must be emitted per run_turn call.
-    chat_spans = [
-        s
-        for s in in_memory_exporter.get_finished_spans()
-        if s.name.startswith("chat ")
-    ]
+    chat_spans = [s for s in in_memory_exporter.get_finished_spans() if s.name.startswith("chat ")]
     assert len(chat_spans) == 1, (
         f"expected 1 chat span, got {len(chat_spans)} — "
         "run_turn should wrap each LLM call in exactly one span."
@@ -310,11 +302,8 @@ async def test_run_turn_emits_chat_span_with_usage(
 
     # gen_ai.conversation.id must be set to the executor context's
     # conversation_id so GenAI-aware backends can correlate turns.
-    assert (
-        _read_attr(span, "gen_ai.conversation.id") == "conv_xyz"
-    ), (
-        "chat span should carry gen_ai.conversation.id for "
-        "cross-turn correlation."
+    assert _read_attr(span, "gen_ai.conversation.id") == "conv_xyz", (
+        "chat span should carry gen_ai.conversation.id for cross-turn correlation."
     )
 
     # Temperature from extra must be recorded. Other request
@@ -346,9 +335,7 @@ async def test_run_turn_emits_chat_span_with_usage(
     # _yield_final_events derives this from the absence of tool
     # calls in the response output.
     finish_reasons = _read_attr(span, "gen_ai.response.finish_reasons")
-    assert finish_reasons == ["stop"], (
-        f"expected finish_reasons=['stop'], got {finish_reasons!r}"
-    )
+    assert finish_reasons == ["stop"], f"expected finish_reasons=['stop'], got {finish_reasons!r}"
 
 
 @pytest.mark.asyncio
@@ -380,9 +367,7 @@ async def test_run_turn_content_capture_records_inputs_and_outputs(
     _install_fake_llm_client(monkeypatch, events)
 
     executor = DefaultExecutor(
-        llm_config=LLMConfig(
-            model="openai/gpt-5.4", retry=RetryConfig(max_attempts=1)
-        )
+        llm_config=LLMConfig(model="openai/gpt-5.4", retry=RetryConfig(max_attempts=1))
     )
     context = ExecutorContext(
         task_id=_RESP_ID,
@@ -401,11 +386,7 @@ async def test_run_turn_content_capture_records_inputs_and_outputs(
         ):
             pass
 
-    chat_spans = [
-        s
-        for s in in_memory_exporter.get_finished_spans()
-        if s.name.startswith("chat ")
-    ]
+    chat_spans = [s for s in in_memory_exporter.get_finished_spans() if s.name.startswith("chat ")]
     assert len(chat_spans) == 1
     span = chat_spans[0]
 
@@ -418,9 +399,7 @@ async def test_run_turn_content_capture_records_inputs_and_outputs(
         "mlflow.spanInputs missing — set_inputs was not called "
         "despite content capture being enabled."
     )
-    assert inputs["messages"] == [
-        {"role": "user", "content": "what's the answer?"}
-    ], (
+    assert inputs["messages"] == [{"role": "user", "content": "what's the answer?"}], (
         f"inputs.messages = {inputs.get('messages')!r} — "
         "messages did not round-trip through set_inputs."
     )
@@ -463,9 +442,7 @@ async def test_run_turn_content_capture_disabled_omits_inputs_outputs(
     _install_fake_llm_client(monkeypatch, events)
 
     executor = DefaultExecutor(
-        llm_config=LLMConfig(
-            model="openai/gpt-5.4", retry=RetryConfig(max_attempts=1)
-        )
+        llm_config=LLMConfig(model="openai/gpt-5.4", retry=RetryConfig(max_attempts=1))
     )
     context = ExecutorContext(
         task_id=_RESP_ID,
@@ -484,11 +461,7 @@ async def test_run_turn_content_capture_disabled_omits_inputs_outputs(
         ):
             pass
 
-    chat_spans = [
-        s
-        for s in in_memory_exporter.get_finished_spans()
-        if s.name.startswith("chat ")
-    ]
+    chat_spans = [s for s in in_memory_exporter.get_finished_spans() if s.name.startswith("chat ")]
     assert len(chat_spans) == 1
     from mlflow.tracing.constant import SpanAttributeKey
 
@@ -531,9 +504,7 @@ async def test_run_turn_emits_tool_call_events(
     _install_fake_llm_client(monkeypatch, events)
 
     executor = DefaultExecutor(
-        llm_config=LLMConfig(
-            model="openai/gpt-5.4", retry=RetryConfig(max_attempts=1)
-        )
+        llm_config=LLMConfig(model="openai/gpt-5.4", retry=RetryConfig(max_attempts=1))
     )
     context = ExecutorContext(
         task_id=_RESP_ID,
@@ -552,17 +523,11 @@ async def test_run_turn_emits_tool_call_events(
         ):
             pass
 
-    chat_spans = [
-        s
-        for s in in_memory_exporter.get_finished_spans()
-        if s.name.startswith("chat ")
-    ]
+    chat_spans = [s for s in in_memory_exporter.get_finished_spans() if s.name.startswith("chat ")]
     assert len(chat_spans) == 1
     # Tool-call responses must have finish_reasons=["tool_calls"]
     # so operators can distinguish them from text-only completions.
-    finish_reasons = _read_attr(
-        chat_spans[0], "gen_ai.response.finish_reasons"
-    )
+    finish_reasons = _read_attr(chat_spans[0], "gen_ai.response.finish_reasons")
     assert finish_reasons == ["tool_calls"], (
         f"expected ['tool_calls'], got {finish_reasons!r} — "
         "_yield_final_events must detect tool calls in the response."

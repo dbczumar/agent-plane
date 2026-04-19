@@ -128,19 +128,32 @@ class SpawnSubAgentTool(Tool):
 
     def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
-        Spawn a single sub-agent and return its handle.
+        Spawn a single named sub-agent and return its handle.
+
+        Phase 4: ``name`` is REQUIRED. The sub-agent's child
+        conversation is titled ``"<type>:<name>"`` and parented
+        to the caller's conversation, which lets later turns use
+        ``send_to_sub_agent`` to continue the same conversation.
+        Names must be unique within a parent (G36 enforced by the
+        partial unique index in the migration).
 
         :param arguments: JSON-encoded arguments string, e.g.
-            ``'{"type": "researcher", "input": "find X"}'``.
+            ``'{"type": "researcher", "name": "auth", "input":
+            "find X"}'``.
         :param ctx: Server-side execution context with task and
             agent identity.
         :returns: JSON handle string with ``task_id``, ``kind``,
-            ``type``, ``status``, and ``message`` keys.
+            ``type``, ``name``, ``status``, and ``message`` keys.
+            On a duplicate name, returns
+            ``{"error": "name_already_exists", ...}`` instead so
+            the LLM can recover (call ``send_to_sub_agent`` or
+            choose a different name).
         """
         args = _parse_spawn_sub_agent_args(arguments)
         if isinstance(args, str):
             return args
         sa_type: str = args["type"]
+        sa_name: str = args["name"]
         sa_input: str = args["input"]
         if sa_type not in self._sub_specs:
             return json.dumps(
@@ -153,20 +166,38 @@ class SpawnSubAgentTool(Tool):
         client_tools: list[dict[str, Any]] = args.get("client_tools", []) or []
 
         root_task_id = _resolve_root_task_id(ctx.task_id)
-        task_id = _spawn_one(
-            agent_id=ctx.agent_id,
-            agent_name=sa_type,
-            user_input=sa_input,
-            root_task_id=root_task_id,
-            client_tools=client_tools,
-        )
+        parent_conversation_id = _resolve_parent_conversation_id(ctx.task_id)
+        try:
+            task_id = _spawn_one(
+                agent_id=ctx.agent_id,
+                agent_name=sa_type,
+                sa_name=sa_name,
+                user_input=sa_input,
+                root_task_id=root_task_id,
+                parent_conversation_id=parent_conversation_id,
+                client_tools=client_tools,
+            )
+        except _NameAlreadyExistsToolError as exc:
+            # Surface the partial-unique-index violation as a
+            # clean LLM-facing error. The LLM can recover by
+            # calling send_to_sub_agent on the same name OR by
+            # picking a different name.
+            return json.dumps(
+                {
+                    "error": "name_already_exists",
+                    "message": str(exc),
+                    "type": sa_type,
+                    "name": sa_name,
+                }
+            )
         return json.dumps(
             {
                 "task_id": task_id,
                 "kind": "sub_agent",
                 "type": sa_type,
+                "name": sa_name,
                 "status": "in_progress",
-                "message": _spawn_handle_message(task_id, sa_type),
+                "message": _spawn_handle_message(task_id, sa_type, sa_name),
             }
         )
 
@@ -207,6 +238,21 @@ def _build_spawn_sub_agent_schema(
                             f"types:\n{type_desc_text}"
                         ),
                     },
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "A unique-within-this-parent label "
+                            "for the sub-agent instance, e.g. "
+                            "'auth' or 'payments'. Lets later "
+                            "turns reuse the same conversation "
+                            "via send_to_sub_agent. Names must "
+                            "be distinct under one parent — a "
+                            "duplicate (type, name) returns "
+                            "name_already_exists; recover by "
+                            "calling send_to_sub_agent OR "
+                            "picking a different name."
+                        ),
+                    },
                     "input": {
                         "type": "string",
                         "description": (
@@ -217,7 +263,7 @@ def _build_spawn_sub_agent_schema(
                         ),
                     },
                 },
-                "required": ["type", "input"],
+                "required": ["type", "name", "input"],
                 "additionalProperties": False,
             },
         },
@@ -241,31 +287,46 @@ def _parse_spawn_sub_agent_args(
         return json.dumps({"error": f"invalid arguments: {exc}"})
     if not isinstance(args, dict):
         return json.dumps({"error": "arguments must be a JSON object"})
-    for required in ("type", "input"):
+    for required in ("type", "name", "input"):
         if required not in args:
             return json.dumps({"error": f"missing required field: {required}"})
     return args
 
 
-def _spawn_handle_message(task_id: str, sa_type: str) -> str:
+def _spawn_handle_message(task_id: str, sa_type: str, sa_name: str) -> str:
     """
     Build the LLM-facing instruction text on a fresh sub-agent handle.
 
     Mirrors ``_async_handle_message`` in workflow.py — the LLM
-    needs the literal task_id and a pointer at check_task /
-    cancel_task so it knows the result is not in this string.
+    needs the literal task_id, the name (so it can call
+    ``send_to_sub_agent`` later in this conversation), and a
+    pointer at ``check_task`` / ``cancel_task`` so it knows the
+    result is not in this string.
 
-    :param task_id: The new sub-agent task's ID, e.g.
-        ``"resp_abc..."``.
+    :param task_id: The new sub-agent task's ID.
     :param sa_type: The dispatched sub-agent's type name.
+    :param sa_name: The dispatched sub-agent's instance name.
     :returns: A compact instruction string.
     """
     return (
-        f"Sub-agent of type {sa_type!r} dispatched. "
-        f"The result will be auto-delivered as a system message "
-        f"when ready. To poll proactively call check_task with "
+        f"Sub-agent {sa_type}:{sa_name} dispatched. The result "
+        f"will be auto-delivered as a system message when ready. "
+        f"To continue this conversation in a later turn call "
+        f"send_to_sub_agent(type={sa_type!r}, name={sa_name!r}, "
+        f"input=...). To poll call check_task with "
         f"task_id={task_id!r}; to abort call cancel_task."
     )
+
+
+class _NameAlreadyExistsToolError(Exception):
+    """
+    Internal-only exception so ``_spawn_one`` can signal a
+    duplicate name without leaking SqlAlchemy's IntegrityError
+    or the store's :class:`NameAlreadyExistsError` to the tool
+    invocation layer (which would re-wrap and obscure the
+    error). Caught and translated to a JSON tool-result by
+    ``SpawnSubAgentTool.invoke``.
+    """
 
 
 # ── Spawn implementation ──────────────────────────────
@@ -293,44 +354,96 @@ def _resolve_root_task_id(task_id: str) -> str:
     return task_id
 
 
+def _resolve_parent_conversation_id(task_id: str) -> str:
+    """
+    Return the conversation_id of the task that's calling spawn.
+
+    Phase 4: child sub-agent conversations point at their
+    immediate parent (not the root). For nested sub-agents (a
+    sub-agent calling spawn_sub_agent), this returns the
+    spawning sub-agent's own conversation, so
+    ``list_sub_agents`` from inside that sub-agent surfaces its
+    own children rather than the root's.
+
+    :param task_id: The currently-executing task's id (the one
+        whose tool ``invoke`` was called).
+    :returns: The conversation_id of that task.
+    :raises RuntimeError: If the task row cannot be found —
+        means the framework's invariant (every tool runs inside
+        an active task) is broken.
+    """
+    from agent_plane.runtime import get_task_store
+
+    task = get_task_store().get_sync(task_id)
+    if task is None:
+        raise RuntimeError(
+            f"task {task_id!r} not found — spawn must run inside an active workflow",
+        )
+    return task.conversation_id
+
+
 def _spawn_one(
     *,
     agent_id: str,
     agent_name: str,
+    sa_name: str,
     user_input: str,
     root_task_id: str,
+    parent_conversation_id: str,
     client_tools: list[dict[str, Any]] | None = None,
 ) -> str:
     """
-    Create a conversation, append the user input, create a task,
-    and start execution for a single sub-agent.
+    Create a named child conversation, append the user input,
+    create a task, and start execution.
 
-    :param agent_id: The root registered agent ID,
-        e.g. ``"ag_xyz789"``.
-    :param agent_name: The sub-agent name,
-        e.g. ``"researcher"``.
+    Phase 4: the child conversation's title is
+    ``"<agent_name>:<sa_name>"`` and its
+    ``parent_conversation_id`` points at the caller's
+    conversation. The conv-store-level partial unique index
+    rejects ``(parent, title)`` collisions; that error is
+    re-raised as :class:`_NameAlreadyExistsToolError` for the
+    invoker to translate to a clean tool result.
+
+    :param agent_id: The root registered agent ID.
+    :param agent_name: The sub-agent's TYPE (e.g. ``"coder"``).
+    :param sa_name: The sub-agent's instance NAME (e.g.
+        ``"auth"``). Combined with ``agent_name`` to form the
+        conversation title.
     :param user_input: The user's input string for the
         sub-agent.
-    :param root_task_id: The top-level task ID for tunneling,
-        e.g. ``"task_abc123"``.
-    :param client_tools: Optional list of client-side tool schemas
-        (OpenAI format) to propagate to the sub-agent. The
-        sub-agent's LLM needs these schemas so it can invoke
-        client-side tools; calls are tunneled back to the root
-        response via ``root_task_id``.
+    :param root_task_id: The top-level task ID for tunneling.
+    :param parent_conversation_id: The owning parent
+        conversation's id (powers list_sub_agents + cascade
+        delete).
+    :param client_tools: Optional client-side tool schemas to
+        propagate to the sub-agent.
     :returns: The created task ID (doubles as response_id).
+    :raises _NameAlreadyExistsToolError: On duplicate
+        ``(parent_conversation_id, title)``.
     """
-    # Lazy imports to avoid circular dependency — these modules
-    # import from runtime which imports from tools.
     from agent_plane.runtime import (
         get_conversation_store,
         get_task_store,
+    )
+    from agent_plane.stores.conversation_store import (
+        NameAlreadyExistsError,
     )
 
     conv_store = get_conversation_store()
     task_store = get_task_store()
 
-    conv = conv_store.create_conversation(kind="sub_agent")
+    title = f"{agent_name}:{sa_name}"
+    try:
+        conv = conv_store.create_conversation(
+            kind="sub_agent",
+            title=title,
+            parent_conversation_id=parent_conversation_id,
+        )
+    except NameAlreadyExistsError as exc:
+        raise _NameAlreadyExistsToolError(
+            f"a sub-agent of type {agent_name!r} with name "
+            f"{sa_name!r} already exists in this conversation"
+        ) from exc
 
     task = task_store.create(
         conversation_id=conv.id,

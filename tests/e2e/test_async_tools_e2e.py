@@ -252,8 +252,7 @@ def test_mixed_sync_and_async_tools_e2e(
     final = _final_text(body)
     # Sync tool result — straightforward integer assert.
     assert "5" in final, (
-        f"Expected the count_chars result '5' in the final response. "
-        f"Got: {final!r}"
+        f"Expected the count_chars result '5' in the final response. Got: {final!r}"
     )
     # Async tool result — distinctive marker.
     assert "ECHO_FROM_ASYNC[beta]" in final, (
