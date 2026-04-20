@@ -32,6 +32,7 @@ _ARCHER_DIR = _REPO_ROOT / "examples" / "agents" / "archer"
 _CLAUDE_CODER_DIR = _REPO_ROOT / "examples" / "agents" / "claude-coder"
 _OPENAI_CODER_DIR = _REPO_ROOT / "examples" / "agents" / "openai-coder"
 _TERMINAL_TEST_DIR = _REPO_ROOT / "examples" / "agents" / "terminal_test"
+_TERMINAL_SUPERVISOR_DIR = _REPO_ROOT / "examples" / "agents" / "terminal_supervisor"
 
 
 def find_free_port() -> int:
@@ -275,6 +276,22 @@ def terminal_test_agent(http_client: httpx.Client) -> str:
     :returns: The agent name, ``"terminal_test"``.
     """
     return _upload_agent(http_client, _TERMINAL_TEST_DIR)
+
+
+@pytest.fixture(scope="session")
+def terminal_supervisor_agent(http_client: httpx.Client) -> str:
+    """Upload the terminal-supervisor bundle and return its name.
+
+    The supervisor's bundle nests its sub-agent (``worker``) under
+    ``agents/worker/``; the server picks that up automatically
+    during upload, so no separate sub-agent bundle needs to be
+    uploaded. Used by the sub-agent-hierarchy e2e test to drive a
+    supervisor → worker → terminal flow.
+
+    :param http_client: HTTP client pointed at the server.
+    :returns: The supervisor agent name, ``"terminal_supervisor"``.
+    """
+    return _upload_agent(http_client, _TERMINAL_SUPERVISOR_DIR)
 
 
 @pytest.fixture(scope="session")

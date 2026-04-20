@@ -1,0 +1,30 @@
+spec_version: 1
+
+name: worker
+description: >
+  Terminal-driving worker. Receives one focused shell task from
+  the parent terminal_supervisor, runs it via the terminal_*
+  builtins, and reports the result. Mirrors the standalone
+  terminal_worker bundle but is keyed as "worker" so the parent's
+  tools.agents entry resolves.
+
+llm:
+  model: gpt-5.4
+  reasoning_effort: medium
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  timeout: 120
+  builtins:
+    - terminal_run
+    - terminal_list
+    - terminal_close
+    - terminal_send_input
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md
