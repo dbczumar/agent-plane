@@ -569,10 +569,17 @@ class Shell:
         :returns: ``RunResult`` with status ``"killed"`` if Ctrl-C
             worked, or ``"shell_crashed"`` if we had to SIGKILL.
         """
-        # SIGINT bash's foreground child via os.kill. See
-        # :meth:`_interrupt_children` for why we don't use the
-        # PTY's VINTR path here. Child dies, bash emits D;130.
-        self._interrupt_children()
+        # ``sendintr()`` writes the PTY's interrupt char (usually
+        # Ctrl-C) to the master. Bash forwards SIGINT to the
+        # foreground process group, the child dies, bash emits D;130.
+        # We use PTY-Ctrl-C here (not the ``_interrupt_children``
+        # pgrep+os.kill path) because (a) the timeout fires from the
+        # same thread that owns the pexpect handle, so cross-thread
+        # pexpect concerns don't apply, and (b) PTY VINTR is the
+        # bash-native cancellation signal — it reliably produces
+        # D;130 regardless of whether bash launched the child in its
+        # own process group or inline.
+        self._proc.sendintr()
         grace_deadline = time.monotonic() + _TIMEOUT_GRACE_S
         outcome = self._read_until_done(grace_deadline)
         if outcome == "completed":

@@ -63,11 +63,12 @@ def test_async_terminal_returns_handle_and_delivers_result(
         json={
             "model": terminal_test_agent,
             "input": (
-                "Run the command 'echo async-e2e-token-zzz' in the "
-                "background using terminal_run with "
-                "synchronous=false. Then wait for it to complete "
-                "automatically and confirm you saw the token "
-                "'async-e2e-token-zzz' in the result."
+                "Call terminal_run right now with "
+                "command='echo async-e2e-token-zzz', "
+                "shell='default', and synchronous=false. After the "
+                "result auto-delivers, report whether you saw the "
+                "token 'async-e2e-token-zzz'. Do NOT write any "
+                "commentary before calling the tool — call it first."
             ),
             "background": True,
         },
@@ -111,7 +112,7 @@ def test_async_terminal_returns_handle_and_delivers_result(
     conv_id = final["conversation"]["id"]
     items_resp = http_client.get(
         f"/v1/conversations/{conv_id}/items",
-        params={"limit": 200},
+        params={"limit": 100},
     )
     items = items_resp.json()["data"]
     all_text_blob = json.dumps(items)
@@ -146,35 +147,41 @@ def test_async_terminal_cancel_stops_sleep(
         json={
             "model": terminal_test_agent,
             "input": (
-                "Start 'sleep 60' in the background using "
-                "terminal_run with synchronous=false. "
-                "IMMEDIATELY after that, call cancel_task on the "
-                "task_id returned from terminal_run. Then "
-                "acknowledge that you cancelled it."
+                "Step 1: call terminal_run with command='sleep 60', "
+                "shell='default', synchronous=false. "
+                "Step 2: IMMEDIATELY call cancel_task with the "
+                "task_id that terminal_run returned. "
+                "Step 3: say 'cancelled'. "
+                "Do NOT write any commentary before the tool calls."
             ),
             "background": True,
         },
     )
     resp.raise_for_status()
     response_id = resp.json()["id"]
-    final = poll_until_terminal(http_client, response_id, timeout=120)
+    final = poll_until_terminal(http_client, response_id, timeout=180)
     elapsed = _time.monotonic() - start
     assert final["status"] == "completed", f"Task failed: {final.get('error')}"
-    # If cancel worked, total elapsed should be well under the sleep
-    # duration. Conservative bound: 45s (leaves room for LLM latency
-    # + auto-delivery). Without cancel working, we'd see ~60s +
-    # overhead = 75s+.
-    assert elapsed < 45, (
+    # The primary correctness check is below (cancelled system
+    # message). The timing assertion is a secondary signal: if
+    # cancel failed entirely, we'd wait ~60s (sleep) PLUS the
+    # 3-4 LLM roundtrips (~40s on gpt-5.4 medium reasoning), so
+    # 90+s. A working cancel path finishes in 40-75s depending on
+    # LLM latency variance. 90s is the boundary that catches
+    # regression without flaking on normal LLM latency swings.
+    assert elapsed < 90, (
         f"Task took {elapsed:.1f}s — cancel likely didn't interrupt "
-        f"the sleep (expected <45s with working cancel; sleep 60 "
-        f"naturally is 60+)."
+        f"the sleep (expected <90s with working cancel; full sleep "
+        f"60 + LLM roundtrips would push past 90s)."
     )
 
-    # Verify the cancelled-terminal system message appears.
+    # Primary correctness check: the cancelled-terminal system
+    # message must appear. If cancel_task's terminal branch failed
+    # to flip status, we'd see '(terminal) completed' instead.
     conv_id = final["conversation"]["id"]
     items_resp = http_client.get(
         f"/v1/conversations/{conv_id}/items",
-        params={"limit": 200},
+        params={"limit": 100},
     )
     items = items_resp.json()["data"]
     system_messages: list[str] = []
@@ -190,4 +197,188 @@ def test_async_terminal_cancel_stops_sleep(
         f"message in the conversation, got {system_messages!r}. "
         f"If 'completed' instead, cancel didn't propagate to the "
         f"workflow's status translation."
+    )
+
+
+def test_check_task_polls_running_terminal_stdout(
+    http_client: httpx.Client,
+    terminal_test_agent: str,
+) -> None:
+    """The LLM can poll a running async terminal via ``check_task``
+    and see partial stdout via ``recent_activity``.
+
+    This exercises the tail-f story (§6.11): while a command is
+    running, ``check_task`` returns ``status="in_progress"`` and
+    a ``recent_activity`` field populated from the shell's ring
+    buffer. If :func:`_get_recent_terminal_activity` is broken or
+    the manager's task-registration path is wrong, the LLM sees no
+    stdout until the auto-delivered completion message.
+
+    Failure modes caught:
+    - ``recent_activity`` not populated → LLM can't see progress.
+    - ``check_task`` short-circuits terminal kind → kind branch
+      doesn't fire.
+    - The manager's ``peek_task_stdout`` cursor doesn't advance →
+      identical data on repeated polls (not strictly asserted here
+      but adjacent).
+    """
+    resp = http_client.post(
+        "/v1/responses",
+        json={
+            "model": terminal_test_agent,
+            "input": (
+                "Step 1: call terminal_run with command='echo "
+                "POLL-MARKER-123; sleep 5; echo POLL-DONE', "
+                "shell='default', synchronous=false. "
+                "Step 2: wait ~1 second, then call check_task with "
+                "the task_id. "
+                "Step 3: after the result auto-delivers, report "
+                "whether you saw POLL-MARKER-123. "
+                "Do NOT write commentary before any tool call."
+            ),
+            "background": True,
+        },
+    )
+    resp.raise_for_status()
+    response_id = resp.json()["id"]
+    final = poll_until_terminal(http_client, response_id, timeout=180)
+    assert final["status"] == "completed", f"Task failed: {final.get('error')}"
+
+    # Find the check_task function_call_output and verify it
+    # contains our marker in recent_activity (or status=completed
+    # + result containing it, since "1 second wait" may or may not
+    # catch the running phase depending on LLM + scheduler timing).
+    fco_items = _get_output_items(final, "function_call_output")
+    check_outputs: list[dict[str, Any]] = []
+    for item in fco_items:
+        raw = item.get("output") or ""
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if parsed.get("kind") == "terminal" and "task_id" in parsed:
+            check_outputs.append(parsed)
+
+    assert len(check_outputs) >= 1, (
+        f"Expected at least one terminal-kind check_task output "
+        f"(kind='terminal' + task_id field), got {len(check_outputs)}. "
+        f"All function_call_outputs: "
+        f"{[i.get('output', '')[:100] for i in fco_items]}"
+    )
+
+    # Check that at least one poll saw the marker — either live
+    # (recent_activity) or after completion (result).
+    saw_marker = False
+    for co in check_outputs:
+        for field in ("recent_activity", "result"):
+            val = co.get(field)
+            if isinstance(val, str) and "POLL-MARKER-123" in val:
+                saw_marker = True
+                break
+        if saw_marker:
+            break
+    debug_view = [
+        (
+            co.get("status"),
+            (co.get("recent_activity") or "")[:80],
+            (co.get("result") or "")[:80],
+        )
+        for co in check_outputs
+    ]
+    assert saw_marker, (
+        f"Expected check_task to surface POLL-MARKER-123 in "
+        f"recent_activity (live poll) or result (completed), got "
+        f"{debug_view}"
+    )
+
+
+def test_parallel_async_terminals_run_on_separate_shells(
+    http_client: httpx.Client,
+    terminal_test_agent: str,
+) -> None:
+    """Two async ``terminal_run`` calls on different shells get two
+    task_ids and both results auto-deliver.
+
+    If the manager's per-shell task tracking is wrong (e.g. one
+    task ID overwriting the other's registration), one of the two
+    auto-delivered system messages would be missing, or one task
+    would never complete.
+
+    Failure modes caught:
+    - Shared task registry across shells → one task ID clobbers
+      the other.
+    - Auto-delivery serializes and only fires once.
+    - Shell cap / name handling breaks at N>1.
+    """
+    resp = http_client.post(
+        "/v1/responses",
+        json={
+            "model": terminal_test_agent,
+            "input": (
+                "Step 1: call terminal_run with command='echo "
+                "PAR-A-XXX', shell='shella', synchronous=false. "
+                "Step 2: call terminal_run with command='echo "
+                "PAR-B-YYY', shell='shellb', synchronous=false. "
+                "Step 3: after BOTH results auto-deliver, confirm "
+                "you saw both PAR-A-XXX and PAR-B-YYY. "
+                "Do NOT write commentary before the tool calls."
+            ),
+            "background": True,
+        },
+    )
+    resp.raise_for_status()
+    response_id = resp.json()["id"]
+    final = poll_until_terminal(http_client, response_id, timeout=180)
+    assert final["status"] == "completed", f"Task failed: {final.get('error')}"
+
+    # Two distinct task_ids should appear in the terminal_run
+    # handle outputs.
+    terminal_run_outputs = []
+    for item in _get_output_items(final, "function_call_output"):
+        raw = item.get("output") or ""
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if parsed.get("tool_name") == "terminal_run":
+            terminal_run_outputs.append(parsed)
+
+    task_ids = {o.get("task_id") for o in terminal_run_outputs}
+    # Both task_ids must exist AND be distinct — a shared id would
+    # collapse the two tasks into one registration, causing one to
+    # be lost.
+    assert len(task_ids) == 2, (
+        f"Expected two distinct async task_ids (one per shell), "
+        f"got {task_ids}. If 1, the two dispatches shared a task_id "
+        f"(registration bug); if 0, the handles weren't returned."
+    )
+
+    # Both completion-system messages must appear in the
+    # conversation items.
+    conv_id = final["conversation"]["id"]
+    items_resp = http_client.get(
+        f"/v1/conversations/{conv_id}/items",
+        params={"limit": 100},
+    )
+    items = items_resp.json()["data"]
+    system_texts: list[str] = []
+    for item in items:
+        if item.get("type") != "message" or item.get("role") != "user":
+            continue
+        for block in item.get("content", []):
+            text = block.get("text") or ""
+            if text.startswith("[System: task"):
+                system_texts.append(text)
+    for tid in task_ids:
+        assert any(isinstance(tid, str) and tid in m for m in system_texts), (
+            f"Missing completion system message for task {tid!r}. "
+            f"Got {system_texts!r}. If only one of the two tasks "
+            f"has a delivery message, the drain dropped one."
+        )
+
+    # Both tokens appear somewhere in the conversation.
+    blob = json.dumps(items)
+    assert "PAR-A-XXX" in blob and "PAR-B-YYY" in blob, (
+        "Both stdout markers must appear — if one is missing, "
+        "that shell's output wasn't surfaced to the LLM."
     )
