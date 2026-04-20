@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent_plane.runtime.policies.function import (
+from agent_plane.policies.function import (
     resolve_function_policy,
 )
 from agent_plane.spec.types import (
@@ -23,7 +23,6 @@ from agent_plane.spec.types import (
     FunctionRef,
     Phase,
     PhaseSelector,
-    PolicyAction,
 )
 
 
@@ -128,7 +127,6 @@ def test_build_engine_fails_on_invalid_function_path(
     from agent_plane.spec.types import (
         AgentSpec,
         GuardrailsSpec,
-        PolicyAction,
     )
 
     spec = AgentSpec(

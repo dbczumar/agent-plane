@@ -83,9 +83,7 @@ def in_memory_exporter() -> Iterator[InMemorySpanExporter]:
     # start_span path sees an unexpected pre-existing trace.
     from mlflow.tracing.trace_manager import InMemoryTraceManager
 
-    trace_manager_instance = getattr(
-        InMemoryTraceManager, "_instance", None
-    )
+    trace_manager_instance = getattr(InMemoryTraceManager, "_instance", None)
     if trace_manager_instance is not None:
         # Clear the internal dicts so no stale trace state leaks.
         trace_manager_instance._traces.clear()  # type: ignore[attr-defined]
@@ -133,9 +131,7 @@ def in_memory_exporter() -> Iterator[InMemorySpanExporter]:
         ),
     ],
 )
-def test_parse_provider_name(
-    input_model: str, expected: tuple[str, str]
-) -> None:
+def test_parse_provider_name(input_model: str, expected: tuple[str, str]) -> None:
     """
     :param input_model: Model string under test.
     :param expected: Expected ``(provider, model)`` tuple.
@@ -249,7 +245,6 @@ def test_trace_context_for_response_root(
     agent-plane-to-trace-backend lookup chain works end-to-end.
     """
     import mlflow
-
     from mlflow.entities import SpanType
 
     with telemetry.trace_context_for_response(response_id=_RESP_ID):
@@ -281,7 +276,6 @@ def test_trace_context_for_response_sub_agent(
     lives in one trace.
     """
     import mlflow
-
     from mlflow.entities import SpanType
 
     sub_response_id = "resp_" + "a" * 32
@@ -313,7 +307,6 @@ def test_trace_context_for_response_shared_across_children(
     freely in the same trace tree.
     """
     import mlflow
-
     from mlflow.entities import SpanType
 
     with telemetry.trace_context_for_response(response_id=_RESP_ID):
@@ -361,20 +354,16 @@ def test_get_traceparent_env_inside_span(
     propagate the parent trace ID to a child process.
     """
     import mlflow
-
     from mlflow.entities import SpanType
 
     with telemetry.trace_context_for_response(response_id=_RESP_ID):
         with mlflow.start_span("root", span_type=SpanType.AGENT):
             env = telemetry.get_traceparent_env()
-            assert "TRACEPARENT" in env, (
-                f"expected TRACEPARENT key, got {list(env.keys())!r}"
-            )
+            assert "TRACEPARENT" in env, f"expected TRACEPARENT key, got {list(env.keys())!r}"
             # W3C traceparent format: 00-{trace_id}-{span_id}-{flags}
             parts = env["TRACEPARENT"].split("-")
             assert len(parts) == 4, (
-                f"expected 4 traceparent parts, got {len(parts)}: "
-                f"{env['TRACEPARENT']!r}"
+                f"expected 4 traceparent parts, got {len(parts)}: {env['TRACEPARENT']!r}"
             )
             version, trace_id_hex, span_id_hex, flags = parts
             assert version == "00"
@@ -401,7 +390,6 @@ def test_record_llm_usage_basic(
     backend.
     """
     import mlflow
-
     from mlflow.entities import SpanType
     from mlflow.tracing.constant import SpanAttributeKey
 
@@ -443,7 +431,6 @@ def test_record_llm_usage_with_cache(
     the input dict has the keys.
     """
     import mlflow
-
     from mlflow.entities import SpanType
     from mlflow.tracing.constant import SpanAttributeKey
 
@@ -478,7 +465,6 @@ def test_record_llm_usage_without_cache_omits_fields(
     "zero tokens cached", which would mislead cost analysis.
     """
     import mlflow
-
     from mlflow.entities import SpanType
     from mlflow.tracing.constant import SpanAttributeKey
 
@@ -508,7 +494,6 @@ def test_record_error_sets_error_type_and_status(
     must be populated.
     """
     import mlflow
-
     from mlflow.entities import SpanType
 
     class CustomError(Exception):
@@ -538,7 +523,6 @@ def test_record_cancellation_sets_cancelled_error_type(
     cancelled traces separately from failures.
     """
     import mlflow
-
     from mlflow.entities import SpanType
 
     with telemetry.trace_context_for_response(response_id=_RESP_ID):

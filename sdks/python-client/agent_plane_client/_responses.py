@@ -13,6 +13,8 @@ import httpx
 
 from ._errors import ToolCallDenied, raise_for_status
 from ._events import (
+    RESERVED_APPROVAL_TOOL_NAME,
+    ApprovalRequest,
     CompactionInProgress,
     ErrorEvent,
     MessageDone,
@@ -34,6 +36,7 @@ from ._events import (
 )
 from ._sse import parse_sse_stream
 from ._tool_handler import (
+    ApprovalRequestCtx,
     CompactionStartCtx,
     FileOutputCtx,
     MessageEndCtx,
@@ -251,6 +254,24 @@ class ResponsesNamespace:
                             )
                         elif is_client_side:
                             pending_client_calls.append(event)
+
+                    elif isinstance(event, ApprovalRequest):
+                        # Policy ASK — the server is waiting on
+                        # a verdict. Route to the approval hook
+                        # (not the tool_handler — this is not a
+                        # real tool). If no hook is registered,
+                        # fail-closed refuse so the parked
+                        # workflow doesn't stall forever.
+                        completed_call_ids.add(event.call_id)
+                        asyncio.ensure_future(
+                            _handle_approval_request(
+                                self._http,
+                                self._base,
+                                hooks,
+                                event,
+                                current_response_id or "",
+                            )
+                        )
 
                     elif isinstance(event, ToolResult):
                         completed_call_ids.add(event.call_id)
@@ -473,6 +494,19 @@ class ResponsesNamespace:
             except json.JSONDecodeError:
                 arguments = {}
 
+            # Reserved-name carve-out: policy ASKs surfacing
+            # via the polling path (no streaming hook
+            # registered) fail-closed refuse. Callers that
+            # want interactive approval must use streaming.
+            if name == RESERVED_APPROVAL_TOOL_NAME:
+                tool_results.append(
+                    {
+                        "call_id": call_id,
+                        "output": json.dumps({"approved": False}),
+                    }
+                )
+                continue
+
             call_info = ToolCallInfo(
                 name=name,
                 arguments=arguments,
@@ -653,3 +687,80 @@ async def _execute_and_patch(
             )
     except Exception:
         _log.exception("Error PATCHing tool result for call_id %s", tool_call.call_id)
+
+
+async def _handle_approval_request(
+    http: httpx.AsyncClient,
+    base_url: str,
+    hooks: StreamHooks,
+    event: ApprovalRequest,
+    response_id: str,
+) -> None:
+    """
+    Route a policy ASK through the approval hook and PATCH the verdict.
+
+    When no ``on_approval_request`` hook is registered the
+    client refuses fail-closed — an ASK the caller cannot
+    answer must not stall the parked workflow forever. The
+    server treats ``{"approved": false}`` the same as refused /
+    timed-out per POLICIES.md §13.
+
+    Runs on a background task so the SSE stream continues to
+    drain while the user is deciding. The verdict PATCH goes
+    through the existing ``tool_results`` contract — no new
+    endpoint, no server-side change.
+
+    :param http: Shared HTTPX client.
+    :param base_url: Server base URL.
+    :param hooks: Stream hooks — the ``on_approval_request``
+        hook gets the decision.
+    :param event: The parsed approval request.
+    :param response_id: Root response id (the parked
+        workflow).
+    """
+    ctx = ApprovalRequestCtx(
+        call_id=event.call_id,
+        reason=event.reason,
+        policy_name=event.policy_name,
+        phase=event.phase,
+        content_preview=event.content_preview,
+        response_id=response_id,
+    )
+    approved = False
+    if hooks.on_approval_request is not None:
+        try:
+            raw = hooks.on_approval_request(ctx)
+            if inspect.isawaitable(raw):
+                raw = await raw
+            approved = bool(raw)
+        except Exception:
+            _log.exception(
+                "on_approval_request hook raised for call_id %s; refusing fail-closed",
+                event.call_id,
+            )
+            approved = False
+    else:
+        _log.info(
+            "No on_approval_request hook registered; refusing ASK call_id=%s policy=%s",
+            event.call_id,
+            event.policy_name,
+        )
+
+    verdict_output = json.dumps({"approved": approved})
+    try:
+        resp = await http.patch(
+            f"{base_url}/v1/responses/{response_id}",
+            json={"tool_results": [{"call_id": event.call_id, "output": verdict_output}]},
+            timeout=60.0,
+        )
+        if resp.status_code not in (200, 404, 409):
+            _log.warning(
+                "PATCH verdict failed for call_id %s: %s",
+                event.call_id,
+                resp.text[:200],
+            )
+    except Exception:
+        _log.exception(
+            "Error PATCHing approval verdict for call_id %s",
+            event.call_id,
+        )

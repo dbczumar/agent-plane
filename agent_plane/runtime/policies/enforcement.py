@@ -13,8 +13,8 @@ hook on later.
 
 from __future__ import annotations
 
+from agent_plane.policies.types import EvaluationContext, PolicyResult
 from agent_plane.runtime.policies.engine import PolicyEngine
-from agent_plane.spec.types import EvaluationContext, PolicyResult
 
 
 async def _enforce_policy(

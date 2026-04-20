@@ -10,11 +10,8 @@ from __future__ import annotations
 
 import json
 
-from agent_plane.spec.types import (
-    EvaluationContext,
-    PolicyAction,
-    PolicyResult,
-)
+from agent_plane.policies.types import EvaluationContext, PolicyResult
+from agent_plane.spec.types import PolicyAction
 
 # Long-sleep threshold. Sleep calls over this many seconds are
 # blocked. Chosen small enough that trivial test args (like 8 s)

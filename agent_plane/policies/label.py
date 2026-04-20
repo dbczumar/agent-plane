@@ -11,12 +11,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_plane.runtime.policies.base import Policy
-from agent_plane.spec.types import (
-    EvaluationContext,
-    LabelPolicySpec,
-    PolicyResult,
-)
+from agent_plane.policies.base import Policy
+from agent_plane.policies.types import EvaluationContext, PolicyResult
+from agent_plane.spec.types import LabelPolicySpec
 
 
 class LabelPolicy(Policy):

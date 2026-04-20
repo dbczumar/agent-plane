@@ -1,16 +1,24 @@
 """
-Abstract base class for runtime policy instances.
+Abstract base class for policy evaluator instances.
 
-A :class:`Policy` is an instantiated, per-workflow runtime
-object derived from a :class:`PolicySpec`. Subclasses
-implement one evaluate() method that returns a
-:class:`PolicyResult`; the engine does the filter-gate-dispatch-
-compose orchestration (see POLICIES.md §4 and
-``engine.py``).
+A :class:`Policy` is an instantiated, per-workflow evaluator
+derived from a :class:`PolicySpec`. Subclasses implement one
+:meth:`evaluate` method that returns a :class:`PolicyResult`;
+the engine (in :mod:`agent_plane.runtime.policies.engine`) does
+the filter-gate-dispatch-compose orchestration (see
+POLICIES.md §4).
 
-Phase 3 ships :class:`LabelPolicy` as the first concrete
-subclass. :class:`FunctionPolicy` lands in Phase 4;
-:class:`PromptPolicy` in Phase 7.
+The three concrete subclasses live next to this module:
+
+- :class:`agent_plane.policies.label.LabelPolicy`
+- :class:`agent_plane.policies.function.FunctionPolicy`
+- :class:`agent_plane.policies.prompt.PromptPolicy`
+
+These classes are pure evaluators — they hold no mutable state
+across calls, do no DB I/O, and don't know about conversations.
+Mutable runtime state (label cache, conversation id,
+write-through store) and the composition loop live in
+:mod:`agent_plane.runtime.policies`.
 """
 
 from __future__ import annotations
@@ -18,11 +26,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-from agent_plane.spec.types import (
-    EvaluationContext,
-    PolicyResult,
-    PolicySpec,
-)
+from agent_plane.policies.types import EvaluationContext, PolicyResult
+from agent_plane.spec.types import PolicySpec
 
 
 class Policy(ABC):

@@ -14,11 +14,8 @@ their own policy callables via pip-installed packages.
 
 from __future__ import annotations
 
-from agent_plane.spec.types import (
-    EvaluationContext,
-    PolicyAction,
-    PolicyResult,
-)
+from agent_plane.policies.types import EvaluationContext, PolicyResult
+from agent_plane.spec.types import PolicyAction
 
 # Deterministic sentinel — arbitrary string unlikely to
 # appear in natural user messages, so the e2e test can

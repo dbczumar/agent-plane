@@ -33,11 +33,11 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from typing import Any
 
+from agent_plane.policies.types import ApprovalRequest, PolicyResult
 from agent_plane.runtime.policies.engine import PolicyEngine
-from agent_plane.spec.types import Phase, PolicyResult
+from agent_plane.spec.types import Phase
 
 # Parking callback contract — the workflow will bind a real
 # DBOS-parking implementation (`dbos_recv_async(topic="tool_result")`
@@ -57,56 +57,6 @@ _EmitCallback = Callable[[dict[str, Any]], None]
 # can wake this workflow when the verdict arrives. Tests
 # typically pass a no-op.
 _RegisterCallback = Callable[[str, str, str], None]
-
-
-@dataclass(frozen=True)
-class ApprovalRequest:
-    """
-    The payload surfaced to the client's approval handler.
-
-    Mirrors the arguments JSON the synthetic
-    ``request_approval`` function_call carries. Kept as a
-    dataclass (not an ad-hoc dict) so the contract is
-    explicit at the seam between workflow and approval
-    helper, and so tests assert against named fields
-    instead of dict keys.
-
-    :param phase: Which enforcement point produced the ASK,
-        e.g. ``"tool_call"``. String form for JSON-friendliness
-        (the wire format is opaque to middleware).
-    :param reason: Combined reason string from all ASKing
-        policies, joined with ``"; "`` per §4. Shown to the
-        user in the approval UI.
-    :param policy_name: Name of the deciding (first-in-YAML-
-        order) ASKing policy. Drives per-policy ask_timeout
-        lookup and observability.
-    :param content_preview: Truncated snapshot of the content
-        being gated. Lets a human reviewer see what they're
-        approving without overwhelming the UI on a 50 KB
-        payload.
-    """
-
-    phase: str
-    reason: str
-    policy_name: str
-    content_preview: str
-
-    def to_arguments_json(self) -> str:
-        """
-        Serialize to the arguments-string format the client
-        sees on the synthetic function_call.
-
-        :returns: JSON string — the ``arguments`` field of
-            the emitted function_call item.
-        """
-        return json.dumps(
-            {
-                "phase": self.phase,
-                "reason": self.reason,
-                "policy_name": self.policy_name,
-                "content_preview": self.content_preview,
-            }
-        )
 
 
 async def _await_policy_approval(
@@ -281,4 +231,4 @@ def _truncate(text: str, *, limit: int) -> str:
     return text[:limit] + " [truncated]"
 
 
-__all__ = ["_await_policy_approval", "ApprovalRequest"]
+__all__ = ["_await_policy_approval"]

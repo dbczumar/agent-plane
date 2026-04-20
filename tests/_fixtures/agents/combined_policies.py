@@ -4,11 +4,8 @@ Callables for the ``combined-policies`` fixture.
 
 from __future__ import annotations
 
-from agent_plane.spec.types import (
-    EvaluationContext,
-    PolicyAction,
-    PolicyResult,
-)
+from agent_plane.policies.types import EvaluationContext, PolicyResult
+from agent_plane.spec.types import PolicyAction
 
 
 def observe_all(ctx: EvaluationContext) -> PolicyResult:

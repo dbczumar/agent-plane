@@ -23,9 +23,9 @@ from __future__ import annotations
 
 import pytest
 
+from agent_plane.policies.types import EvaluationContext
 from agent_plane.runtime.policies.engine import PolicyEngine
 from agent_plane.spec.types import (
-    EvaluationContext,
     LabelDef,
     Phase,
     PolicyAction,
@@ -207,7 +207,7 @@ def test_spec_for_finds_policy_by_name(
 ) -> None:
     """When a policy with the given name exists, spec_for
     returns its spec. Proves the YAML-order list lookup works."""
-    from agent_plane.runtime.policies.label import LabelPolicy
+    from agent_plane.policies.label import LabelPolicy
     from agent_plane.spec.types import LabelPolicySpec, PhaseSelector
 
     conv = conversation_store.create_conversation()

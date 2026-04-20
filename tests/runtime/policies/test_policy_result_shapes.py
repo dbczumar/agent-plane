@@ -12,13 +12,11 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
+from agent_plane.policies.types import EvaluationContext, PolicyResult
 from agent_plane.spec.types import (
-    EvaluationContext,
     Phase,
     PolicyAction,
-    PolicyResult,
 )
-
 
 # ── Frozen / immutable ────────────────────────────────
 

@@ -24,6 +24,13 @@ NATIVE_TOOL_TYPES: frozenset[str] = frozenset(
     }
 )
 
+# Reserved tool name for policy approval requests. The server
+# emits a synthetic ``function_call`` item with this name when
+# a policy returns ASK; the client must route it to an
+# approval handler rather than a normal ToolHandler (it is not
+# a real tool). See POLICIES.md §7 / §15.10.
+RESERVED_APPROVAL_TOOL_NAME = "request_approval"
+
 
 # ── Response lifecycle events ────────────────────────────
 
@@ -132,6 +139,37 @@ class ToolResult:
 
     call_id: str
     output: str
+
+
+@dataclass
+class ApprovalRequest:
+    """
+    A policy ASK surfaced as a synthetic ``request_approval`` call.
+
+    Parsed out of the ``function_call`` item whose ``name`` is
+    :data:`RESERVED_APPROVAL_TOOL_NAME`. Consumers respond by
+    calling ``client.responses.submit_approval(response_id,
+    call_id, approved=...)`` — the server routes the verdict
+    through the same PATCH endpoint client-side tool results use.
+
+    :param call_id: Server-assigned call_id. Must be echoed back
+        verbatim when submitting the verdict.
+    :param reason: Combined reason string from the deciding ASK
+        policies (``"; "``-joined per POLICIES.md §4).
+    :param policy_name: Name of the deciding (first-in-YAML-
+        order) ASKing policy, e.g. ``"approve_web_search"``.
+    :param phase: Which enforcement point produced the ASK —
+        one of ``"input"``, ``"tool_call"``, ``"tool_result"``,
+        ``"output"``.
+    :param content_preview: Truncated snapshot of the gated
+        content. Safe to display verbatim in an approval UI.
+    """
+
+    call_id: str
+    reason: str
+    policy_name: str
+    phase: str
+    content_preview: str
 
 
 @dataclass

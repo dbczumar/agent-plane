@@ -24,6 +24,12 @@ Design constraints:
   replaces the live LLM call for unit tests. The override
   is strictly for tests — production always goes through
   :func:`_default_classifier`.
+
+:func:`_default_classifier` is the live LLM entry point. It
+lives in :mod:`agent_plane.runtime.policies.prompt_classifier`
+because it does I/O and depends on the runtime LLM wiring.
+PromptPolicy takes the classifier as a constructor argument so
+this module stays pure.
 """
 
 from __future__ import annotations
@@ -33,13 +39,12 @@ import json
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from agent_plane.runtime.policies.base import Policy
+from agent_plane.policies.base import Policy
+from agent_plane.policies.types import EvaluationContext, PolicyResult
 from agent_plane.spec.types import (
     DEFAULT_POLICY_CLASSIFIER_TIMEOUT,
-    EvaluationContext,
     LLMConfig,
     PolicyAction,
-    PolicyResult,
     PromptPolicySpec,
 )
 

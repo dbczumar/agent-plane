@@ -36,20 +36,19 @@ from typing import Any
 
 import pytest
 
+from agent_plane.policies.label import LabelPolicy
+from agent_plane.policies.types import ApprovalRequest, PolicyResult
 from agent_plane.runtime.policies.approval import (
-    ApprovalRequest,
     _await_policy_approval,
     _parse_verdict,
     _truncate,
 )
 from agent_plane.runtime.policies.engine import PolicyEngine
-from agent_plane.runtime.policies.label import LabelPolicy
 from agent_plane.spec.types import (
     LabelPolicySpec,
     Phase,
     PhaseSelector,
     PolicyAction,
-    PolicyResult,
 )
 from agent_plane.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,

@@ -1,0 +1,32 @@
+spec_version: 1
+
+name: e2e-output-gate
+description: |
+  E2E fixture: OUTPUT-phase policy enforcement.
+  Always-ASK LabelPolicy on OUTPUT fires after the LLM emits
+  the final assistant text, BEFORE persistence (POLICIES.md
+  §11.4's load-bearing ordering — a refused OUTPUT must
+  never reach conversation_items or downstream compaction).
+  The agent has no tools, so every turn goes:
+  INPUT (ALLOW, no policy) → LLM → OUTPUT ASK → persist
+  (or sentinel).
+
+llm:
+  model: openai/gpt-4o
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+guardrails:
+  policies:
+    ask_on_output:
+      type: label
+      on: [output]
+      action: ask
+      reason: Review assistant reply before releasing.
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

@@ -183,8 +183,7 @@ def test_single_sub_agent_e2e(
         http_client,
         model=sub_agent_test_agent,
         user_text=(
-            "Dispatch the researcher sub-agent. Tell me the "
-            "literal marker string it returns."
+            "Dispatch the researcher sub-agent. Tell me the literal marker string it returns."
         ),
     )
     assert body["status"] == "completed", (
@@ -286,6 +285,5 @@ def test_mixed_sub_agent_and_async_tool_e2e(
     assert body["status"] == "completed"
     final = _final_text(body)
     assert "RESEARCHER_MARKER_2025" in final, (
-        f"researcher marker missing from final response. "
-        f"Got: {final!r}"
+        f"researcher marker missing from final response. Got: {final!r}"
     )

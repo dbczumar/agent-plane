@@ -24,15 +24,15 @@ from typing import Any
 
 import pytest
 
+from agent_plane.policies.prompt import PromptPolicy
+from agent_plane.policies.types import EvaluationContext
 from agent_plane.runtime.policies import (
     _await_policy_approval,
     build_policy_engine,
 )
 from agent_plane.runtime.policies.engine import PolicyEngine
-from agent_plane.runtime.policies.prompt import PromptPolicy
 from agent_plane.spec.parser import parse
 from agent_plane.spec.types import (
-    EvaluationContext,
     Phase,
     PolicyAction,
 )
@@ -243,7 +243,7 @@ async def test_approval_writes_persistent_audit_label(
     This is a hand-crafted agent (no fixture) because it's
     the canonical use case for ASK-writes-labels that isn't
     covered by the three omniagents fixtures."""
-    from agent_plane.runtime.policies.label import LabelPolicy
+    from agent_plane.policies.label import LabelPolicy
     from agent_plane.spec.types import (
         LabelPolicySpec,
         PhaseSelector,

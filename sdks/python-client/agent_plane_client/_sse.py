@@ -13,6 +13,8 @@ from typing import Any
 
 from ._events import (
     NATIVE_TOOL_TYPES,
+    RESERVED_APPROVAL_TOOL_NAME,
+    ApprovalRequest,
     CompactionInProgress,
     ErrorEvent,
     MessageDone,
@@ -195,10 +197,25 @@ def _parse_output_item(data: dict[str, Any]) -> StreamEvent | None:
             arguments = json.loads(args_str)
         except json.JSONDecodeError:
             arguments = {}
+        name = str(item.get("name", ""))
+        call_id = str(item.get("call_id", ""))
+        # Reserved-name carve-out: policy ASKs arrive as a
+        # synthetic ``function_call`` named ``request_approval``.
+        # Surface them as a distinct event type so the stream
+        # consumer never feeds them into a ToolHandler — the
+        # verdict goes through ``submit_approval`` instead.
+        if name == RESERVED_APPROVAL_TOOL_NAME:
+            return ApprovalRequest(
+                call_id=call_id,
+                reason=str(arguments.get("reason") or ""),
+                policy_name=str(arguments.get("policy_name") or ""),
+                phase=str(arguments.get("phase") or ""),
+                content_preview=str(arguments.get("content_preview") or ""),
+            )
         return ToolCall(
-            name=str(item.get("name", "")),
+            name=name,
             arguments=arguments,
-            call_id=str(item.get("call_id", "")),
+            call_id=call_id,
             status=str(item.get("status", "")),
             agent_name=str(item.get("model", "")),
         )

@@ -17,11 +17,11 @@ will start instantiating them as those phases ship.
 
 from __future__ import annotations
 
-from agent_plane.runtime.policies.base import Policy
+from agent_plane.policies.base import Policy
+from agent_plane.policies.function import resolve_function_policy
+from agent_plane.policies.label import LabelPolicy
+from agent_plane.policies.prompt import resolve_prompt_policy
 from agent_plane.runtime.policies.engine import PolicyEngine
-from agent_plane.runtime.policies.function import resolve_function_policy
-from agent_plane.runtime.policies.label import LabelPolicy
-from agent_plane.runtime.policies.prompt import resolve_prompt_policy
 from agent_plane.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     AgentSpec,

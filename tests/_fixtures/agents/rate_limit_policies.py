@@ -10,11 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_plane.spec.types import (
-    EvaluationContext,
-    PolicyAction,
-    PolicyResult,
-)
+from agent_plane.policies.types import EvaluationContext, PolicyResult
+from agent_plane.spec.types import PolicyAction
 
 
 def rate_limit_search(limit: int = 3) -> Any:

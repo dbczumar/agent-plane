@@ -5,7 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    # EvaluationContext is a runtime evaluation artifact (see
+    # agent_plane.policies.types); PhaseSelector.matches takes
+    # one by attribute access only, so the annotation lives
+    # behind TYPE_CHECKING to avoid an import cycle.
+    from agent_plane.policies.types import EvaluationContext
 
 # Default HTTP status codes considered transient and retryable.
 _DEFAULT_RETRYABLE_STATUS_CODES = [429, 500, 502, 503]
@@ -423,78 +430,6 @@ class PolicyAction(str, Enum):
     ALLOW = "allow"
     ASK = "ask"
     DENY = "deny"
-
-
-@dataclass(frozen=True)
-class EvaluationContext:
-    """
-    Everything the engine needs to evaluate one phase.
-
-    Filled by the caller (workflow or executor hook) BEFORE
-    calling ``engine.evaluate(ctx)``. The engine never has to
-    introspect ``content`` to answer "which tool was this?" —
-    the caller resolves ``tool_name`` because only it has the
-    local state to do so cheaply (on ``TOOL_RESULT`` the
-    ``function_call_output`` payload carries ``call_id`` but no
-    ``name``; the caller knows the name from the earlier
-    dispatch).
-
-    :param phase: The enforcement point.
-    :param content: Phase-specific payload — shape depends on
-        ``phase``: ``INPUT`` / ``OUTPUT`` carry ``str`` (raw
-        user / assistant text); ``TOOL_CALL`` / ``TOOL_RESULT``
-        carry ``dict[str, Any]`` (the function_call or
-        function_call_output dict, which includes
-        ``call_id``). Policies know which shape to expect from
-        their declared ``on:`` phases — the engine never
-        introspects this field itself.
-    :param tool_name: Resolved tool name. Populated on
-        ``TOOL_CALL`` and ``TOOL_RESULT``; ``None`` on
-        ``INPUT`` and ``OUTPUT``.
-    """
-
-    phase: Phase
-    content: Any
-    tool_name: str | None = None
-
-
-@dataclass(frozen=True)
-class PolicyResult:
-    """
-    One policy's decision (or the engine's composed decision).
-
-    Returned by ``Policy.evaluate()`` and by
-    ``PolicyEngine.evaluate()``. The same shape is used at
-    both layers: individual policies return a single-policy
-    decision, the engine composes them and returns the
-    aggregate.
-
-    :param action: The decision (``ALLOW``, ``ASK``, or
-        ``DENY``), e.g. ``PolicyAction.DENY``.
-    :param reason: Human-readable reason string. Shown to the
-        user on ASK, included in logs / spans on DENY, ``None``
-        on ALLOW, e.g. ``"Canada-related topics are denied."``.
-    :param set_labels: Labels the policy wants to write. For
-        a single-policy result: the raw writes the policy
-        requested (before whitelist filtering). For an
-        engine-composed result: the writes the engine has
-        accumulated and intends to apply on this decision
-        (filtering already done). ``None`` when the policy
-        wrote no labels, e.g. ``{"integrity": "0"}``.
-    :param deciding_policy: Name of the policy whose action
-        drove the composed result. Engine-set only —
-        single-policy results leave it ``None``. On DENY: the
-        first short-circuiting policy. On ASK: the first
-        ASKing policy in YAML order. On ALLOW: ``None``.
-        Powers the ``deciding_policy`` outer-span attribute
-        (POLICIES.md §11.5) and the per-policy ``ask_timeout``
-        lookup (§7.2).
-    """
-
-    action: PolicyAction
-    reason: str | None = None
-    set_labels: dict[str, str] | None = None
-    deciding_policy: str | None = None
 
 
 @dataclass(frozen=True)

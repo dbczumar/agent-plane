@@ -27,6 +27,8 @@ Usage::
 
 from __future__ import annotations
 
+import json
+import time
 from pathlib import Path
 
 import httpx
@@ -40,6 +42,7 @@ _E2E_POLICY_GATE_DIR = (
 _E2E_LABEL_GATE_DIR = (
     Path(__file__).resolve().parents[1] / "_fixtures" / "agents" / "e2e-label-gate"
 )
+_ASK_DEMO_DIR = Path(__file__).resolve().parents[2] / "examples" / "agents" / "ask-demo"
 
 
 @pytest.fixture(scope="session")
@@ -52,6 +55,101 @@ def policy_gate_agent(http_client: httpx.Client) -> str:
 def label_gate_agent(http_client: httpx.Client) -> str:
     """Upload the e2e-label-gate fixture and return its name."""
     return _upload_agent(http_client, _E2E_LABEL_GATE_DIR)
+
+
+@pytest.fixture(scope="session")
+def ask_demo_agent(http_client: httpx.Client) -> str:
+    """Upload the ``ask-demo`` example agent — always-ASK on INPUT."""
+    return _upload_agent(http_client, _ASK_DEMO_DIR)
+
+
+def _find_pending_approval(body: dict) -> dict | None:
+    """
+    Locate the synthetic ``request_approval`` function_call
+    in a polled response body.
+
+    Returns the item dict (carries ``call_id`` and
+    ``arguments``) or ``None`` when no approval is pending.
+
+    :param body: The response body from GET /v1/responses/{id}.
+    :returns: The item dict, or ``None``.
+    """
+    for item in body.get("output", []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "function_call":
+            continue
+        if item.get("name") != "request_approval":
+            continue
+        if item.get("status") != "action_required":
+            continue
+        return item
+    return None
+
+
+def _wait_for_pending_approval(
+    client: httpx.Client,
+    response_id: str,
+    timeout: float = 30.0,
+) -> dict:
+    """
+    Poll until a ``request_approval`` appears in the output.
+
+    :param client: HTTP client.
+    :param response_id: In-progress response id.
+    :param timeout: Max seconds to wait.
+    :returns: The approval function_call item.
+    :raises AssertionError: If no approval appears in time.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resp = client.get(f"/v1/responses/{response_id}")
+        resp.raise_for_status()
+        body = resp.json()
+        item = _find_pending_approval(body)
+        if item is not None:
+            return item
+        if body.get("status") in ("completed", "failed"):
+            raise AssertionError(
+                f"Response finished with status {body['status']} but no "
+                "approval was ever requested.",
+            )
+        time.sleep(0.5)
+    raise AssertionError(f"No approval surfaced within {timeout}s.")
+
+
+def _patch_approval_verdict(
+    client: httpx.Client,
+    response_id: str,
+    call_id: str,
+    approved: bool,
+) -> None:
+    """
+    PATCH the approval verdict through the existing
+    ``tool_results`` contract.
+
+    The server's ``_parse_verdict`` does a strict ``is True``
+    on ``parsed["approved"]`` — anything else (missing field,
+    wrong type, explicit false) counts as refuse.
+
+    :param client: HTTP client.
+    :param response_id: The parked response id.
+    :param call_id: The synthetic call_id from the approval.
+    :param approved: ``True`` to approve, ``False`` to
+        refuse.
+    """
+    resp = client.patch(
+        f"/v1/responses/{response_id}",
+        json={
+            "tool_results": [
+                {
+                    "call_id": call_id,
+                    "output": json.dumps({"approved": approved}),
+                },
+            ],
+        },
+    )
+    resp.raise_for_status()
 
 
 def _extract_all_assistant_text(body: dict) -> str:
@@ -262,7 +360,6 @@ def test_label_gate_taint_persists_across_turns(
 
     # Turn 2: clean input — no trigger. But the label is
     # already persisted from turn 1.
-    conv_id = body1["conversation"]["id"]
     resp2 = http_client.post(
         "/v1/responses",
         json={
@@ -388,3 +485,146 @@ def test_no_guardrails_agent_unaffected(
     # Real LLM output — not a policy sentinel.
     assert len(text.strip()) > 0
     assert "[Denied by policy" not in text
+
+
+# ── Polling-API ASK coverage ──────────────────────────────
+#
+# The REPL tests in ``test_repl_approval_e2e.py`` exercise
+# the streaming-SSE path. These tests cover the polling
+# path that headless / scripted clients use:
+# POST background=true → poll for pending approval →
+# PATCH a verdict → poll to terminal. Same server-side
+# enforcement, different client-side protocol.
+
+
+def test_polling_api_explicit_approval_allows_llm(
+    http_client: httpx.Client,
+    ask_demo_agent: str,
+) -> None:
+    """
+    Polling client approves an ASK → server unparks → LLM
+    runs → response terminal status = completed with real
+    text.
+
+    Proves scripted / headless clients (CI runners,
+    dashboards, background automation) can participate in
+    the approval flow via the existing PATCH contract —
+    no streaming SDK required.
+    """
+    resp = http_client.post(
+        "/v1/responses",
+        json={
+            "model": ask_demo_agent,
+            "input": "hello polling",
+            "background": True,
+        },
+    )
+    resp.raise_for_status()
+    rid = resp.json()["id"]
+
+    approval = _wait_for_pending_approval(http_client, rid, timeout=60)
+    call_id = approval["call_id"]
+    # Sanity: the arguments dict carries the policy identity
+    # so clients can render a real approval UI.
+    args = json.loads(approval["arguments"])
+    assert args["policy_name"] == "always_ask_on_input"
+    assert args["phase"] == "input"
+
+    _patch_approval_verdict(http_client, rid, call_id, approved=True)
+
+    body = poll_until_terminal(http_client, rid, timeout=60)
+    assert body["status"] == "completed", f"Response did not complete: {body.get('error')}"
+    text = _extract_all_assistant_text(body)
+    assert len(text.strip()) > 0, "Approve path produced no assistant text"
+    # No DENY sentinel — approve must NOT substitute the
+    # blocked text.
+    assert "[Denied by policy" not in text, f"Approve leaked a DENY sentinel: {text!r}"
+
+
+def test_polling_api_explicit_refusal_denies(
+    http_client: httpx.Client,
+    ask_demo_agent: str,
+) -> None:
+    """
+    Polling client refuses an ASK → server returns DENY
+    sentinel as the assistant reply.
+
+    Same contract as the REPL refuse path, different
+    transport. The terminal response carries ``status:
+    completed`` (the agent turn finished cleanly — the
+    policy just replaced the reply).
+    """
+    resp = http_client.post(
+        "/v1/responses",
+        json={
+            "model": ask_demo_agent,
+            "input": "hello refusal",
+            "background": True,
+        },
+    )
+    resp.raise_for_status()
+    rid = resp.json()["id"]
+
+    approval = _wait_for_pending_approval(http_client, rid, timeout=60)
+    _patch_approval_verdict(
+        http_client,
+        rid,
+        approval["call_id"],
+        approved=False,
+    )
+
+    body = poll_until_terminal(http_client, rid, timeout=60)
+    assert body["status"] == "completed"
+    text = _extract_all_assistant_text(body)
+    assert "[Denied by policy" in text, (
+        f"Refuse path did not produce a DENY sentinel.\nGot: {text!r}"
+    )
+
+
+def test_polling_api_malformed_verdict_treated_as_refuse(
+    http_client: httpx.Client,
+    ask_demo_agent: str,
+) -> None:
+    """
+    A client that PATCHes a malformed verdict (missing
+    ``approved`` key, wrong type, non-JSON output) → server's
+    ``_parse_verdict`` strict-checks → refuse fail-closed.
+    POLICIES.md §13 invariant: only exact
+    ``{"approved": true}`` approves; everything else denies.
+
+    This is the critical safety rail. A buggy client that
+    accidentally sends garbage must NOT accidentally approve.
+    """
+    resp = http_client.post(
+        "/v1/responses",
+        json={
+            "model": ask_demo_agent,
+            "input": "malformed verdict test",
+            "background": True,
+        },
+    )
+    resp.raise_for_status()
+    rid = resp.json()["id"]
+
+    approval = _wait_for_pending_approval(http_client, rid, timeout=60)
+    # Garbage verdict — not JSON, not "approved: true".
+    patch_resp = http_client.patch(
+        f"/v1/responses/{rid}",
+        json={
+            "tool_results": [
+                {
+                    "call_id": approval["call_id"],
+                    "output": "not even json, definitely not approved",
+                },
+            ],
+        },
+    )
+    patch_resp.raise_for_status()
+
+    body = poll_until_terminal(http_client, rid, timeout=60)
+    text = _extract_all_assistant_text(body)
+    assert "[Denied by policy" in text, (
+        "Malformed verdict did not fail-closed refuse — major safety "
+        "regression. The server must treat anything other than exact "
+        f'{{"approved": true}} as a refusal.\nGot: {text!r}'
+    )

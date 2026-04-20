@@ -187,22 +187,18 @@ async def test_spawn_sub_agent_auto_delivers_result(
     fco_items = [
         i
         for i in items
-        if i.get("type") == "function_call_output"
-        and i.get("call_id") == "call_spawn_p3_1"
+        if i.get("type") == "function_call_output" and i.get("call_id") == "call_spawn_p3_1"
     ]
     assert len(fco_items) == 1, f"Expected 1 spawn function_call_output; got {len(fco_items)}"
     handle = json.loads(fco_items[0]["output"])
-    assert handle["kind"] == "sub_agent", (
-        f"Handle kind must be 'sub_agent'; got {handle!r}"
-    )
+    assert handle["kind"] == "sub_agent", f"Handle kind must be 'sub_agent'; got {handle!r}"
     assert handle["type"] == "researcher"
     assert handle["status"] == "in_progress"
     assert isinstance(handle["task_id"], str) and handle["task_id"], (
         f"Handle task_id must be non-empty string; got {handle!r}"
     )
     assert handle["task_id"] in handle["message"], (
-        f"Handle message must embed the task_id verbatim (G12); "
-        f"got {handle!r}"
+        f"Handle message must embed the task_id verbatim (G12); got {handle!r}"
     )
 
     # 2. A [System: task ... completed] auto-delivered message
@@ -214,8 +210,7 @@ async def test_spawn_sub_agent_auto_delivers_result(
     ]
     completion_messages = [t for t in user_texts if t.startswith("[System: task ")]
     assert len(completion_messages) >= 1, (
-        f"Expected at least one auto-delivered system message; "
-        f"got user_texts={user_texts}"
+        f"Expected at least one auto-delivered system message; got user_texts={user_texts}"
     )
     completion_blob = "\n".join(completion_messages)
     assert "SUBAGENT_RESULT_MARKER_47" in completion_blob, (
@@ -237,12 +232,10 @@ async def test_spawn_sub_agent_auto_delivers_result(
     sub_task = await task_store.get(handle["task_id"])
     assert sub_task is not None
     assert sub_task.kind == "sub_agent", (
-        f"Sub-agent task row must carry kind='sub_agent'; "
-        f"got kind={sub_task.kind!r}"
+        f"Sub-agent task row must carry kind='sub_agent'; got kind={sub_task.kind!r}"
     )
     assert sub_task.status == "completed", (
-        f"Sub-agent task row must be terminal completed; "
-        f"got status={sub_task.status!r}"
+        f"Sub-agent task row must be terminal completed; got status={sub_task.status!r}"
     )
 
 
@@ -298,9 +291,7 @@ async def test_sub_agent_failure_surfaces_to_parent(
     mock_llm.add_call(text="placeholder", exception_fn=_crash_only_subagent)
     # Parent's iteration after the failure system message
     # arrives: produces the final text.
-    parent_final = mock_llm.add_call(
-        text="Sub-agent crashed.", exception_fn=_crash_only_subagent
-    )
+    parent_final = mock_llm.add_call(text="Sub-agent crashed.", exception_fn=_crash_only_subagent)
 
     result = await create_test_response(
         client,
@@ -343,8 +334,7 @@ async def test_sub_agent_failure_surfaces_to_parent(
     assert parent_final.received_kwargs is not None
     final_input = json.dumps(parent_final.received_kwargs["input"])
     assert "CRASHED_SUBAGENT_MARKER" in final_input, (
-        "The failure marker must appear in the parent's final "
-        "LLM input."
+        "The failure marker must appear in the parent's final LLM input."
     )
 
 
@@ -396,7 +386,9 @@ async def test_sub_agent_handle_kind_distinct_from_async_tool(
 
     items = await _get_items(client, conv_id)
     fco_items = [
-        i for i in items if i.get("type") == "function_call_output" and i.get("call_id") == "call_kind"
+        i
+        for i in items
+        if i.get("type") == "function_call_output" and i.get("call_id") == "call_kind"
     ]
     assert len(fco_items) == 1
     handle = json.loads(fco_items[0]["output"])
@@ -404,8 +396,7 @@ async def test_sub_agent_handle_kind_distinct_from_async_tool(
     # comparison must be exact. Any other value would silently
     # break LLM-side reasoning that branches on the kind.
     assert handle["kind"] == "sub_agent", (
-        f"Sub-agent handles must report kind='sub_agent'; "
-        f"got {handle.get('kind')!r}"
+        f"Sub-agent handles must report kind='sub_agent'; got {handle.get('kind')!r}"
     )
 
 
@@ -458,7 +449,9 @@ async def test_old_spawn_sub_agents_tool_removed(
 
     items = await _get_items(client, conv_id)
     fco_items = [
-        i for i in items if i.get("type") == "function_call_output" and i.get("call_id") == "call_legacy"
+        i
+        for i in items
+        if i.get("type") == "function_call_output" and i.get("call_id") == "call_legacy"
     ]
     assert len(fco_items) == 1, "Expected one function_call_output for the legacy invocation"
     output = fco_items[0]["output"]
@@ -508,7 +501,11 @@ async def test_check_sub_agents_tool_removed(
     await _wait_for_completion(client, result.body["id"])
     items = await _get_items(client, result.body["conversation"]["id"])
     fco = next(
-        (i for i in items if i.get("type") == "function_call_output" and i.get("call_id") == "call_check"),
+        (
+            i
+            for i in items
+            if i.get("type") == "function_call_output" and i.get("call_id") == "call_check"
+        ),
         None,
     )
     assert fco is not None
@@ -549,7 +546,11 @@ async def test_cancel_sub_agent_tool_removed(
     await _wait_for_completion(client, result.body["id"])
     items = await _get_items(client, result.body["conversation"]["id"])
     fco = next(
-        (i for i in items if i.get("type") == "function_call_output" and i.get("call_id") == "call_cancel"),
+        (
+            i
+            for i in items
+            if i.get("type") == "function_call_output" and i.get("call_id") == "call_cancel"
+        ),
         None,
     )
     assert fco is not None

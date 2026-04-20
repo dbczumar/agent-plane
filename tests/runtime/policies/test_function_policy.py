@@ -35,21 +35,20 @@ from typing import Any
 
 import pytest
 
-from agent_plane.runtime.policies.engine import PolicyEngine
-from agent_plane.runtime.policies.function import (
+from agent_plane.policies.function import (
     FunctionPolicy,
     resolve_function_policy,
 )
-from agent_plane.runtime.policies.label import LabelPolicy
+from agent_plane.policies.label import LabelPolicy
+from agent_plane.policies.types import EvaluationContext, PolicyResult
+from agent_plane.runtime.policies.engine import PolicyEngine
 from agent_plane.spec.types import (
-    EvaluationContext,
     FunctionPolicySpec,
     FunctionRef,
     LabelPolicySpec,
     Phase,
     PhaseSelector,
     PolicyAction,
-    PolicyResult,
 )
 from agent_plane.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -360,7 +359,9 @@ def test_resolve_function_policy_short_form(tmp_path: Path) -> None:
         tmp_path,
         "probe",
         """
-        from agent_plane.spec.types import PolicyAction, PolicyResult
+        from agent_plane.policies.types import PolicyResult
+
+        from agent_plane.spec.types import PolicyAction
 
         def noop(ctx):
             return PolicyResult(action=PolicyAction.ALLOW)
@@ -385,7 +386,9 @@ def test_resolve_function_policy_factory_form(tmp_path: Path) -> None:
         tmp_path,
         "probe_factory",
         """
-        from agent_plane.spec.types import PolicyAction, PolicyResult
+        from agent_plane.policies.types import PolicyResult
+
+        from agent_plane.spec.types import PolicyAction
 
         def make(limit):
             calls = 0
@@ -423,7 +426,9 @@ async def test_factory_closure_counter_isolated_per_build(
         tmp_path,
         "probe_iso",
         """
-        from agent_plane.spec.types import PolicyAction, PolicyResult
+        from agent_plane.policies.types import PolicyResult
+
+        from agent_plane.spec.types import PolicyAction
 
         def make(limit):
             calls = 0

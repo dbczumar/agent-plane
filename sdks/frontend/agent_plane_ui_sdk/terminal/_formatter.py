@@ -9,13 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from rich import box
-from rich.console import RenderableType
-from rich.markdown import Markdown
-from rich.padding import Padding
-from rich.panel import Panel
-from rich.text import Text
-
 from agent_plane_client import (
     AnyBlock,
     CompactionBlock,
@@ -33,6 +26,12 @@ from agent_plane_client import (
     ToolGroup,
     ToolResultBlock,
 )
+from rich import box
+from rich.console import RenderableType
+from rich.markdown import Markdown
+from rich.padding import Padding
+from rich.panel import Panel
+from rich.text import Text
 
 
 @dataclass

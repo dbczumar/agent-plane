@@ -24,13 +24,9 @@ import inspect
 from collections.abc import Callable
 from typing import Any
 
-from agent_plane.runtime.policies.base import Policy
-from agent_plane.spec.types import (
-    EvaluationContext,
-    FunctionPolicySpec,
-    PolicyAction,
-    PolicyResult,
-)
+from agent_plane.policies.base import Policy
+from agent_plane.policies.types import EvaluationContext, PolicyResult
+from agent_plane.spec.types import FunctionPolicySpec, PolicyAction
 
 # Type alias for what a resolved FunctionPolicy callable can be.
 # Distinguishing form handled at call time — the adapter wraps

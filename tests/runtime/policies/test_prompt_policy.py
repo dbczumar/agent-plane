@@ -30,14 +30,14 @@ from typing import Any
 
 import pytest
 
-from agent_plane.runtime.policies.engine import PolicyEngine
-from agent_plane.runtime.policies.prompt import (
+from agent_plane.policies.prompt import (
     DEFAULT_POLICY_CLASSIFIER_TIMEOUT,
     PromptPolicy,
     _parse_classifier_response,
 )
+from agent_plane.policies.types import EvaluationContext
+from agent_plane.runtime.policies.engine import PolicyEngine
 from agent_plane.spec.types import (
-    EvaluationContext,
     LLMConfig,
     Phase,
     PhaseSelector,
@@ -486,7 +486,7 @@ async def test_default_classifier_not_yet_wired() -> None:
     pending executor integration. This ensures a spec that
     declares PromptPolicy without a stub fails loudly at
     evaluate() time rather than silently ALLOWing."""
-    from agent_plane.runtime.policies.prompt import _default_classifier
+    from agent_plane.policies.prompt import _default_classifier
 
     with pytest.raises(NotImplementedError, match="not yet wired"):
         await _default_classifier("any prompt")

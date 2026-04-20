@@ -1891,7 +1891,6 @@ async def test_spawn_and_auto_collect_sub_agent(
     )
 
 
-
 # ── Sub-agent parking and tunneling tests ──────────────
 
 
