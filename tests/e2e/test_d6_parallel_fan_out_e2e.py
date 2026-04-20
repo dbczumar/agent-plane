@@ -22,8 +22,6 @@ Excluded from default ``pytest`` runs via
 
 from __future__ import annotations
 
-import tarfile
-import tempfile
 import time
 from pathlib import Path
 
@@ -37,6 +35,8 @@ from agent_plane_client._events import (
     ResponseIncomplete,
 )
 from agent_plane_client.tools import build_tool_handler, tool
+
+from tests.e2e.conftest import upload_agent
 
 _FIXTURES_DIR = Path(__file__).resolve().parents[1] / "_fixtures" / "agents"
 _FIXTURE = _FIXTURES_DIR / "d6-fan-out-test"
@@ -56,42 +56,10 @@ _FAN_OUT = 3
 _PARALLEL_WALL_CLOCK_MAX_S = 8.0
 
 
-def _upload(http_client: httpx.Client, agent_dir: Path) -> str:
-    """
-    Upload an agent bundle from a directory tree.
-
-    :param http_client: HTTP client pointed at the live server.
-    :param agent_dir: Directory containing config.yaml.
-    :returns: The agent's name.
-    """
-    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-        with tarfile.open(tmp.name, "w:gz") as tar:
-            tar.add(str(agent_dir), arcname=".")
-        bundle_path = tmp.name
-    try:
-        with open(bundle_path, "rb") as f:
-            resp = http_client.post(
-                "/api/agents",
-                files={
-                    "bundle": (
-                        "agent.tar.gz",
-                        f,
-                        "application/gzip",
-                    ),
-                },
-            )
-        if resp.status_code == 409:
-            return agent_dir.name
-        resp.raise_for_status()
-        return resp.json()["name"]
-    finally:
-        Path(bundle_path).unlink(missing_ok=True)
-
-
 @pytest.fixture(scope="session")
 def fan_out_test_agent(http_client: httpx.Client) -> str:
     """Upload the shared D6 dispatch fixture."""
-    return _upload(http_client, _FIXTURE)
+    return upload_agent(http_client, _FIXTURE)
 
 
 # Concurrency fingerprint: every invocation appends a

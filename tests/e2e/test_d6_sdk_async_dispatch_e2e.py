@@ -31,8 +31,6 @@ Excluded from default ``pytest`` runs via
 from __future__ import annotations
 
 import asyncio
-import tarfile
-import tempfile
 from pathlib import Path
 
 import httpx
@@ -46,6 +44,8 @@ from agent_plane_client._events import (
 )
 from agent_plane_client.tools import build_tool_handler, tool
 
+from tests.e2e.conftest import upload_agent
+
 _FIXTURES_DIR = Path(__file__).resolve().parents[1] / "_fixtures" / "agents"
 _FIXTURE = _FIXTURES_DIR / "d6-sdk-async-dispatch-test"
 
@@ -58,42 +58,10 @@ _FIXTURE = _FIXTURES_DIR / "d6-sdk-async-dispatch-test"
 _MARKER = "D6_SDK_ASYNC_LIFECYCLE_OK_77"
 
 
-def _upload(http_client: httpx.Client, agent_dir: Path) -> str:
-    """
-    Upload an agent bundle from a directory tree.
-
-    :param http_client: HTTP client pointed at the live server.
-    :param agent_dir: Directory containing config.yaml.
-    :returns: The agent's name.
-    """
-    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-        with tarfile.open(tmp.name, "w:gz") as tar:
-            tar.add(str(agent_dir), arcname=".")
-        bundle_path = tmp.name
-    try:
-        with open(bundle_path, "rb") as f:
-            resp = http_client.post(
-                "/api/agents",
-                files={
-                    "bundle": (
-                        "agent.tar.gz",
-                        f,
-                        "application/gzip",
-                    ),
-                },
-            )
-        if resp.status_code == 409:
-            return agent_dir.name
-        resp.raise_for_status()
-        return resp.json()["name"]
-    finally:
-        Path(bundle_path).unlink(missing_ok=True)
-
-
 @pytest.fixture(scope="session")
 def d6_test_agent(http_client: httpx.Client) -> str:
     """Upload the D6 E2E fixture."""
-    return _upload(http_client, _FIXTURE)
+    return upload_agent(http_client, _FIXTURE)
 
 
 # Tool body — the SDK runs this in an asyncio.Task when the

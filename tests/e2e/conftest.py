@@ -156,7 +156,7 @@ def http_client(live_server: str) -> Iterator[httpx.Client]:
         yield client
 
 
-def _upload_agent(
+def upload_agent(
     client: httpx.Client,
     agent_dir: Path,
 ) -> str:
@@ -200,7 +200,7 @@ def coder_agent(http_client: httpx.Client) -> str:
     :param http_client: HTTP client pointed at the server.
     :returns: The agent name, e.g. ``"coder"``.
     """
-    return _upload_agent(http_client, _CODER_DIR)
+    return upload_agent(http_client, _CODER_DIR)
 
 
 @pytest.fixture(scope="session")
@@ -212,7 +212,7 @@ def archer_agent(http_client: httpx.Client) -> str:
     :param http_client: HTTP client pointed at the server.
     :returns: The agent name, e.g. ``"archer"``.
     """
-    return _upload_agent(http_client, _ARCHER_DIR)
+    return upload_agent(http_client, _ARCHER_DIR)
 
 
 @pytest.fixture(scope="session")
@@ -226,7 +226,7 @@ def claude_coder_agent(http_client: httpx.Client) -> str:
     :param http_client: HTTP client pointed at the server.
     :returns: The agent name, ``"claude-coder"``.
     """
-    return _upload_agent(http_client, _CLAUDE_CODER_DIR)
+    return upload_agent(http_client, _CLAUDE_CODER_DIR)
 
 
 @pytest.fixture(scope="session")
@@ -238,7 +238,7 @@ def openai_coder_agent(http_client: httpx.Client) -> str:
     :param http_client: HTTP client pointed at the server.
     :returns: The agent name, ``"openai-coder"``.
     """
-    return _upload_agent(http_client, _OPENAI_CODER_DIR)
+    return upload_agent(http_client, _OPENAI_CODER_DIR)
 
 
 @pytest.fixture(scope="session")

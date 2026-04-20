@@ -1,0 +1,23 @@
+spec_version: 1
+
+name: d6-direct-cancel-test
+
+description: |
+  Test-only agent that dispatches one async client tool and
+  then immediately cancels it, to exercise the SDK's D6
+  direct-cancel propagation.
+
+llm:
+  model: gpt-5.4
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  timeout: 60
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

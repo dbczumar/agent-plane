@@ -44,14 +44,14 @@ Excluded from default ``pytest`` runs via
 from __future__ import annotations
 
 import json
-import tarfile
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+
+from tests.e2e.conftest import upload_agent
 
 _FIXTURES_DIR = Path(__file__).resolve().parents[1] / "_fixtures" / "agents"
 _FIXTURE = _FIXTURES_DIR / "client-tool-cancellation-message-test"
@@ -93,42 +93,10 @@ _ASYNC_CLIENT_TOOL: dict[str, Any] = {
 }
 
 
-def _upload(http_client: httpx.Client, agent_dir: Path) -> str:
-    """
-    Upload an agent bundle from a directory tree.
-
-    :param http_client: HTTP client pointed at the live server.
-    :param agent_dir: Directory containing config.yaml.
-    :returns: The agent's name.
-    """
-    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-        with tarfile.open(tmp.name, "w:gz") as tar:
-            tar.add(str(agent_dir), arcname=".")
-        bundle_path = tmp.name
-    try:
-        with open(bundle_path, "rb") as f:
-            resp = http_client.post(
-                "/api/agents",
-                files={
-                    "bundle": (
-                        "agent.tar.gz",
-                        f,
-                        "application/gzip",
-                    ),
-                },
-            )
-        if resp.status_code == 409:
-            return agent_dir.name
-        resp.raise_for_status()
-        return resp.json()["name"]
-    finally:
-        Path(bundle_path).unlink(missing_ok=True)
-
-
 @pytest.fixture(scope="session")
 def cancellation_message_test_agent(http_client: httpx.Client) -> str:
     """Upload the cancellation-message E2E fixture."""
-    return _upload(http_client, _FIXTURE)
+    return upload_agent(http_client, _FIXTURE)
 
 
 def _items(http_client: httpx.Client, conv_id: str) -> list[dict[str, Any]]:
