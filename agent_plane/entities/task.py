@@ -73,6 +73,16 @@ class Task:
     :param root_task_id: ID of the top-level task that initiated
         this sub-agent's spawn tree, or ``None`` for top-level
         tasks, e.g. ``"task_abc123"``.
+    :param parent_task_id: ID of the IMMEDIATE parent task that
+        caused this task to be created (distinct from
+        :attr:`root_task_id`, which walks to the top-level).
+        For top-level user turns this is ``None``. For async
+        child tasks (``kind="tool"``, ``"sub_agent"``,
+        ``"client_tool"``) created from inside a sub-agent, this
+        is the sub-agent's own task id — *not* the root.
+        Drives the ``async_work_complete`` drain's signal target
+        so the immediate caller's drain wakes when the child
+        completes.
     :param tools: Client-specified tool dicts (OpenAI format with
         ``agent_plane`` extension) supplied at request time. Restored
         from DBOS workflow inputs on recovery. ``None`` means no
@@ -95,6 +105,7 @@ class Task:
     created_at: int
     completed_at: int | None = None
     root_task_id: str | None = None
+    parent_task_id: str | None = None
     # Heterogeneous output items (messages, reasoning, function_calls)
     # serialized as dicts; shape varies by item type.
     output: list[dict[str, Any]] = field(default_factory=list)

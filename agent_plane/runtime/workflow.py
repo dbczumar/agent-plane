@@ -2813,6 +2813,7 @@ async def _dispatch_async_tool(
             agent_id=agent_id,
             agent_name=agent_name,
             root_task_id=parent_task_id,
+            parent_task_id=parent_task_id,
             kind=_TOOL_KIND,
         )
 
@@ -2979,10 +2980,15 @@ async def _dispatch_async_client_tools(
             f"parent task {parent_task_id!r} not found — "
             f"async client tool dispatch invariant broken"
         )
-    # Resolve root_task_id so signals route to the original
-    # top-level task even for nested sub-agents calling client
-    # tools.
+    # Resolve root_task_id for cancel-cascade scoping
+    # (cancel_pending_child_tools walks list_tasks(root_task_id=...)).
     root_task_id = parent_row.root_task_id or parent_task_id
+    # ``parent_task_id`` is the IMMEDIATE calling agent — what
+    # the PATCH handler signals so its drain wakes. Audit fix
+    # #1: this differs from ``root_task_id`` when the caller is
+    # a sub-agent. Signaling the root would land the completion
+    # on the wrong conversation.
+    immediate_parent_task_id = parent_task_id
 
     fco_items: list[NewConversationItem] = []
     for tc in tool_calls:
@@ -2996,6 +3002,7 @@ async def _dispatch_async_client_tools(
                 agent_id=agent_id,
                 agent_name=agent_name,
                 root_task_id=root_task_id,
+                parent_task_id=immediate_parent_task_id,
                 kind=_CLIENT_TOOL_KIND,
             )
 

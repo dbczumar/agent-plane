@@ -280,7 +280,16 @@ async def _finalize_and_signal(
         output=async_result.output,
         error=async_result.error,
     )
-    parent_task_id = task.root_task_id or task.id
+    # Audit fix #1: signal the IMMEDIATE caller's drain, not the
+    # root. For a top-level caller, parent_task_id is None and
+    # root_task_id is also None (falling back to task.id
+    # routes the signal back to a non-existent recipient, but
+    # the top-level agent doesn't wait for its own
+    # client-tool completions on the drain — it finishes and
+    # the signal is harmless). For sub-agent callers, the
+    # immediate parent is the sub-agent; signaling root would
+    # land the completion on the wrong conversation.
+    parent_task_id = task.parent_task_id or task.root_task_id or task.id
     payload: dict[str, Any] = {
         "task_id": async_result.task_id,
         "kind": "client_tool",

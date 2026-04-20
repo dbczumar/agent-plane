@@ -152,6 +152,7 @@ def _to_entity(row: SqlTask) -> Task:
         previous_response_id=row.previous_response_id,
         background=row.background,
         root_task_id=row.root_task_id,
+        parent_task_id=row.parent_task_id,
         kind=row.kind,
         # task.status is typed str; store the enum's .value so f-string
         # formatting produces "queued" not "TaskStatus.QUEUED".
@@ -296,6 +297,7 @@ class SqlAlchemyTaskStore(TaskStore):
         previous_response_id: str | None = None,
         background: bool = False,
         root_task_id: str | None = None,
+        parent_task_id: str | None = None,
         kind: str = "agent_task",
     ) -> Task:
         """
@@ -312,6 +314,12 @@ class SqlAlchemyTaskStore(TaskStore):
         :param background: Whether this is a background task.
         :param root_task_id: ID of the top-level task for
             sub-agent spawns. ``None`` for top-level tasks.
+        :param parent_task_id: ID of the IMMEDIATE parent task
+            (the caller that created this one) — distinct from
+            ``root_task_id`` when a sub-agent is the caller.
+            ``None`` for top-level tasks. Signal routing for
+            ``async_work_complete`` delivers to this id so the
+            immediate calling agent's drain wakes (audit fix #1).
         :param kind: Task kind discriminator, one of
             ``"agent_task"`` (default — user-initiated turn),
             ``"tool"`` (background ``@tool(synchronous=False)``),
@@ -332,6 +340,7 @@ class SqlAlchemyTaskStore(TaskStore):
             inbox_closed=False,
             background=background,
             root_task_id=root_task_id,
+            parent_task_id=parent_task_id,
             kind=kind,
         )
         with self._session() as session:

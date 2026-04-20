@@ -162,6 +162,16 @@ class SqlTask(Base):
     :param root_task_id: ID of the top-level task that initiated
         this sub-agent's spawn tree, or ``None`` for top-level
         tasks.
+    :param parent_task_id: ID of the IMMEDIATE parent task that
+        caused this task to be created (distinct from
+        :attr:`root_task_id`, which walks to the top-level root).
+        For top-level user turns this is ``None``. For async
+        child tasks (``kind="tool"``, ``"sub_agent"``,
+        ``"client_tool"``) created by a sub-agent, this is the
+        sub-agent's own task id — *not* the root. Used by the
+        ``async_work_complete`` drain to signal the immediate
+        calling agent (so a sub-agent's drain wakes on its own
+        children's completions, not the root's).
     :param kind: Task kind discriminator. ``"agent_task"`` for
         user-initiated turns; ``"tool"`` for background custom-tool
         invocations spawned via ``@tool(synchronous=False)``;
@@ -188,6 +198,14 @@ class SqlTask(Base):
     root_task_id: Mapped[str | None] = mapped_column(
         String(64), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=True
     )
+    # Immediate parent — distinct from root_task_id when a
+    # sub-agent creates children. The ``async_work_complete``
+    # drain signals this task_id (not the root) so the calling
+    # agent's own drain wakes. Nullable so pre-existing rows and
+    # top-level tasks both round-trip cleanly.
+    parent_task_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=True
+    )
     # Server-side default backfills pre-existing rows to "agent_task";
     # all new task creation paths set kind explicitly per G74.
     kind: Mapped[str] = mapped_column(
@@ -209,6 +227,7 @@ class SqlTask(Base):
         Index("ix_tasks_agent_id", "agent_id"),
         Index("ix_tasks_created_at", "created_at"),
         Index("ix_tasks_root_task_id", "root_task_id"),
+        Index("ix_tasks_parent_task_id", "parent_task_id"),
         Index("ix_tasks_kind", "kind"),
         CheckConstraint(
             "kind IN ('agent_task', 'tool', 'sub_agent', 'client_tool')",

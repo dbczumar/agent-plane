@@ -232,6 +232,25 @@ class WebFetchTool(Tool):
             },
         }
 
+    def is_async(self) -> bool:
+        """
+        Run web_fetch in a background workflow.
+
+        ``invoke()`` here spawns a sub-agent (the
+        ``__web_researcher``) that runs its own multi-iteration
+        agent loop — typically tens of seconds per fetch.
+        Returning ``True`` makes the runtime dispatch each call
+        as a ``kind="tool"`` background workflow and hand the
+        LLM a ``{task_id, kind: "tool"}`` handle inline, so
+        the LLM can fan out multiple fetches in one turn (and
+        can cancel any of them via the standard cancel path).
+        The eventual researcher output is auto-delivered to the
+        parent on the unified ``async_work_complete`` drain.
+
+        :returns: ``True`` — web_fetch is always long-running.
+        """
+        return True
+
     def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
         Spawn the web researcher sub-agent and wait for results.
@@ -314,6 +333,10 @@ def _spawn_and_wait(
         sa_name=sa_name,
         user_input=prompt,
         root_task_id=root_task_id,
+        # web_fetch is invoked as a server-side tool from the
+        # calling task; audit fix #1 → store the caller as
+        # parent_task_id so drain signals route correctly.
+        parent_task_id=task_id,
         parent_conversation_id=parent_conversation_id,
     )
 

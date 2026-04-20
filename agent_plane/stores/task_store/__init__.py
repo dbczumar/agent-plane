@@ -47,6 +47,7 @@ class TaskStore(ABC):
         previous_response_id: str | None = None,
         background: bool = False,
         root_task_id: str | None = None,
+        parent_task_id: str | None = None,
         kind: str = "agent_task",
     ) -> Task:
         """
@@ -78,6 +79,12 @@ class TaskStore(ABC):
         :param root_task_id: ID of the top-level task that
             initiated this sub-agent's spawn tree. ``None``
             for top-level tasks, e.g. ``"task_abc123"``.
+        :param parent_task_id: ID of the IMMEDIATE parent task
+            (the caller that created this one) — distinct from
+            ``root_task_id`` when a sub-agent is the caller.
+            ``None`` for top-level tasks. The
+            ``async_work_complete`` drain signals this id so the
+            immediate calling agent wakes (audit fix #1).
         :param kind: Task kind discriminator, one of
             ``"agent_task"`` (default — user-initiated turn),
             ``"tool"`` (background ``@tool(synchronous=False)``),

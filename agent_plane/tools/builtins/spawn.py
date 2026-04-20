@@ -174,6 +174,7 @@ class SpawnSubAgentTool(Tool):
                 sa_name=sa_name,
                 user_input=sa_input,
                 root_task_id=root_task_id,
+                parent_task_id=ctx.task_id,
                 parent_conversation_id=parent_conversation_id,
                 client_tools=client_tools,
             )
@@ -389,6 +390,7 @@ def _spawn_one(
     sa_name: str,
     user_input: str,
     root_task_id: str,
+    parent_task_id: str,
     parent_conversation_id: str,
     client_tools: list[dict[str, Any]] | None = None,
 ) -> str:
@@ -412,6 +414,10 @@ def _spawn_one(
     :param user_input: The user's input string for the
         sub-agent.
     :param root_task_id: The top-level task ID for tunneling.
+    :param parent_task_id: The IMMEDIATE calling task id. Stored
+        on the new task row so async-complete signals route back
+        to the caller's drain (distinct from ``root_task_id``
+        when the caller is itself a sub-agent).
     :param parent_conversation_id: The owning parent
         conversation's id (powers list_sub_agents + cascade
         delete).
@@ -450,6 +456,7 @@ def _spawn_one(
         agent_id=agent_id,
         agent_name=agent_name,
         root_task_id=root_task_id,
+        parent_task_id=parent_task_id,
         # G74: explicitly mark spawned tasks so the parent loop's
         # auto-collect path can distinguish sub-agents from
         # top-level user turns and from async @tool work items.
@@ -579,6 +586,7 @@ class SendToSubAgentTool(Tool):
                 sa_name=sa_name,
                 user_input=sa_input,
                 root_task_id=root_task_id,
+                parent_task_id=ctx.task_id,
                 parent_conversation_id=parent_conversation_id,
                 client_tools=client_tools,
             )
@@ -704,6 +712,7 @@ def _send_to_one(
     sa_name: str,
     user_input: str,
     root_task_id: str,
+    parent_task_id: str,
     parent_conversation_id: str,
     client_tools: list[dict[str, Any]] | None = None,
 ) -> str:
@@ -783,6 +792,7 @@ def _send_to_one(
         agent_id=agent_id,
         agent_name=agent_name,
         root_task_id=root_task_id,
+        parent_task_id=parent_task_id,
         kind="sub_agent",
     )
 
