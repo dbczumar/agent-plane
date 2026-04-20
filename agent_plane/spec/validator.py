@@ -359,16 +359,36 @@ def _validate_mcp_servers(spec: AgentSpec, result: ValidationResult) -> None:
 def _validate_local_tools(spec: AgentSpec, result: ValidationResult) -> None:
     """
     Validate local tool name uniqueness across all tool sources
-    (MCP servers and local tools).
+    (MCP servers and local tools), and reject collisions with
+    reserved builtin names (POLICIES.md §15.8).
 
     :param spec: The agent spec to check.
     :param result: Accumulator for any validation errors found.
     """
-    # Check for duplicate tool names across all tool sources (MCP + local)
+    # Lazy import to avoid pulling the tools package during
+    # spec load (the validator runs from ``agent_plane.spec``,
+    # which is a lower layer than ``agent_plane.tools``).
+    from agent_plane.tools.builtins import BUILTIN_NAMES
+
+    # Collect everything the agent declares and cross-check
+    # against the reserved builtin name-space. The same set is
+    # also used for duplicate-name detection across sources.
     all_tool_names: set[str] = set()
-    for mcp in spec.mcp_servers:
+    for i, mcp in enumerate(spec.mcp_servers):
+        if mcp.name in BUILTIN_NAMES:
+            result.add(
+                f"mcp_servers[{i}].name",
+                f"tool name {mcp.name!r} collides with a reserved "
+                f"builtin tool name; choose a different name",
+            )
         all_tool_names.add(mcp.name)
     for i, tool in enumerate(spec.local_tools):
+        if tool.name in BUILTIN_NAMES:
+            result.add(
+                f"local_tools[{i}].name",
+                f"tool name {tool.name!r} collides with a reserved "
+                f"builtin tool name; choose a different name",
+            )
         if tool.name in all_tool_names:
             result.add(
                 f"local_tools[{i}].name",

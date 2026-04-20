@@ -1,0 +1,33 @@
+spec_version: 1
+
+name: e2e-policy-gate
+description: |
+  Minimal agent for the policy-system e2e test. Declares a
+  LabelPolicy at INPUT that DENYs any message containing the
+  literal string "BLOCK_THIS_TOKEN" (the token is arbitrary — it
+  doesn't match any real content a normal user would send, so
+  the DENY path is deterministically triggerable by the test).
+
+  The DENY path is gated via a FunctionPolicy that inspects the
+  raw user content — the LabelPolicy alone can't pattern-match,
+  so we use a FunctionPolicy callable that checks for the
+  sentinel token.
+
+llm:
+  model: openai/gpt-4o
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+guardrails:
+  policies:
+    block_sentinel:
+      type: function
+      on: [input]
+      function: agent_plane._e2e_policy_callables.block_on_sentinel
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

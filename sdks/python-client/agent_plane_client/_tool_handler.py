@@ -192,6 +192,43 @@ class SubAgentCompletedCtx:
 
 
 @dataclass
+class ApprovalRequestCtx:
+    """
+    Context for ``on_approval_request``.
+
+    Surfaced when the server emits a synthetic
+    ``request_approval`` function_call (a policy ASK — see
+    POLICIES.md §7). The hook returns ``True`` to approve or
+    ``False`` to refuse; the client submits the verdict to
+    the server automatically.
+
+    :param call_id: Server-assigned call_id. Echoed back
+        verbatim on the verdict PATCH.
+    :param reason: Combined reason string from the deciding
+        ASKing policies (``"; "``-joined). Render this in the
+        approval UI so the user understands what they are
+        approving.
+    :param policy_name: Name of the first-in-YAML-order policy
+        that ASKed, e.g. ``"approve_web_search"``.
+    :param phase: Which of ``"input"`` / ``"tool_call"`` /
+        ``"tool_result"`` / ``"output"`` produced the ASK.
+    :param content_preview: Truncated (1024 chars) snapshot of
+        the gated content. Safe to display verbatim.
+    :param response_id: The in-progress response id — the hook
+        must PATCH the verdict back to this id. The client
+        handles the PATCH itself; this field is exposed for
+        logging / audit purposes.
+    """
+
+    call_id: str
+    reason: str
+    policy_name: str
+    phase: str
+    content_preview: str
+    response_id: str
+
+
+@dataclass
 class ResponseStartCtx:
     """Context for ``on_response_start``."""
 
@@ -257,3 +294,12 @@ class StreamHooks:
     # Response lifecycle
     on_response_start: Callable[[ResponseStartCtx], Awaitable[None] | None] | None = None
     on_response_end: Callable[[ResponseEndCtx], Awaitable[None] | None] | None = None
+
+    # Policy approval requests. Called when the server emits a
+    # synthetic ``request_approval`` function_call (policy ASK,
+    # POLICIES.md §7). The callback returns ``True`` to approve
+    # or ``False`` to refuse; the client PATCHes the verdict
+    # back. When no callback is registered, the client
+    # fail-closed refuses — an unhandled ASK becomes DENY,
+    # preserving the fail-loud-rather-than-block semantics.
+    on_approval_request: Callable[[ApprovalRequestCtx], Awaitable[bool] | bool] | None = None

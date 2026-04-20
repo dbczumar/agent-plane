@@ -1,0 +1,60 @@
+spec_version: 1
+
+name: e2e-label-ask-gate
+description: |
+  E2E fixture: label-driven ASK composition.
+  Two policies on INPUT, chained across turns:
+
+  1. ``taint_on_banana`` (FunctionPolicy) ALLOWs every
+     message; when the user's text contains ``BANANA_TRIGGER``
+     it writes ``tainted: "1"``.
+  2. ``ask_when_tainted`` (LabelPolicy) has
+     ``condition: {tainted: "1"}``. Fires ASK — not DENY —
+     once the label is set.
+
+  The composition:
+  - Turn 1 with BANANA_TRIGGER → taint_on_banana ALLOWs +
+    writes the label. ask_when_tainted's condition checks
+    the PRE-evaluation snapshot so it does NOT fire this
+    turn.
+  - Turn 2 (any message) → the persisted label matches
+    ask_when_tainted's condition → ASK fires. User
+    approves or refuses.
+
+  Exercises the ASK variant of the label-gate chain that
+  ``e2e-label-gate`` tests for DENY, plus label persistence
+  across workflows, plus ASK approve / refuse paths through
+  the REPL.
+
+llm:
+  model: openai/gpt-4o
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+guardrails:
+  labels:
+    tainted:
+      initial: "0"
+      values: ["0", "1"]
+      monotonic: increasing
+
+  policies:
+    taint_on_banana:
+      type: function
+      on: [input]
+      function: agent_plane._e2e_policy_callables.taint_on_banana
+
+    ask_when_tainted:
+      type: label
+      on: [input]
+      condition:
+        tainted: "1"
+      action: ask
+      reason: Conversation is tainted — confirm before continuing.
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

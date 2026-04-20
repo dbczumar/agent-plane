@@ -1,0 +1,27 @@
+spec_version: 1
+
+name: e2e-subagent-tool-gate
+description: |
+  E2E fixture: sub-agent TOOL_CALL approval tunneling.
+  Parent delegates to a ``toolworker`` sub-agent for every
+  user message. The sub-agent's AGENTS.md forces it to call
+  ``echo``; a TOOL_CALL-phase ASK policy on that tool fires
+  from within the sub-agent and must tunnel to the ROOT
+  REPL's SSE stream (same mechanism as sub-agent INPUT ASK
+  in ``e2e-subagent-gate``, but on a different phase).
+
+llm:
+  model: openai/gpt-4o
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  agents:
+    - toolworker
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

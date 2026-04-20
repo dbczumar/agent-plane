@@ -614,6 +614,10 @@ def test_execution_timeout_preserves_prior_output(
         conv_store: Any,
         tool_mgr: Any,
         workspace_path: str | None = None,
+        *,
+        policy_engine: Any,
+        task_store: Any,
+        root_task_id: str | None,
     ) -> str | None:
         """
         Fake tool call handler that injects a prior output item.
@@ -632,8 +636,13 @@ def test_execution_timeout_preserves_prior_output(
             a prior item to simulate accumulated output.
         :param conv_store: Conversation store (unused).
         :param tool_mgr: Tool manager (unused).
+        :param policy_engine: Policy engine (unused — this
+            fake skips enforcement entirely).
+        :param task_store: Task store (unused).
+        :param root_task_id: Root task id (unused).
         :returns: A last_seen cursor value.
         """
+        del policy_engine, task_store, root_task_id
         output_items.append(prior_output_item)
         return "item_001"
 

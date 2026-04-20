@@ -1,0 +1,71 @@
+spec_version: 1
+name: combined-policies
+description: |
+  Combined fixture using all three policy types (label,
+  function, prompt) in one agent. Exercised by the Phase 5b
+  integration tests; the closest e2e proxy available before
+  the workflow.py wiring lands.
+
+llm:
+  model: openai/gpt-4o
+
+guardrails:
+  ask_timeout: 60
+
+  labels:
+    integrity:
+      initial: "1"
+      values: ["0", "1"]
+      monotonic: decreasing
+    sensitivity:
+      initial: public
+      values: [public, internal, confidential]
+      monotonic: increasing
+
+  policies:
+    # ── LabelPolicy: taint on web_search ──
+    taint_web:
+      type: label
+      on: [tool_call:web_search]
+      action: allow
+      set_labels:
+        integrity: "0"
+
+    # ── LabelPolicy: elevate sensitivity on confidential read ──
+    classify_confidential_read:
+      type: label
+      on: [tool_call:read_confidential]
+      action: allow
+      set_labels:
+        sensitivity: confidential
+
+    # ── FunctionPolicy: rate-limit search ──
+    search_rate_limit:
+      type: function
+      on: [tool_call:web_search]
+      function:
+        path: tests._fixtures.agents.rate_limit_policies.rate_limit_search
+        arguments:
+          limit: 2
+
+    # ── FunctionPolicy: classifier-only (never blocks) ──
+    observe_writes:
+      type: function
+      on: [tool_call:write_file]
+      function: tests._fixtures.agents.combined_policies.observe_all
+      # Pure classifier — never blocks; if it ever raises,
+      # the engine substitutes ALLOW per §13 carve-out.
+      action: [allow]
+
+    # ── LabelPolicy: gate-on-double-taint (DENY) ──
+    deny_exfil:
+      type: label
+      on: [tool_call:write_file, tool_call:run_shell]
+      condition:
+        integrity: "0"
+        sensitivity: confidential
+      action: deny
+      reason: |
+        Agent has both tainted integrity AND confidential
+        sensitivity — file writes / shell are exfiltration
+        risks.

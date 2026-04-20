@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -30,6 +30,13 @@ class Conversation:
     :param parent_conversation_id: Phase 4 — for child
         sub-agent conversations, points at the owning parent
         conversation. ``None`` for top-level conversations.
+    :param labels: Session-scoped guardrails labels persisted
+        in ``conversation_labels``. Populated by
+        :meth:`ConversationStore.get_conversation` via a JOIN;
+        empty dict when no labels have been written yet. Labels
+        survive conversation_items compaction by design
+        (POLICIES.md §6.3) — the two tables are
+        independent.
     """
 
     id: str
@@ -38,6 +45,7 @@ class Conversation:
     title: str | None = None
     kind: str = "default"
     parent_conversation_id: str | None = None
+    labels: dict[str, str] = field(default_factory=dict)
 
 
 # ── Conversation item data types ───────────────────────

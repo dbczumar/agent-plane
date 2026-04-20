@@ -1,0 +1,45 @@
+spec_version: 1
+
+name: e2e-prompt-policy
+description: |
+  E2E fixture: PromptPolicy with the real LLM-backed
+  classifier (Phase 9).
+
+  The ``deny_canada`` policy DENYs any input mentioning
+  Canada; otherwise ALLOWs. Uses a classic single-topic
+  classification that GPT-4o handles reliably, so the
+  e2e test can assert both paths deterministically.
+
+  The policy's ``llm:`` is omitted — the classifier
+  inherits the agent's top-level LLM config, which is the
+  common pattern. ``action`` is ``[allow, deny]``, so a
+  malformed classifier response fails closed DENY (no
+  classifier-only carve-out).
+
+llm:
+  model: openai/gpt-4o
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+guardrails:
+  policies:
+    deny_canada:
+      type: prompt
+      on: [input]
+      prompt: |
+        You are a strict content filter. Look at the user's
+        message and decide:
+        - If it mentions Canada, Canadian, Ontario,
+          Quebec, Toronto, Montreal, or anything
+          unambiguously Canadian, return:
+          {"action": "deny", "reason": "mentions Canada"}
+        - Otherwise return: {"action": "allow", "reason": ""}
+        Return ONLY valid JSON, no other text.
+      action: [allow, deny]
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

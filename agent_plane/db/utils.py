@@ -114,6 +114,15 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
     with engine.begin() as connection:
         config.attributes["connection"] = connection
         command.upgrade(config, "head")
+    # Belt-and-suspenders: if the migration file was modified
+    # in place (project has no external users yet, so we revise
+    # existing migrations rather than stacking follow-ups),
+    # existing DBs whose alembic_version is already "head" will
+    # skip alembic.upgrade above and miss the new table. Create
+    # any still-missing tables from the ORM metadata so the
+    # schema always matches the Python model set. No-op for
+    # fresh DBs (upgrade already created everything).
+    Base.metadata.create_all(bind=engine, checkfirst=True)
 
 
 def clear_engine_cache() -> None:

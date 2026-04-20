@@ -1,0 +1,29 @@
+spec_version: 1
+
+name: e2e-tool-gate
+description: |
+  E2E fixture: TOOL_CALL-phase policy enforcement.
+  A local ``echo`` tool with a LabelPolicy that ASKs before
+  every call to it. The AGENTS.md strongly instructs the
+  LLM to call the tool, so every user turn drives one ASK at
+  Phase 6's TOOL_CALL site.
+
+llm:
+  model: openai/gpt-4o
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+guardrails:
+  policies:
+    ask_before_echo:
+      type: label
+      on: [tool_call:echo]
+      action: ask
+      reason: Confirm the echo tool may run.
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

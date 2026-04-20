@@ -1,0 +1,30 @@
+spec_version: 1
+
+name: worker
+description: |
+  Minimal sub-agent with an INPUT-phase ASK policy.
+  Fires a ``request_approval`` the moment it's spawned,
+  regardless of what the parent delegates. The ASK surfaces
+  on the ROOT task's SSE stream via the sub-agent tunneling
+  path (POLICIES.md §7 + workflow.py _handle_policy_ask
+  publish_target).
+
+llm:
+  model: openai/gpt-4o
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+guardrails:
+  policies:
+    worker_input_gate:
+      type: label
+      on: [input]
+      action: ask
+      reason: Confirm the worker may process this delegation.
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

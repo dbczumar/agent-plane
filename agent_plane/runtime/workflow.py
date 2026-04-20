@@ -2115,6 +2115,9 @@ async def _handle_final_response(
     task_store: TaskStore,
     conv_store: ConversationStore,
     iteration_item_ids: frozenset[str] | None = None,
+    *,
+    policy_engine: Any,
+    root_task_id: str | None,
 ) -> _AgentLoopResult | _SteeringRetry:
     """
     Handle the no-tool-calls path using persist-first-then-check.
@@ -2155,6 +2158,26 @@ async def _handle_final_response(
     # message must exist in the conversation regardless of
     # whether late steering messages arrived.
     text = _get_text_content(llm_resp)
+    # Phase 6: OUTPUT-phase policy enforcement.
+    # Fires on the final assistant text BEFORE persistence —
+    # POLICIES.md §11.4 makes pre-persistence ordering
+    # load-bearing so compaction cannot resurface blocked
+    # content. DENY replaces the text with a sentinel; the
+    # streamed tokens the client already saw will be
+    # overwritten by the next response the loop emits (the
+    # client renders from persisted conversation items on
+    # reconnect). A no-op engine returns ALLOW unchanged.
+    # _get_text_content returns str | None (empty-text
+    # responses land as None). Coerce to "" before OUTPUT
+    # enforcement — a policy evaluating None is meaningless
+    # and the assistant item path downstream expects str.
+    text = await _enforce_output_policy(
+        engine=policy_engine,
+        task_id=task_id,
+        root_task_id=root_task_id,
+        task_store=task_store,
+        text=text or "",
+    )
     file_annotations = _collect_file_annotations(output_items)
     _emit_file_annotations(task_id, file_annotations)
     item = _build_assistant_item(
@@ -2309,6 +2332,10 @@ async def _execute_tools(
     conv_store: ConversationStore,
     agent_id: str,
     workspace_path: str | None = None,
+    *,
+    policy_engine: Any,
+    task_store: TaskStore,
+    root_task_id: str | None,
 ) -> str:
     """
     Execute tool calls in parallel and persist output in call order.
@@ -2319,6 +2346,13 @@ async def _execute_tools(
     persisted in the original call order so the LLM sees
     ``function_call_output`` items matching their ``function_call``
     items.
+
+    Phase 6: wraps each dispatch with TOOL_CALL enforcement
+    (before) and TOOL_RESULT enforcement (after). Policies
+    that DENY a call replace its output with a ``[Denied by
+    policy: ...]`` sentinel; the tool is never dispatched. An
+    approved ASK proceeds to dispatch; a refused ASK yields
+    the same sentinel.
 
     :param task_id: The task identifier, e.g.
         ``"task_abc123"``.
@@ -2334,17 +2368,41 @@ async def _execute_tools(
     :param conv_store: The ConversationStore for persistence.
     :param agent_id: The registered agent ID, passed through
         to :class:`ToolContext`, e.g. ``"ag_abc123"``.
+    :param policy_engine: The per-workflow
+        :class:`PolicyEngine` — consulted before dispatch
+        (TOOL_CALL) and after (TOOL_RESULT).
+    :param task_store: Store used by the ASK seams.
+    :param root_task_id: Root task id for ASK SSE routing, or
+        ``None`` when this is itself a root task.
     :returns: The ID of the last persisted tool output item.
     """
+    mgr = get_tool_manager()
+    results: dict[str, str] = {}
+    # TOOL_CALL enforcement: evaluate each call BEFORE dispatch.
+    # Sentinels land directly in ``results`` and the tool is
+    # skipped entirely — no side effects on DENY.
+    calls_to_dispatch: list[_ToolCall] = []
+    for tc in tool_calls:
+        sentinel = await _enforce_tool_call_policy(
+            engine=policy_engine,
+            task_id=task_id,
+            root_task_id=root_task_id,
+            task_store=task_store,
+            tool_name=tc.name,
+            arguments=tc.arguments,
+        )
+        if sentinel is not None:
+            results[tc.call_id] = sentinel
+            continue
+        calls_to_dispatch.append(tc)
+
     # Separate async @tool(synchronous=False) calls from sync
     # ones. Async calls dispatch directly here (workflow body,
     # NOT a @step) because DBOS forbids start_workflow from
     # inside a step. Sync calls still go through the @step
     # `_call_tool` so DBOS checkpoints their results for replay.
-    mgr = get_tool_manager()
-    results: dict[str, str] = {}
     sync_calls: list[_ToolCall] = []
-    for tc in tool_calls:
+    for tc in calls_to_dispatch:
         tool = mgr.get_tool(tc.name) if mgr is not None else None
         # is_async is per-invocation — pass arguments so tools like
         # ``TerminalRunTool`` can inspect the call-time ``synchronous``
@@ -2359,6 +2417,10 @@ async def _execute_tools(
                 arguments=tc.arguments,
                 workspace_path=workspace_path,
             )
+            # Async @tool dispatch yields a handle, not a
+            # result — TOOL_RESULT fires on the async
+            # completion payload later, not here. Surface
+            # the handle as-is for now.
             results[tc.call_id] = handle.to_handle_json()
             continue
         sync_calls.append(tc)
@@ -2390,6 +2452,22 @@ async def _execute_tools(
         )
         for i, tc in enumerate(sync_calls):
             results[tc.call_id] = sync_tasks[i].result()
+
+    # TOOL_RESULT enforcement: post-dispatch, before persist.
+    # Applies to sync results only; async-handle payloads
+    # (opaque handles, not real tool output) are skipped.
+    sync_call_ids = {tc.call_id for tc in sync_calls}
+    for tc in tool_calls:
+        if tc.call_id not in sync_call_ids:
+            continue
+        results[tc.call_id] = await _enforce_tool_result_policy(
+            engine=policy_engine,
+            task_id=task_id,
+            root_task_id=root_task_id,
+            task_store=task_store,
+            tool_name=tc.name,
+            result_text=results[tc.call_id],
+        )
 
     # Persist in original call order so the LLM sees outputs
     # matching the function_call item sequence.
@@ -2555,6 +2633,10 @@ async def _handle_tool_calls(
     conv_store: ConversationStore,
     tool_mgr: ToolManager,
     workspace_path: str | None = None,
+    *,
+    policy_engine: Any,
+    task_store: TaskStore,
+    root_task_id: str | None,
 ) -> str | _ClientToolCallsPending:
     """
     Handle the tool execution path: build ``function_call`` items,
@@ -2658,6 +2740,9 @@ async def _handle_tool_calls(
             conv_store,
             agent_id=agent_id,
             workspace_path=workspace_path,
+            policy_engine=policy_engine,
+            task_store=task_store,
+            root_task_id=root_task_id,
         )
 
     if client_async:
@@ -3800,6 +3885,623 @@ def _sync_steered_after_tools(
     return post_tool_last_seen
 
 
+async def _enforce_input_policies(
+    *,
+    engine: Any,
+    history: list[ConversationItem],
+    last_enforced_input_id: str | None,
+    agent_name: str,
+    task_id: str,
+    root_task_id: str | None,
+    task_store: TaskStore,
+) -> tuple[str | None, str | None]:
+    """
+    Check newly-surfaced user messages against INPUT policies.
+
+    Walks the user-message items in history after
+    ``last_enforced_input_id`` and evaluates each against the
+    engine. Returns ``(deny_sentinel, new_cursor)`` — the
+    caller advances its cursor to ``new_cursor`` so the next
+    iteration only re-checks steering messages, not the
+    already-enforced turn-1 input.
+
+    :param engine: The per-workflow :class:`PolicyEngine`. For
+        agents without guardrails, this is a no-op engine that
+        always returns ALLOW.
+    :param history: The conversation history (already extended
+        by ``_sync_history`` for this iteration).
+    :param last_enforced_input_id: The id of the last
+        user-message item enforced in a prior iteration, or
+        ``None`` on the very first iteration (everything
+        counts as new).
+    :param agent_name: Used for error logging / sentinel shaping.
+    :param task_id: Current task id — passed to the ASK seam
+        so parked workflows are woken by the right PATCH
+        verdict.
+    :param root_task_id: Root task id (for ASK SSE routing),
+        or ``None`` when this is itself a root task.
+    :param task_store: Store used by the ASK seam.
+    :returns: ``(deny_sentinel_text_or_None, advanced_cursor)``.
+        ``deny_sentinel_text`` is ``None`` when no policy
+        DENYed; otherwise it's the text to persist as the
+        assistant reply. ``advanced_cursor`` is the id of the
+        last user message seen (or the prior value when no new
+        messages were found).
+    """
+    from agent_plane.policies.types import EvaluationContext
+    from agent_plane.runtime.policies import _enforce_policy
+    from agent_plane.spec.types import (
+        Phase,
+        PolicyAction,
+    )
+
+    # Determine where the "new" user messages begin.
+    #
+    # Three cases:
+    # 1. We already enforced up to ``last_enforced_input_id``
+    #    earlier in this workflow — resume from the item after
+    #    it. Picks up steering messages delivered mid-turn.
+    # 2. Fresh invocation (cursor is None): a prior turn may
+    #    have left user/assistant history in the store. Only
+    #    enforce user messages that arrived *after* the last
+    #    assistant response — anything before that is already
+    #    part of a completed turn and has already been shown
+    #    to the LLM + policy engine as applicable.
+    # 3. Brand-new conversation (no assistant yet, cursor
+    #    None): start from index 0 so the first user message
+    #    gets enforced. Case 2 degenerates to this.
+    if last_enforced_input_id is not None:
+        start_index = 0
+        for i, item in enumerate(history):
+            if item.id == last_enforced_input_id:
+                start_index = i + 1
+                break
+    else:
+        start_index = _last_assistant_index(history) + 1
+    cursor = last_enforced_input_id
+    for item in history[start_index:]:
+        if item.type != "message":
+            continue
+        data = item.data
+        if getattr(data, "role", None) != "user":
+            continue
+        text = _extract_user_text(data)
+        if not text:
+            continue
+        result = await _enforce_policy(
+            engine,
+            EvaluationContext(
+                phase=Phase.INPUT,
+                content=text,
+                tool_name=None,
+            ),
+        )
+        cursor = item.id
+        if result.action == PolicyAction.DENY:
+            _logger.info(
+                "policy DENY at INPUT for agent %s: %s",
+                agent_name,
+                result.reason,
+            )
+            return _build_deny_sentinel(result.reason), cursor
+        if result.action == PolicyAction.ASK:
+            approved = await _handle_policy_ask(
+                engine=engine,
+                task_id=task_id,
+                root_task_id=root_task_id,
+                task_store=task_store,
+                result=result,
+                phase=Phase.INPUT,
+                content_preview=text,
+            )
+            if not approved:
+                return _build_deny_sentinel(result.reason), cursor
+    return None, cursor
+
+
+def _last_assistant_index(history: list[ConversationItem]) -> int:
+    """
+    Find the index of the last assistant message in *history*.
+
+    Used by :func:`_enforce_input_policies` to skip user
+    messages that belong to prior, already-responded turns.
+    Anything before the last assistant message has already
+    been handled (the agent replied to it) — re-enforcing
+    would fire ASK / DENY on every historical input every
+    new turn, which is both wrong behavior and a major UX
+    bug (three approvals for one new message).
+
+    :param history: The conversation history in store order.
+    :returns: The index of the last assistant message, or
+        ``-1`` when no assistant message is present yet (the
+        caller adds 1 to get the start index, so ``-1 + 1 =
+        0`` enforces everything for brand-new
+        conversations).
+    """
+    for i in range(len(history) - 1, -1, -1):
+        item = history[i]
+        if item.type != "message":
+            continue
+        if getattr(item.data, "role", None) == "assistant":
+            return i
+    return -1
+
+
+def _extract_user_text(data: Any) -> str:
+    """
+    Concatenate text content blocks from a user MessageData.
+
+    :param data: The item's data payload (MessageData shape).
+    :returns: Joined text, or an empty string when no text blocks.
+    """
+    content = getattr(data, "content", None) or []
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict):
+            text = block.get("text") or block.get("input_text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts)
+
+
+# ── Phase 6: TOOL_CALL / TOOL_RESULT / OUTPUT enforcement ───
+
+
+def _build_deny_sentinel(reason: str | None) -> str:
+    """
+    Assemble the standard DENY sentinel text.
+
+    All four enforcement sites (INPUT, TOOL_CALL, TOOL_RESULT,
+    OUTPUT) use the same ``[Denied by policy: <reason>]`` shape
+    so e2e tests can match a single substring. ``reason`` is
+    ``None`` only when a policy DENYs without supplying a
+    reason — in that case we emit a bare ``[Denied by policy]``
+    so the output is still grepable.
+
+    :param reason: Reason string from the composed
+        :class:`PolicyResult`, or ``None``.
+    :returns: The sentinel string to surface in place of the
+        blocked content.
+    """
+    if reason:
+        return f"[Denied by policy: {reason}]"
+    return "[Denied by policy]"
+
+
+def _content_preview(content: Any) -> str:
+    """
+    Render content for an approval UI preview.
+
+    Strings pass through; dicts / lists JSON-dump; anything
+    else falls back to ``repr``. Final truncation to the
+    approval-UI cap happens inside ``_await_policy_approval``
+    — this helper just produces a readable string regardless
+    of shape.
+
+    :param content: The ``EvaluationContext.content`` — any
+        shape a policy might gate.
+    :returns: A readable string suitable for the preview
+        field.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (dict, list)):
+        try:
+            return json.dumps(content, default=str, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return repr(content)
+    return repr(content)
+
+
+async def _handle_policy_ask(
+    *,
+    engine: Any,
+    task_id: str,
+    root_task_id: str | None,
+    task_store: TaskStore,
+    result: Any,
+    phase: Any,
+    content_preview: str,
+) -> bool:
+    """
+    Drive one ASK round-trip at a real enforcement site.
+
+    Wires the three seams (``register``, ``emit``, ``park``)
+    on :func:`_await_policy_approval` to the production DBOS +
+    task_store + SSE stack. See
+    :file:`designs/POLICIES_INTEGRATION_GUIDE.md` §6 for the
+    intended shape.
+
+    * ``register`` — insert a ``pending_tool_calls`` row using
+      the same ``create_pending_tool_call`` path that
+      client-side tool tunneling uses. The reserved tool name
+      is ``request_approval``. The PATCH endpoint routes the
+      verdict back without needing any special-casing.
+    * ``emit`` — publish the synthetic ``function_call`` item
+      on the root task's SSE stream via :func:`_write_output`.
+      Clients that understand the ``request_approval``
+      reserved name render an approval UI.
+    * ``park`` — block on the existing ``tool_result`` DBOS
+      topic. The PATCH endpoint calls
+      ``DBOS.send(task_id, None, topic="tool_result")`` when
+      the verdict arrives. On wake, we fetch the completed
+      row's ``result`` string and return it.
+
+    :param engine: The per-workflow :class:`PolicyEngine`.
+    :param task_id: The parked workflow's task id.
+    :param root_task_id: The root task whose SSE stream
+        carries the synthetic approval request. ``None`` when
+        this is itself a root task.
+    :param task_store: Store for the pending row.
+    :param result: The composed ASK :class:`PolicyResult` the
+        engine returned.
+    :param phase: The :class:`Phase` that produced the ASK.
+    :param content_preview: A readable snapshot of the gated
+        content (truncated again inside the helper to 1024
+        chars).
+    :returns: ``True`` on approve; ``False`` on refuse /
+        timeout / cancel / malformed verdict.
+    """
+    from agent_plane.runtime.policies import _await_policy_approval
+
+    publish_target = root_task_id if root_task_id is not None else task_id
+
+    def _register(call_id: str, inner_task_id: str, args_json: str) -> None:
+        """
+        Register the synthetic call_id row so PATCH can deliver
+        the verdict to this parked workflow.
+        """
+        task_store.create_pending_tool_call(
+            call_id=call_id,
+            root_task_id=publish_target,
+            task_id=inner_task_id,
+            tool_name="request_approval",
+            arguments=args_json,
+        )
+
+    def _emit(event: dict[str, Any]) -> None:
+        """Publish the synthetic function_call on the root SSE stream."""
+        _write_output(publish_target, event)
+
+    async def _park(call_id: str, timeout_s: int) -> str | None:
+        """
+        Block on the ``tool_result`` topic until PATCH delivers
+        a verdict. Return the verdict string or ``None`` when
+        the matching row isn't in "completed" state on wake
+        (cancel races, malformed PATCH, etc.).
+        """
+        await dbos_recv_async(topic="tool_result", timeout_seconds=timeout_s)
+        rows = task_store.list_pending_tool_calls(
+            call_id=call_id,
+            status="completed",
+        )
+        if not rows:
+            return None
+        return rows[0].result
+
+    return await _await_policy_approval(
+        task_id=task_id,
+        root_task_id=publish_target,
+        result=result,
+        phase=phase,
+        content_preview=content_preview,
+        policy_engine=engine,
+        register=_register,
+        emit=_emit,
+        park=_park,
+    )
+
+
+async def _enforce_tool_call_policy(
+    *,
+    engine: Any,
+    task_id: str,
+    root_task_id: str | None,
+    task_store: TaskStore,
+    tool_name: str,
+    arguments: str,
+) -> str | None:
+    """
+    Evaluate TOOL_CALL policies; return a sentinel iff blocked.
+
+    Called from :func:`_execute_tools` before the actual
+    tool dispatch. ``None`` means "proceed to dispatch";
+    a non-``None`` string is the pre-built blocked sentinel
+    that should replace the tool's output in
+    ``function_call_output``.
+
+    :param engine: Per-workflow :class:`PolicyEngine`.
+    :param task_id: The workflow's task id (for ASK parking).
+    :param root_task_id: Root task id (for ASK SSE routing),
+        or ``None`` when this is itself a root task.
+    :param task_store: Store used by the ASK seam.
+    :param tool_name: Resolved tool name the LLM called.
+    :param arguments: JSON-encoded tool arguments string as
+        sent by the LLM.
+    :returns: ``None`` on ALLOW (or approved ASK); a
+        ``[Denied by policy: ...]`` sentinel string on DENY
+        or refused ASK.
+    """
+    from agent_plane.policies.types import EvaluationContext
+    from agent_plane.runtime.policies import _enforce_policy
+    from agent_plane.spec.types import Phase, PolicyAction
+
+    try:
+        args_payload: Any = json.loads(arguments)
+    except (TypeError, json.JSONDecodeError):
+        # Malformed arguments from the LLM shouldn't crash the
+        # enforcement site — the policy can still gate on the
+        # tool name, and the tool itself (if we ALLOW through)
+        # will reject the malformed payload. Keep as a string
+        # so policies that inspect content see *something*.
+        args_payload = arguments
+    ctx = EvaluationContext(
+        phase=Phase.TOOL_CALL,
+        content={"tool": tool_name, "args": args_payload},
+        tool_name=tool_name,
+    )
+    result = await _enforce_policy(engine, ctx)
+    if result.action == PolicyAction.DENY:
+        _logger.info(
+            "policy DENY at TOOL_CALL for %s: %s",
+            tool_name,
+            result.reason,
+        )
+        return _build_deny_sentinel(result.reason)
+    if result.action == PolicyAction.ASK:
+        approved = await _handle_policy_ask(
+            engine=engine,
+            task_id=task_id,
+            root_task_id=root_task_id,
+            task_store=task_store,
+            result=result,
+            phase=Phase.TOOL_CALL,
+            content_preview=_content_preview(ctx.content),
+        )
+        if not approved:
+            return _build_deny_sentinel(result.reason)
+    return None
+
+
+async def _enforce_tool_result_policy(
+    *,
+    engine: Any,
+    task_id: str,
+    root_task_id: str | None,
+    task_store: TaskStore,
+    tool_name: str,
+    result_text: str,
+) -> str:
+    """
+    Evaluate TOOL_RESULT policies; return the result to persist.
+
+    Called from :func:`_execute_tools` after each tool returns.
+    On ALLOW (or approved ASK), returns the original
+    ``result_text`` unchanged. On DENY or refused ASK,
+    substitutes a blocked sentinel — the LLM sees that in
+    ``function_call_output`` instead of the raw tool output.
+
+    :param engine: Per-workflow :class:`PolicyEngine`.
+    :param task_id: Workflow task id (for ASK parking).
+    :param root_task_id: Root task id (for ASK SSE), or
+        ``None``.
+    :param task_store: Store used by the ASK seam.
+    :param tool_name: MUST match the same name passed at the
+        TOOL_CALL site — LabelPolicy selectors that target
+        a specific tool rely on this (POLICIES.md §4).
+    :param result_text: The raw tool output the dispatcher
+        produced.
+    :returns: The text to persist as the
+        ``function_call_output`` — either ``result_text``
+        itself or a sentinel.
+    """
+    from agent_plane.policies.types import EvaluationContext
+    from agent_plane.runtime.policies import _enforce_policy
+    from agent_plane.spec.types import Phase, PolicyAction
+
+    ctx = EvaluationContext(
+        phase=Phase.TOOL_RESULT,
+        content={"output": result_text},
+        tool_name=tool_name,
+    )
+    policy_result = await _enforce_policy(engine, ctx)
+    if policy_result.action == PolicyAction.DENY:
+        _logger.info(
+            "policy DENY at TOOL_RESULT for %s: %s",
+            tool_name,
+            policy_result.reason,
+        )
+        return _build_deny_sentinel(policy_result.reason)
+    if policy_result.action == PolicyAction.ASK:
+        approved = await _handle_policy_ask(
+            engine=engine,
+            task_id=task_id,
+            root_task_id=root_task_id,
+            task_store=task_store,
+            result=policy_result,
+            phase=Phase.TOOL_RESULT,
+            content_preview=_content_preview(ctx.content),
+        )
+        if not approved:
+            return _build_deny_sentinel(policy_result.reason)
+    return result_text
+
+
+async def _enforce_output_policy(
+    *,
+    engine: Any,
+    task_id: str,
+    root_task_id: str | None,
+    task_store: TaskStore,
+    text: str,
+) -> str:
+    """
+    Evaluate OUTPUT policies; return the text to persist.
+
+    Called from :func:`_handle_final_response` BEFORE the
+    assistant message is persisted — POLICIES.md §11.4 makes
+    pre-persistence ordering load-bearing (otherwise
+    compaction could resurface blocked text).
+
+    When a DENY or refused-ASK substitutes the sentinel, the
+    original LLM text has ALREADY streamed to clients as
+    ``response.output_text.delta`` events (text deltas fire
+    during the LLM's generation, before ``_handle_final_response``
+    runs). Streaming clients that fold deltas into displayed
+    text (REPL BlockStream, UI SDK) would render the original
+    text and never see the sentinel, because the subsequent
+    ``response.output_item.done`` event is treated as a
+    section-end boundary, not a text source. To keep those
+    clients aligned with what actually lands in
+    ``conversation_items``, we emit an additional text delta
+    carrying the sentinel — the user sees both what the
+    agent tried to say AND the policy denial. The persisted
+    conversation item still contains ONLY the sentinel, so
+    compaction / follow-up turns see only the denial.
+
+    :param engine: Per-workflow :class:`PolicyEngine`.
+    :param task_id: Workflow task id (for ASK parking).
+    :param root_task_id: Root task id (for ASK SSE), or
+        ``None``.
+    :param task_store: Store used by the ASK seam.
+    :param text: The LLM's final assistant text.
+    :returns: The text to persist — either the original or a
+        sentinel.
+    """
+    from agent_plane.policies.types import EvaluationContext
+    from agent_plane.runtime.policies import _enforce_policy
+    from agent_plane.spec.types import Phase, PolicyAction
+
+    ctx = EvaluationContext(
+        phase=Phase.OUTPUT,
+        content=text,
+        tool_name=None,
+    )
+    policy_result = await _enforce_policy(engine, ctx)
+    if policy_result.action == PolicyAction.DENY:
+        _logger.info(
+            "policy DENY at OUTPUT: %s",
+            policy_result.reason,
+        )
+        sentinel = _build_deny_sentinel(policy_result.reason)
+        _stream_output_substitution(task_id, sentinel)
+        return sentinel
+    if policy_result.action == PolicyAction.ASK:
+        approved = await _handle_policy_ask(
+            engine=engine,
+            task_id=task_id,
+            root_task_id=root_task_id,
+            task_store=task_store,
+            result=policy_result,
+            phase=Phase.OUTPUT,
+            content_preview=_content_preview(ctx.content),
+        )
+        if not approved:
+            sentinel = _build_deny_sentinel(policy_result.reason)
+            _stream_output_substitution(task_id, sentinel)
+            return sentinel
+    return text
+
+
+def _stream_output_substitution(task_id: str, sentinel: str) -> str:
+    """
+    Emit the sentinel as an extra text delta so streaming
+    clients see it after the original LLM text.
+
+    Streaming clients (REPL, UI SDK) assemble assistant text
+    from ``response.output_text.delta`` events. When OUTPUT
+    enforcement substitutes the text, the original deltas
+    already fired — emitting the sentinel as a delta means
+    the client's accumulated text becomes
+    ``<original>\\n<sentinel>``. That's what the user sees on
+    screen, while the persisted conversation item (written
+    next by ``_handle_final_response``) contains ONLY the
+    sentinel. Follow-up turns and compaction never see the
+    original.
+
+    :param task_id: The task whose SSE stream gets the
+        delta.
+    :param sentinel: The DENY sentinel string.
+    :returns: The sentinel (for call-site convenience).
+    """
+    _write_output(
+        task_id,
+        {
+            "type": "response.output_text.delta",
+            # Leading newline separates the sentinel from the
+            # LLM's original text so users can read both.
+            "delta": f"\n{sentinel}",
+        },
+    )
+    return sentinel
+
+
+async def _persist_input_deny_sentinel(
+    *,
+    task_id: str,
+    conversation_id: str,
+    assistant_message: str,
+    output_items: list[dict[str, Any]],
+    conv_store: ConversationStore,
+) -> _AgentLoopResult:
+    """
+    Short-circuit the loop with a synthetic DENY assistant message.
+
+    Persists the sentinel as a real assistant message in the
+    conversation (so follow-up turns see it in history) AND
+    streams it to the SSE output so streaming clients (REPL,
+    UI SDK) render it immediately. Without the SSE emit,
+    only polling clients saw the sentinel — a DENY through
+    ``ap chat`` looked like silence.
+
+    :param task_id: The current task id.
+    :param conversation_id: The current conversation id.
+    :param assistant_message: The sentinel text to persist.
+    :param output_items: Mutable output-items list — the sentinel
+        is appended for both the SSE stream and the final
+        response body.
+    :param conv_store: Conversation store for persistence.
+    :returns: A completed :class:`_AgentLoopResult`.
+    """
+    # Emit the sentinel as a text delta first so streaming
+    # consumers (REPL BlockStream, UI SDK formatters) render
+    # it. Without this, the assistant message's text would
+    # arrive only via ``response.output_item.done`` — which
+    # BlockStream treats as an end-of-text boundary, not a
+    # source of text. Typical LLM flow is delta-then-done;
+    # matching that shape keeps client code simple.
+    _write_output(
+        task_id,
+        {
+            "type": "response.output_text.delta",
+            "delta": assistant_message,
+        },
+    )
+    new_item = NewConversationItem(
+        type="message",
+        response_id=task_id,
+        data=MessageData(
+            role="assistant",
+            agent="policy",
+            content=[{"type": "output_text", "text": assistant_message}],
+        ),
+    )
+    # _persist_and_stream persists to conv_store, appends to
+    # output_items, and emits an SSE response.output_item.done
+    # event — single call covers all three consumers. Wrapped
+    # in _to_thread because the store call is sync.
+    await _to_thread(
+        lambda: _persist_and_stream(
+            task_id,
+            conv_store,
+            conversation_id,
+            [new_item],
+            output_items,
+        ),
+    )
+    return _AgentLoopResult(status="completed", output=output_items)
+
+
 def _sync_history(
     conv_store: ConversationStore,
     conversation_id: str,
@@ -4673,6 +5375,19 @@ async def _run_agent_loop(
     tool_schemas = tool_mgr.get_tool_schemas()
     conv_store = get_conversation_store()
     task_store = get_task_store()
+    # Phase 6: build the per-workflow PolicyEngine. The engine is a
+    # plain local (not a ContextVar) passed explicitly to the
+    # enforcement sites. For agents without a guardrails block in
+    # their spec, this returns a no-op engine — all four
+    # enforcement sites still call through, they just always ALLOW.
+    # See POLICIES.md §4 + designs/POLICIES_INTEGRATION_GUIDE.md.
+    from agent_plane.runtime.policies import build_policy_engine
+
+    policy_engine = build_policy_engine(
+        spec=spec,
+        conversation_id=conversation_id,
+        conversation_store=conv_store,
+    )
     # Determine if this is a sub-agent (has root_task_id).
     # Sub-agents park when hitting client tools instead of
     # completing — the park mechanism tunnels tool calls to
@@ -4683,6 +5398,11 @@ async def _run_agent_loop(
     # to avoid loading the full conversation on long-running agents.
     history = _load_initial_history(conv_store, conversation_id)
     last_seen = history[-1].id if history else None
+    # Tracks the most recent user-message item we've already
+    # evaluated against INPUT policies. ``None`` means "no
+    # messages enforced yet" — every user message in history
+    # gets checked on the first loop iteration (Phase 6).
+    last_enforced_input_id: str | None = None
     output_items: list[dict[str, Any]] = []
     # For remote executors, spec.llm may be None — they ignore it.
     # Provide a stub LLMConfig so downstream code doesn't break.
@@ -4752,6 +5472,33 @@ async def _run_agent_loop(
                 last_seen,
                 history,
             )
+            # Phase 6: INPUT-phase policy enforcement.
+            # Check user messages newly added since the last input
+            # enforcement run. On the first iteration, every user
+            # message in history is "new" from the engine's view.
+            # On DENY, replace the content with a sentinel BEFORE
+            # the LLM sees it (POLICIES.md §5.1 / §11.4). A no-op
+            # engine (agent without guardrails) returns ALLOW on
+            # every check — zero overhead beyond the enum compare.
+            deny_assistant_message, last_enforced_input_id = await _enforce_input_policies(
+                engine=policy_engine,
+                history=history,
+                last_enforced_input_id=last_enforced_input_id,
+                agent_name=agent_name,
+                task_id=task_id,
+                root_task_id=root_task_id,
+                task_store=task_store,
+            )
+            if deny_assistant_message is not None:
+                # Persist the sentinel as an assistant message and
+                # return — the DENY short-circuits this turn.
+                return await _persist_input_deny_sentinel(
+                    task_id=task_id,
+                    conversation_id=conversation_id,
+                    assistant_message=deny_assistant_message,
+                    output_items=output_items,
+                    conv_store=conv_store,
+                )
             # Drain any async-work signals that piled up since the
             # last iteration (D4). Each completion is persisted as a
             # `[System: task ... <status>]` user message; the next
@@ -4988,6 +5735,8 @@ async def _run_agent_loop(
                         task_store,
                         conv_store,
                         iteration_item_ids=iteration_item_ids,
+                        policy_engine=policy_engine,
+                        root_task_id=root_task_id,
                     )
                     if isinstance(result, _SteeringRetry):
                         # Late steered messages arrived during streaming.
@@ -5021,6 +5770,9 @@ async def _run_agent_loop(
                     conv_store,
                     tool_mgr,
                     workspace_path=workspace_path,
+                    policy_engine=policy_engine,
+                    task_store=task_store,
+                    root_task_id=root_task_id,
                 )
                 if isinstance(handle_result, _ClientToolCallsPending):
                     if root_task_id is not None:
@@ -5112,6 +5864,59 @@ def _find_spec_by_name(
         if found is not None:
             return found
     return None
+
+
+def _resolve_workdir_for_spec(
+    root_spec: AgentSpec,
+    root_workdir: Path,
+    target_name: str | None,
+) -> Path:
+    """
+    Walk the spec tree and return the on-disk directory that
+    *owns* the spec with the given name.
+
+    The bundle layout places sub-agents at
+    ``<root>/agents/<sub_name>/``. Nested sub-agents live at
+    ``<root>/agents/<parent>/agents/<sub>/``. Local tools are
+    always declared with paths relative to the agent that
+    owns them — so the ``ToolManager`` for a sub-agent must
+    use that sub-agent's directory as the workdir, not the
+    root's. Before this helper, the runtime passed
+    ``loaded.workdir`` unconditionally, which meant
+    sub-agents with local Python tools tried to load them
+    from ``<root>/tools/python/...`` and failed.
+
+    :param root_spec: The root agent's parsed spec — holds
+        the full sub-agent tree.
+    :param root_workdir: On-disk path of the root agent's
+        bundle (``<root>``).
+    :param target_name: Name of the spec whose workdir we
+        want. ``None`` or the root spec's own name returns
+        ``root_workdir`` unchanged.
+    :returns: The directory that contains
+        ``config.yaml`` / ``tools/`` / ``agents/`` for the
+        target spec.
+    """
+    if target_name is None or target_name == root_spec.name:
+        return root_workdir
+    # DFS through the tree tracking the physical path in
+    # parallel with the spec pointer.
+    stack: list[tuple[AgentSpec, Path]] = [(root_spec, root_workdir)]
+    while stack:
+        current_spec, current_workdir = stack.pop()
+        for sub in current_spec.sub_agents:
+            sub_workdir = current_workdir / "agents" / (sub.name or "")
+            if sub.name == target_name:
+                return sub_workdir
+            stack.append((sub, sub_workdir))
+    # Fallback — no matching sub-agent found. This mirrors the
+    # pre-existing ``_resolve_agent_spec_for_task`` raising
+    # LookupError earlier in the pipeline; if we're called
+    # with a bad name we bail loud rather than silently
+    # returning root.
+    raise LookupError(
+        f"sub-agent {target_name!r} not found when resolving workdir under {root_workdir!s}",
+    )
 
 
 async def _resolve_agent_spec_for_task(
@@ -5290,10 +6095,21 @@ async def agent_execution_workflow(
                 span.set_attribute(SpanAttributeKey.MODEL_PROVIDER, provider)
 
             client_tool_specs: list[ClientSideToolSpec] = parse_client_side_tool_specs(tools or [])
+            # When this workflow is a sub-agent, its local
+            # tools live at ``<root>/agents/<sub>/tools/...``,
+            # not ``<root>/tools/...``. Resolve the correct
+            # per-spec workdir so local tool paths (stored
+            # relative to the owning agent's dir by the
+            # parser) join correctly.
+            effective_workdir = _resolve_workdir_for_spec(
+                root_spec,
+                loaded.workdir,
+                spec.name,
+            )
             tool_mgr = ToolManager(
                 spec,
                 client_tool_specs=client_tool_specs,
-                workdir=loaded.workdir,
+                workdir=effective_workdir,
                 sandbox_enabled=caps.sandbox_enabled,
             )
             set_tool_manager(tool_mgr)

@@ -1,0 +1,28 @@
+spec_version: 1
+
+name: toolworker
+description: |
+  Sub-agent with a LOCAL Python tool and a TOOL_CALL ASK
+  policy. This fixture deliberately uses a local tool (not a
+  builtin) to cover both the sub-agent approval tunneling
+  AND the sub-agent local-tool workdir resolution path.
+
+llm:
+  model: openai/gpt-4o
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+guardrails:
+  policies:
+    worker_tool_gate:
+      type: label
+      on: [tool_call:echo]
+      action: ask
+      reason: Confirm sub-agent may run the echo tool.
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md
