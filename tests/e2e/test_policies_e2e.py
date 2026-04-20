@@ -37,12 +37,21 @@ from tests.e2e.conftest import _upload_agent, poll_until_terminal
 _E2E_POLICY_GATE_DIR = (
     Path(__file__).resolve().parents[1] / "_fixtures" / "agents" / "e2e-policy-gate"
 )
+_E2E_LABEL_GATE_DIR = (
+    Path(__file__).resolve().parents[1] / "_fixtures" / "agents" / "e2e-label-gate"
+)
 
 
 @pytest.fixture(scope="session")
 def policy_gate_agent(http_client: httpx.Client) -> str:
     """Upload the e2e-policy-gate fixture and return its name."""
     return _upload_agent(http_client, _E2E_POLICY_GATE_DIR)
+
+
+@pytest.fixture(scope="session")
+def label_gate_agent(http_client: httpx.Client) -> str:
+    """Upload the e2e-label-gate fixture and return its name."""
+    return _upload_agent(http_client, _E2E_LABEL_GATE_DIR)
 
 
 def _extract_all_assistant_text(body: dict) -> str:
@@ -212,6 +221,141 @@ def test_policy_gate_deny_persists_to_history(
 
 
 # ── Regression: no-guardrails agents still work ──────
+
+
+# ── Multi-policy composition via labels across turns ─
+
+
+def test_label_gate_taint_persists_across_turns(
+    http_client: httpx.Client,
+    label_gate_agent: str,
+) -> None:
+    """Turn 1: user triggers FunctionPolicy that writes
+    ``tainted: "1"``. Turn 2: clean input, but
+    LabelPolicy's condition ``tainted: "1"`` now matches →
+    DENY.
+
+    End-to-end proof that FunctionPolicy set_labels reach
+    the store, persist across workflow restarts, and drive
+    condition gates on the next turn — the core IFC-through-
+    labels pattern."""
+    # Turn 1: trigger the taint.
+    resp1 = http_client.post(
+        "/v1/responses",
+        json={
+            "model": label_gate_agent,
+            "input": "BANANA_TRIGGER — say hi briefly.",
+            "background": True,
+        },
+    )
+    resp1.raise_for_status()
+    rid1 = resp1.json()["id"]
+    body1 = poll_until_terminal(http_client, rid1, timeout=120)
+    # Turn 1 completes with a real LLM reply (taint_on_banana
+    # is ALLOW-with-set_labels; deny_when_tainted hasn't
+    # fired yet because the condition was evaluated against
+    # the pre-turn-1 label snapshot).
+    assert body1["status"] == "completed", f"Turn 1 failed: {body1.get('error')}"
+    text1 = _extract_all_assistant_text(body1)
+    assert "[Denied by policy" not in text1
+    assert len(text1.strip()) > 0
+
+    # Turn 2: clean input — no trigger. But the label is
+    # already persisted from turn 1.
+    conv_id = body1["conversation"]["id"]
+    resp2 = http_client.post(
+        "/v1/responses",
+        json={
+            "model": label_gate_agent,
+            "input": "A clean follow-up message.",
+            "previous_response_id": rid1,
+            "background": True,
+        },
+    )
+    resp2.raise_for_status()
+    rid2 = resp2.json()["id"]
+    body2 = poll_until_terminal(http_client, rid2, timeout=60)
+    assert body2["status"] == "completed"
+    text2 = _extract_all_assistant_text(body2)
+    # Turn 2 MUST hit the DENY path because tainted=1
+    # survived to this turn.
+    assert "[Denied by policy" in text2, (
+        f"Turn 2 should DENY on tainted conversation; got: {text2[:400]!r}"
+    )
+    # Reason matches the LabelPolicy declaration.
+    assert "tainted" in text2.lower()
+
+
+def test_label_gate_untainted_conversation_passes(
+    http_client: httpx.Client,
+    label_gate_agent: str,
+) -> None:
+    """A conversation that never triggers taint_on_banana
+    should pass every turn — the condition
+    ``tainted: "1"`` never matches against the default
+    ``tainted: "0"`` seed."""
+    resp = http_client.post(
+        "/v1/responses",
+        json={
+            "model": label_gate_agent,
+            "input": "Hello. Reply briefly.",
+            "background": True,
+        },
+    )
+    resp.raise_for_status()
+    rid = resp.json()["id"]
+    body = poll_until_terminal(http_client, rid, timeout=120)
+    assert body["status"] == "completed", f"Clean conversation failed: {body.get('error')}"
+    text = _extract_all_assistant_text(body)
+    assert "[Denied by policy" not in text
+    assert len(text.strip()) > 0
+
+
+def test_label_gate_persisted_labels_in_store(
+    http_client: httpx.Client,
+    label_gate_agent: str,
+) -> None:
+    """After the taint turn, the ``tainted`` label is
+    persisted to ``conversation_labels`` — verifiable via
+    a follow-up request that creates a fresh workflow
+    (engine rebuilt from persisted state).
+
+    Not just an in-memory snapshot — the labels survive
+    workflow restarts, which is what Phase 1's store API
+    guarantees."""
+    # Turn 1: taint.
+    resp1 = http_client.post(
+        "/v1/responses",
+        json={
+            "model": label_gate_agent,
+            "input": "BANANA_TRIGGER, please acknowledge.",
+            "background": True,
+        },
+    )
+    resp1.raise_for_status()
+    rid1 = resp1.json()["id"]
+    body1 = poll_until_terminal(http_client, rid1, timeout=120)
+    assert body1["status"] == "completed"
+
+    # Turn 2 on same conversation. The workflow rebuilds
+    # the engine from persisted state — if the label didn't
+    # persist, the condition wouldn't match and turn 2 would
+    # pass through. Behavior asserts persistence.
+    resp2 = http_client.post(
+        "/v1/responses",
+        json={
+            "model": label_gate_agent,
+            "input": "ok.",
+            "previous_response_id": rid1,
+            "background": True,
+        },
+    )
+    resp2.raise_for_status()
+    rid2 = resp2.json()["id"]
+    body2 = poll_until_terminal(http_client, rid2, timeout=60)
+    text2 = _extract_all_assistant_text(body2)
+    # Persisted → condition matches → DENY.
+    assert "[Denied by policy" in text2
 
 
 def test_no_guardrails_agent_unaffected(

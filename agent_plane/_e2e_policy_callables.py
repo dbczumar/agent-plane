@@ -42,3 +42,33 @@ def block_on_sentinel(ctx: EvaluationContext) -> PolicyResult:
             reason=f"contains reserved token {_SENTINEL!r}",
         )
     return PolicyResult(action=PolicyAction.ALLOW)
+
+
+# Trigger token for the e2e-label-gate fixture. When a user
+# message contains this string, the FunctionPolicy emits ALLOW
+# + a `tainted: "1"` label write. Subsequent turns see the
+# label and drive downstream condition gates.
+_BANANA_TRIGGER = "BANANA_TRIGGER"
+
+
+def taint_on_banana(ctx: EvaluationContext) -> PolicyResult:
+    """
+    ALLOW every message and emit a label write when the
+    input contains the banana-trigger token.
+
+    Used by the e2e-label-gate fixture to prove
+    FunctionPolicy label writes persist across turns and
+    drive LabelPolicy condition gates on subsequent
+    evaluations.
+
+    :param ctx: Current evaluation context.
+    :returns: Always ALLOW; carries ``set_labels={"tainted": "1"}``
+        when the trigger token appears.
+    """
+    content = ctx.content
+    if isinstance(content, str) and _BANANA_TRIGGER in content:
+        return PolicyResult(
+            action=PolicyAction.ALLOW,
+            set_labels={"tainted": "1"},
+        )
+    return PolicyResult(action=PolicyAction.ALLOW)

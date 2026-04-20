@@ -1,0 +1,57 @@
+spec_version: 1
+
+name: e2e-label-gate
+description: |
+  E2E fixture agent demonstrating multi-policy composition
+  through the real workflow. Two policies, both on INPUT:
+
+  1. ``taint_on_banana`` (FunctionPolicy): when the user
+     mentions "BANANA_TRIGGER", emit ALLOW + writes
+     ``tainted: "1"`` to the conversation labels.
+  2. ``deny_when_tainted`` (LabelPolicy): fires when the
+     ``tainted`` label equals ``"1"`` and DENYs.
+
+  The composition chain across turns:
+  - Turn 1: user says BANANA_TRIGGER → taint_on_banana ALLOWs
+    + writes label; deny_when_tainted does not fire yet
+    (condition checks the PRE-evaluation label snapshot).
+    LLM runs normally.
+  - Turn 2: user says anything → deny_when_tainted condition
+    matches (label persisted from turn 1) → DENY.
+
+  Tests that label writes from FunctionPolicy survive turns,
+  reach the store, and drive subsequent condition-gated
+  policies. Same IFC pattern real agents use.
+
+llm:
+  model: openai/gpt-4o
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+guardrails:
+  labels:
+    tainted:
+      initial: "0"
+      values: ["0", "1"]
+      monotonic: increasing
+
+  policies:
+    taint_on_banana:
+      type: function
+      on: [input]
+      function: agent_plane._e2e_policy_callables.taint_on_banana
+
+    deny_when_tainted:
+      type: label
+      on: [input]
+      condition:
+        tainted: "1"
+      action: deny
+      reason: Conversation is tainted from a prior turn.
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md
