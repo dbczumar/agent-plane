@@ -1,0 +1,23 @@
+spec_version: 1
+
+name: d6-fan-out-test
+
+description: |
+  Test-only agent that dispatches multiple async client tool
+  calls in a single turn to exercise the SDK's parallel
+  fan-out (D6).
+
+llm:
+  model: gpt-5.4
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  timeout: 60
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

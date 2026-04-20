@@ -13,6 +13,7 @@ surfaces the error back to the agent as a tool error.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import inspect
 import json
@@ -112,7 +113,16 @@ def build_tool_handler(functions: list[Callable[..., Any]]) -> ToolHandler:
     async def execute(call: ToolCallInfo) -> str:
         """Dispatch ``call`` to the matching ``@tool`` function.
 
-        Sync functions run inline; async functions are awaited.
+        Async functions (``async def``) are awaited on the
+        event loop. Sync functions (``def``) are dispatched to
+        a worker thread via ``asyncio.to_thread`` so blocking
+        calls inside — ``time.sleep``, file I/O, subprocess,
+        ``requests`` — don't stall the event loop. Without the
+        thread bounce, several concurrent ``@tool`` invocations
+        (e.g. a parallel fan-out of async client tools) would
+        serialize: each body would block every sibling AND any
+        caller render loop sharing the loop.
+
         The return value is JSON-serialized unless the function
         already returned a string (which is passed through).
 
@@ -130,9 +140,13 @@ def build_tool_handler(functions: list[Callable[..., Any]]) -> ToolHandler:
         # Drop the routing-hint key. Use `dict(...)` rather than
         # popping in place so we don't mutate caller state.
         invoke_args = {k: v for k, v in call.arguments.items() if k != _SYNCHRONOUS_PROPERTY_NAME}
-        result = fn(**invoke_args)
-        if inspect.isawaitable(result):
-            result = await result
+        if inspect.iscoroutinefunction(fn):
+            result = await fn(**invoke_args)
+        else:
+            # Sync body — route to a worker thread so it
+            # doesn't block the event loop (see the fan-out
+            # serialization case above).
+            result = await asyncio.to_thread(lambda: fn(**invoke_args))
         if isinstance(result, str):
             return result
         # Pydantic models and dataclasses commonly aren't JSON-ready
