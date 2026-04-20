@@ -2475,7 +2475,6 @@ def _strip_mcp_tool_prefix(name: str) -> str:
     return name
 
 
-
 # ─── Async tool dispatch ───────────────────────────────────
 
 
@@ -3200,6 +3199,162 @@ def _sync_steered_after_tools(
     if steered:
         history.extend(steered)
     return post_tool_last_seen
+
+
+async def _enforce_input_policies(
+    *,
+    engine: Any,
+    history: list[ConversationItem],
+    last_enforced_input_id: str | None,
+    agent_name: str,
+) -> tuple[str | None, str | None]:
+    """
+    Check newly-surfaced user messages against INPUT policies.
+
+    Phase 6: walks the user-message items in history after
+    ``last_enforced_input_id`` and evaluates each against the
+    engine. Returns ``(deny_sentinel, new_cursor)`` — the
+    caller advances its cursor to ``new_cursor`` so the next
+    iteration only re-checks steering messages, not the
+    already-enforced turn-1 input.
+
+    :param engine: The per-workflow :class:`PolicyEngine`. For
+        agents without guardrails, this is a no-op engine that
+        always returns ALLOW.
+    :param history: The conversation history (already extended
+        by ``_sync_history`` for this iteration).
+    :param last_enforced_input_id: The id of the last
+        user-message item enforced in a prior iteration, or
+        ``None`` on the very first iteration (everything
+        counts as new).
+    :param agent_name: Used for error logging / sentinel shaping.
+    :returns: ``(deny_sentinel_text_or_None, advanced_cursor)``.
+        ``deny_sentinel_text`` is ``None`` when no policy
+        DENYed; otherwise it's the text to persist as the
+        assistant reply. ``advanced_cursor`` is the id of the
+        last user message seen (or the prior value when no new
+        messages were found).
+    """
+    from agent_plane.runtime.policies import _enforce_policy
+    from agent_plane.spec.types import (
+        EvaluationContext,
+        Phase,
+        PolicyAction,
+    )
+
+    # Determine where the new items begin. If
+    # last_enforced_input_id is None, check everything.
+    start_index = 0
+    if last_enforced_input_id is not None:
+        for i, item in enumerate(history):
+            if item.id == last_enforced_input_id:
+                start_index = i + 1
+                break
+    cursor = last_enforced_input_id
+    for item in history[start_index:]:
+        if item.type != "message":
+            continue
+        data = item.data
+        if getattr(data, "role", None) != "user":
+            continue
+        text = _extract_user_text(data)
+        if not text:
+            continue
+        result = await _enforce_policy(
+            engine,
+            EvaluationContext(
+                phase=Phase.INPUT,
+                content=text,
+                tool_name=None,
+            ),
+        )
+        cursor = item.id
+        if result.action == PolicyAction.DENY:
+            _logger.info(
+                "policy DENY at INPUT for agent %s: %s",
+                agent_name,
+                result.reason,
+            )
+            sentinel = (
+                f"[Denied by policy: {result.reason}]" if result.reason else "[Denied by policy]"
+            )
+            return sentinel, cursor
+        # ALLOW / ASK: Phase 6 only enforces INPUT DENY; ASK at
+        # INPUT will be wired in a later phase alongside the
+        # real DBOS park. For now ASK degrades to ALLOW
+        # (permissive) — safer than failing closed mid-turn
+        # without approval UI.
+    return None, cursor
+
+
+def _extract_user_text(data: Any) -> str:
+    """
+    Concatenate text content blocks from a user MessageData.
+
+    :param data: The item's data payload (MessageData shape).
+    :returns: Joined text, or an empty string when no text blocks.
+    """
+    content = getattr(data, "content", None) or []
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict):
+            text = block.get("text") or block.get("input_text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts)
+
+
+async def _persist_input_deny_sentinel(
+    *,
+    task_id: str,
+    conversation_id: str,
+    assistant_message: str,
+    output_items: list[dict[str, Any]],
+    conv_store: ConversationStore,
+) -> _AgentLoopResult:
+    """
+    Short-circuit the loop with a synthetic DENY assistant message.
+
+    Appends the sentinel as a real assistant message in the
+    conversation (so a follow-up turn sees it in history) and
+    returns a completed :class:`_AgentLoopResult` with the
+    sentinel as the only output item.
+
+    :param task_id: The current task id.
+    :param conversation_id: The current conversation id.
+    :param assistant_message: The sentinel text to persist.
+    :param output_items: Mutable output-items list — the sentinel
+        is appended for the SSE stream.
+    :param conv_store: Conversation store for persistence.
+    :returns: A completed :class:`_AgentLoopResult`.
+    """
+    # Persist as an assistant message so `_handle_final_response`-
+    # style follow-ups can read it from history.
+    await _to_thread(
+        lambda: conv_store.append(
+            conversation_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=task_id,
+                    data=MessageData(
+                        role="assistant",
+                        agent="policy",
+                        content=[{"type": "output_text", "text": assistant_message}],
+                    ),
+                ),
+            ],
+        )
+    )
+    # Also emit as an output item for the immediate stream.
+    output_items.append(
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": assistant_message}],
+        }
+    )
+    return _AgentLoopResult(status="completed", output=output_items)
 
 
 def _sync_history(
@@ -4087,6 +4242,19 @@ async def _run_agent_loop(
     tool_schemas = tool_mgr.get_tool_schemas()
     conv_store = get_conversation_store()
     task_store = get_task_store()
+    # Phase 6: build the per-workflow PolicyEngine. The engine is a
+    # plain local (not a ContextVar) passed explicitly to the
+    # enforcement sites. For agents without a guardrails block in
+    # their spec, this returns a no-op engine — all four
+    # enforcement sites still call through, they just always ALLOW.
+    # See POLICIES.md §4 + designs/POLICIES_INTEGRATION_GUIDE.md.
+    from agent_plane.runtime.policies import build_policy_engine
+
+    policy_engine = build_policy_engine(
+        spec=spec,
+        conversation_id=conversation_id,
+        conversation_store=conv_store,
+    )
     # Determine if this is a sub-agent (has root_task_id).
     # Sub-agents park when hitting client tools instead of
     # completing — the park mechanism tunnels tool calls to
@@ -4097,6 +4265,11 @@ async def _run_agent_loop(
     # to avoid loading the full conversation on long-running agents.
     history = _load_initial_history(conv_store, conversation_id)
     last_seen = history[-1].id if history else None
+    # Tracks the most recent user-message item we've already
+    # evaluated against INPUT policies. ``None`` means "no
+    # messages enforced yet" — every user message in history
+    # gets checked on the first loop iteration (Phase 6).
+    last_enforced_input_id: str | None = None
     output_items: list[dict[str, Any]] = []
     # For remote executors, spec.llm may be None — they ignore it.
     # Provide a stub LLMConfig so downstream code doesn't break.
@@ -4166,6 +4339,30 @@ async def _run_agent_loop(
                 last_seen,
                 history,
             )
+            # Phase 6: INPUT-phase policy enforcement.
+            # Check user messages newly added since the last input
+            # enforcement run. On the first iteration, every user
+            # message in history is "new" from the engine's view.
+            # On DENY, replace the content with a sentinel BEFORE
+            # the LLM sees it (POLICIES.md §5.1 / §11.4). A no-op
+            # engine (agent without guardrails) returns ALLOW on
+            # every check — zero overhead beyond the enum compare.
+            deny_assistant_message, last_enforced_input_id = await _enforce_input_policies(
+                engine=policy_engine,
+                history=history,
+                last_enforced_input_id=last_enforced_input_id,
+                agent_name=agent_name,
+            )
+            if deny_assistant_message is not None:
+                # Persist the sentinel as an assistant message and
+                # return — the DENY short-circuits this turn.
+                return await _persist_input_deny_sentinel(
+                    task_id=task_id,
+                    conversation_id=conversation_id,
+                    assistant_message=deny_assistant_message,
+                    output_items=output_items,
+                    conv_store=conv_store,
+                )
             # Drain any async-work signals that piled up since the
             # last iteration (D4). Each completion is persisted as a
             # `[System: task ... <status>]` user message; the next

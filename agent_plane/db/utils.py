@@ -91,9 +91,10 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
         ``sqlalchemy.url`` config option, e.g.
         ``"sqlite:///mydb.db"``.
     """
-    from agent_plane.db.db_models import Base
     from alembic import command
     from alembic.config import Config
+
+    from agent_plane.db.db_models import Base
 
     expected_tables = {table.name for table in Base.metadata.sorted_tables}
     actual_tables = set(inspect(engine).get_table_names())
@@ -113,6 +114,15 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
     with engine.begin() as connection:
         config.attributes["connection"] = connection
         command.upgrade(config, "head")
+    # Belt-and-suspenders: if the migration file was modified
+    # in place (project has no external users yet, so we revise
+    # existing migrations rather than stacking follow-ups),
+    # existing DBs whose alembic_version is already "head" will
+    # skip alembic.upgrade above and miss the new table. Create
+    # any still-missing tables from the ORM metadata so the
+    # schema always matches the Python model set. No-op for
+    # fresh DBs (upgrade already created everything).
+    Base.metadata.create_all(bind=engine, checkfirst=True)
 
 
 def clear_engine_cache() -> None:
