@@ -488,12 +488,15 @@ class TerminalCloseTool(Tool):
 
 # ── terminal_send_input ───────────────────────────────────────────
 
-# Default wait-for-output budgets. These match OpenAI Agents SDK's
-# ``write_stdin`` defaults (250 ms typing, 5 s polling) — the LLM-
-# ergonomics story is covered in
+# Default wait-for-output budgets. Numerical values match OpenAI
+# Agents SDK's ``write_stdin`` defaults (250 ms typing, 5 s
+# polling) — the LLM-ergonomics story is covered in
 # designs/PERSISTENT_TERMINAL_RESEARCH.md §6.12. ``None`` on the
-# ``yield_time_ms`` parameter picks whichever default applies based
-# on whether ``chars`` is empty; explicit values skip the auto-bump.
+# ``wait_ms`` parameter picks whichever default applies based on
+# whether ``chars`` is empty; explicit values skip the auto-bump.
+# (Internal constants keep the word "yield" because they describe
+# the quiescence-based waiting mechanism, distinct from the
+# public parameter name.)
 _SEND_INPUT_DEFAULT_YIELD_TYPING_MS = 250
 _SEND_INPUT_DEFAULT_YIELD_POLLING_MS = 5_000
 _SEND_INPUT_YIELD_FLOOR_MS = 50
@@ -515,7 +518,7 @@ _SEND_INPUT_SCHEMA: dict[str, Any] = {
             "(vim, less, sqlite3, read prompts, password dialogs, "
             "REPLs). Only works on task_ids from "
             "terminal_run(synchronous=false). After writing, waits up "
-            "to yield_time_ms for the program to react, then returns "
+            "to wait_ms for the program to react, then returns "
             "the streaming stdout delta AND the rendered screen so "
             "you can see what changed in one call. Common escape "
             "sequences (all JSON-encodable strings): '\\u0003' for "
@@ -553,7 +556,7 @@ _SEND_INPUT_SCHEMA: dict[str, Any] = {
                         "see the tool description for common ones."
                     ),
                 },
-                "yield_time_ms": {
+                "wait_ms": {
                     "type": ["integer", "null"],
                     "description": (
                         "How long (milliseconds) to wait after "
@@ -573,18 +576,18 @@ _SEND_INPUT_SCHEMA: dict[str, Any] = {
 }
 
 
-def _resolve_yield_time_ms(yield_time_ms: int | None, *, chars_empty: bool) -> int:
-    """Pick the effective yield-time given the caller's argument.
+def _resolve_wait_ms(wait_ms: int | None, *, chars_empty: bool) -> int:
+    """Pick the effective wait budget given the caller's argument.
 
-    :param yield_time_ms: Caller's raw input. ``None`` means
-        "pick a default based on intent."
+    :param wait_ms: Caller's raw input. ``None`` means "pick a
+        default based on intent."
     :param chars_empty: Whether the caller passed ``chars=""``
         (pure poll). Used only for the default path; explicit
         numeric values are honored verbatim (clamped to the
         module ceiling/floor).
     :returns: The effective wait budget in milliseconds.
     """
-    if yield_time_ms is None:
+    if wait_ms is None:
         return (
             _SEND_INPUT_DEFAULT_YIELD_POLLING_MS
             if chars_empty
@@ -592,7 +595,7 @@ def _resolve_yield_time_ms(yield_time_ms: int | None, *, chars_empty: bool) -> i
         )
     return max(
         _SEND_INPUT_YIELD_FLOOR_MS,
-        min(_SEND_INPUT_YIELD_CEILING_MS, yield_time_ms),
+        min(_SEND_INPUT_YIELD_CEILING_MS, wait_ms),
     )
 
 
@@ -618,14 +621,14 @@ class TerminalSendInputTool(Tool):
 
         Dispatches via ``TerminalManager.send_input_to_task``, then
         loops polling the stdout ring buffer until either the
-        ``yield_time_ms`` budget expires or output has gone silent
-        for :data:`_SEND_INPUT_QUIESCENCE_WINDOW_MS`. Returns a
-        shape that mirrors the terminal-kind ``check_task`` payload
-        with an extra ``delivered`` boolean up front so the LLM can
+        ``wait_ms`` budget expires or output has gone silent for
+        :data:`_SEND_INPUT_QUIESCENCE_WINDOW_MS`. Returns a shape
+        that mirrors the terminal-kind ``check_task`` payload with
+        an extra ``delivered`` boolean up front so the LLM can
         quickly see whether the input was even writable.
 
         :param arguments: JSON with ``task_id`` (required), ``chars``
-            (required), and optional ``yield_time_ms``.
+            (required), and optional ``wait_ms``.
         :param ctx: Must have ``conversation_id`` populated.
         :returns: JSON string of shape
             ``{delivered, task_id, recent_activity?, screen?,
@@ -639,7 +642,7 @@ class TerminalSendInputTool(Tool):
 
         task_id = parsed.get("task_id")
         chars = parsed.get("chars", "")
-        yield_time_ms_raw = parsed.get("yield_time_ms")
+        wait_ms_raw = parsed.get("wait_ms")
         if not isinstance(task_id, str) or not task_id:
             return json.dumps({"delivered": False, "reason": "task_id is required"})
         if not isinstance(chars, str):
@@ -676,7 +679,7 @@ class TerminalSendInputTool(Tool):
                 }
             )
 
-        effective_yield_ms = _resolve_yield_time_ms(yield_time_ms_raw, chars_empty=not chars)
+        effective_yield_ms = _resolve_wait_ms(wait_ms_raw, chars_empty=not chars)
         self._wait_for_quiescence(manager, task_id, effective_yield_ms)
 
         # Render via the :class:`Shell` we captured at send time

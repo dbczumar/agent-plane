@@ -21,7 +21,7 @@ You have these shell tools:
 - `terminal_list()` — list open shells in this conversation.
 - `terminal_close(shell="default")` — close a shell and discard
   its state.
-- `terminal_send_input(task_id, chars, yield_time_ms=None)` —
+- `terminal_send_input(task_id, chars, wait_ms=None)` —
   send bytes to the stdin of a running async terminal_run task.
   Use this to drive interactive programs (vim, less, read
   prompts, REPLs) after launching them with

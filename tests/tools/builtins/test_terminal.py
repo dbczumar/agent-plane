@@ -23,7 +23,7 @@ from agent_plane.tools.builtins.terminal import (
     TerminalListTool,
     TerminalRunTool,
     TerminalSendInputTool,
-    _resolve_yield_time_ms,
+    _resolve_wait_ms,
 )
 
 
@@ -298,7 +298,7 @@ def test_close_tool_noop_when_no_manager(
 
 
 def test_send_input_tool_schema_required_fields() -> None:
-    """Schema has task_id and chars required; yield_time_ms optional.
+    """Schema has task_id and chars required; wait_ms optional.
 
     Regression guard: if the required list changes, the LLM's tool
     constructor will start failing on valid calls.
@@ -307,7 +307,7 @@ def test_send_input_tool_schema_required_fields() -> None:
     assert schema["function"]["name"] == "terminal_send_input"
     params = schema["function"]["parameters"]
     assert sorted(params["required"]) == ["chars", "task_id"]
-    assert "yield_time_ms" in params["properties"]
+    assert "wait_ms" in params["properties"]
 
 
 def test_send_input_tool_reports_task_no_longer_running_when_unknown(
@@ -370,7 +370,7 @@ def test_send_input_tool_delivers_to_registered_task(
                     {
                         "task_id": "tid-send",
                         "chars": "tool-routed\n",
-                        "yield_time_ms": 500,
+                        "wait_ms": 500,
                     }
                 ),
                 ctx,
@@ -419,7 +419,7 @@ def test_send_input_tool_empty_chars_is_pure_poll(
                     {
                         "task_id": "tid-poll",
                         "chars": "",
-                        "yield_time_ms": 100,  # short — nothing's arriving
+                        "wait_ms": 100,  # short — nothing's arriving
                     }
                 ),
                 ctx,
@@ -431,25 +431,25 @@ def test_send_input_tool_empty_chars_is_pure_poll(
         manager.unregister_running_task("tid-poll")
 
 
-# ---- _resolve_yield_time_ms ------------------------------------
+# ---- _resolve_wait_ms ------------------------------------
 
 
-def test_resolve_yield_time_ms_picks_typing_default_when_none() -> None:
+def test_resolve_wait_ms_picks_typing_default_when_none() -> None:
     """None + non-empty chars → 250 ms (typing default)."""
-    assert _resolve_yield_time_ms(None, chars_empty=False) == 250
+    assert _resolve_wait_ms(None, chars_empty=False) == 250
 
 
-def test_resolve_yield_time_ms_picks_polling_default_when_empty() -> None:
+def test_resolve_wait_ms_picks_polling_default_when_empty() -> None:
     """None + empty chars → 5000 ms (polling default).
 
     Regression guard for the empty-chars auto-bump: if someone
     flips the chars_empty default, pure polls would only wait
     250 ms and miss slow programs.
     """
-    assert _resolve_yield_time_ms(None, chars_empty=True) == 5000
+    assert _resolve_wait_ms(None, chars_empty=True) == 5000
 
 
-def test_resolve_yield_time_ms_honors_explicit_value_with_empty_chars() -> None:
+def test_resolve_wait_ms_honors_explicit_value_with_empty_chars() -> None:
     """Explicit integer wins over auto-bump — matches documented behavior.
 
     OpenAI's resolver force-bumps even explicit values to 5s when
@@ -457,10 +457,10 @@ def test_resolve_yield_time_ms_honors_explicit_value_with_empty_chars() -> None:
     contract that encodes that choice. If someone adds a bump back,
     this test catches it.
     """
-    assert _resolve_yield_time_ms(100, chars_empty=True) == 100
+    assert _resolve_wait_ms(100, chars_empty=True) == 100
 
 
-def test_resolve_yield_time_ms_clamps_floor_and_ceiling() -> None:
+def test_resolve_wait_ms_clamps_floor_and_ceiling() -> None:
     """Values below 50 get clamped up; values above 30000 get clamped down."""
-    assert _resolve_yield_time_ms(10, chars_empty=False) == 50
-    assert _resolve_yield_time_ms(60_000, chars_empty=False) == 30_000
+    assert _resolve_wait_ms(10, chars_empty=False) == 50
+    assert _resolve_wait_ms(60_000, chars_empty=False) == 30_000

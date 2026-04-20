@@ -973,8 +973,8 @@ class Shell:
 
         :param chars: Bytes (as a string) to write to stdin. Empty
             string is a no-op (the caller may pass it to poll for
-            output via ``terminal_send_input`` with
-            ``yield_time_ms`` only).
+            output via ``terminal_send_input`` with ``wait_ms``
+            only).
         """
         if not chars:
             return

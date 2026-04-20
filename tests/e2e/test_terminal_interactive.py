@@ -305,7 +305,7 @@ def test_send_input_drives_vim_writes_file(
     - Alt-screen escape codes not handled — vim's ``~`` marker
       lines, the ``INSERT`` mode indicator, and the filename in
       the status line all vanish.
-    - yield_time_ms too short to let vim react — the send_input
+    - wait_ms too short to let vim react — the send_input
       response would come back before vim re-renders and the
       screen check fails cleanly.
     - srt sandbox blocking workspace writes — ``cat`` returns an
@@ -336,7 +336,7 @@ def test_send_input_drives_vim_writes_file(
                 "writable.\n"
                 "Step 2: call terminal_send_input with that task_id, "
                 f"chars='i{unique}\\u001b:wq\\n', and "
-                "yield_time_ms=3000. The 'i' enters insert mode, the "
+                "wait_ms=3000. The 'i' enters insert mode, the "
                 "body is the literal marker, '\\u001b' is Escape to "
                 "exit insert mode, ':wq\\n' writes and quits. The "
                 "generous yield gives vim time to process the full "
@@ -488,14 +488,14 @@ def test_send_input_multi_turn_python_repl_holds_state(
                 "command='python3 -i -q', shell='default', "
                 "synchronous=false. Keep the task_id. "
                 "Step 2: call terminal_send_input with the task_id "
-                "and chars='x = 42\\n' and yield_time_ms=500. "
+                "and chars='x = 42\\n' and wait_ms=500. "
                 "Step 3: call terminal_send_input with the SAME "
                 "task_id and chars='y = x * 2\\n' and "
-                "yield_time_ms=500. This line REFERENCES x — if the "
+                "wait_ms=500. This line REFERENCES x — if the "
                 "REPL forgot x from step 2 it will raise NameError. "
                 "Step 4: call terminal_send_input with the SAME "
                 "task_id and chars='print(y)\\n' and "
-                "yield_time_ms=2000 so Python has time to print and "
+                "wait_ms=2000 so Python has time to print and "
                 "redraw the prompt. "
                 "Step 5: call terminal_send_input with the SAME "
                 "task_id and chars='exit()\\n' so the REPL "
@@ -509,7 +509,7 @@ def test_send_input_multi_turn_python_repl_holds_state(
     )
     resp.raise_for_status()
     response_id = resp.json()["id"]
-    # Multi-turn with real LLM + 4 send_input calls + yield_time_ms
+    # Multi-turn with real LLM + 4 send_input calls + wait_ms
     # budgets adds up: give this one a generous ceiling.
     final = poll_until_terminal(http_client, response_id, timeout=240)
     assert final["status"] == "completed", f"Task failed: {final.get('error')}"
@@ -657,7 +657,7 @@ def test_three_persistent_repls_and_followup_turn_is_processed(
                 "— you'll need them.\n"
                 "Step 2: call terminal_send_input on EACH of the "
                 "three task_ids with chars='import random; "
-                "print(random.random())\\n' and yield_time_ms=1500. "
+                "print(random.random())\\n' and wait_ms=1500. "
                 "Do this three times (once per task_id).\n"
                 "Step 3: report that you launched three REPLs and "
                 "printed a random number from each. Do NOT try to "

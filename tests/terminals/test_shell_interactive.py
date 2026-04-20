@@ -130,7 +130,7 @@ def test_send_input_delivers_to_running_command(shell: Shell) -> None:
 def test_send_input_empty_string_is_noop(shell: Shell) -> None:
     """Empty ``send_input`` doesn't write anything or break subsequent calls.
 
-    The tool's poll mode (``chars=""`` + yield_time_ms) relies on
+    The tool's poll mode (``chars=""`` + wait_ms) relies on
     this: it short-circuits without touching the PTY. Regression
     guard for the early-return in :meth:`Shell.send_input`.
     """
