@@ -144,6 +144,17 @@ _SUB_AGENT_OUTPUT_BUDGET = 10_000
 # threshold without flooding the channel with pings.
 _HEARTBEAT_INTERVAL_S = 15.0
 
+# How often the blocking drain wakes to poll the conversation
+# store for steering messages. Decoupled from
+# ``_HEARTBEAT_INTERVAL_S`` because they answer different
+# questions: heartbeat is for SSE-proxy keepalive (ceiling on
+# how long a connection can stay idle), steering poll is for
+# user-perceived latency (floor on how quickly the agent
+# reacts to a mid-flight "hello"). 1 s is fast enough that
+# steering feels instant while keeping conv_store load to
+# 1 QPS per blocked workflow.
+_STEERING_POLL_INTERVAL_S = 1.0
+
 # Generic type variable used by ``_to_thread`` (pure helper).
 _T = TypeVar("_T")
 
@@ -3425,23 +3436,32 @@ async def _drain_async_completions(
 
     drained: list[dict[str, Any]] = []
     if block_for_one:
-        # Loop with the documented heartbeat cadence (G20: 15s).
-        # Each timeout slice emits a `response.heartbeat` so SSE
-        # proxies that close idle connections see traffic. The
-        # parent workflow_id is the heartbeat target — it's
-        # always available in this DBOS workflow context.
+        # Two cadences run off the same recv loop:
+        #
+        # * Steering poll every _STEERING_POLL_INTERVAL_S (1s)
+        #   — fast enough to feel instant when the user types
+        #   mid-drain; sets the recv timeout.
+        # * Heartbeat emission every _HEARTBEAT_INTERVAL_S
+        #   (15s) — SSE-proxy keepalive ceiling; driven by a
+        #   wall-clock deadline independent of the recv
+        #   timeout so the heartbeat rate stays constant even
+        #   if ``recv`` returns early due to steering polling.
         parent_id = get_workflow_id()
+        next_heartbeat_at = time.monotonic() + _HEARTBEAT_INTERVAL_S
         first: dict[str, Any] | None = None
         while first is None:
             first = await dbos_recv_async(
                 topic=ASYNC_WORK_COMPLETE_TOPIC,
-                timeout_seconds=_HEARTBEAT_INTERVAL_S,
+                timeout_seconds=_STEERING_POLL_INTERVAL_S,
             )
             if first is None:
-                _write_output(
-                    parent_id,
-                    {"type": "response.heartbeat"},
-                )
+                now = time.monotonic()
+                if now >= next_heartbeat_at:
+                    _write_output(
+                        parent_id,
+                        {"type": "response.heartbeat"},
+                    )
+                    next_heartbeat_at = now + _HEARTBEAT_INTERVAL_S
                 if (
                     _steering_conv_store is not None
                     and _steering_conv_id is not None
