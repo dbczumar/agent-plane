@@ -788,3 +788,111 @@ async def test_list_tasks_includes_client_tool_kind(
     # Tear down.
     await client.post(f"/v1/responses/{response_id}/cancel")
     await _wait_for_completion(client, response_id)
+
+
+async def test_parent_natural_completion_reaps_pending_client_tool_children(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Audit fix #2 — when the parent workflow reaches a terminal
+    state NATURALLY (LLM emits final text without calling another
+    tool), any non-terminal ``kind="client_tool"`` child must be
+    reaped: its holder workflow gets cancelled so the row's
+    DBOS-backed status transitions to ``cancelled``.
+
+    Without this, a client that never PATCHes leaves the row in
+    ``in_progress`` forever and any late PATCH signals a gone
+    parent. The reap runs in ``agent_execution_workflow`` right
+    before it returns a terminal result (idempotent with the
+    route-level ``/cancel`` handler's propagation).
+
+    Specific production breakage this test catches:
+    - If ``cancel_pending_child_tools`` is not called on the
+      natural-completion path, the assertion
+      ``task_row.status == "cancelled"`` fails with
+      ``"in_progress"``.
+    - If the reap is called on the CancelledError path (wrong —
+      DBOS rejects ``@step`` after cancel), the workflow would
+      crash mid-cancel; covered by existing cancel tests not
+      regressing.
+    """
+    # Use max_iterations=1: turn 1 dispatches the async client
+    # tool; the loop then exits with status="incomplete" (it
+    # can't wait for the drain because it's out of iterations).
+    # That exit path is the exact natural-termination site the
+    # audit flagged — the happy-path end-of-turn auto-collect
+    # would otherwise block on the drain and mask the bug.
+    await create_test_agent(client, max_iterations=1)
+
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_reap_test",
+                "name": "client_long_compute",
+                "arguments": _async_args(n=1),
+            },
+        ],
+    )
+
+    resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": "Test natural-completion reap",
+            "background": True,
+            "stream": False,
+            "tools": [_ASYNC_CAPABLE_CLIENT_TOOL],
+        },
+    )
+    response_id = resp.json()["id"]
+    conv_id = resp.json()["conversation"]["id"]
+
+    # Grab the client_tool task_id from the handle FCO.
+    fco = await _wait_for_item_type(client, conv_id, "function_call_output")
+    handle = json.loads(fco["output"])
+    client_tool_task_id: str = handle["task_id"]
+    assert handle["kind"] == "client_tool", handle
+
+    # Do NOT PATCH — simulate the "client never responds" case.
+    # Wait for the parent to reach terminal.
+    parent_body = await _wait_for_completion(client, response_id)
+    # Parent can legitimately complete, fail, or hit incomplete
+    # — any terminal status is fine; the reap runs from the
+    # happy-path return AND the except-Exception branch.
+    assert parent_body["status"] in ("completed", "failed", "incomplete"), (
+        f"Parent should reach a non-cancelled terminal; got "
+        f"status={parent_body['status']!r}. "
+        f"(The CancelledError path is separately tested and was "
+        f"not expected to fire here since the test doesn't POST /cancel.)"
+    )
+
+    # Load-bearing assertion: the client_tool task row is now
+    # terminal — specifically cancelled — because the reap
+    # kicked its holder workflow.
+    child_body_resp = await client.get(f"/v1/responses/{client_tool_task_id}")
+    assert child_body_resp.status_code == 200
+    child_body = child_body_resp.json()
+    assert child_body["status"] == "cancelled", (
+        f"AUDIT FIX #2: client_tool task {client_tool_task_id!r} "
+        f"must be reaped to 'cancelled' when the parent terminates "
+        f"naturally. Got status={child_body['status']!r}. "
+        f"If 'in_progress', agent_execution_workflow is not "
+        f"calling cancel_pending_child_tools on its happy-path "
+        f"return — the row will be stranded forever."
+    )
+
+    # Cross-check via the task store directly — surfaces any
+    # drift between the API's status derivation and the DBOS
+    # workflow's terminal state.
+    from agent_plane.runtime import get_task_store
+
+    task_row = await get_task_store().get(client_tool_task_id)
+    assert task_row is not None
+    assert task_row.status == "cancelled", (
+        f"Store-level status for reaped client_tool task "
+        f"must also be 'cancelled'; got {task_row.status!r}. "
+        f"A mismatch between the API's status and the store's "
+        f"status indicates _enrich_from_dbos didn't pick up the "
+        f"cancellation."
+    )

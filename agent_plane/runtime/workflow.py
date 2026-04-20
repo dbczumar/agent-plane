@@ -5033,6 +5033,19 @@ async def agent_execution_workflow(
                     executor,
                     reasoning=reasoning,
                 )
+                # Audit fix #2: reap any non-terminal children
+                # (``kind in _DRAIN_KINDS``) before returning.
+                # _run_agent_loop's end-of-turn auto-collect
+                # usually waits for pending children on the happy
+                # path, but an LLM that hits max_iterations or
+                # returns final text without another tool call
+                # can exit while a client_tool is still
+                # in_progress. Without this reap, the child row
+                # stays in_progress forever and a late PATCH
+                # signals a gone parent. Idempotent — re-running
+                # skips children already cancelled by the route's
+                # cancel endpoint.
+                await cancel_pending_child_tools(task_id)
                 span.set_outputs({"status": result.status})
                 # Phase 3: if this workflow is a sub-agent, signal
                 # the parent on the unified async_work_complete topic
@@ -5080,6 +5093,19 @@ async def agent_execution_workflow(
                 raise
             except Exception as exc:
                 _logger.exception("agent loop failed for task %s", task_id)
+                # Audit fix #2: reap stranded children on the
+                # failure path too. Safe here because we haven't
+                # been cancelled by DBOS yet — @step calls like
+                # ``task_store.list_tasks`` still succeed.
+                # Swallow errors from reap (the primary failure
+                # below is what we care about surfacing).
+                try:
+                    await cancel_pending_child_tools(task_id)
+                except Exception:
+                    _logger.exception(
+                        "failed to reap child tools during agent loop failure for task %s",
+                        task_id,
+                    )
                 _write_output(
                     task_id,
                     {

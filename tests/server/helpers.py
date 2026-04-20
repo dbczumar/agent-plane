@@ -24,6 +24,7 @@ def build_agent_bundle(
     name: str,
     description: str | None = None,
     sub_agents: list[dict[str, Any]] | None = None,
+    max_iterations: int | None = None,
 ) -> bytes:
     """
     Build a minimal valid agent bundle (tar.gz) for testing.
@@ -38,6 +39,10 @@ def build_agent_bundle(
     :param sub_agents: Optional list of sub-agent config dicts.
         Each must have at least a ``"name"`` key, e.g.
         ``[{"name": "researcher", "description": "..."}]``.
+    :param max_iterations: Optional override for
+        ``executor.max_iterations`` — useful for tests that want
+        to force an ``incomplete`` terminal state after a known
+        number of LLM turns. ``None`` uses the spec default.
     """
     # Any: YAML config values are heterogeneous (str, int, etc.)
     config: dict[str, Any] = {
@@ -55,6 +60,8 @@ def build_agent_bundle(
     }
     if description is not None:
         config["description"] = description
+    if max_iterations is not None:
+        config["executor"] = {"max_iterations": max_iterations}
     if sub_agents:
         config["tools"] = {
             "agents": [sa["name"] for sa in sub_agents],
@@ -91,9 +98,14 @@ async def create_test_agent(
     client: httpx.AsyncClient,
     name: str = "test-agent",
     description: str | None = None,
+    max_iterations: int | None = None,
 ) -> dict[str, Any]:
     """Create an agent via the API and return the response JSON."""
-    bundle = build_agent_bundle(name=name, description=description)
+    bundle = build_agent_bundle(
+        name=name,
+        description=description,
+        max_iterations=max_iterations,
+    )
     resp = await client.post(
         "/api/agents",
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
