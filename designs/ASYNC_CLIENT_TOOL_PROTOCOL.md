@@ -373,12 +373,17 @@ and parsed in `_sse.py`.
 |---|---|
 | PATCH unknown `task_id` | 404 NOT_FOUND |
 | PATCH a non-client_tool kind (e.g. `agent_task`, `tool`, `sub_agent`) | 409 CONFLICT — these have their own status sources of truth |
+| PATCH `status` not in {`completed`, `failed`, `cancelled`} | 422 UNPROCESSABLE_ENTITY — Pydantic `Literal` rejects |
 | Repeat PATCH after terminal status | 200 OK no-op (G3 first-write-wins) |
 | Empty `tool_results` + populated `async_tool_results` | Both legs accepted |
 | Empty both arrays | 200 OK no-op |
 | Parent already terminal when PATCH arrives | Signal queued in DBOS, harmless |
-| Async tool exceeds 1h on the client | NOT enforced server-side today; D6 SDK lifecycle should add `asyncio.wait_for(timeout=3600)` |
+| Async tool exceeds 1h server-side | `client_tool_workflow`'s `DBOS.recv` times out → drain payload `status="failed"` with timeout message → parent sees `[System: task X (client_tool) failed]` |
+| Async tool body exceeds 1h client-side | NOT enforced today; D6 SDK lifecycle should add `asyncio.wait_for(timeout=3600)` to match the server-side cap |
 | SSE drops mid-flight | See § 9 — polling/HTTP fallback recovers without server-side state loss |
+| Long client_tool wait (SSE proxy idle close) | Server emits `response.heartbeat` SSE every 15 s while the parent's drain is waiting — keeps proxies that close idle connections at 30 s safely under their threshold |
+| PATCH body size | No explicit server-side cap. uvicorn / h11 defaults apply (effectively unbounded). Audit gap — see § 11 |
+| Output truncation | Each producer (`background_tool_workflow`, `client_tool_workflow`, sub-agent path) truncates its `output` body at `_SUB_AGENT_OUTPUT_BUDGET` (10K chars) **before** sending the drain payload, so a single drained item can't blow the LLM's context |
 
 ---
 
@@ -562,7 +567,42 @@ Each test follows the same shape:
 
 ---
 
-## 11. What's missing (D6 deferred work)
+## 11. Forward-compat: the `kind` field
+
+Handle JSON has a `kind` field discriminating which producer
+created the task. Today's registry (must match `_DRAIN_KINDS`
+in `agent_plane/runtime/workflow.py`):
+
+| `kind` | Producer | Drain delivery |
+|---|---|---|
+| `"agent_task"` | Top-level user turn | Not drained (the agent itself, not a child) |
+| `"tool"` | `@tool(synchronous=False)` invocation | `[System: task X (tool) <status>]\n<body>` |
+| `"sub_agent"` | `spawn_sub_agent` | `[System: task X (sub_agent) <status>]\n<body>` |
+| `"client_tool"` | Async client tool (Phase 5) | `[System: task X (client_tool) <status>]\n<body>` |
+
+**Forward-compat guidance for clients.** A future kind may be
+added (e.g. `"web_hook"`, `"queue"`). Clients reading handle
+JSON should:
+
+- Not assume the four kinds above are exhaustive — branch on
+  the kind they recognize, surface unknown kinds to logs (or
+  the LLM as raw JSON), don't crash.
+- Use `task_id` for cross-references. The `task_id` is durable
+  across kinds; the `kind` only changes the *producer*, not
+  the *handle protocol*.
+- Treat `[System: task X (...) ...]` as an open-ended pattern
+  — match on `[System: task ` prefix and `]` separator, not
+  on the exact kind list.
+
+Server-side, adding a new kind requires updates to:
+- `db_models.py:SqlTask` — kind column's CHECK constraint.
+- `runtime/workflow.py:_DRAIN_KINDS` — if the kind should
+  participate in the drain.
+- Whichever workflow produces it.
+
+---
+
+## 12. What's missing (D6 deferred work)
 
 Today there is **no SDK helper** that automates the client side.
 A user must:
@@ -591,7 +631,7 @@ fire-and-forget asyncio tasks, automatic
 
 ---
 
-## 12. File reference index
+## 13. File reference index
 
 | Concern | File:line |
 |---|---|
