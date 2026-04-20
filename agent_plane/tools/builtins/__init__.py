@@ -44,29 +44,14 @@ __all__ = [
     "list_skill_resources",
 ]
 
-# Lazy imports for code_sandbox and upload_file to avoid
-# circular imports — they are registered in the factory below.
+# Lazy imports avoid circular import cycles — each tool's actual
+# class is imported only when the factory fires.
 
 # Factory type: each constructor accepts a config dict and returns
 # a Tool. Callable is used instead of type[Tool] because the base
 # Tool.__init__ does not declare a config parameter — only the
 # web search subclasses do.
 _BuiltinFactory = Callable[[dict[str, str]], Tool]
-
-
-# Registry of built-in tools that agents can enable via
-# ``tools.builtins`` in config.yaml. Keyed by the name string
-# users write in the spec.
-def _create_code_sandbox(config: dict[str, str]) -> Tool:
-    """
-    Lazy factory for CodeSandboxTool.
-
-    :param config: Tool config (unused).
-    :returns: A CodeSandboxTool instance.
-    """
-    from agent_plane.tools.builtins.code_sandbox import CodeSandboxTool
-
-    return CodeSandboxTool()
 
 
 def _create_upload_file(config: dict[str, str]) -> Tool:
@@ -131,6 +116,54 @@ def _create_export_agent(config: dict[str, str]) -> Tool:
     return ExportAgentTool()
 
 
+def _create_terminal_run(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for :class:`TerminalRunTool`.
+
+    :param config: Tool config (unused).
+    :returns: A TerminalRunTool instance.
+    """
+    from agent_plane.tools.builtins.terminal import TerminalRunTool
+
+    return TerminalRunTool()
+
+
+def _create_terminal_list(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for :class:`TerminalListTool`.
+
+    :param config: Tool config (unused).
+    :returns: A TerminalListTool instance.
+    """
+    from agent_plane.tools.builtins.terminal import TerminalListTool
+
+    return TerminalListTool()
+
+
+def _create_terminal_close(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for :class:`TerminalCloseTool`.
+
+    :param config: Tool config (unused).
+    :returns: A TerminalCloseTool instance.
+    """
+    from agent_plane.tools.builtins.terminal import TerminalCloseTool
+
+    return TerminalCloseTool()
+
+
+def _create_terminal_send_input(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for :class:`TerminalSendInputTool`.
+
+    :param config: Tool config (unused).
+    :returns: A TerminalSendInputTool instance.
+    """
+    from agent_plane.tools.builtins.terminal import TerminalSendInputTool
+
+    return TerminalSendInputTool()
+
+
 # Canonical set of all builtin tool names that agents can enable
 # via ``tools.builtins`` in config.yaml. Used for discovery (e.g.
 # by the onboarding assistant's list_builtin_tools).
@@ -139,7 +172,10 @@ BUILTIN_NAMES: frozenset[str] = frozenset(
         "web_search",
         "web_fetch",
         "introspect",
-        "code_sandbox",
+        "terminal_run",
+        "terminal_list",
+        "terminal_close",
+        "terminal_send_input",
         "upload_file",
         "list_files",
         "download_file",
@@ -153,7 +189,10 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory] = {
     # to instantiate — ToolManager handles them before reaching
     # this registry. They are listed in BUILTIN_NAMES above.
     "web_search": lambda config: WebSearchTool(config=config),
-    "code_sandbox": _create_code_sandbox,
+    "terminal_run": _create_terminal_run,
+    "terminal_list": _create_terminal_list,
+    "terminal_close": _create_terminal_close,
+    "terminal_send_input": _create_terminal_send_input,
     "upload_file": _create_upload_file,
     "list_files": _create_list_files,
     "download_file": _create_download_file,

@@ -48,7 +48,7 @@ def _make_spec() -> AgentSpec:
         tools=ToolsConfig(
             builtins=[
                 BuiltinToolConfig(name="web_search"),
-                BuiltinToolConfig(name="code_sandbox"),
+                BuiltinToolConfig(name="terminal_run"),
             ],
             agents=["researcher"],
         ),
@@ -89,7 +89,7 @@ def test_summary_lists_builtins() -> None:
     tool = IntrospectTool(spec=_make_spec())
     result = tool.invoke("{}", None)
     assert "web_search" in result
-    assert "code_sandbox" in result
+    assert "terminal_run" in result
 
 
 def test_summary_lists_skills() -> None:
@@ -165,7 +165,7 @@ def test_tools_section_lists_builtins() -> None:
     tool = IntrospectTool(spec=_make_spec())
     result = tool.invoke('{"section": "tools"}', None)
     assert "web_search" in result
-    assert "code_sandbox" in result
+    assert "terminal_run" in result
 
 
 def test_tools_section_lists_local() -> None:

@@ -131,7 +131,7 @@ class WebSearchTool(Tool):
             },
         }
 
-    def is_async(self) -> bool:
+    def is_async(self, arguments: str | None = None) -> bool:
         """
         Run web search in a background workflow.
 
@@ -152,6 +152,8 @@ class WebSearchTool(Tool):
         path. ``invoke()`` is also never called in OpenAI mode
         (it raises if it ever is).
 
+        :param arguments: Ignored — async-ness is a property of
+            this tool, not the per-call arguments.
         :returns: ``True`` — every reachable invocation should
             run async.
         """

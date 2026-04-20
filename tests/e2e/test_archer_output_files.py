@@ -1,7 +1,7 @@
 """E2E test: archer agent generates a chart and uploads it.
 
 Verifies the full output attachment pipeline: agent uses
-``code_sandbox`` to generate a matplotlib chart, calls
+``terminal_run`` to generate a matplotlib chart, calls
 ``upload_file`` to store it, the response includes a
 ``file_citation`` annotation, and the file is downloadable
 via ``GET /v1/files/{file_id}/content``.
@@ -45,7 +45,7 @@ def test_archer_generates_chart_and_uploads(
 ) -> None:
     """
     The archer agent generates a matplotlib chart via
-    ``code_sandbox``, uploads it via ``upload_file``, and the
+    ``terminal_run``, uploads it via ``upload_file``, and the
     response includes a ``file_citation`` annotation. The file
     is downloadable via the files API.
 
@@ -58,7 +58,7 @@ def test_archer_generates_chart_and_uploads(
             "model": archer_agent,
             "input": (
                 "Do these two steps:\n"
-                '1. code_sandbox: python -c "'
+                '1. terminal_run: python -c "'
                 "import matplotlib;matplotlib.use('Agg');"
                 "import matplotlib.pyplot as plt;"
                 "plt.plot([1,2,3],[1,4,9]);"

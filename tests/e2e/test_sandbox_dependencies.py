@@ -1,11 +1,11 @@
 """E2E test: agent installs dependencies from PyPI and npm in sandbox.
 
-Verifies that the ``code_sandbox`` tool can install packages via
+Verifies that the ``terminal_run`` tool can install packages via
 ``pip install`` and ``npm install`` inside the per-conversation
 workspace, and that the installed packages are usable by subsequent
 commands within the same turn.
 
-Uses the ``archer`` agent which has ``code_sandbox`` enabled.
+Uses the ``archer`` agent which has ``terminal_run`` enabled.
 
 Usage::
 
@@ -73,7 +73,7 @@ def test_pip_install_and_use_package(
         json={
             "model": archer_agent,
             "input": (
-                "Use the code_sandbox tool to: "
+                "Use the terminal_run tool to: "
                 "1) pip install cowsay "
                 "2) Run: python -c \"import cowsay; cowsay.cow('hello from agent-plane')\" "
                 "Show me the output."
@@ -92,9 +92,9 @@ def test_pip_install_and_use_package(
         f"The agent should complete after installing and running cowsay."
     )
 
-    # The agent must have called code_sandbox at least once.
-    assert _has_tool_call(body, "code_sandbox"), (
-        "Expected at least one code_sandbox tool call. "
+    # The agent must have called terminal_run at least once.
+    assert _has_tool_call(body, "terminal_run"), (
+        "Expected at least one terminal_run tool call. "
         "The agent may not have used the sandbox tool."
     )
 
@@ -134,7 +134,7 @@ def test_npm_install_and_use_package(
         json={
             "model": archer_agent,
             "input": (
-                "Use the code_sandbox tool to: "
+                "Use the terminal_run tool to: "
                 "1) npm install cowsay "
                 "2) Run: node -e \"const cowsay = require('cowsay'); "
                 "console.log(cowsay.say({text: 'npm works'}))\" "
@@ -154,7 +154,7 @@ def test_npm_install_and_use_package(
         f"The agent should complete after npm install and node run."
     )
 
-    assert _has_tool_call(body, "code_sandbox"), "Expected at least one code_sandbox tool call."
+    assert _has_tool_call(body, "terminal_run"), "Expected at least one terminal_run tool call."
 
     text = _extract_all_text(body)
     all_output = " ".join(

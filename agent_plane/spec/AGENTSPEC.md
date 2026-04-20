@@ -148,7 +148,7 @@ by the client, not at runtime by the server — the spec is self-contained).
   environment variable fallbacks).
 
 **`web_fetch` — zero-config web research:** Spawns an internal sub-agent with
-`code_sandbox` to search the web and fetch pages using plain HTTP. No API keys
+`terminal_run` to search the web and fetch pages using plain HTTP. No API keys
 needed — works with any model provider. The sub-agent inherits the parent's
 LLM model and credentials. Only works with the default `llm` executor.
 

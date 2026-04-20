@@ -101,38 +101,14 @@ class ToolManager:
         self._uv_available = shutil.which("uv") is not None
         self._register_skill_tools()
         self._register_builtin_tools()
-        self._register_task_lifecycle_tools()
         self._register_sub_agent_tools()
         self._register_local_tools(workdir)
         self._register_client_tools(client_tool_specs or [])
-
-    def _register_task_lifecycle_tools(self) -> None:
-        """
-        Register the always-available task-lifecycle tools.
-
-        ``check_task`` and ``cancel_task`` are needed any time
-        the LLM dispatches background work it might want to
-        poll or abort — async ``@tool(synchronous=False)``
-        invocations, sub-agent spawns, async client tools.
-        Every dispatched handle's message even tells the LLM
-        to "call check_task / cancel_task" — that promise
-        only holds if these are registered unconditionally.
-
-        Both are gated server-side: ``CheckTaskTool`` and
-        ``CancelTaskTool`` themselves filter out
-        ``kind="agent_task"`` and out-of-scope task_ids (G23),
-        so registering them universally doesn't expose any
-        cross-agent state.
-        """
-        from agent_plane.tools.builtins.task_lifecycle import (
-            CancelTaskTool,
-            CheckTaskTool,
-        )
-
-        check_tool = CheckTaskTool()
-        cancel_tool = CancelTaskTool()
-        self._tools[check_tool.name()] = check_tool
-        self._tools[cancel_tool.name()] = cancel_tool
+        # Task lifecycle builtins (check_task / cancel_task /
+        # list_tasks) are auto-enabled at the end so the
+        # ``list_tasks`` gating can inspect every already-registered
+        # tool to detect async / sub-agent / terminal sources.
+        self._register_task_lifecycle_tools()
 
     def _register_skill_tools(self) -> None:
         """
@@ -154,17 +130,20 @@ class ToolManager:
         Register built-in tools declared in ``tools.builtins``.
 
         Most tools are looked up in the built-in registry and
-        instantiated with spec-level config. ``code_sandbox`` and
-        ``upload_file`` are handled specially — they need sandbox
-        capability flags from ToolManager.
+        instantiated with spec-level config. Some (``web_search``,
+        ``web_fetch``, ``introspect``, ``upload_file``) need
+        runtime context the registry doesn't have and are
+        dispatched through :meth:`_create_builtin` instead.
         """
         for entry in self._spec.tools.builtins:
             tool = self._create_builtin(entry.name, entry.config)
             if tool is None:
                 _logger.warning(
                     "Unknown built-in tool %r — skipping. "
-                    "Available: web_search, code_sandbox, upload_file, "
-                    "search_conversations, list_files, download_file",
+                    "Available: web_search, web_fetch, introspect, "
+                    "terminal_run, terminal_list, terminal_close, "
+                    "upload_file, list_files, download_file, "
+                    "search_conversations, export_agent",
                     entry.name,
                 )
                 continue
@@ -188,8 +167,6 @@ class ToolManager:
             return self._create_web_fetch()
         if name == "introspect":
             return self._create_introspect()
-        if name == "code_sandbox":
-            return self._create_code_sandbox()
         if name == "upload_file":
             from agent_plane.tools.builtins.upload_file import UploadFileTool
 
@@ -235,19 +212,6 @@ class ToolManager:
 
         return IntrospectTool(spec=self._spec)
 
-    def _create_code_sandbox(self) -> Tool:
-        """
-        Build a CodeSandboxTool with runtime capability flags.
-
-        :returns: A CodeSandboxTool with srt/sandbox settings.
-        """
-        from agent_plane.tools.builtins.code_sandbox import CodeSandboxTool
-
-        return CodeSandboxTool(
-            srt_available=self._srt_available,
-            sandbox_enabled=self._sandbox_enabled,
-        )
-
     def _register_sub_agent_tools(self) -> None:
         """
         Register spawn/collect tools when the agent has sub-agents
@@ -278,6 +242,57 @@ class ToolManager:
         # caller's child conversations regardless of which types
         # the parent declared.
         self._tools[ListSubAgentsTool.name()] = ListSubAgentsTool()
+
+    def _register_task_lifecycle_tools(self) -> None:
+        """
+        Auto-register ``check_task``, ``cancel_task``, and
+        (conditionally) ``list_tasks``.
+
+        ``check_task`` and ``cancel_task`` are registered
+        unconditionally on every agent: any dispatched handle's
+        system message tells the LLM to "call check_task /
+        cancel_task" — that promise only holds if these are
+        always in the schema. Both are gated server-side (G23 —
+        they filter out ``kind="agent_task"`` and out-of-scope
+        task_ids) so universal registration leaks no cross-agent
+        state.
+
+        ``list_tasks`` is only useful when the agent can produce
+        background work, so it's conditional on any of:
+
+        - Sub-agent declarations (``tools.agents``) — ``spawn_sub_agent``
+          returns handles.
+        - Async local Python tools (``@tool(synchronous=False)``) —
+          returns handles.
+        - ``terminal_run`` (supports ``synchronous=False`` per
+          designs/PERSISTENT_TERMINAL_RESEARCH.md §6.11).
+
+        Idempotent: explicit registrations elsewhere win.
+
+        See ``agent_plane/tools/builtins/task_lifecycle.py`` for
+        the three tools' docstrings.
+        """
+        from agent_plane.tools.builtins.task_lifecycle import (
+            CancelTaskTool,
+            CheckTaskTool,
+            ListTasksTool,
+        )
+
+        # Idempotent: explicit registration wins.
+        if CheckTaskTool.name() not in self._tools:
+            self._tools[CheckTaskTool.name()] = CheckTaskTool()
+        if CancelTaskTool.name() not in self._tools:
+            self._tools[CancelTaskTool.name()] = CancelTaskTool()
+
+        # list_tasks is scoped to agents that actually produce
+        # background work — otherwise it would always return [].
+        any_async = any(tool.is_async() for tool in self._tools.values())
+        has_sub_agents = bool(self._spec.tools.agents)
+        has_terminal_run = "terminal_run" in self._tools
+        if not (any_async or has_sub_agents or has_terminal_run):
+            return
+        if ListTasksTool.name() not in self._tools:
+            self._tools[ListTasksTool.name()] = ListTasksTool()
 
     def _register_local_tools(self, workdir: Path | None) -> None:
         """

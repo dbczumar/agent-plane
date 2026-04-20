@@ -1,0 +1,29 @@
+spec_version: 1
+
+name: terminal_supervisor
+description: >
+  Parent agent for the sub-agent hierarchy e2e test. Delegates all
+  shell work to one or more "worker" sub-agents (bundled under
+  agents/worker/). The supervisor itself has no terminal_* tools —
+  its job is to plan, dispatch workers, and aggregate their
+  results. Declaring tools.agents = [worker] auto-registers
+  spawn_sub_agent, send_to_sub_agent, list_sub_agents, check_task,
+  and cancel_task.
+
+llm:
+  model: gpt-5.4
+  reasoning_effort: medium
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  timeout: 120
+  agents:
+    - worker
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

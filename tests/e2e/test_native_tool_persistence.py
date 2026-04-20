@@ -62,7 +62,7 @@ def test_web_search_results_not_repeated(
 
     The LLM calls web_search for each repo. If the results are
     lost on the next iteration (e.g. because the LLM also calls
-    a regular tool like code_sandbox), the LLM sees no search
+    a regular tool like terminal_run), the LLM sees no search
     results in its history and re-requests the same searches.
     This loops dozens of times, wasting tokens and time.
 

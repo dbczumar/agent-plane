@@ -1,7 +1,7 @@
 """E2E test for ``web_fetch`` built-in tool.
 
 Verifies that an agent with ``web_fetch`` can actually spawn the
-``__web_researcher`` sub-agent, which uses ``code_sandbox`` to
+``__web_researcher`` sub-agent, which uses ``terminal_run`` to
 fetch web content and return results. Uses an LLM judge to evaluate
 whether the fetched content is relevant.
 
@@ -59,7 +59,7 @@ def test_web_fetch_returns_live_content(
     **What breaks if this fails:**
     - __web_researcher sub-agent spec is malformed → spawn fails
     - Model inheritance broken → sub-agent has no LLM → workflow error
-    - code_sandbox not available to sub-agent → can't run scripts
+    - terminal_run not available to sub-agent → can't run scripts
     - Network blocked in sandbox → DNS failure (known srt issue)
     - Polling loop broken → timeout instead of results
     - Output extraction broken → empty response
@@ -130,7 +130,7 @@ def test_web_fetch_returns_live_content(
         body = resp.json()
 
         # "completed" means the full chain worked: agent → web_fetch
-        # → spawn __web_researcher → code_sandbox → fetch → return.
+        # → spawn __web_researcher → terminal_run → fetch → return.
         assert body["status"] == "completed", (
             f"Response status is {body['status']!r}, expected 'completed'. "
             f"Output: {body.get('output', [])}"

@@ -20,6 +20,7 @@ if TYPE_CHECKING:
         FileStore,
         TaskStore,
     )
+    from agent_plane.terminals import TerminalManagerRegistry
     from agent_plane.tools import ToolManager
 
 
@@ -182,3 +183,26 @@ def get_caps() -> RuntimeCaps:
         non-None (defaults are used if none were provided).
     """
     return _globals._caps
+
+
+def get_terminal_registry() -> TerminalManagerRegistry:
+    """
+    Return the server-resident terminal registry.
+
+    Constructed once by :func:`init` and shared across all
+    workflows. Callers use
+    ``registry.for_conversation(conv_id, workspace)`` to
+    look up (or lazily create) a per-conversation
+    :class:`TerminalManager`. The registry's internal locks
+    make this safe from any thread; see §6.9 of
+    ``designs/PERSISTENT_TERMINAL_RESEARCH.md``.
+
+    :returns: The :class:`TerminalManagerRegistry` set during
+        :func:`init`.
+    :raises RuntimeError: If the runtime has not been
+        initialized.
+    """
+    reg = _globals._terminal_registry
+    if reg is None:
+        raise RuntimeError("runtime not initialized — call init() first")
+    return reg

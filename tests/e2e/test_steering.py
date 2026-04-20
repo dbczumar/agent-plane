@@ -219,7 +219,7 @@ def test_steering_during_multi_tool_iterations(
 ) -> None:
     """
     Steering is picked up between tool call iterations when the
-    agent makes multiple sequential tool calls (web search + code_sandbox).
+    agent makes multiple sequential tool calls (web search + terminal_run).
 
     This tests ``_sync_steered_after_tools`` with the pre-LLM cursor
     fix. The agent is explicitly told to make multiple tool calls
@@ -240,9 +240,9 @@ def test_steering_during_multi_tool_iterations(
                 "Do these steps in order, one tool call at a time:\n"
                 "1. Use web search to find the current number of "
                 "GitHub stars for mlflow/mlflow\n"
-                "2. Use code_sandbox to run: echo 'Stars found'\n"
-                "3. Use code_sandbox to run: echo 'Creating chart'\n"
-                "4. Use code_sandbox to create a file chart.txt "
+                "2. Use terminal_run to run: echo 'Stars found'\n"
+                "3. Use terminal_run to run: echo 'Creating chart'\n"
+                "4. Use terminal_run to create a file chart.txt "
                 "with the star count\n"
                 "Do NOT skip any steps."
             ),

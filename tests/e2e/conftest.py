@@ -31,6 +31,8 @@ _CODER_DIR = _REPO_ROOT / "examples" / "agents" / "coder"
 _ARCHER_DIR = _REPO_ROOT / "examples" / "agents" / "archer"
 _CLAUDE_CODER_DIR = _REPO_ROOT / "examples" / "agents" / "claude-coder"
 _OPENAI_CODER_DIR = _REPO_ROOT / "examples" / "agents" / "openai-coder"
+_TERMINAL_TEST_DIR = _REPO_ROOT / "examples" / "agents" / "terminal_test"
+_TERMINAL_SUPERVISOR_DIR = _REPO_ROOT / "examples" / "agents" / "terminal_supervisor"
 
 
 def find_free_port() -> int:
@@ -108,17 +110,53 @@ def live_server(
     :param tmp_path_factory: Pytest temp path factory for the DB.
     :returns: The server's base URL, e.g. ``"http://localhost:18501"``.
     """
-    port = 18501
+    # Dynamic free port so back-to-back test sessions don't race
+    # on a hard-coded port (which produced
+    # "address already in use" → server death → ConnectError in
+    # every subsequent test when a prior run hadn't fully torn
+    # down).
+    port = find_free_port()
     db_path = tmp_path_factory.mktemp("e2e") / "e2e.db"
+    artifact_dir = tmp_path_factory.mktemp("e2e_artifacts")
+    server_log = tmp_path_factory.mktemp("e2e_logs") / "server.log"
+    # PYTHONPATH forces the server to import from the worktree
+    # checkout rather than whatever version is installed in the
+    # venv — otherwise a branch with migration or model changes
+    # would run against the stale installed copy and fail with
+    # "no such column" or similar schema mismatches. _REPO_ROOT is
+    # the worktree root (tests/e2e/conftest.py → parents[2]).
     env = {
         **os.environ,
         "OPENAI_API_KEY": llm_api_key,
-        "AP_DB_URI": f"sqlite:///{db_path}",
+        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
     }
+    # The CLI exposes ``--database-uri`` but not an env var, so the
+    # DB path must be on the command line. Absolute path prevents
+    # the server from writing into the CWD (which was previously
+    # happening silently — each e2e run polluted ``agent_plane.db``
+    # in whatever dir pytest was invoked from).
+    # Route server output to a file so DBOS/agent logs don't fill
+    # a PIPE buffer (which would block the server after ~64KB —
+    # previously every session failed mid-way through the second
+    # test with "ConnectError: Connection refused" as the server
+    # deadlocked on a full stdout pipe). Keeping the log as a file
+    # also lets tests inspect it on failure.
+    log_handle = open(server_log, "w")
     proc = subprocess.Popen(
-        ["ap", "server", "--port", str(port)],
+        [
+            "python",
+            "-m",
+            "agent_plane.cli",
+            "server",
+            "--port",
+            str(port),
+            "--database-uri",
+            f"sqlite:///{db_path}",
+            "--artifact-location",
+            str(artifact_dir),
+        ],
         env=env,
-        stdout=subprocess.PIPE,
+        stdout=log_handle,
         stderr=subprocess.STDOUT,
     )
     base_url = f"http://localhost:{port}"
@@ -134,14 +172,23 @@ def live_server(
         time.sleep(0.5)
     else:
         proc.kill()
-        stdout = proc.stdout.read().decode() if proc.stdout else ""
-        raise RuntimeError(f"Server didn't start within 30s. Output:\n{stdout}")
+        log_handle.close()
+        log_contents = server_log.read_text() if server_log.exists() else ""
+        raise RuntimeError(
+            f"Server didn't start within 30s. Log at {server_log}:\n{log_contents[-3000:]}"
+        )
 
-    yield base_url
-
-    # Teardown: kill server.
-    proc.send_signal(signal.SIGTERM)
-    proc.wait(timeout=10)
+    try:
+        yield base_url
+    finally:
+        # Teardown: kill server and close log handle.
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        log_handle.close()
 
 
 @pytest.fixture(scope="session")
@@ -213,6 +260,38 @@ def archer_agent(http_client: httpx.Client) -> str:
     :returns: The agent name, e.g. ``"archer"``.
     """
     return upload_agent(http_client, _ARCHER_DIR)
+
+
+@pytest.fixture(scope="session")
+def terminal_test_agent(http_client: httpx.Client) -> str:
+    """
+    Upload the terminal-test agent and return its name.
+
+    The terminal-test agent has only the three persistent-terminal
+    builtins (``terminal_run``, ``terminal_list``, ``terminal_close``)
+    — nothing else that could do shell-like work. Used to e2e-test
+    those tools without LLM ambiguity over which tool to pick.
+
+    :param http_client: HTTP client pointed at the server.
+    :returns: The agent name, ``"terminal_test"``.
+    """
+    return upload_agent(http_client, _TERMINAL_TEST_DIR)
+
+
+@pytest.fixture(scope="session")
+def terminal_supervisor_agent(http_client: httpx.Client) -> str:
+    """Upload the terminal-supervisor bundle and return its name.
+
+    The supervisor's bundle nests its sub-agent (``worker``) under
+    ``agents/worker/``; the server picks that up automatically
+    during upload, so no separate sub-agent bundle needs to be
+    uploaded. Used by the sub-agent-hierarchy e2e test to drive a
+    supervisor → worker → terminal flow.
+
+    :param http_client: HTTP client pointed at the server.
+    :returns: The supervisor agent name, ``"terminal_supervisor"``.
+    """
+    return upload_agent(http_client, _TERMINAL_SUPERVISOR_DIR)
 
 
 @pytest.fixture(scope="session")
