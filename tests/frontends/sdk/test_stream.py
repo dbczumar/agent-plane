@@ -8,6 +8,8 @@ from typing import Any
 import pytest
 from agent_plane_client._blocks import (
     ReasoningBlock,
+    ReasoningChunk,
+    ReasoningStartBlock,
     TextChunk,
     TextDone,
     ToolGroup,
@@ -107,14 +109,23 @@ async def test_text_with_code_blocks(block_stream: BlockStream) -> None:
 
 
 @pytest.mark.asyncio()
-async def test_reasoning_block(block_stream: BlockStream) -> None:
-    """Reasoning events → ReasoningStartBlock + ReasoningBlock."""
+async def test_reasoning_streams_chunks_live(block_stream: BlockStream) -> None:
+    """
+    Reasoning deltas must surface as :class:`ReasoningChunk` blocks
+    while reasoning is in progress so the TUI can render live
+    progress (e.g. Codex commands) instead of waiting until the
+    section ends to dump a single panel.
+
+    Contract: when chunks fire, the trailing :class:`ReasoningBlock`
+    is suppressed — emitting both would make renderers show the same
+    text twice (once streaming, once as a panel).
+    """
     session = FakeSession(
         [
             ResponseCreated(response=_make_response()),
             ReasoningStarted(),
-            ReasoningDelta(delta="Let me think..."),
-            ReasoningSummaryDelta(delta="Summary here"),
+            ReasoningDelta(delta="Let me think...\n"),
+            ReasoningSummaryDelta(delta="Summary here\n"),
             TextDelta(delta="Answer"),
             MessageDone(content=[]),
             ResponseCompleted(response=_make_response()),
@@ -124,12 +135,103 @@ async def test_reasoning_block(block_stream: BlockStream) -> None:
     blocks = [b async for b in block_stream.stream(session, "test")]  # type: ignore[arg-type]
     types = [type(b).__name__ for b in blocks]
 
+    # Start indicator and at least one streamed chunk.
     assert "ReasoningStartBlock" in types
-    assert "ReasoningBlock" in types
+    chunk_texts = [b.text for b in blocks if isinstance(b, ReasoningChunk)]
+    assert chunk_texts, (
+        f"No ReasoningChunk emitted — reasoning would be invisible "
+        f"during the section. Got: {types}"
+    )
+    # Both delta sources must reach the consumer (the executor maps
+    # Codex events to ReasoningSummaryDelta; LLM-native reasoning
+    # comes through ReasoningDelta). Concatenated chunk text must
+    # contain content from both.
+    joined = "".join(chunk_texts)
+    assert "Let me think" in joined, (
+        f"ReasoningDelta payload missing from chunks. Joined: {joined!r}"
+    )
+    assert "Summary here" in joined, (
+        f"ReasoningSummaryDelta payload missing from chunks. Joined: {joined!r}"
+    )
 
-    reasoning = next(b for b in blocks if isinstance(b, ReasoningBlock))
-    assert reasoning.reasoning_text == "Let me think..."
-    assert reasoning.summary_text == "Summary here"
+    # ReasoningBlock must be suppressed — chunks already covered it.
+    assert "ReasoningBlock" not in types, (
+        f"ReasoningBlock leaked alongside chunks; renderers would "
+        f"show the same text twice. Got: {types}"
+    )
+
+
+@pytest.mark.asyncio()
+async def test_reasoning_started_without_deltas_emits_block(
+    block_stream: BlockStream,
+) -> None:
+    """
+    Edge case: ``ReasoningStarted`` arrives but no deltas follow
+    before the section closes. With no chunks to stream, the
+    :class:`ReasoningBlock` must still fire so non-streaming
+    renderers know reasoning happened (even if empty).
+    """
+    session = FakeSession(
+        [
+            ResponseCreated(response=_make_response()),
+            ReasoningStarted(),
+            # No deltas — straight to text.
+            TextDelta(delta="Direct answer"),
+            MessageDone(content=[]),
+            ResponseCompleted(response=_make_response()),
+        ]
+    )
+
+    blocks = [b async for b in block_stream.stream(session, "test")]  # type: ignore[arg-type]
+    types = [type(b).__name__ for b in blocks]
+
+    assert "ReasoningStartBlock" in types
+    assert "ReasoningChunk" not in types
+    # Block fires because no chunks did.
+    assert "ReasoningBlock" in types
+    block = next(b for b in blocks if isinstance(b, ReasoningBlock))
+    assert block.reasoning_text == ""
+    assert block.summary_text == ""
+
+
+@pytest.mark.asyncio()
+async def test_reasoning_delta_without_started_emits_implicit_start(
+    block_stream: BlockStream,
+) -> None:
+    """
+    Codex events arrive as bridged ``ReasoningSummaryDelta`` with
+    no preceding ``ReasoningStarted`` (the executor maps directly
+    from ``codex/event`` to deltas). The block stream must
+    synthesize a :class:`ReasoningStartBlock` on the first delta
+    so the formatter still gets its "thinking…" anchor.
+    """
+    session = FakeSession(
+        [
+            ResponseCreated(response=_make_response()),
+            # No ReasoningStarted — straight into a delta.
+            ReasoningSummaryDelta(delta="$ ls /tmp\n"),
+            TextDelta(delta="Result"),
+            MessageDone(content=[]),
+            ResponseCompleted(response=_make_response()),
+        ]
+    )
+
+    blocks = [b async for b in block_stream.stream(session, "test")]  # type: ignore[arg-type]
+
+    start_idx = next(
+        (i for i, b in enumerate(blocks) if isinstance(b, ReasoningStartBlock)),
+        None,
+    )
+    chunk_idx = next(
+        (i for i, b in enumerate(blocks) if isinstance(b, ReasoningChunk)),
+        None,
+    )
+    assert start_idx is not None, (
+        "Implicit ReasoningStartBlock missing — Codex-bridged deltas "
+        "would arrive without a section header in the TUI."
+    )
+    assert chunk_idx is not None, "ReasoningChunk missing for the bridged delta."
+    assert start_idx < chunk_idx, "Start block must precede the first chunk."
 
 
 @pytest.mark.asyncio()

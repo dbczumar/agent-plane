@@ -113,10 +113,19 @@ def live_server(
     env = {
         **os.environ,
         "OPENAI_API_KEY": llm_api_key,
-        "AP_DB_URI": f"sqlite:///{db_path}",
     }
     proc = subprocess.Popen(
-        ["ap", "server", "--port", str(port)],
+        [
+            "ap",
+            "server",
+            "--port",
+            str(port),
+            # Explicit DB URI — the CLI does not read AP_DB_URI. Without
+            # this, the server falls back to ./agent_plane.db in CWD,
+            # which can carry a stale schema from prior dev runs.
+            "--database-uri",
+            f"sqlite:///{db_path}",
+        ],
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

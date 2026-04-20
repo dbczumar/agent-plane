@@ -1,6 +1,6 @@
 [project]
 name = "agent-plane"
-version = "0.1.4"
+version = "0.1.5"
 description = "MLflow AgentPlane — agent specification, runtime, server"
 requires-python = ">=3.10"
 dependencies = [
@@ -63,7 +63,18 @@ agent-plane-acp = "integrations.toad.__main__:main"
 where = ["."]
 include = ["agent_plane*", "integrations*"]
 
+[tool.setuptools.package-data]
+# Ship alembic configuration and migration template with the wheel —
+# required by db/utils.py:_run_migrations.
+"agent_plane.db" = ["alembic.ini"]
+"agent_plane.db.migrations" = ["script.py.mako"]
 
+[tool.uv.workspace]
+members = ["sdks/python-client", "sdks/frontend"]
+
+[tool.uv.sources]
+agent-plane-client = { workspace = true }
+agent-plane-ui-sdk = { workspace = true }
 
 [build-system]
 requires = ["setuptools>=68.0"]

@@ -91,10 +91,9 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
         ``sqlalchemy.url`` config option, e.g.
         ``"sqlite:///mydb.db"``.
     """
+    from agent_plane.db.db_models import Base
     from alembic import command
     from alembic.config import Config
-
-    from agent_plane.db.db_models import Base
 
     expected_tables = {table.name for table in Base.metadata.sorted_tables}
     actual_tables = set(inspect(engine).get_table_names())

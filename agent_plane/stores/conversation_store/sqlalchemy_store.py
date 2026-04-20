@@ -172,13 +172,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             # check, which would misclassify any future unique
             # constraint added to the conversations table.
             msg = str(exc).lower()
-            is_partial_index_violation = (
-                "ix_conversations_parent_title_unique" in msg
-                or (
-                    "unique" in msg
-                    and "parent_conversation_id" in msg
-                    and "title" in msg
-                )
+            is_partial_index_violation = "ix_conversations_parent_title_unique" in msg or (
+                "unique" in msg and "parent_conversation_id" in msg and "title" in msg
             )
             if is_partial_index_violation:
                 raise NameAlreadyExistsError(

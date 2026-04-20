@@ -216,8 +216,11 @@ def _start_local_server(agent_path: Path, port: int) -> subprocess.Popen[bytes]:
         # in connection blocks (e.g. ${OPENAI_API_KEY}). The subprocess
         # resolves these at spec-parse time, not at runtime.
         env={**os.environ},
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        # Discard stdout/stderr. A PIPE here would deadlock once the
+        # kernel's ~64 KB pipe buffer fills (e.g. under the Codex MCP
+        # notification firehose) because nothing drains it.
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
 
@@ -228,8 +231,7 @@ def _wait_for_server(
     Poll until the server responds.
 
     :param port: The server port.
-    :param server_proc: The server subprocess, used to detect early exit and
-        capture output on failure.
+    :param server_proc: The server subprocess, used to detect early exit.
     :param timeout: Max seconds to wait.
     :raises click.ClickException: If the server doesn't start.
     """
@@ -250,20 +252,15 @@ def _wait_for_server(
 
 def _raise_server_failed(server_proc: subprocess.Popen[bytes]) -> None:
     """
-    Read server output and raise a descriptive error.
+    Raise a descriptive error for a failed server startup.
 
     :param server_proc: The server subprocess.
     :raises click.ClickException: Always.
     """
-    output = ""
-    if server_proc.stdout:
-        raw = server_proc.stdout.read(8192)
-        if raw:
-            output = raw.decode("utf-8", errors="replace").strip()
-    msg = "Server failed to start."
-    if output:
-        msg += f"\n\nServer output:\n{output}"
-    raise click.ClickException(msg)
+    raise click.ClickException(
+        "Server failed to start. Re-run the agent_plane server directly to see its output:\n"
+        f"  {' '.join(server_proc.args) if isinstance(server_proc.args, list) else server_proc.args}"
+    )
 
 
 def _stop_server(proc: subprocess.Popen[bytes]) -> None:

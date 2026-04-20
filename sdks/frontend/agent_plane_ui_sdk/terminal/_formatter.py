@@ -16,6 +16,7 @@ from agent_plane_client import (
     FileBlock,
     NativeToolBlock,
     ReasoningBlock,
+    ReasoningChunk,
     ReasoningStartBlock,
     ResponseEndBlock,
     ResponseStartBlock,
@@ -100,6 +101,8 @@ class RichBlockFormatter:
             return self.format_native_tool(block)
         if isinstance(block, ReasoningStartBlock):
             return self.format_reasoning_start(block)
+        if isinstance(block, ReasoningChunk):
+            return self.format_reasoning_chunk(block)
         if isinstance(block, ReasoningBlock):
             return self.format_reasoning(block)
         if isinstance(block, ErrorBlock):
@@ -162,6 +165,14 @@ class RichBlockFormatter:
                 f"   [{self.accent}]·[/{self.accent}] [{self.muted}]thinking…[/{self.muted}]"
             )
         ]
+
+    def format_reasoning_chunk(self, block: ReasoningChunk) -> list[FormattedItem]:
+        # Stream reasoning live (incremental, like TextChunk) so users
+        # see Codex's commands / model reasoning during the tool-call
+        # window instead of staring at a blank screen for 30 s. Wrap
+        # in dim ANSI codes so reasoning visually distinguishes from
+        # the agent's final prose, which is rendered un-styled.
+        return [StreamingText(text=f"\x1b[2m{block.text}\x1b[0m")]
 
     def format_reasoning(self, block: ReasoningBlock) -> list[FormattedItem]:
         text = block.summary_text or block.reasoning_text

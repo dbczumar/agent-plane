@@ -156,8 +156,30 @@ class ReasoningStartBlock(StreamBlock):
 
 
 @dataclass(kw_only=True)
+class ReasoningChunk(StreamBlock):
+    """An incremental reasoning chunk — analog of :class:`TextChunk`.
+
+    Emitted while reasoning is still in progress so renderers can
+    show live progress (e.g. Codex's command/reasoning stream during
+    the long tool-call window). The eventual :class:`ReasoningBlock`
+    is suppressed when any chunks were emitted, to avoid the
+    formatter re-rendering the same text as a summary panel.
+
+    :param text: The incremental reasoning text, e.g. one flushed
+        line of summary tokens.
+    """
+
+    text: str
+
+
+@dataclass(kw_only=True)
 class ReasoningBlock(StreamBlock):
     """A completed reasoning/thinking block.
+
+    Emitted only when no :class:`ReasoningChunk` was streamed for
+    this reasoning section. Carries the full accumulated reasoning
+    so non-streaming renderers (logs, web UIs that prefer cards)
+    still get a single summary block.
 
     :param reasoning_text: The raw reasoning text.
     :param summary_text: A summary of the reasoning.
@@ -238,6 +260,7 @@ AnyBlock = (
     | TextChunk
     | TextDone
     | ReasoningStartBlock
+    | ReasoningChunk
     | ReasoningBlock
     | ErrorBlock
     | RetryBlock

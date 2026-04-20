@@ -20,15 +20,18 @@ Environment::
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import shutil
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, Union
 from uuid import uuid4
 
+from mcp.types import ServerNotification
+from pydantic import BaseModel, ConfigDict, Field, RootModel
 from typing_extensions import Self
 
 from agent_plane.runtime.executors.base import (
@@ -491,16 +494,84 @@ def _map_tool_called(item: Any) -> ToolCallObserved | None:
 # ── Codex MCP integration (Layer 2) ─────────────────────
 
 
+class _CodexEventMsg(BaseModel):
+    """
+    The ``params.msg`` payload inside a Codex ``codex/event``
+    notification. Codex uses ``msg.type`` as a discriminator for
+    event kinds (``reasoning``, ``exec_command_begin``,
+    ``agent_message_delta``, etc.). All other fields are
+    kind-specific and accepted permissively.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    type: str = ""
+
+
+class _CodexEventParams(BaseModel):
+    """
+    The ``params`` block of a Codex ``codex/event`` notification.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    msg: _CodexEventMsg = Field(default_factory=_CodexEventMsg)
+
+
+class _CodexEventNotification(BaseModel):
+    """
+    Pydantic model for Codex's vendor ``codex/event`` MCP
+    notification. The MCP spec does not define this method, so
+    the Python SDK's default ``ServerNotification`` union rejects
+    it. :class:`_PermissiveServerNotification` adds this variant
+    so the notification reaches the session's message handler
+    instead of being logged-and-dropped.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    method: Literal["codex/event"]
+    params: _CodexEventParams
+
+
+# Extend the default server-notification union with the Codex
+# vendor method. ``_CodexEventNotification`` is listed first so
+# Pydantic matches it before trying the spec variants.
+_PermissiveRoot = Union[  # noqa: UP007 — RootModel needs typing.Union at runtime
+    _CodexEventNotification,
+    ServerNotification.model_fields["root"].annotation,  # type: ignore[misc]
+]
+
+
+class _PermissiveServerNotification(RootModel[_PermissiveRoot]):
+    """
+    Server-notification union that also accepts Codex's vendor
+    ``codex/event`` method. Used as the session's
+    ``_receive_notification_type`` so Codex streaming events
+    pass Pydantic validation and reach the message handler.
+    """
+
+
+_CODEX_REASONING_MSG_TYPES: frozenset[str] = frozenset(
+    {
+        # The model's planning/reasoning text — the thing the
+        # user explicitly wants to see mid-turn.
+        "reasoning",
+        "agent_reasoning",
+        # Shell commands being executed inside Codex — visible
+        # signal of progress that helps explain the wait.
+        "exec_command_begin",
+    },
+)
+
+
 class _CodexSessionRewriter:
     """
-    Tracks Codex ``threadId`` for session continuity.
+    Tracks Codex ``threadId`` for within-turn session continuity.
 
     Filters ``codex-reply`` from tool discovery so the LLM
     only sees ``codex``. Rewrites subsequent ``codex`` calls
-    to ``codex-reply`` with the stored ``threadId``.
-
-    :param thread_id: The current Codex thread ID, or ``None``
-        before the first call.
+    to ``codex-reply`` with the stored ``threadId``. Scoped
+    to a single turn's ``codex mcp-server`` subprocess: a
+    fresh instance is constructed in :func:`_build_agent`
+    each turn because the subprocess is respawned per turn.
     """
 
     def __init__(self) -> None:
@@ -682,23 +753,62 @@ def _make_session_aware_mcp_server(
 ) -> Any:
     """
     Create an ``MCPServerStdio`` subclass instance that
-    intercepts ``call_tool`` for Codex session rewriting.
+
+    - intercepts ``call_tool`` for Codex session rewriting, and
+    - captures Codex's vendor ``codex/event`` notification
+      stream onto ``self.codex_events`` (an ``asyncio.Queue``),
+      so the executor can interleave Codex reasoning/progress
+      with the SDK's event stream.
 
     Uses runtime subclassing so the instance passes all
     ``isinstance`` checks the SDK performs internally.
 
-    :param rewriter: The ``_CodexSessionRewriter`` for this
-        conversation.
-    :param kwargs: Forwarded to ``MCPServerStdio``.
+    :param rewriter: The ``_CodexSessionRewriter`` for this turn.
+    :param kwargs: Forwarded to ``MCPServerStdio``. Must not
+        include ``message_handler`` — this factory wires its own.
     :returns: A session-aware MCP server instance.
     """
     from agents.mcp import MCPServerStdio
 
     class _SessionAware(MCPServerStdio):
         """
-        ``MCPServerStdio`` subclass with ``call_tool``
-        intercepted for Codex session rewriting.
+        ``MCPServerStdio`` subclass that rewrites ``codex`` →
+        ``codex-reply`` and captures ``codex/event`` notifications.
         """
+
+        def __init__(self, **inner_kwargs: Any) -> None:
+            # Queue carrying parsed ``_CodexEventMsg`` payloads —
+            # consumed by the executor in ``_stream_sdk_turn``.
+            # Unbounded: Codex can fire hundreds of events per
+            # tool call; dropping them would defeat the purpose.
+            self.codex_events: asyncio.Queue[_CodexEventMsg] = asyncio.Queue()
+            super().__init__(
+                message_handler=self._handle_message,
+                **inner_kwargs,
+            )
+
+        async def _handle_message(self, message: Any) -> None:
+            """
+            Forward ``codex/event`` notifications onto
+            :attr:`codex_events`. Non-Codex messages are a no-op
+            (the default handler is also a no-op).
+            """
+            root = getattr(message, "root", None)
+            if isinstance(root, _CodexEventNotification):
+                await self.codex_events.put(root.params.msg)
+
+        async def connect(self) -> None:
+            """
+            Connect and replace the session's
+            ``_receive_notification_type`` with the permissive
+            union so Pydantic accepts ``codex/event``. Without
+            this swap, ``BaseSession._receive_loop`` logs a
+            ``ValidationError`` on every event and never calls
+            ``message_handler``.
+            """
+            await super().connect()
+            if self.session is not None:
+                self.session._receive_notification_type = _PermissiveServerNotification
 
         async def call_tool(
             self,
@@ -730,24 +840,13 @@ def _make_session_aware_mcp_server(
     return _SessionAware(**kwargs)
 
 
-# Per-conversation Codex session rewriters. Persisted across
-# tasks so threadId survives between turns.
-_codex_rewriters: dict[str, _CodexSessionRewriter] = {}
-
-
-def _get_or_create_rewriter(
-    conv_id: str,
-) -> _CodexSessionRewriter:
-    """
-    Get or create a session rewriter for a conversation.
-
-    :param conv_id: The conversation identifier, e.g.
-        ``"conv_abc123"``.
-    :returns: The rewriter for this conversation.
-    """
-    if conv_id not in _codex_rewriters:
-        _codex_rewriters[conv_id] = _CodexSessionRewriter()
-    return _codex_rewriters[conv_id]
+# Rewriter lifetime is scoped to a single turn's MCP server:
+# ``MCPServerManager`` spawns a fresh ``codex mcp-server`` process
+# per turn and kills it at turn end, so the ``threadId`` captured
+# from turn N is invalid (``Session not found``) when replayed
+# against the fresh subprocess in turn N+1. Within a turn, multiple
+# codex calls still chain correctly because the subprocess and
+# rewriter share the same lifetime.
 
 
 class AgentsSdkExecutor(Executor):
@@ -833,8 +932,9 @@ class AgentsSdkExecutor(Executor):
 
     def on_task_end(self, context: ExecutorContext) -> None:
         """
-        No-op. Codex session rewriters persist in the module-level
-        ``_codex_rewriters`` dict for session continuity.
+        No-op. Codex session state is scoped to the per-turn MCP
+        server — a fresh rewriter is built in :func:`_build_agent`
+        for each turn's subprocess.
 
         :param context: Agent-plane capabilities and identifiers.
         """
@@ -886,9 +986,11 @@ class AgentsSdkExecutor(Executor):
                 # Replace agent's mcp_servers with the
                 # connected ones from the manager.
                 agent.mcp_servers = mgr.active_servers
+                codex_events = _find_codex_event_queue(mgr.active_servers)
                 async for event in _stream_sdk_turn(
                     agent,
                     input_items,
+                    codex_events=codex_events,
                 ):
                     yield event
         else:
@@ -897,6 +999,25 @@ class AgentsSdkExecutor(Executor):
                 input_items,
             ):
                 yield event
+
+
+def _find_codex_event_queue(
+    active_servers: list[Any],
+) -> asyncio.Queue[_CodexEventMsg] | None:
+    """
+    Return the first connected MCP server's ``codex_events``
+    queue, if any. Returns ``None`` when no Codex MCP is
+    attached to this turn (e.g. an agent with only
+    ``web_search``).
+
+    :param active_servers: The ``MCPServerManager.active_servers``
+        list after ``__aenter__``.
+    """
+    for server in active_servers:
+        queue = getattr(server, "codex_events", None)
+        if isinstance(queue, asyncio.Queue):
+            return queue
+    return None
 
 
 def _build_agent(
@@ -937,9 +1058,7 @@ def _build_agent(
     # Codex MCP for coding tools (Shell, ApplyPatch).
     mcp_servers: list[Any] = []
     if executor._codex_tools:
-        rewriter = _get_or_create_rewriter(
-            context.conversation_id,
-        )
+        rewriter = _CodexSessionRewriter()
         workspace = str(
             context.storage_dir / "workspace",
         )
@@ -976,15 +1095,24 @@ def _build_agent(
 async def _stream_sdk_turn(
     agent: Any,
     input_items: list[dict[str, Any]],
+    codex_events: asyncio.Queue[_CodexEventMsg] | None = None,
 ) -> AsyncIterator[ExecutorEvent]:
     """
-    Run ``Runner.run_streamed()`` and yield executor events.
+    Run ``Runner.run_streamed()`` and yield executor events,
+    interleaving Codex reasoning / progress events from
+    ``codex_events`` when provided.
 
     Handles ``MaxTurnsExceeded`` and generic exceptions,
     converting them to executor event types.
 
     :param agent: The configured Agents SDK ``Agent``.
     :param input_items: Responses API input items.
+    :param codex_events: Per-turn Codex event queue populated by
+        ``_SessionAware._handle_message``. When present,
+        ``codex/event`` payloads (reasoning text, command begin)
+        are surfaced as :class:`ReasoningChunk` events so the
+        TUI can render live progress during the tool call
+        window. ``None`` for agents without Codex tools.
     """
     sdk = _ensure_sdk()
     try:
@@ -993,10 +1121,11 @@ async def _stream_sdk_turn(
             input=input_items,
             max_turns=_SDK_MAX_TURNS,
         )
-        async for event in result.stream_events():
-            mapped = _map_event(event)
-            if mapped is not None:
-                yield mapped
+        async for event in _merge_sdk_and_codex_events(
+            result.stream_events(),
+            codex_events,
+        ):
+            yield event
         yield TurnComplete(text=result.final_output)
     except Exception as exc:
         cls_name = type(exc).__name__
@@ -1008,3 +1137,113 @@ async def _stream_sdk_turn(
                 message=f"Agents SDK error: {exc}",
                 code=cls_name,
             )
+
+
+async def _merge_sdk_and_codex_events(
+    sdk_stream: AsyncIterator[Any],
+    codex_events: asyncio.Queue[_CodexEventMsg] | None,
+) -> AsyncIterator[ExecutorEvent]:
+    """
+    Interleave openai-agents SDK events with Codex
+    ``codex/event`` notifications.
+
+    Keeps one outstanding ``__anext__`` on the SDK stream and
+    one outstanding ``get()`` on the Codex queue, yielding
+    whichever completes first. On SDK exhaustion, cancels the
+    pending Codex task and returns. A one-line race between
+    the two sources; no polling.
+
+    :param sdk_stream: The SDK's async event iterator.
+    :param codex_events: Codex notification queue, or ``None``
+        when the agent has no Codex MCP attached.
+    """
+    if codex_events is None:
+        async for event in sdk_stream:
+            mapped = _map_event(event)
+            if mapped is not None:
+                yield mapped
+        return
+
+    sdk_iter = sdk_stream.__aiter__()
+    sdk_task: asyncio.Task[Any] | None = asyncio.ensure_future(sdk_iter.__anext__())
+    codex_task: asyncio.Task[_CodexEventMsg] | None = asyncio.ensure_future(
+        codex_events.get(),
+    )
+    try:
+        while sdk_task is not None:
+            pending: set[asyncio.Task[Any]] = {sdk_task}
+            if codex_task is not None:
+                pending.add(codex_task)
+            done, _ = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                if task is sdk_task:
+                    try:
+                        sdk_event = task.result()
+                    except StopAsyncIteration:
+                        sdk_task = None
+                        continue
+                    mapped = _map_event(sdk_event)
+                    if mapped is not None:
+                        yield mapped
+                    sdk_task = asyncio.ensure_future(sdk_iter.__anext__())
+                else:
+                    msg: _CodexEventMsg = task.result()
+                    mapped_codex = _codex_msg_to_executor_event(msg)
+                    if mapped_codex is not None:
+                        yield mapped_codex
+                    codex_task = asyncio.ensure_future(codex_events.get())
+    finally:
+        if codex_task is not None and not codex_task.done():
+            codex_task.cancel()
+        if sdk_task is not None and not sdk_task.done():
+            sdk_task.cancel()
+
+
+def _codex_msg_to_executor_event(msg: _CodexEventMsg) -> ExecutorEvent | None:
+    """
+    Map a Codex ``codex/event`` ``msg`` payload to an executor
+    event, or ``None`` to drop.
+
+    Only a small subset is surfaced — the types that actually
+    tell the user what Codex is doing right now:
+
+    - ``reasoning`` / ``agent_reasoning`` → :class:`ReasoningChunk`
+      with the reasoning text. This is the main thing the user
+      asked to see.
+    - ``exec_command_begin`` → :class:`ReasoningChunk` containing
+      the command string as ``$ <cmd>``, so long shell calls
+      don't sit silently.
+
+    All other Codex events (lifecycle, token_count, internal
+    item bookkeeping) are dropped — they'd be noise in the TUI.
+
+    :param msg: The parsed ``msg`` block from a ``codex/event``
+        notification.
+    """
+    if msg.type not in _CODEX_REASONING_MSG_TYPES:
+        return None
+    raw = msg.model_dump()
+    if msg.type == "exec_command_begin":
+        command = raw.get("command")
+        if isinstance(command, list):
+            rendered = " ".join(str(c) for c in command)
+        elif isinstance(command, str):
+            rendered = command
+        else:
+            return None
+        return ReasoningChunk(
+            delta=f"$ {rendered}\n",
+            event_type="reasoning_summary",
+        )
+    # ``reasoning`` / ``agent_reasoning`` — text body lives in one
+    # of a handful of field names depending on Codex build.
+    text = raw.get("text") or raw.get("delta") or raw.get("content") or ""
+    if not isinstance(text, str) or not text:
+        return None
+    return ReasoningChunk(
+        delta=text,
+        event_type="reasoning_summary",
+    )

@@ -19,6 +19,7 @@ from ._blocks import (
     FileBlock,
     NativeToolBlock,
     ReasoningBlock,
+    ReasoningChunk,
     ReasoningStartBlock,
     ResponseEndBlock,
     ResponseStartBlock,
@@ -128,6 +129,14 @@ class BlockStream:
         in_reasoning = False
         reasoning_text = ""
         summary_text = ""
+        # Per-section accumulator for reasoning chunks awaiting a
+        # newline / threshold flush. Mirrors ``accumulated`` for text.
+        reasoning_accumulated = ""
+        # Set when this reasoning section streamed any
+        # ``ReasoningChunk``. The final ``ReasoningBlock`` is then
+        # suppressed so renderers don't show the same text twice
+        # (once live, once as a summary panel).
+        reasoning_chunks_emitted = False
         in_text = False
         accumulated = ""
         full_text = ""
@@ -175,23 +184,61 @@ class BlockStream:
                 in_reasoning = True
                 reasoning_text = ""
                 summary_text = ""
+                reasoning_accumulated = ""
+                reasoning_chunks_emitted = False
                 yield ReasoningStartBlock(ctx=_ctx())
 
-            elif isinstance(event, ReasoningDelta):
-                reasoning_text += event.delta
-
-            elif isinstance(event, ReasoningSummaryDelta):
-                summary_text += event.delta
+            elif isinstance(event, (ReasoningDelta, ReasoningSummaryDelta)):
+                # An out-of-order delta (no preceding ReasoningStarted)
+                # marks an implicit start — Codex's bridged events
+                # arrive this way. Emit the start block once so the
+                # formatter has its "thinking…" anchor.
+                if not in_reasoning:
+                    in_reasoning = True
+                    reasoning_text = ""
+                    summary_text = ""
+                    reasoning_accumulated = ""
+                    reasoning_chunks_emitted = False
+                    yield ReasoningStartBlock(ctx=_ctx())
+                if isinstance(event, ReasoningDelta):
+                    reasoning_text += event.delta
+                else:
+                    summary_text += event.delta
+                # Stream the delta as a ReasoningChunk so the TUI can
+                # render mid-flight. Mirrors the TextDelta line/
+                # threshold flush so chunks land on natural breaks.
+                reasoning_accumulated += event.delta
+                while "\n" in reasoning_accumulated:
+                    line, reasoning_accumulated = reasoning_accumulated.split("\n", 1)
+                    yield ReasoningChunk(text=line + "\n", ctx=_ctx())
+                    reasoning_chunks_emitted = True
+                if len(reasoning_accumulated) >= self._flush_threshold:
+                    last_space = reasoning_accumulated.rfind(" ")
+                    if last_space > 0:
+                        yield ReasoningChunk(
+                            text=reasoning_accumulated[: last_space + 1],
+                            ctx=_ctx(),
+                        )
+                        reasoning_accumulated = reasoning_accumulated[last_space + 1 :]
+                        reasoning_chunks_emitted = True
 
             # ── Text ─────────────────────────────────
             elif isinstance(event, TextDelta):
                 if in_reasoning:
                     in_reasoning = False
-                    yield ReasoningBlock(
-                        reasoning_text=reasoning_text,
-                        summary_text=summary_text,
-                        ctx=_ctx(),
-                    )
+                    if reasoning_accumulated:
+                        yield ReasoningChunk(
+                            text=reasoning_accumulated,
+                            ctx=_ctx(),
+                        )
+                        reasoning_chunks_emitted = True
+                        reasoning_accumulated = ""
+                    if not reasoning_chunks_emitted:
+                        yield ReasoningBlock(
+                            reasoning_text=reasoning_text,
+                            summary_text=summary_text,
+                            ctx=_ctx(),
+                        )
                 # Emit results for tools that completed.
                 for ex in list(pending_tools.values()):
                     if ex.output is not None:
@@ -222,11 +269,19 @@ class BlockStream:
             elif isinstance(event, ToolCall):
                 if in_reasoning:
                     in_reasoning = False
-                    yield ReasoningBlock(
-                        reasoning_text=reasoning_text,
-                        summary_text=summary_text,
-                        ctx=_ctx(),
-                    )
+                    if reasoning_accumulated:
+                        yield ReasoningChunk(
+                            text=reasoning_accumulated,
+                            ctx=_ctx(),
+                        )
+                        reasoning_chunks_emitted = True
+                        reasoning_accumulated = ""
+                    if not reasoning_chunks_emitted:
+                        yield ReasoningBlock(
+                            reasoning_text=reasoning_text,
+                            summary_text=summary_text,
+                            ctx=_ctx(),
+                        )
                 if in_text:
                     if accumulated:
                         yield TextChunk(text=accumulated, ctx=_ctx())
@@ -272,11 +327,19 @@ class BlockStream:
             elif isinstance(event, MessageDone):
                 if in_reasoning:
                     in_reasoning = False
-                    yield ReasoningBlock(
-                        reasoning_text=reasoning_text,
-                        summary_text=summary_text,
-                        ctx=_ctx(),
-                    )
+                    if reasoning_accumulated:
+                        yield ReasoningChunk(
+                            text=reasoning_accumulated,
+                            ctx=_ctx(),
+                        )
+                        reasoning_chunks_emitted = True
+                        reasoning_accumulated = ""
+                    if not reasoning_chunks_emitted:
+                        yield ReasoningBlock(
+                            reasoning_text=reasoning_text,
+                            summary_text=summary_text,
+                            ctx=_ctx(),
+                        )
                 if in_text:
                     if accumulated:
                         yield TextChunk(text=accumulated, ctx=_ctx())
@@ -315,11 +378,19 @@ class BlockStream:
             ):
                 if in_reasoning:
                     in_reasoning = False
-                    yield ReasoningBlock(
-                        reasoning_text=reasoning_text,
-                        summary_text=summary_text,
-                        ctx=_ctx(),
-                    )
+                    if reasoning_accumulated:
+                        yield ReasoningChunk(
+                            text=reasoning_accumulated,
+                            ctx=_ctx(),
+                        )
+                        reasoning_chunks_emitted = True
+                        reasoning_accumulated = ""
+                    if not reasoning_chunks_emitted:
+                        yield ReasoningBlock(
+                            reasoning_text=reasoning_text,
+                            summary_text=summary_text,
+                            ctx=_ctx(),
+                        )
                 if in_text:
                     if accumulated:
                         yield TextChunk(text=accumulated, ctx=_ctx())
