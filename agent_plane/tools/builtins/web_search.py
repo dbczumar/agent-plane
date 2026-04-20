@@ -131,6 +131,32 @@ class WebSearchTool(Tool):
             },
         }
 
+    def is_async(self) -> bool:
+        """
+        Run web search in a background workflow.
+
+        The provider HTTP round-trip (Google / Perplexity)
+        typically takes 1–3 s, sometimes longer. Returning
+        ``True`` lets the runtime dispatch each call as a
+        ``kind="tool"`` background workflow, return a
+        ``{task_id, kind: "tool"}`` handle to the LLM
+        immediately, and deliver the eventual result via the
+        unified ``async_work_complete`` drain — so the LLM can
+        fan out multiple parallel searches in a single turn
+        instead of serializing them.
+
+        For OpenAI mode this method is never consulted: the
+        passthrough emits a native ``web_search_preview`` item
+        the provider executes server-side, so no
+        ``function_call`` reaches the workflow's tool-dispatch
+        path. ``invoke()`` is also never called in OpenAI mode
+        (it raises if it ever is).
+
+        :returns: ``True`` — every reachable invocation should
+            run async.
+        """
+        return True
+
     def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
         Execute a web search query.
