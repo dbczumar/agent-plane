@@ -128,16 +128,25 @@ def test_async_terminal_cancel_stops_sleep(
     http_client: httpx.Client,
     terminal_test_agent: str,
 ) -> None:
-    """The LLM can cancel a running async terminal command.
+    """The LLM can cancel a running async terminal command and
+    observe the cancelled status via check_task.
 
     Agent is instructed to start a long sleep in the background,
-    then immediately cancel it. If cancel_task's terminal-kind
-    branch is broken, the sleep runs to natural completion and the
-    whole task takes ~60s. With cancel working, task finishes in
-    a few seconds.
+    immediately cancel it, then poll via check_task with wait_ms
+    so it sees the post-cancel status directly. Terminals are
+    no longer in ``_DRAIN_KINDS`` (see
+    designs/PERSISTENT_TERMINAL_RESEARCH.md §6.12), so the
+    "[System: task X cancelled]" auto-delivery is gone — the
+    agent polls explicitly.
 
-    Verified observationally (total task time) AND by looking for
-    the "(terminal) cancelled" system message.
+    Failure modes caught:
+    - cancel_task's terminal-kind branch doesn't interrupt the
+      sleep (check_task sees 'completed' after the full 60s or
+      times out the wait_ms budget with 'in_progress').
+    - SIGINT reaches bash but status classification is wrong
+      (check_task sees 'completed' instead of 'cancelled').
+    - Elapsed timing check confirms cancel actually short-
+      circuited the sleep rather than waiting it out.
     """
     import time as _time
 
@@ -151,7 +160,10 @@ def test_async_terminal_cancel_stops_sleep(
                 "shell='default', synchronous=false. "
                 "Step 2: IMMEDIATELY call cancel_task with the "
                 "task_id that terminal_run returned. "
-                "Step 3: say 'cancelled'. "
+                "Step 3: call check_task with the same task_id and "
+                "wait_ms=15000 so the tool blocks long enough for "
+                "the cancellation to finalize in the workflow. "
+                "Step 4: say 'cancelled'. "
                 "Do NOT write any commentary before the tool calls."
             ),
             "background": True,
@@ -162,41 +174,46 @@ def test_async_terminal_cancel_stops_sleep(
     final = poll_until_terminal(http_client, response_id, timeout=180)
     elapsed = _time.monotonic() - start
     assert final["status"] == "completed", f"Task failed: {final.get('error')}"
-    # The primary correctness check is below (cancelled system
-    # message). The timing assertion is a secondary signal: if
-    # cancel failed entirely, we'd wait ~60s (sleep) PLUS the
-    # 3-4 LLM roundtrips (~40s on gpt-5.4 medium reasoning), so
-    # 90+s. A working cancel path finishes in 40-75s depending on
-    # LLM latency variance. 90s is the boundary that catches
-    # regression without flaking on normal LLM latency swings.
+    # Timing check: without a working cancel, the sleep runs to
+    # natural completion (~60s) plus LLM roundtrips (~40s on gpt-
+    # 5.4 medium). With cancel working, the path is cancel → SIGINT
+    # → shell exits ~immediately, then just LLM latency. 90s is
+    # the regression boundary — past 90s means we waited out the
+    # sleep.
     assert elapsed < 90, (
         f"Task took {elapsed:.1f}s — cancel likely didn't interrupt "
-        f"the sleep (expected <90s with working cancel; full sleep "
-        f"60 + LLM roundtrips would push past 90s)."
+        f"the sleep (expected <90s; full sleep 60 + LLM roundtrips "
+        f"would push past 90s)."
     )
 
-    # Primary correctness check: the cancelled-terminal system
-    # message must appear. If cancel_task's terminal branch failed
-    # to flip status, we'd see '(terminal) completed' instead.
-    conv_id = final["conversation"]["id"]
-    items_resp = http_client.get(
-        f"/v1/conversations/{conv_id}/items",
-        params={"limit": 100},
-    )
-    items = items_resp.json()["data"]
-    system_messages: list[str] = []
-    for item in items:
-        if item.get("type") != "message" or item.get("role") != "user":
+    # Primary correctness check: the check_task function_call_output
+    # reports status='cancelled'. If cancel_task's terminal branch
+    # failed to flip the workflow status, we'd see 'completed' or
+    # 'in_progress' here — both are clear regression signals.
+    check_payloads: list[dict[str, Any]] = []
+    for item in final.get("output", []):
+        if item.get("type") != "function_call_output":
             continue
-        for block in item.get("content", []):
-            text = block.get("text") or ""
-            if text.startswith("[System: task"):
-                system_messages.append(text)
-    assert any("(terminal) cancelled" in m for m in system_messages), (
-        f"Expected a '[System: task X (terminal) cancelled]' system "
-        f"message in the conversation, got {system_messages!r}. "
-        f"If 'completed' instead, cancel didn't propagate to the "
-        f"workflow's status translation."
+        raw = item.get("output") or ""
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict) and parsed.get("kind") == "terminal":
+            check_payloads.append(parsed)
+    assert check_payloads, (
+        f"No check_task function_call_output with kind='terminal'. "
+        f"The LLM didn't poll via check_task even though the prompt "
+        f"instructed it to. Outputs: "
+        f"{[(i.get('type'), (i.get('output') or '')[:80]) for i in final.get('output', [])]}"
+    )
+    assert any(co.get("status") == "cancelled" for co in check_payloads), (
+        f"No check_task saw the task in 'cancelled' status. "
+        f"Statuses observed: "
+        f"{[co.get('status') for co in check_payloads]}. If all "
+        f"'in_progress', wait_ms=5000 expired before the cancel "
+        f"finalized (SIGINT path too slow). If 'completed', SIGINT "
+        f"didn't flip the status (sleep ran to completion)."
     )
 
 

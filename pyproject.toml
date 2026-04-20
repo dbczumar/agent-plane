@@ -23,6 +23,14 @@ dependencies = [
     # completion via OSC 633 markers. See
     # designs/PERSISTENT_TERMINAL_RESEARCH.md.
     "pexpect>=4.9,<5",
+    # pyte: in-process terminal emulator that consumes the raw PTY
+    # byte stream and maintains a rendered 2D screen. Used by the
+    # persistent-terminal tool so interactive programs (vim, less,
+    # htop) are addressable — agents read ``screen`` alongside the
+    # streaming ``recent_activity`` in ``check_task`` and
+    # ``terminal_send_input``. See
+    # designs/PERSISTENT_TERMINAL_RESEARCH.md §6.2.
+    "pyte>=0.8,<1",
     "prompt_toolkit>=3.0",
     "pydantic>=2.0,<3",
     "pyyaml>=6.0,<7",

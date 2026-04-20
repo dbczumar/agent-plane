@@ -27,6 +27,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pexpect
+import pyte
 
 from agent_plane.terminals._sandbox import (
     build_srt_config,
@@ -85,6 +86,21 @@ _TAIL_CHARS = 10_000
 # relative so the path shown in stdout markers is workspace-relative
 # and copy-pasteable into ``cat`` / ``Read``-style tools.
 _DISK_LOG_SUBDIR = Path(".agent_plane") / "terminal"
+
+# Rendered-screen dimensions for the pyte HistoryScreen. Generous on
+# both axes so interactive programs (vim, less, htop, long
+# `grep --color` output) lay out without wrapping too aggressively,
+# but bounded so a single rendered screen fits well under
+# :data:`_INLINE_CAP_CHARS`. The PTY is resized to match via
+# ``proc.setwinsize`` on spawn — programs inside will render for
+# these dimensions.
+_SCREEN_COLS = 160
+_SCREEN_ROWS = 50
+
+# Lines of scrollback pyte retains above the visible screen. Exposed
+# only through the ``screen`` view today; bounded so a very chatty
+# program can't unbounded-grow the in-memory buffer.
+_SCREEN_HISTORY_LINES = 1_000
 
 
 @dataclasses.dataclass(frozen=True)
@@ -193,6 +209,30 @@ class Shell:
         # interrupt-arrival signal is visible across threads without
         # needing a separate lock.
         self._interrupt_signal = threading.Event()
+        # pyte emulator — fed the same bytes as the ring buffer on
+        # every PTY read. Exposes a rendered 2D screen view via
+        # :meth:`rendered_screen` for interactive programs (vim,
+        # less, htop) where raw stdout is mostly cursor codes. The
+        # ring buffer remains authoritative for scripted-command
+        # output where ANSI-stripping is the right answer; pyte is
+        # an additive view, not a replacement.
+        #
+        # ``HistoryScreen`` keeps N lines above the visible region so
+        # programs that scroll (e.g. long `make` output in an
+        # interactive shell) don't lose context. Size / history
+        # bounded by module constants.
+        self._pyte_screen = pyte.HistoryScreen(
+            columns=_SCREEN_COLS,
+            lines=_SCREEN_ROWS,
+            history=_SCREEN_HISTORY_LINES,
+        )
+        self._pyte_stream = pyte.ByteStream(self._pyte_screen)
+        # Guards both ``_pyte_stream.feed`` (called from the PTY
+        # read loop) and ``rendered_screen`` (called from any
+        # thread). pyte itself is not thread-safe — feeding from
+        # one thread while reading ``screen.display`` from another
+        # would tear the 2D buffer mid-render.
+        self._pyte_lock = threading.Lock()
 
     @property
     def name(self) -> str:
@@ -287,6 +327,15 @@ class Shell:
         # Disable local echo so command text doesn't appear in captured
         # stdout between marker boundaries.
         proc.setecho(False)
+        # Size the PTY to match the pyte screen dimensions. Programs
+        # that query the TTY size (vim, less, htop, anything using
+        # ``tput cols``) will lay out for this viewport; without the
+        # call they see whatever the parent's controlling TTY used
+        # (often 80x24 from pexpect's default) which can produce
+        # truncated/wrapped rendering that pyte then re-wraps
+        # awkwardly. Signalling the resize once at spawn is the
+        # simplest contract — no dynamic resize story needed yet.
+        proc.setwinsize(_SCREEN_ROWS, _SCREEN_COLS)
 
         try:
             proc.expect(_D_MARKER, timeout=_SPAWN_READY_TIMEOUT_S)
@@ -553,6 +602,31 @@ class Shell:
             except pexpect.exceptions.EOF:
                 return "crashed"
             self._ring.append(chunk)
+            # Feed the same chunk to pyte so ``rendered_screen``
+            # stays current. pyte stream mutations must hold
+            # ``_pyte_lock`` so readers on other threads (check_task,
+            # terminal_send_input) don't tear mid-render.
+            #
+            # pyte has known gaps on some escape sequences (e.g. it
+            # dispatches private-mode SGR — ``\x1b[?...m`` — with
+            # ``private=True``, which ``Screen.select_graphic_rendition``
+            # doesn't accept; programs like vim emit these). Any
+            # feed() exception is purely a rendering concern — the
+            # ring buffer has the authoritative bytes — so we swallow
+            # it and keep reading. Otherwise a single odd escape
+            # sequence kills the entire command's read loop,
+            # surfacing as a workflow failure with no recovery.
+            with self._pyte_lock:
+                try:
+                    self._pyte_stream.feed(chunk)
+                except Exception:
+                    # Fall through: rendered screen may be stale
+                    # or partial, but the command continues. We
+                    # deliberately don't log each occurrence —
+                    # pyte stumbles often enough on real-world
+                    # terminal output that a per-chunk log would
+                    # flood the server log.
+                    pass
             if _D_MARKER.search(self._ring.bytes()):
                 return "completed"
 
@@ -758,42 +832,156 @@ class Shell:
             self._interrupt_children()
 
     def _interrupt_children(self) -> None:
-        """SIGINT every direct child of the bash subprocess.
+        """SIGINT every LEAF descendant of the spawned subprocess.
 
-        Helper for :meth:`interrupt`. Lists children via ``pgrep -P``
-        (portable across Linux and macOS), then sends SIGINT to each.
-        No-op if bash has no children (idle at prompt). Exceptions
-        from ``pgrep`` (e.g. not installed) or ``os.kill``
-        (e.g. child exited between listing and kill) are swallowed —
-        interrupt is best-effort; if the child is already gone,
-        there's nothing to interrupt.
+        Walks the process tree from ``self._proc.pid`` and signals
+        only PIDs that have no children of their own (leaves).
+        This reaches the actual foreground command (e.g. sleep)
+        while leaving intermediate shells (bash, and the node
+        srt wrapper) alone. Signalling bash at an idle prompt is
+        fatal under pexpect's non-interactive spawn — it kills the
+        whole shell and forces a subsequent ``shell_crashed``
+        result. Signalling only leaves avoids that failure mode
+        while still getting the command killed.
 
-        Why not ``killpg``: bash spawned by pexpect doesn't always
-        create a new process group for each foreground command, so
-        killpg would go to bash's own group (including bash) and
-        kill the shell.
+        Under the srt sandbox: ``self._proc`` is the node wrapper,
+        node's child is bash, bash's child is the command. Only
+        the command is a leaf, so only the command gets signalled.
+
+        Exceptions from ``pgrep`` (not installed) or ``os.kill``
+        (child exited between listing and kill) are swallowed —
+        interrupt is best-effort.
         """
-        try:
-            result = subprocess.run(
-                ["pgrep", "-P", str(self._proc.pid)],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-        except (subprocess.SubprocessError, FileNotFoundError):
-            return
-        for token in result.stdout.split():
+        leaves = self._collect_leaf_descendant_pids(self._proc.pid)
+        for leaf_pid in leaves:
             try:
-                child_pid = int(token)
-            except ValueError:
-                continue
-            try:
-                os.kill(child_pid, signal.SIGINT)
+                os.kill(leaf_pid, signal.SIGINT)
             except (ProcessLookupError, PermissionError):
-                # Child exited between pgrep and kill, or we don't
-                # own it (shouldn't happen for our own bash). Either
-                # way, nothing to interrupt; ignore and continue.
                 continue
+
+    @staticmethod
+    def _collect_leaf_descendant_pids(root_pid: int) -> list[int]:
+        """Return every leaf PID under ``root_pid`` (no children of its own).
+
+        BFS through the process subtree using ``pgrep -P``; yield
+        every PID that has no listed children. Excludes ``root_pid``
+        itself even if it's leaf-shaped (callers of this helper
+        specifically want to skip the root). Bounded by a visited
+        set for defensive PID-reuse protection.
+
+        :param root_pid: The parent PID to start from.
+        :returns: List of leaf PIDs in discovery order. Empty if
+            the root has no children or ``pgrep`` is unavailable.
+        """
+        leaves: list[int] = []
+        queue: list[int] = [root_pid]
+        seen: set[int] = {root_pid}
+        is_root = True
+        while queue:
+            parent = queue.pop(0)
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-P", str(parent)],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+            except (subprocess.SubprocessError, FileNotFoundError):
+                break
+            children_tokens = result.stdout.split()
+            if not children_tokens and not is_root:
+                # parent has no children → it's a leaf (and not the
+                # root we started from).
+                leaves.append(parent)
+            for token in children_tokens:
+                try:
+                    child = int(token)
+                except ValueError:
+                    continue
+                if child in seen:
+                    continue
+                seen.add(child)
+                queue.append(child)
+            is_root = False
+        return leaves
+
+    def rendered_screen(self) -> str:
+        """Return the pyte-rendered screen as text lines joined by newlines.
+
+        Used by ``check_task`` and ``terminal_send_input`` on
+        ``kind="terminal"`` tasks so the agent can see the current
+        view of a full-screen program (vim, less, htop) — i.e.
+        "what a human would see on the terminal right now."
+        Complementary to :meth:`peek_partial_stdout`, which returns
+        the streaming byte delta; screen vs. stream is useful in
+        different regimes (alt-screen apps vs. log streams).
+
+        Rendered lines are right-stripped of trailing whitespace to
+        trim the padding pyte writes to fill each row out to the
+        configured column width. Empty trailing rows are left in
+        place so the 2D shape is preserved — the agent can infer
+        screen size from the output.
+
+        Thread-safe: holds :data:`_pyte_lock` for the duration of
+        the render so the read loop's ``stream.feed`` call cannot
+        mutate the screen mid-read.
+
+        :returns: The rendered screen as ``\\n``-separated lines.
+            Always exactly :data:`_SCREEN_ROWS` lines; lines may be
+            empty. Empty string is only possible on a brand-new
+            shell that has never received output (pyte initializes
+            all cells to space).
+        """
+        with self._pyte_lock:
+            # ``display`` is a list of _SCREEN_ROWS strings, each of
+            # length _SCREEN_COLS (pyte always returns a full grid).
+            # rstrip each row to remove the right-padding spaces
+            # pyte emits; keep intra-line whitespace.
+            return "\n".join(line.rstrip() for line in self._pyte_screen.display)
+
+    def total_bytes_written(self) -> int:
+        """Return the ring buffer's cumulative byte-count.
+
+        Monotonically non-decreasing; advances every time the
+        read loop appends a chunk. Used by the terminal-send-input
+        tool for quiescence detection (wait until this counter
+        stops moving) without touching per-task cursors.
+
+        :returns: Total bytes ever written to this shell's ring
+            buffer, including bytes subsequently evicted.
+        """
+        return self._ring.total_appended
+
+    def send_input(self, chars: str) -> None:
+        """Write ``chars`` to the PTY so the foreground program reads it.
+
+        Used by ``terminal_send_input`` to drive interactive
+        programs running under an async ``terminal_run``. The bytes
+        go to the PTY master; the kernel tty layer forwards them to
+        whichever process has foreground control (typically the
+        command the agent launched, e.g. ``vim``, not bash itself).
+        Control characters and escape sequences are passed through
+        literally — callers send ``"\\u0003"`` for Ctrl-C,
+        ``"\\u001b"`` for Escape, etc.
+
+        Thread-safe: ``pexpect.spawn.send`` writes a string to the
+        PTY file descriptor, which is a single ``write(2)`` under
+        the hood. Safe to call from any thread concurrently with
+        ``run_sync``'s read loop, which only reads from the PTY.
+        Does NOT acquire :data:`_cmd_lock` — the lock guards
+        command boundaries, not the stream direction.
+
+        :param chars: Bytes (as a string) to write to stdin. Empty
+            string is a no-op (the caller may pass it to poll for
+            output via ``terminal_send_input`` with
+            ``yield_time_ms`` only).
+        """
+        if not chars:
+            return
+        # ``send`` with ``encoding=None`` on spawn expects bytes.
+        # Encode UTF-8 defensively; the PTY layer treats the stream
+        # as bytes and the caller gave us a Python str.
+        self._proc.send(chars.encode("utf-8"))
 
     def peek_partial_stdout(self, cursor: int) -> PartialReadResult:
         """Return stdout bytes produced since ``cursor``, ANSI-stripped.

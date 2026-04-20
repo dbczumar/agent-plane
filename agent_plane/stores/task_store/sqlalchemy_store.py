@@ -170,6 +170,24 @@ def _apply_workflow_status(task: Task, wf_status: WorkflowStatus) -> Task:
         task.output = result["output"]
         task.usage = result.get("usage")
         task.completed_at = result.get("completed_at")
+        # Business-level status override: some workflows (notably the
+        # terminal async path with its in-process SIGINT cancel)
+        # return NORMALLY from DBOS's perspective but carry a
+        # ``status`` field in the payload that overrides the
+        # SUCCESS → COMPLETED mapping. For terminal kind, SIGINT
+        # produces ``status="cancelled"`` and a timeout produces
+        # ``status="failed"``; both should surface to check_task /
+        # list_tasks as the payload says, not as "completed".
+        payload_status = result.get("status")
+        if payload_status in {
+            TaskStatus.CANCELLED.value,
+            TaskStatus.FAILED.value,
+        }:
+            task.status = payload_status
+            if payload_status == TaskStatus.FAILED.value:
+                payload_error = result.get("error")
+                if isinstance(payload_error, dict):
+                    task.error = payload_error
 
     if task.status == TaskStatus.FAILED and wf_status.error is not None:
         task.error = {

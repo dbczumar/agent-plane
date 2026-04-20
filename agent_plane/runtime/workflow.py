@@ -127,10 +127,23 @@ _TOOL_KIND = "tool"
 _SUB_AGENT_KIND = "sub_agent"
 _TERMINAL_KIND = "terminal"
 # Kinds whose completion arrives via the async_work_complete drain
-# (Phase 2: tools; Phase 3: sub-agents; Phase 2+ terminal: async
-# terminal_run commands). The legacy "agent_task" kind is the
-# top-level user turn — always tracked separately.
-_DRAIN_KINDS = frozenset({_TOOL_KIND, _SUB_AGENT_KIND, _TERMINAL_KIND})
+# and that can block the parent turn from finalizing. Tools and
+# sub-agents belong here: they represent jobs the parent expects
+# to finish, and blocking the turn so the LLM sees the result in-
+# line is a real UX win.
+#
+# Terminals are NOT in this set. An async ``terminal_run`` may be
+# either a short job (``sleep 5``) or a long-lived session
+# (``python3 -i``, ``vim``, ``bash``). We can't tell up front, and
+# making the turn block on a session that never ends produces a
+# deadlock (see designs/PERSISTENT_TERMINAL_RESEARCH.md §6.12).
+# Instead, agents poll via ``check_task(task_id, wait_ms=...)`` —
+# the tool holds a bounded DBOS wait under the hood — so the "I
+# want to wait for this to finish" use case is still cheap without
+# risking a runaway turn. When a terminal workflow does complete,
+# its final status is persisted into DBOS by the workflow itself
+# and surfaced through the next ``check_task`` call.
+_DRAIN_KINDS = frozenset({_TOOL_KIND, _SUB_AGENT_KIND})
 
 # Per-payload character cap for sub-agent output piggy-backed on
 # the async_work_complete signal (matches the @tool path's

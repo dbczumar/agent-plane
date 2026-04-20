@@ -152,6 +152,18 @@ def _create_terminal_close(config: dict[str, str]) -> Tool:
     return TerminalCloseTool()
 
 
+def _create_terminal_send_input(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for :class:`TerminalSendInputTool`.
+
+    :param config: Tool config (unused).
+    :returns: A TerminalSendInputTool instance.
+    """
+    from agent_plane.tools.builtins.terminal import TerminalSendInputTool
+
+    return TerminalSendInputTool()
+
+
 # Canonical set of all builtin tool names that agents can enable
 # via ``tools.builtins`` in config.yaml. Used for discovery (e.g.
 # by the onboarding assistant's list_builtin_tools).
@@ -163,6 +175,7 @@ BUILTIN_NAMES: frozenset[str] = frozenset(
         "terminal_run",
         "terminal_list",
         "terminal_close",
+        "terminal_send_input",
         "upload_file",
         "list_files",
         "download_file",
@@ -179,6 +192,7 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory] = {
     "terminal_run": _create_terminal_run,
     "terminal_list": _create_terminal_list,
     "terminal_close": _create_terminal_close,
+    "terminal_send_input": _create_terminal_send_input,
     "upload_file": _create_upload_file,
     "list_files": _create_list_files,
     "download_file": _create_download_file,

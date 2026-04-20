@@ -495,3 +495,115 @@ def test_register_overwrite_resets_cursor(
     # The invariant here is just: peek didn't error, cursor moved
     # forward from 0.
     assert isinstance(peek.text, str)
+
+
+def test_send_input_to_task_unknown_returns_none(
+    manager: TerminalManager,
+) -> None:
+    """Unknown task_id → ``None`` (not exception).
+
+    Lets the tool layer distinguish "shell gone" from "input
+    silently dropped." If this raised, the LLM would see a
+    generic error and the UX for "this task is already done"
+    would be worse.
+    """
+    assert manager.send_input_to_task("never-registered", "hi\n") is None
+
+
+def test_send_input_to_task_empty_chars_returns_shell_when_registered(
+    manager: TerminalManager,
+) -> None:
+    """Empty-chars poll still returns the :class:`Shell` when registered.
+
+    The tool uses the returned Shell to render the final screen —
+    ``chars=""`` needs to look up and return the shell without
+    writing anything, so the pure-poll path still produces a
+    ``screen`` in the response.
+    """
+    from agent_plane.terminals.shell import Shell as _Shell
+
+    manager.run_sync("sh1", "echo warmup")
+    manager.register_running_task("tid-poll", "sh1")
+    try:
+        result = manager.send_input_to_task("tid-poll", "")
+        assert isinstance(result, _Shell)
+    finally:
+        manager.unregister_running_task("tid-poll")
+
+
+def test_send_input_to_task_writes_to_running_shell(
+    manager: TerminalManager,
+) -> None:
+    """send_input dispatched by task_id reaches the right shell.
+
+    End-to-end wiring test: start ``cat`` in a background thread
+    on one shell, dispatch input via the manager keyed by task_id,
+    verify the stdout reflects our bytes. If the task→shell map is
+    broken, ``cat`` would time out waiting for input.
+    """
+    import threading
+    import time
+
+    from agent_plane.terminals.shell import Shell as _Shell
+
+    manager.run_sync("worker", "echo warmup")
+    manager.register_running_task("tid-cat", "worker")
+
+    result: list[object] = []
+
+    def _runner() -> None:
+        result.append(manager.run_sync("worker", "cat", timeout_ms=10_000))
+
+    t = threading.Thread(target=_runner)
+    t.start()
+    try:
+        time.sleep(0.3)
+        returned = manager.send_input_to_task("tid-cat", "routed\n")
+        assert isinstance(returned, _Shell), (
+            f"Expected a Shell back from send_input_to_task, got {returned!r}"
+        )
+        time.sleep(0.1)
+        manager.send_input_to_task("tid-cat", "\x04")  # EOF
+        t.join(timeout=5.0)
+        assert result, "cat didn't return"
+        assert "routed" in result[0].stdout  # type: ignore[attr-defined]
+    finally:
+        manager.unregister_running_task("tid-cat")
+
+
+def test_rendered_screen_for_task_unknown_returns_none(
+    manager: TerminalManager,
+) -> None:
+    """Unknown task → None. Mirrors peek_task_stdout's shape."""
+    assert manager.rendered_screen_for_task("never-registered") is None
+
+
+def test_rendered_screen_for_task_returns_screen_from_right_shell(
+    manager: TerminalManager,
+) -> None:
+    """The screen we get back is the screen of the task's shell.
+
+    Writes distinguishing output on two different shells, each
+    with its own task_id, and confirms the lookup returns the
+    right one. If the task→shell map is keyed wrong (e.g. by
+    shell name rather than task id), this test catches it.
+    """
+    import time
+
+    manager.run_sync("shell-a", "echo AAAAA-uniq")
+    manager.run_sync("shell-b", "echo BBBBB-uniq")
+    manager.register_running_task("tid-a", "shell-a")
+    manager.register_running_task("tid-b", "shell-b")
+    try:
+        time.sleep(0.1)  # let pyte catch up
+        screen_a = manager.rendered_screen_for_task("tid-a")
+        screen_b = manager.rendered_screen_for_task("tid-b")
+        assert screen_a is not None and "AAAAA-uniq" in screen_a
+        assert screen_b is not None and "BBBBB-uniq" in screen_b
+        # Cross-contamination check: each shell should only show
+        # its own marker.
+        assert "BBBBB-uniq" not in screen_a
+        assert "AAAAA-uniq" not in screen_b
+    finally:
+        manager.unregister_running_task("tid-a")
+        manager.unregister_running_task("tid-b")

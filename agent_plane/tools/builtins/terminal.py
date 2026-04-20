@@ -486,6 +486,278 @@ class TerminalCloseTool(Tool):
         return json.dumps({"closed": closed, "shell": shell_name})
 
 
+# ── terminal_send_input ───────────────────────────────────────────
+
+# Default wait-for-output budgets. These match OpenAI Agents SDK's
+# ``write_stdin`` defaults (250 ms typing, 5 s polling) — the LLM-
+# ergonomics story is covered in
+# designs/PERSISTENT_TERMINAL_RESEARCH.md §6.12. ``None`` on the
+# ``yield_time_ms`` parameter picks whichever default applies based
+# on whether ``chars`` is empty; explicit values skip the auto-bump.
+_SEND_INPUT_DEFAULT_YIELD_TYPING_MS = 250
+_SEND_INPUT_DEFAULT_YIELD_POLLING_MS = 5_000
+_SEND_INPUT_YIELD_FLOOR_MS = 50
+_SEND_INPUT_YIELD_CEILING_MS = 30_000
+# Inner quiescence window — if no bytes arrive for this long, we
+# break out of the yield loop early. Avoids waiting the full budget
+# when a fast command (``ls``) has already answered. Set lower than
+# the floor to ensure the quiescence path fires for small typing
+# defaults too.
+_SEND_INPUT_QUIESCENCE_WINDOW_MS = 40
+
+_SEND_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "terminal_send_input",
+        "description": (
+            "Send keystrokes/bytes to the stdin of a running async "
+            "terminal_run task — enables driving interactive programs "
+            "(vim, less, sqlite3, read prompts, password dialogs, "
+            "REPLs). Only works on task_ids from "
+            "terminal_run(synchronous=false). After writing, waits up "
+            "to yield_time_ms for the program to react, then returns "
+            "the streaming stdout delta AND the rendered screen so "
+            "you can see what changed in one call. Common escape "
+            "sequences (all JSON-encodable strings): '\\u0003' for "
+            "Ctrl-C, '\\u0004' for Ctrl-D / EOF, '\\u001b' for "
+            "Escape, '\\u001b[A'/'B'/'C'/'D' for Up/Down/Right/Left "
+            "arrows, '\\t' for Tab, '\\n' for Enter, '\\u007f' for "
+            "Backspace. For programs that want text followed by "
+            "Enter, send e.g. '\\n'-terminated text in a single "
+            "call. Pass chars='' to just poll for output without "
+            "typing anything (useful when a command is slowly "
+            "producing output and you want to wait for more)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": (
+                        "Task id returned by a prior "
+                        "terminal_run(synchronous=false) call. The "
+                        "target must still be running — after the "
+                        "task enters a terminal status, further "
+                        "terminal_send_input calls return "
+                        "{'delivered': false, 'reason': "
+                        "'task_no_longer_running'}."
+                    ),
+                },
+                "chars": {
+                    "type": "string",
+                    "description": (
+                        "Bytes (as a string) to write to the task's "
+                        "stdin. Pass '' (empty) to poll for output "
+                        "without typing. Control characters and "
+                        "escape sequences pass through literally — "
+                        "see the tool description for common ones."
+                    ),
+                },
+                "yield_time_ms": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "How long (milliseconds) to wait after "
+                        "writing for the program to produce output "
+                        "before returning. Null (default) picks 250 "
+                        "for non-empty chars (typing latency) or "
+                        "5000 for empty chars (pure poll). Explicit "
+                        "values are clamped to [50, 30000]; explicit "
+                        "values skip the empty-chars auto-bump."
+                    ),
+                    "default": None,
+                },
+            },
+            "required": ["task_id", "chars"],
+        },
+    },
+}
+
+
+def _resolve_yield_time_ms(yield_time_ms: int | None, *, chars_empty: bool) -> int:
+    """Pick the effective yield-time given the caller's argument.
+
+    :param yield_time_ms: Caller's raw input. ``None`` means
+        "pick a default based on intent."
+    :param chars_empty: Whether the caller passed ``chars=""``
+        (pure poll). Used only for the default path; explicit
+        numeric values are honored verbatim (clamped to the
+        module ceiling/floor).
+    :returns: The effective wait budget in milliseconds.
+    """
+    if yield_time_ms is None:
+        return (
+            _SEND_INPUT_DEFAULT_YIELD_POLLING_MS
+            if chars_empty
+            else _SEND_INPUT_DEFAULT_YIELD_TYPING_MS
+        )
+    return max(
+        _SEND_INPUT_YIELD_FLOOR_MS,
+        min(_SEND_INPUT_YIELD_CEILING_MS, yield_time_ms),
+    )
+
+
+class TerminalSendInputTool(Tool):
+    """Write input to a running async ``terminal_run`` task's stdin."""
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"terminal_send_input"``."""
+        return "terminal_send_input"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Same prose as the LLM-facing schema description."""
+        return str(_SEND_INPUT_SCHEMA["function"]["description"])
+
+    def get_schema(self) -> dict[str, Any]:
+        """:returns: The OpenAI schema dict."""
+        return _SEND_INPUT_SCHEMA
+
+    def invoke(self, arguments: str, ctx: ToolContext) -> str:
+        """Write input, wait for a quiescence-bounded response, return state.
+
+        Dispatches via ``TerminalManager.send_input_to_task``, then
+        loops polling the stdout ring buffer until either the
+        ``yield_time_ms`` budget expires or output has gone silent
+        for :data:`_SEND_INPUT_QUIESCENCE_WINDOW_MS`. Returns a
+        shape that mirrors the terminal-kind ``check_task`` payload
+        with an extra ``delivered`` boolean up front so the LLM can
+        quickly see whether the input was even writable.
+
+        :param arguments: JSON with ``task_id`` (required), ``chars``
+            (required), and optional ``yield_time_ms``.
+        :param ctx: Must have ``conversation_id`` populated.
+        :returns: JSON string of shape
+            ``{delivered, task_id, recent_activity?, screen?,
+            reason?}``. ``reason`` is set only when
+            ``delivered=False``.
+        """
+        try:
+            parsed: dict[str, Any] = json.loads(arguments) if arguments else {}
+        except json.JSONDecodeError as exc:
+            return json.dumps({"delivered": False, "reason": f"invalid arguments: {exc}"})
+
+        task_id = parsed.get("task_id")
+        chars = parsed.get("chars", "")
+        yield_time_ms_raw = parsed.get("yield_time_ms")
+        if not isinstance(task_id, str) or not task_id:
+            return json.dumps({"delivered": False, "reason": "task_id is required"})
+        if not isinstance(chars, str):
+            return json.dumps({"delivered": False, "reason": "chars must be a string"})
+
+        err = _validate_ctx(ctx, require_workspace=False)
+        if err is not None:
+            return err
+        assert ctx.conversation_id is not None
+
+        registry = get_terminal_registry()
+        if ctx.conversation_id not in registry.active_conversation_ids():
+            return json.dumps(
+                {
+                    "delivered": False,
+                    "task_id": task_id,
+                    "reason": "shell_unavailable",
+                }
+            )
+        from pathlib import Path
+
+        ws = ctx.workspace if ctx.workspace is not None else Path(".")
+        manager = registry.for_conversation(ctx.conversation_id, ws)
+
+        shell = manager.send_input_to_task(task_id, chars)
+        if shell is None:
+            # Either the task was never registered or its shell was
+            # closed. Either way nothing to write to.
+            return json.dumps(
+                {
+                    "delivered": False,
+                    "task_id": task_id,
+                    "reason": "task_no_longer_running",
+                }
+            )
+
+        effective_yield_ms = _resolve_yield_time_ms(yield_time_ms_raw, chars_empty=not chars)
+        self._wait_for_quiescence(manager, task_id, effective_yield_ms)
+
+        # Render via the :class:`Shell` we captured at send time
+        # rather than looking up by task_id again. Fast
+        # interactions (e.g. ``read`` + ``echo`` completing inside
+        # our yield window) cause the background workflow to
+        # unregister the task before we get here; the shell object
+        # itself outlives the task so its screen + ring buffer
+        # still reflect the final state. This is the whole reason
+        # ``send_input_to_task`` returns the Shell rather than a
+        # bool. peek_task_stdout still goes through the manager so
+        # it can advance the per-task cursor when the task is
+        # still registered; when unregistered we accept losing
+        # that advancement and the LLM leans on ``screen``.
+        delta = manager.peek_task_stdout(task_id)
+        screen = shell.rendered_screen()
+        payload: dict[str, Any] = {
+            "delivered": True,
+            "task_id": task_id,
+        }
+        if delta is not None:
+            text = delta.text
+            if delta.lost_bytes > 0:
+                text = f"[... {delta.lost_bytes} bytes evicted before this poll ...]\n{text}"
+            payload["recent_activity"] = text
+        payload["screen"] = screen
+        return json.dumps(payload)
+
+    def _wait_for_quiescence(
+        self,
+        manager: Any,
+        task_id: str,
+        budget_ms: int,
+    ) -> None:
+        """Spin until ``budget_ms`` elapses or stdout goes idle.
+
+        Uses the ring buffer's monotonic ``total_bytes_written``
+        counter to detect new output. Each iteration: sample the
+        counter, if it grew since the last sample reset the
+        quiescence timer, else if the timer has elapsed return
+        early. This does NOT advance the task's peek cursor, so
+        the final :meth:`peek_task_stdout` call in
+        :meth:`invoke` still sees every byte that arrived during
+        the wait.
+
+        Without an early-return the LLM waits the full budget for
+        fast commands; without a minimum quiescence window we
+        return before even the first byte arrives for slow-to-
+        react programs.
+
+        :param manager: The :class:`TerminalManager` the task lives
+            under.
+        :param task_id: The task to watch.
+        :param budget_ms: Maximum wait in milliseconds.
+        """
+        import time as _time
+
+        deadline = _time.monotonic() + budget_ms / 1000
+        poll_interval = 0.02  # 20 ms; fast enough to catch echoes
+        quiescence_s = _SEND_INPUT_QUIESCENCE_WINDOW_MS / 1000
+        last_count = manager.total_bytes_written_for_task(task_id)
+        if last_count is None:
+            # Task unknown at the start — nothing to wait on.
+            return
+        last_activity = _time.monotonic()
+        while True:
+            now = _time.monotonic()
+            if now >= deadline:
+                return
+            current = manager.total_bytes_written_for_task(task_id)
+            if current is None:
+                # Task unregistered mid-wait.
+                return
+            if current > last_count:
+                last_count = current
+                last_activity = now
+            elif now - last_activity >= quiescence_s:
+                return
+            _time.sleep(poll_interval)
+
+
 # ── shared helpers ────────────────────────────────────────────────
 
 

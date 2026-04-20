@@ -475,6 +475,98 @@ class TerminalManager:
                 return None
             return self._shells.get(shell_name)
 
+    def send_input_to_task(self, task_id: str, chars: str) -> Shell | None:
+        """Write ``chars`` to the PTY of ``task_id``'s shell and return it.
+
+        Used by ``terminal_send_input`` to drive interactive
+        programs running under an async ``terminal_run``. Looks up
+        the shell via the task-registration map
+        (:meth:`register_running_task`) and forwards to
+        :meth:`Shell.send_input`.
+
+        Returning the :class:`Shell` rather than a boolean lets the
+        caller hold a reference past the task's lifecycle — if the
+        program exits during the caller's yield loop and
+        ``_task_shells`` unregisters before the caller builds its
+        response, the shell object itself is still valid for a
+        final ``rendered_screen`` / ring-buffer read. The
+        alternative (re-looking-up by task_id at response time)
+        fails for fast interactions.
+
+        :param task_id: The background task's id.
+        :param chars: Bytes (as a string) to write. Empty strings
+            are allowed — they short-circuit to a non-None return
+            without touching the PTY so callers can use
+            ``terminal_send_input(task_id, chars="")`` as a
+            pure-poll while still requiring a registered shell.
+        :returns: The :class:`Shell` if the task is registered and
+            its shell exists; ``None`` if the task is not
+            registered or its shell has been closed.
+        """
+        with self._lock:
+            shell_name = self._task_shells.get(task_id)
+            if shell_name is None:
+                return None
+            shell = self._shells.get(shell_name)
+            if shell is None:
+                return None
+        # Send outside the manager lock — the PTY write is a syscall
+        # and we don't want to block concurrent shell operations on
+        # the same conversation while it blocks on kernel buffers.
+        shell.send_input(chars)
+        return shell
+
+    def rendered_screen_for_task(self, task_id: str) -> str | None:
+        """Return the pyte-rendered screen of ``task_id``'s shell.
+
+        Used by ``check_task`` and ``terminal_send_input`` on
+        terminal-kind tasks to give the LLM a view of what a full-
+        screen program is currently displaying. Complementary to
+        :meth:`peek_task_stdout`, which returns the streaming text
+        delta.
+
+        :param task_id: The background task's id.
+        :returns: The rendered screen as ``\\n``-separated lines,
+            or ``None`` if the task is unknown (completed,
+            unregistered, or its shell was closed).
+        """
+        with self._lock:
+            shell_name = self._task_shells.get(task_id)
+            if shell_name is None:
+                return None
+            shell = self._shells.get(shell_name)
+            if shell is None:
+                return None
+        # Render outside the manager lock — Shell has its own pyte
+        # lock and manager-lock contention on conversation-level
+        # ops should not block screen reads.
+        return shell.rendered_screen()
+
+    def total_bytes_written_for_task(self, task_id: str) -> int | None:
+        """Return the monotonic total-bytes-written counter for the task's shell.
+
+        Used by :class:`TerminalSendInputTool` for quiescence
+        detection: the tool writes input, then polls this counter
+        until it stops growing for a short window. Unlike
+        :meth:`peek_task_stdout`, this does NOT advance the per-
+        task cursor — that way the final ``peek_task_stdout`` call
+        in the tool's response-build phase still sees every byte
+        written during the wait.
+
+        :param task_id: The background task's id.
+        :returns: The ring buffer's cumulative
+            ``total_appended`` counter for the task's shell, or
+            ``None`` if the task / shell isn't resolvable.
+        """
+        with self._lock:
+            shell_name = self._task_shells.get(task_id)
+            if shell_name is None:
+                return None
+            shell = self._shells.get(shell_name)
+            if shell is None:
+                return None
+        return shell.total_bytes_written()
+
     def peek_task_stdout(self, task_id: str) -> TaskStdoutDelta | None:
         """Return the stdout delta for ``task_id`` since the last peek.
 

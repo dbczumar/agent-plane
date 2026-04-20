@@ -21,6 +21,17 @@ You have these shell tools:
 - `terminal_list()` — list open shells in this conversation.
 - `terminal_close(shell="default")` — close a shell and discard
   its state.
+- `terminal_send_input(task_id, chars, yield_time_ms=None)` —
+  send bytes to the stdin of a running async terminal_run task.
+  Use this to drive interactive programs (vim, less, read
+  prompts, REPLs) after launching them with
+  ``synchronous=false``. Returns both the streaming stdout
+  delta (`recent_activity`) AND the rendered screen (`screen`)
+  so you can see what changed. Common escapes (JSON strings):
+  `"\u0003"`=Ctrl-C, `"\u0004"`=Ctrl-D/EOF, `"\u001b"`=Escape,
+  `"\u001b[A"`/`B`/`C`/`D`=Up/Down/Right/Left arrows, `"\t"`=Tab,
+  `"\n"`=Enter, `"\u007f"`=Backspace.
+  Pass `chars=""` to poll without typing.
 
 **Important**: when the user asks you to run a command, call the
 tool FIRST, then report results. Do not write commentary like

@@ -22,6 +22,8 @@ from agent_plane.tools.builtins.terminal import (
     TerminalCloseTool,
     TerminalListTool,
     TerminalRunTool,
+    TerminalSendInputTool,
+    _resolve_yield_time_ms,
 )
 
 
@@ -290,3 +292,175 @@ def test_close_tool_noop_when_no_manager(
     assert result["closed"] is False
     # No manager was created as a side effect.
     assert registry.active_conversation_ids() == []
+
+
+# ---- terminal_send_input ----------------------------------------
+
+
+def test_send_input_tool_schema_required_fields() -> None:
+    """Schema has task_id and chars required; yield_time_ms optional.
+
+    Regression guard: if the required list changes, the LLM's tool
+    constructor will start failing on valid calls.
+    """
+    schema = TerminalSendInputTool().get_schema()
+    assert schema["function"]["name"] == "terminal_send_input"
+    params = schema["function"]["parameters"]
+    assert sorted(params["required"]) == ["chars", "task_id"]
+    assert "yield_time_ms" in params["properties"]
+
+
+def test_send_input_tool_reports_task_no_longer_running_when_unknown(
+    registry: TerminalManagerRegistry, ctx: ToolContext
+) -> None:
+    """Unknown task_id → ``delivered: false`` with a clear reason.
+
+    Without a manager for the conversation the reason is
+    ``shell_unavailable``; with a manager but no task it's
+    ``task_no_longer_running``. This covers the first (registry
+    empty). The LLM sees a structured outcome rather than an
+    opaque error.
+    """
+    tool = TerminalSendInputTool()
+    out = json.loads(
+        tool.invoke(
+            json.dumps({"task_id": "ghost", "chars": "hi"}),
+            ctx,
+        )
+    )
+    assert out["delivered"] is False
+    assert out["reason"] == "shell_unavailable"
+    assert out["task_id"] == "ghost"
+
+
+def test_send_input_tool_delivers_to_registered_task(
+    registry: TerminalManagerRegistry, ctx: ToolContext
+) -> None:
+    """A registered task_id receives the bytes and the tool returns
+    a delivered=True payload with recent_activity + screen fields.
+
+    Spawns a shell, starts ``cat`` in a thread, registers a
+    task_id, invokes the tool, asserts the response shape AND
+    that the bytes made it through to cat's stdout (via the
+    thread's eventual ``completed`` result).
+    """
+    import threading
+    import time
+
+    manager = registry.for_conversation(
+        ctx.conversation_id,
+        ctx.workspace,
+    )
+    manager.run_sync("default", "echo warmup")
+    manager.register_running_task("tid-send", "default")
+
+    runner_result: list[object] = []
+
+    def _runner() -> None:
+        runner_result.append(manager.run_sync("default", "cat", timeout_ms=10_000))
+
+    t = threading.Thread(target=_runner)
+    t.start()
+    try:
+        time.sleep(0.3)
+        tool = TerminalSendInputTool()
+        resp = json.loads(
+            tool.invoke(
+                json.dumps(
+                    {
+                        "task_id": "tid-send",
+                        "chars": "tool-routed\n",
+                        "yield_time_ms": 500,
+                    }
+                ),
+                ctx,
+            )
+        )
+        assert resp["delivered"] is True
+        assert resp["task_id"] == "tid-send"
+        # The echo of what we typed — cat should have echoed it
+        # back within the 500 ms yield. If the yield was too short
+        # this could flake on slow machines, but 500 ms is
+        # generous for a local echo.
+        assert "tool-routed" in resp.get("recent_activity", ""), (
+            f"Expected 'tool-routed' in recent_activity, got {resp.get('recent_activity')!r}"
+        )
+        # Screen field populated (pyte-rendered view).
+        assert "screen" in resp
+        assert isinstance(resp["screen"], str) and resp["screen"]
+
+        # Finish cat cleanly via EOF so the worker thread exits.
+        tool.invoke(
+            json.dumps({"task_id": "tid-send", "chars": "\x04"}),
+            ctx,
+        )
+        t.join(timeout=5.0)
+    finally:
+        manager.unregister_running_task("tid-send")
+
+
+def test_send_input_tool_empty_chars_is_pure_poll(
+    registry: TerminalManagerRegistry, ctx: ToolContext
+) -> None:
+    """chars="" returns delivered=True + current state, no input written.
+
+    Polling semantics: the tool shouldn't error out when the
+    caller just wants an up-to-date view. Mirrors OpenAI's
+    ``write_stdin(chars="")`` contract.
+    """
+    manager = registry.for_conversation(ctx.conversation_id, ctx.workspace)
+    manager.run_sync("default", "echo poll-warmup")
+    manager.register_running_task("tid-poll", "default")
+    try:
+        tool = TerminalSendInputTool()
+        resp = json.loads(
+            tool.invoke(
+                json.dumps(
+                    {
+                        "task_id": "tid-poll",
+                        "chars": "",
+                        "yield_time_ms": 100,  # short — nothing's arriving
+                    }
+                ),
+                ctx,
+            )
+        )
+        assert resp["delivered"] is True
+        assert resp["task_id"] == "tid-poll"
+    finally:
+        manager.unregister_running_task("tid-poll")
+
+
+# ---- _resolve_yield_time_ms ------------------------------------
+
+
+def test_resolve_yield_time_ms_picks_typing_default_when_none() -> None:
+    """None + non-empty chars → 250 ms (typing default)."""
+    assert _resolve_yield_time_ms(None, chars_empty=False) == 250
+
+
+def test_resolve_yield_time_ms_picks_polling_default_when_empty() -> None:
+    """None + empty chars → 5000 ms (polling default).
+
+    Regression guard for the empty-chars auto-bump: if someone
+    flips the chars_empty default, pure polls would only wait
+    250 ms and miss slow programs.
+    """
+    assert _resolve_yield_time_ms(None, chars_empty=True) == 5000
+
+
+def test_resolve_yield_time_ms_honors_explicit_value_with_empty_chars() -> None:
+    """Explicit integer wins over auto-bump — matches documented behavior.
+
+    OpenAI's resolver force-bumps even explicit values to 5s when
+    chars is empty. We chose to honor the caller; this test is the
+    contract that encodes that choice. If someone adds a bump back,
+    this test catches it.
+    """
+    assert _resolve_yield_time_ms(100, chars_empty=True) == 100
+
+
+def test_resolve_yield_time_ms_clamps_floor_and_ceiling() -> None:
+    """Values below 50 get clamped up; values above 30000 get clamped down."""
+    assert _resolve_yield_time_ms(10, chars_empty=False) == 50
+    assert _resolve_yield_time_ms(60_000, chars_empty=False) == 30_000

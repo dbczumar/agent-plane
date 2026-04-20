@@ -220,26 +220,28 @@ async def test_terminal_run_async_returns_handle_immediately(
 # ── Completion auto-delivers as a system message ──────────────
 
 
-async def test_completed_async_terminal_command_auto_delivers(
+async def test_completed_async_terminal_surfaces_via_check_task(
     client: httpx.AsyncClient,
     mock_llm: ControllableMockClient,
 ) -> None:
-    """After the async terminal command completes, the result
-    appears in the parent's conversation as a ``[System: task ...]``
-    user message.
+    """After an async terminal command completes, ``check_task`` on
+    the handle surfaces ``status="completed"`` and the result.
 
-    Proves the end-to-end drain path:
-    1. Parent dispatches async terminal_run.
-    2. background_terminal_workflow runs the command, sends
-       async_work_complete.
-    3. Parent's drain wakes, formats payload, persists as user
-       message.
-    4. LLM's next iteration sees the message.
+    Since terminals were removed from ``_DRAIN_KINDS`` (turn
+    finalization must not block on sessions that might never end),
+    the agent polls via ``check_task`` rather than receiving an
+    auto-delivered system message. This test exercises that
+    polling contract end-to-end: dispatch → child workflow runs →
+    DBOS persists the result → next LLM turn calls check_task →
+    sees completed + output.
 
     Failure modes caught:
-    - Drain not picking up the signal → task hangs forever.
-    - Payload not formatted → system message missing or malformed.
-    - Terminal kind not recognized by formatter → garbage text.
+    - Background terminal workflow not persisting status to DBOS
+      (check_task would see in_progress forever).
+    - Task-store enrichment from DBOS broken for terminal kind
+      (check_task would see agent_task-like defaults).
+    - check_task's terminal-kind branch dropping ``result`` field
+      on completion (LLM sees status but no output).
     """
     await _create_async_terminal_agent(client)
 
@@ -258,47 +260,98 @@ async def test_completed_async_terminal_command_auto_delivers(
             },
         ],
     )
-    # Second LLM call: the drain injects the completion and re-calls
-    # the LLM. We return a final text.
+
+    # Second LLM call: the LLM polls check_task after the first
+    # turn's terminal_run returned a handle. We pass wait_ms to
+    # let the tool block server-side for the short echo to
+    # complete rather than returning stale in_progress.
+    def _check_task_fn(create_kwargs: dict[str, Any]) -> list[dict[str, str]]:
+        handle_task_id = _extract_terminal_run_task_id(create_kwargs)
+        return [
+            {
+                "call_id": "call_check_terminal",
+                "name": "check_task",
+                "arguments": json.dumps({"task_id": handle_task_id, "wait_ms": 5000}),
+            }
+        ]
+
+    mock_llm.add_call(tool_calls_fn=_check_task_fn)
+    # Third LLM call: final ack after we've inspected the result.
     mock_llm.add_call(text="final: command completed.")
 
     result = await create_test_response(
         client,
         model=_AGENT_NAME,
-        input_text="Run a quick async echo.",
+        input_text="Run a quick async echo and check on it.",
     )
     assert result.status_code == 200
     response_id = result.body["id"]
     body = await _wait_for_completion(client, response_id)
     assert body["status"] == "completed"
 
-    # Fetch the conversation's items and assert a "[System: task ...
-    # (terminal) completed]" message exists with the echo's stdout.
-    conv_id = body["conversation"]["id"]
-    items_resp = await client.get(
-        f"/v1/conversations/{conv_id}/items",
-        params={"limit": 100},
-    )
-    items = items_resp.json()["data"]
-    system_messages = []
-    for item in items:
-        if item.get("type") != "message" or item.get("role") != "user":
+    # The check_task function_call_output should contain status=
+    # "completed" and the echo's stdout. This is the load-bearing
+    # assertion: if the background workflow didn't persist its
+    # result to DBOS, check_task sees in_progress and the test
+    # fails loudly.
+    check_outputs = []
+    for item in body.get("output", []):
+        if item.get("type") != "function_call_output":
             continue
-        for block in item.get("content", []):
-            text = block.get("text") or ""
-            if text.startswith("[System: task"):
-                system_messages.append(text)
-    assert any("(terminal) completed" in m for m in system_messages), (
-        f"Expected a '[System: task X (terminal) completed]' user "
-        f"message after the async drain ran. Got system messages: "
-        f"{system_messages}"
+        raw = item.get("output") or ""
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if parsed.get("kind") == "terminal":
+            check_outputs.append(parsed)
+    assert check_outputs, (
+        f"Expected at least one check_task function_call_output "
+        f"with kind='terminal', got none. Items: "
+        f"{[i.get('type') for i in body.get('output', [])]}"
     )
-    # And the stdout token is in the auto-delivered body — proves
-    # the formatter embedded the terminal result (not just a header).
-    assert any("async-complete-token" in m for m in system_messages), (
-        f"Stdout token missing from system messages — the result "
-        f"payload wasn't formatted with the terminal output. "
-        f"Messages: {system_messages}"
+    completed = [co for co in check_outputs if co.get("status") == "completed"]
+    assert completed, (
+        f"No check_task saw the terminal task in 'completed' "
+        f"status. Observed statuses: "
+        f"{[co.get('status') for co in check_outputs]}. "
+        f"Likely means background_terminal_workflow didn't persist "
+        f"the completion to DBOS, or wait_ms=5000 wasn't long "
+        f"enough for the echo to finish (unlikely — echo is ~1ms)."
+    )
+    result_field = completed[-1].get("result") or ""
+    assert "async-complete-token" in result_field, (
+        f"check_task returned status=completed but the terminal "
+        f"result doesn't contain the echo's stdout token. Got "
+        f"result={result_field!r}. The task_store's DBOS-result "
+        f"enrichment didn't surface the payload, or the formatter "
+        f"dropped it."
+    )
+
+
+def _extract_terminal_run_task_id(create_kwargs: dict[str, Any]) -> str:
+    """Pull the task_id out of a terminal_run's prior
+    function_call_output so the next turn can reference it.
+
+    :param create_kwargs: The litellm-shaped ``create()`` kwargs
+        containing the ``input`` list the mock was called with.
+    :returns: The task_id from the most recent terminal_run handle.
+    :raises AssertionError: If no such handle is in the input.
+    """
+    input_items: list[dict[str, Any]] = create_kwargs.get("input", [])
+    for item in reversed(input_items):
+        if item.get("type") != "function_call_output":
+            continue
+        try:
+            parsed = json.loads(item.get("output") or "")
+        except (ValueError, TypeError):
+            continue
+        tid = parsed.get("task_id")
+        if isinstance(tid, str) and tid and parsed.get("tool_name") == "terminal_run":
+            return tid
+    raise AssertionError(
+        "No terminal_run handle in LLM input; test setup invariant "
+        "broken — the prior turn should have produced one."
     )
 
 
@@ -509,24 +562,29 @@ async def test_cancel_task_interrupts_async_terminal(
     mock_llm: ControllableMockClient,
 ) -> None:
     """``cancel_task`` on a running terminal task SIGINTs the shell
-    and the eventual drain delivers status="cancelled".
+    and ``check_task`` subsequently sees ``status="cancelled"``.
 
     The flow:
     1. Mock LLM kicks off an async ``sleep 30`` via terminal_run.
     2. Mock LLM's next call issues ``cancel_task(task_id)`` using
        the handle from step 1.
     3. Cancel sends SIGINT → bash kills sleep → run_sync returns
-       status="killed" → background workflow sends
-       async_work_complete(status="cancelled").
-    4. Parent drain delivers a "[System: task X (terminal) cancelled]"
-       message; final LLM call acknowledges.
+       status="killed" → background workflow writes
+       status="cancelled" into DBOS.
+    4. Mock LLM's third call polls ``check_task(task_id,
+       wait_ms=…)`` and the tool sees ``status="cancelled"``.
+
+    Terminals are no longer in ``_DRAIN_KINDS`` so the turn does
+    not block on auto-delivery; the agent polls explicitly. See
+    designs/PERSISTENT_TERMINAL_RESEARCH.md §6.12 for rationale.
 
     Failure modes caught:
-    - cancel_task's terminal-kind branch doesn't interrupt (blocks
-      for 30s, test times out).
+    - cancel_task's terminal-kind branch doesn't interrupt
+      (check_task would see running or completed, not cancelled).
     - SIGINT reaches bash but status classification is wrong
       ("completed" instead of "cancelled").
-    - Drain doesn't pick up the cancellation signal.
+    - Background terminal workflow never persists the cancelled
+      status to DBOS (check_task hangs or shows in_progress).
     """
     from agent_plane.runtime.background_tool_workflow import (
         AsyncWorkCompletePayload,  # noqa: F401 — used via check below
@@ -593,15 +651,48 @@ async def test_cancel_task_interrupts_async_terminal(
         ]
 
     mock_llm.add_call(tool_calls_fn=_cancel_fn)
-    # Third LLM call: after cancel_task output arrives, the parent
-    # doesn't immediately finalize — pending async work (the child
-    # terminal workflow) still exists, so the drain blocks here.
-    # Return a bridge text that the parent will persist while it
-    # waits for the drain to deliver the cancellation signal.
-    mock_llm.add_call(text="cancelling now...")
-    # Fourth LLM call: after the drain delivers the "[System: task
-    # ... cancelled]" message, the parent re-invokes the LLM. We
-    # return the final acknowledgement so the workflow finalizes.
+
+    # Third LLM call: after cancel_task's output arrives, poll
+    # check_task with wait_ms so the tool itself blocks briefly
+    # for the child workflow to finalize its cancelled status in
+    # DBOS. Without the drain (terminals aren't in _DRAIN_KINDS
+    # anymore) the parent turn doesn't wait for the child, so the
+    # LLM has to explicitly observe the post-cancel state.
+    def _check_after_cancel_fn(create_kwargs: dict[str, Any]) -> list[dict[str, str]]:
+        """Emit a check_task call pointed at the handle, with a
+        wait_ms budget big enough to cover SIGINT → child workflow
+        finalize → DBOS status update.
+
+        :param create_kwargs: Litellm create() kwargs.
+        :returns: One check_task call.
+        """
+        input_items: list[dict[str, Any]] = create_kwargs.get("input", [])
+        handle_task_id: str | None = None
+        for item in input_items:
+            if item.get("type") != "function_call_output":
+                continue
+            try:
+                parsed = json.loads(item.get("output") or "")
+            except (ValueError, TypeError):
+                continue
+            tid = parsed.get("task_id")
+            if isinstance(tid, str) and tid and parsed.get("tool_name") == "terminal_run":
+                handle_task_id = tid
+                break
+        assert handle_task_id is not None, (
+            f"No terminal_run handle in input; setup invariant broken. "
+            f"Input items: {[i.get('type') for i in input_items]}"
+        )
+        return [
+            {
+                "call_id": "call_check_after_cancel",
+                "name": "check_task",
+                "arguments": json.dumps({"task_id": handle_task_id, "wait_ms": 5000}),
+            }
+        ]
+
+    mock_llm.add_call(tool_calls_fn=_check_after_cancel_fn)
+    # Fourth LLM call: final ack.
     mock_llm.add_call(text="cancelled.")
 
     result = await create_test_response(
@@ -611,53 +702,39 @@ async def test_cancel_task_interrupts_async_terminal(
     )
     assert result.status_code == 200
     response_id = result.body["id"]
-
-    # Extended poll — the default 20s isn't enough for this test
-    # because the sleep 30 is running in parallel with the cancel
-    # path. Even with cancel working, the chain (call 1 → dispatch
-    # → call 2 → cancel → SIGINT → child sends signal → drain →
-    # call 3/4 → finalize) needs a few seconds on a warm test env.
-    async def _wait_long(response_id: str) -> dict[str, Any]:
-        """Poll up to 60s for terminal status."""
-        import asyncio as _asyncio
-
-        for _ in range(600):
-            resp = await client.get(f"/v1/responses/{response_id}")
-            body_ = resp.json()
-            if body_["status"] in ("completed", "failed", "cancelled"):
-                return body_
-            await _asyncio.sleep(0.1)
-        raise AssertionError(f"Response {response_id} did not reach terminal status in 60s")
-
-    body = await _wait_long(response_id)
+    body = await _wait_for_completion(client, response_id)
     assert body["status"] == "completed", (
-        f"Parent task didn't reach completed (likely cancel_task "
-        f"failed to interrupt and we waited for the sleep). "
-        f"Error: {body.get('error')}"
+        f"Parent task didn't reach completed: {body.get('error')}"
     )
 
-    # Check conversation items for the cancelled-terminal system
-    # message. Without the SIGINT path, the workflow would either
-    # time out or deliver a different status.
-    conv_id = body["conversation"]["id"]
-    items_resp = await client.get(
-        f"/v1/conversations/{conv_id}/items",
-        params={"limit": 100},
-    )
-    items = items_resp.json()["data"]
-    system_messages: list[str] = []
-    for item in items:
-        if item.get("type") != "message" or item.get("role") != "user":
+    # The check_task function_call_output must report
+    # status="cancelled" for the terminal handle. Without a working
+    # SIGINT path, status would be "in_progress" (sleep still
+    # running) or "completed" (sleep finished). Either is a
+    # regression.
+    check_outputs = []
+    for item in body.get("output", []):
+        if item.get("type") != "function_call_output":
             continue
-        for block in item.get("content", []):
-            text = block.get("text") or ""
-            if text.startswith("[System: task"):
-                system_messages.append(text)
-
-    assert any("(terminal) cancelled" in m for m in system_messages), (
-        f"Expected a '[System: task X (terminal) cancelled]' "
-        f"message, got {system_messages!r}. If the message says "
-        f"'completed' instead, the SIGINT path didn't flip status "
-        f"to killed; if no message at all, the drain missed the "
-        f"signal."
+        raw = item.get("output") or ""
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if parsed.get("kind") == "terminal":
+            check_outputs.append(parsed)
+    assert check_outputs, (
+        "No check_task output observed for the terminal task. "
+        "The mock LLM's third call didn't produce a visible "
+        "check_task call, or the check_task tool errored before "
+        "reaching the payload-build stage."
+    )
+    cancelled = [co for co in check_outputs if co.get("status") == "cancelled"]
+    assert cancelled, (
+        f"No check_task saw the terminal task as 'cancelled'. "
+        f"Observed statuses: {[co.get('status') for co in check_outputs]}. "
+        f"If 'in_progress', the 5000 ms wait_ms expired before the "
+        f"child workflow finalized — the SIGINT path is too slow "
+        f"or broken. If 'completed', the SIGINT path didn't flip "
+        f"status to killed (sleep ran to completion)."
     )
