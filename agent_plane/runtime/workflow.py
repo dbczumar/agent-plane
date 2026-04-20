@@ -2417,6 +2417,36 @@ def _split_tool_calls(
     return _ToolCallSplit(server=server, client=client, has_client=bool(client))
 
 
+def _wants_async_dispatch(tc: _ToolCall) -> bool:
+    """
+    Decide whether the LLM asked for async dispatch on this call.
+
+    Phase 5 v2: the LLM expresses async dispatch by setting
+    ``synchronous: false`` in its tool-call arguments. The
+    tool's schema (typically ``parameters.properties.synchronous``)
+    is what surfaces the choice to the LLM in the first place;
+    if the schema doesn't expose it, the LLM has nowhere to set
+    the field and this function returns ``False`` (sync default).
+
+    Malformed JSON arguments are treated as sync — the call's
+    real execution path will surface a parse error in its own
+    error path; routing decisions don't fail loud here.
+
+    :param tc: The tool call from the LLM.
+    :returns: ``True`` iff ``arguments`` JSON-decodes to a dict
+        with ``synchronous`` literally equal to ``False``. Any
+        other value (missing key, ``True``, malformed JSON,
+        non-bool value) yields ``False``.
+    """
+    try:
+        parsed = json.loads(tc.arguments) if tc.arguments else {}
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    return parsed.get("synchronous") is False
+
+
 async def _handle_tool_calls(
     task_id: str,
     conversation_id: str,
@@ -2501,17 +2531,19 @@ async def _handle_tool_calls(
 
     split = _split_tool_calls(tool_calls, tool_mgr)
 
-    # Phase 5: split client tools again by ``is_async()``.
-    # Async client tools take the unified async_work_complete
-    # path — we register a kind="client_tool" task, persist a
-    # handle JSON as their function_call_output, and let the
-    # drain auto-deliver the eventual result from the client's
-    # PATCH. Sync client tools keep the legacy parking model.
+    # Phase 5: split client tools again by per-call ``synchronous``
+    # argument. The LLM expresses async dispatch by setting
+    # ``synchronous: false`` in its tool-call arguments — the
+    # tool's schema may declare ``synchronous`` inside
+    # ``parameters.properties`` to surface this choice. Async
+    # client tools take the unified async_work_complete path
+    # (kind="client_tool" task + handle FCO + drain delivery);
+    # sync client tools keep the parking + ``tool_results`` PATCH
+    # model. Default (no key in args) is sync.
     client_async: list[_ToolCall] = []
     client_sync: list[_ToolCall] = []
     for tc in split.client:
-        client_tool = tool_mgr.get_tool(tc.name)
-        if client_tool is not None and client_tool.is_async():
+        if _wants_async_dispatch(tc):
             client_async.append(tc)
         else:
             client_sync.append(tc)

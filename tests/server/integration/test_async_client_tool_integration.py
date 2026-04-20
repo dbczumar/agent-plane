@@ -3,11 +3,14 @@ Server-integration tests for the Phase 5 async client-tool pipeline.
 
 The full chain under test:
 
-1. Caller submits a tool with ``"synchronous": false`` in
-   ``POST /v1/responses``'s ``tools[]``.
-2. LLM emits a ``function_call`` for that tool.
-3. Workflow dispatches via ``_dispatch_async_client_tools``:
-   creates a ``kind="client_tool"`` task, persists a
+1. Caller submits a tool whose ``parameters.properties`` includes
+   a ``synchronous`` boolean — surfacing the per-call
+   async-dispatch choice to the LLM.
+2. LLM emits a ``function_call`` whose ``arguments`` set
+   ``synchronous: false``.
+3. Workflow's ``_wants_async_dispatch`` reads the per-call arg
+   and routes to ``_dispatch_async_client_tools``: creates a
+   ``kind="client_tool"`` task, persists a
    ``function_call_output`` carrying the handle JSON
    ``{task_id, kind: "client_tool", ...}``.
 4. LLM sees the handle on the next iteration and continues.
@@ -37,9 +40,12 @@ from tests.server.helpers import create_test_agent
 pytestmark = [pytest.mark.asyncio]
 
 
-_ASYNC_CLIENT_TOOL: dict[str, Any] = {
+# Schema that exposes the per-call ``synchronous`` choice to the
+# LLM. The mock LLM is driven by call args (``async_args`` /
+# ``sync_args`` below) — these schemas are what the server's
+# parser sees as the tool surface.
+_ASYNC_CAPABLE_CLIENT_TOOL: dict[str, Any] = {
     "type": "function",
-    "synchronous": False,
     "function": {
         "name": "client_long_compute",
         "description": "Long-running client-side computation.",
@@ -47,6 +53,10 @@ _ASYNC_CLIENT_TOOL: dict[str, Any] = {
             "type": "object",
             "properties": {
                 "n": {"type": "integer"},
+                "synchronous": {
+                    "type": "boolean",
+                    "description": "Set false for async dispatch.",
+                },
             },
             "required": ["n"],
         },
@@ -66,6 +76,20 @@ _SYNC_CLIENT_TOOL: dict[str, Any] = {
         },
     },
 }
+
+
+def _async_args(**extra: Any) -> str:
+    """
+    Build a JSON args string that requests async dispatch.
+
+    Mock-LLM tool calls use ``arguments`` as a string payload;
+    this helper bundles ``synchronous: false`` together with any
+    tool-specific args so each test states its intent in one place.
+
+    :param extra: Tool-specific args (``n=5``, etc.).
+    :returns: JSON-encoded args dict including ``synchronous: false``.
+    """
+    return json.dumps({**extra, "synchronous": False})
 
 
 async def _wait_for_completion(
@@ -150,7 +174,7 @@ async def test_async_client_tool_returns_handle_to_llm(
             {
                 "call_id": "call_async_client_1",
                 "name": "client_long_compute",
-                "arguments": json.dumps({"n": 42}),
+                "arguments": _async_args(n=42),
             },
         ],
     )
@@ -168,7 +192,7 @@ async def test_async_client_tool_returns_handle_to_llm(
             "input": "Compute n=42",
             "background": True,
             "stream": False,
-            "tools": [_ASYNC_CLIENT_TOOL],
+            "tools": [_ASYNC_CAPABLE_CLIENT_TOOL],
         },
     )
     assert resp.status_code == 200
@@ -230,7 +254,7 @@ async def test_async_client_tool_completion_via_patch_auto_delivers(
             {
                 "call_id": "call_async_client_done",
                 "name": "client_long_compute",
-                "arguments": json.dumps({"n": 7}),
+                "arguments": _async_args(n=7),
             },
         ],
     )
@@ -245,7 +269,7 @@ async def test_async_client_tool_completion_via_patch_auto_delivers(
             "model": "test-agent",
             "input": "Compute via the async client tool",
             "background": True,
-            "tools": [_ASYNC_CLIENT_TOOL],
+            "tools": [_ASYNC_CAPABLE_CLIENT_TOOL],
         },
     )
     response_id = resp.json()["id"]
@@ -335,7 +359,7 @@ async def test_async_client_tool_failure_path(
             {
                 "call_id": "call_async_fail",
                 "name": "client_long_compute",
-                "arguments": json.dumps({"n": -1}),
+                "arguments": _async_args(n=-1),
             },
         ],
     )
@@ -348,7 +372,7 @@ async def test_async_client_tool_failure_path(
             "model": "test-agent",
             "input": "Trigger a failure on the client tool",
             "background": True,
-            "tools": [_ASYNC_CLIENT_TOOL],
+            "tools": [_ASYNC_CAPABLE_CLIENT_TOOL],
         },
     )
     response_id = resp.json()["id"]
@@ -412,7 +436,7 @@ async def test_async_client_tool_idempotent_patch(
             {
                 "call_id": "call_async_idem",
                 "name": "client_long_compute",
-                "arguments": json.dumps({"n": 1}),
+                "arguments": _async_args(n=1),
             },
         ],
     )
@@ -425,7 +449,7 @@ async def test_async_client_tool_idempotent_patch(
             "model": "test-agent",
             "input": "Idempotent PATCH test",
             "background": True,
-            "tools": [_ASYNC_CLIENT_TOOL],
+            "tools": [_ASYNC_CAPABLE_CLIENT_TOOL],
         },
     )
     response_id = resp.json()["id"]
@@ -570,7 +594,7 @@ async def test_mixed_tool_results_and_async_tool_results_in_one_patch(
             {
                 "call_id": "call_async_mixed",
                 "name": "client_long_compute",
-                "arguments": json.dumps({"n": 5}),
+                "arguments": _async_args(n=5),
             },
         ],
     )
@@ -583,7 +607,7 @@ async def test_mixed_tool_results_and_async_tool_results_in_one_patch(
             "model": "test-agent",
             "input": "Async client only — empty tool_results",
             "background": True,
-            "tools": [_ASYNC_CLIENT_TOOL, _SYNC_CLIENT_TOOL],
+            "tools": [_ASYNC_CAPABLE_CLIENT_TOOL, _SYNC_CLIENT_TOOL],
         },
     )
     response_id = resp.json()["id"]
@@ -655,7 +679,7 @@ async def test_parent_cancel_emits_response_client_task_cancel_sse(
             {
                 "call_id": "call_async_cancel",
                 "name": "client_long_compute",
-                "arguments": json.dumps({"n": 99}),
+                "arguments": _async_args(n=99),
             },
         ],
     )
@@ -668,7 +692,7 @@ async def test_parent_cancel_emits_response_client_task_cancel_sse(
             "model": "test-agent",
             "input": "Cancel test",
             "background": True,
-            "tools": [_ASYNC_CLIENT_TOOL],
+            "tools": [_ASYNC_CAPABLE_CLIENT_TOOL],
         },
     )
     response_id = resp.json()["id"]
@@ -734,7 +758,7 @@ async def test_list_tasks_includes_client_tool_kind(
             {
                 "call_id": "call_async_listed",
                 "name": "client_long_compute",
-                "arguments": json.dumps({"n": 1}),
+                "arguments": _async_args(n=1),
             },
         ],
     )
@@ -747,7 +771,7 @@ async def test_list_tasks_includes_client_tool_kind(
             "model": "test-agent",
             "input": "list test",
             "background": True,
-            "tools": [_ASYNC_CLIENT_TOOL],
+            "tools": [_ASYNC_CAPABLE_CLIENT_TOOL],
         },
     )
     response_id = resp.json()["id"]

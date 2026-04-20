@@ -13,6 +13,7 @@ surfaces the error back to the agent as a tool error.
 
 from __future__ import annotations
 
+import copy
 import inspect
 import json
 from collections.abc import Callable
@@ -20,6 +21,28 @@ from typing import Any
 
 from .._tool_handler import ToolCallInfo, ToolHandler
 from ._decorator import TOOL_MARKER_ATTR, ToolMetadata
+
+# JSON Schema property injected for ``@tool(synchronous=False)``
+# tools. Surfaces the per-call async-dispatch choice to the LLM
+# inside ``parameters.properties`` (the spec-compliant home for
+# tool arguments). The server reads ``arguments["synchronous"]``
+# from each call and routes accordingly. The SDK strips the key
+# before invoking the user's function so tool authors don't have
+# to declare a ``synchronous`` parameter on their signatures.
+_SYNCHRONOUS_PROPERTY_NAME = "synchronous"
+_SYNCHRONOUS_PROPERTY_SCHEMA: dict[str, object] = {
+    "type": "boolean",
+    "description": (
+        "Set to false to dispatch this call as a background "
+        "task; you'll receive a {task_id, kind: 'client_tool'} "
+        "handle immediately and the actual result will arrive "
+        "as a [System: task ... completed] message in a later "
+        "turn. Use false for long-running calls or when you "
+        "want to fan out several calls in parallel; use true "
+        "(or omit) for quick calls whose result you need before "
+        "deciding the next step."
+    ),
+}
 
 
 def build_tool_handler(functions: list[Callable[..., Any]]) -> ToolHandler:
@@ -65,20 +88,25 @@ def build_tool_handler(functions: list[Callable[..., Any]]) -> ToolHandler:
                 f"{fn.__qualname__} both export the same name."
             )
         funcs_by_name[meta.name] = fn
+        parameters = meta.json_schema
+        # Phase 5 v2: for @tool(synchronous=False), inject a
+        # ``synchronous`` boolean property into the parameters
+        # schema so the LLM can request async dispatch per call.
+        # Spec-compliant — `properties` is exactly where the
+        # OpenAI tool-call spec puts argument schemas. Deep-copy
+        # so we never mutate the metadata's shared json_schema
+        # (other handlers, replays, etc. would observe the
+        # mutation otherwise).
+        if not meta.synchronous:
+            parameters = _inject_synchronous_property(meta.json_schema)
         schema: dict[str, object] = {
             "type": "function",
             "function": {
                 "name": meta.name,
                 "description": meta.description,
-                "parameters": meta.json_schema,
+                "parameters": parameters,
             },
         }
-        # Phase 5: only emit the ``synchronous`` flag when it
-        # diverges from the server-side default (True) — keeps
-        # the wire shape minimal for ordinary tools and forces
-        # the server's parser to recognize the explicit opt-out.
-        if not meta.synchronous:
-            schema["synchronous"] = False
         schemas.append(schema)
 
     async def execute(call: ToolCallInfo) -> str:
@@ -87,6 +115,11 @@ def build_tool_handler(functions: list[Callable[..., Any]]) -> ToolHandler:
         Sync functions run inline; async functions are awaited.
         The return value is JSON-serialized unless the function
         already returned a string (which is passed through).
+
+        The ``synchronous`` argument (if present) is a routing
+        hint consumed by the server to choose async vs sync
+        dispatch — it is stripped before invoking the user's
+        function so tool authors don't have to declare it.
         """
         fn = funcs_by_name.get(call.name)
         if fn is None:
@@ -94,7 +127,10 @@ def build_tool_handler(functions: list[Callable[..., Any]]) -> ToolHandler:
             # error — this typically means the LLM invented a tool
             # name that wasn't in the schemas we sent.
             raise KeyError(f"Unknown tool {call.name!r}. Registered: {sorted(funcs_by_name)}")
-        result = fn(**call.arguments)
+        # Drop the routing-hint key. Use `dict(...)` rather than
+        # popping in place so we don't mutate caller state.
+        invoke_args = {k: v for k, v in call.arguments.items() if k != _SYNCHRONOUS_PROPERTY_NAME}
+        result = fn(**invoke_args)
         if inspect.isawaitable(result):
             result = await result
         if isinstance(result, str):
@@ -104,3 +140,37 @@ def build_tool_handler(functions: list[Callable[..., Any]]) -> ToolHandler:
         return json.dumps(result, default=str)
 
     return ToolHandler(schemas=schemas, execute=execute)
+
+
+def _inject_synchronous_property(json_schema: dict[str, Any]) -> dict[str, Any]:
+    """
+    Return a copy of ``json_schema`` with ``synchronous`` added to its properties.
+
+    Used for ``@tool(synchronous=False)`` tools so the LLM sees
+    the per-call async-dispatch choice as a real argument. The
+    property is added but NOT marked required — the LLM may omit
+    it (defaults to sync server-side).
+
+    :param json_schema: The function's auto-derived JSON Schema
+        (an ``object`` schema with ``properties``).
+    :returns: A deep copy with ``properties[synchronous]`` set
+        to :data:`_SYNCHRONOUS_PROPERTY_SCHEMA`. Never mutates
+        the input.
+    :raises ValueError: If ``json_schema`` already declares a
+        ``synchronous`` property — the tool author would
+        otherwise silently lose their declaration to ours, and
+        a name collision means their tool can't safely use the
+        async-dispatch hint anyway.
+    """
+    new_schema = copy.deepcopy(json_schema)
+    properties = new_schema.setdefault("properties", {})
+    if _SYNCHRONOUS_PROPERTY_NAME in properties:
+        raise ValueError(
+            f"@tool(synchronous=False) cannot be combined with a "
+            f"function parameter named {_SYNCHRONOUS_PROPERTY_NAME!r}: "
+            f"the SDK injects {_SYNCHRONOUS_PROPERTY_NAME!r} as the "
+            f"per-call async-dispatch hint and would shadow the "
+            f"tool's own argument. Rename the parameter."
+        )
+    properties[_SYNCHRONOUS_PROPERTY_NAME] = copy.deepcopy(_SYNCHRONOUS_PROPERTY_SCHEMA)
+    return new_schema

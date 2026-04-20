@@ -724,13 +724,18 @@ arrays; both are optional and processed independently.
   default). Each entry maps a `call_id` from a parked `function_call` with
   `status: "action_required"` to its output string. The server unparks the
   parent's tool loop and the next iteration starts immediately.
-- **`async_tool_results`** — asynchronous client tools (`synchronous: false`).
-  Each entry carries a server-issued `task_id` from the handle JSON the
-  parent already saw in its `function_call_output`, plus a terminal `status`
-  (`"completed"`, `"failed"`, or `"cancelled"`) and an optional `output`
-  string or `error` dict. The server marks the `kind="client_tool"` task
-  terminal in-store and signals the parent on the unified
-  `async_work_complete` topic so its drain auto-delivers a system message.
+- **`async_tool_results`** — asynchronous client tools. The LLM
+  opts a single call into async dispatch by setting
+  `arguments.synchronous = false` (the tool's schema must
+  declare `synchronous` inside `parameters.properties` for the
+  LLM to know it has the option). Each entry carries a
+  server-issued `task_id` from the handle JSON the parent
+  already saw in its `function_call_output`, plus a terminal
+  `status` (`"completed"`, `"failed"`, or `"cancelled"`) and an
+  optional `output` string or `error` dict. The server marks
+  the `kind="client_tool"` task terminal in-store and signals
+  the parent on the unified `async_work_complete` topic so its
+  drain auto-delivers a system message.
 
 Idempotent: repeating an `async_tool_results` PATCH after the task is
 terminal is a no-op (G3 first-write-wins — a late "completed" PATCH does

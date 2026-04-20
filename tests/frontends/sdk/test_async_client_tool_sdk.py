@@ -4,11 +4,14 @@ Phase 5 part D — minimal SDK changes for async client tools.
 Covers two narrow surface areas that lift the SDK to recognize
 the Phase 5 protocol:
 
-1. ``build_tool_handler`` emits ``"synchronous": false`` on the
-   wire schema for ``@tool(synchronous=False)``-decorated
-   functions, so the server's ``parse_client_side_tool_spec``
-   sees the opt-out and routes the call through the
-   async-dispatch path instead of parking.
+1. ``build_tool_handler`` injects a per-call ``synchronous``
+   boolean into ``parameters.properties`` for
+   ``@tool(synchronous=False)``-decorated functions. Spec-
+   compliant — ``properties`` is exactly where the OpenAI tool
+   schema puts argument schemas, so the LLM sees the choice as
+   a normal optional argument and the server reads
+   ``arguments.synchronous`` per-call to route between sync
+   parking and async dispatch.
 2. The SSE parser converts the ``response.client_task.cancel``
    event the server emits during parent-cancel propagation into
    a typed :class:`ClientTaskCancel` event so consumers can
@@ -52,21 +55,71 @@ async def _async_long_compute(n: int) -> dict[str, int]:
     return {"n": n, "result": n * 2}
 
 
+@tool(synchronous=False)
+async def _async_with_collision(synchronous: bool, payload: str) -> str:
+    """Bad tool — its real ``synchronous`` arg collides with the routing hint.
+
+    Used by the collision-rejection test below; the SDK must
+    refuse to build a handler for this since injecting our
+    routing hint would shadow the author's argument.
+
+    Args:
+        synchronous: Real arg whose name collides with the
+            SDK's per-call async-dispatch hint.
+        payload: Real payload string.
+    """
+    _ = synchronous  # avoid unused-arg lint; real test uses the metadata
+    return payload
+
+
+def _properties_of(schema: dict[str, object]) -> dict[str, object]:
+    """
+    Extract ``parameters.properties`` from a tool schema.
+
+    Centralized so tests fail with a clear error if the schema
+    shape ever changes.
+
+    :param schema: One entry from
+        :attr:`ToolHandler.schemas` — an OpenAI function tool
+        wrapper.
+    :returns: The properties dict (may be empty).
+    """
+    fn = schema["function"]
+    assert isinstance(fn, dict)
+    parameters = fn["parameters"]
+    assert isinstance(parameters, dict)
+    properties = parameters.get("properties", {})
+    assert isinstance(properties, dict)
+    return properties
+
+
 def test_build_tool_handler_omits_synchronous_for_sync_tools() -> None:
     """
-    Default-synchronous tools must NOT carry ``"synchronous"``
-    on the wire — the field is an explicit Phase 5 opt-out, not
-    a redundant default. If the schema serialized
-    ``synchronous: true`` for every tool, the wire shape would
-    diverge from what existing OpenResponses-compatible clients
-    expect.
+    Default-synchronous tools must NOT inject a ``synchronous``
+    property into the parameters schema — the LLM has nothing
+    to set, and the server's per-call check
+    (:func:`_wants_async_dispatch`) returns ``False`` so the
+    tool keeps the legacy sync parking path.
+
+    Catches a regression where the SDK injects the property
+    universally and accidentally surfaces async dispatch on
+    every tool.
     """
     handler = build_tool_handler([_sync_echo])
     assert len(handler.schemas) == 1
     schema = handler.schemas[0]
-    # No top-level synchronous field — defaults take over server-side.
+    # No top-level synchronous field — the v1 wire-shape extension
+    # is gone entirely under v2.
     assert "synchronous" not in schema, (
-        f"Sync tools must not emit 'synchronous' on the wire; got schema={schema!r}"
+        f"Sync tools must not emit a top-level 'synchronous' "
+        f"field (the v1 extension is removed); got schema={schema!r}"
+    )
+    # And no synchronous *property* either — sync tools opt out
+    # of even surfacing the choice to the LLM.
+    properties = _properties_of(schema)
+    assert "synchronous" not in properties, (
+        f"Sync tools must not inject 'synchronous' into "
+        f"parameters.properties; got properties={properties!r}"
     )
     # Sanity: function name and structure unchanged.
     assert schema["type"] == "function"
@@ -75,52 +128,109 @@ def test_build_tool_handler_omits_synchronous_for_sync_tools() -> None:
     assert fn_field["name"] == "_sync_echo"
 
 
-def test_build_tool_handler_emits_synchronous_false_for_async_tools() -> None:
+def test_build_tool_handler_injects_synchronous_property_for_async_tools() -> None:
     """
-    ``@tool(synchronous=False)`` must surface in the emitted
-    schema as a top-level ``"synchronous": false`` so the
-    server's ``parse_client_side_tool_spec`` (which reads
-    ``raw["synchronous"]`` at the top level, not inside
-    ``function``) routes the call through the async-dispatch
-    path. If the field is missing or placed inside ``function``,
-    the server would default to the legacy parking path and the
-    LLM would block on the call instead of receiving the
-    ``{task_id, kind: "client_tool"}`` handle.
+    ``@tool(synchronous=False)`` must inject a ``synchronous``
+    boolean into ``parameters.properties`` so the LLM sees the
+    per-call async-dispatch choice as a real argument. The
+    server's :func:`_wants_async_dispatch` then routes calls
+    where ``arguments.synchronous == False`` through the
+    async-dispatch path; calls that omit or set ``True`` go to
+    the sync (parking) path.
+
+    If the property is missing, the LLM has no way to express
+    async intent and every call would fall back to sync — the
+    tool author's ``synchronous=False`` declaration would be
+    silently void.
     """
     handler = build_tool_handler([_async_long_compute])
     assert len(handler.schemas) == 1
     schema = handler.schemas[0]
-    # Top-level (NOT inside function) per server contract.
-    assert schema.get("synchronous") is False, (
-        f"Async tools must emit 'synchronous: false' at the "
-        f"schema's top level; got schema={schema!r}"
+    # Top-level extension is gone in v2.
+    assert "synchronous" not in schema, (
+        f"v1's top-level 'synchronous' wire extension must NOT appear in v2; got schema={schema!r}"
     )
-    fn_field = schema["function"]
-    assert isinstance(fn_field, dict)
-    assert "synchronous" not in fn_field, (
-        "synchronous must NOT live inside 'function' — server parser reads it from the outer dict."
+    properties = _properties_of(schema)
+    assert "synchronous" in properties, (
+        f"@tool(synchronous=False) must inject 'synchronous' "
+        f"into parameters.properties; got properties={properties!r}"
+    )
+    sync_prop = properties["synchronous"]
+    assert isinstance(sync_prop, dict)
+    assert sync_prop["type"] == "boolean", (
+        f"Injected 'synchronous' must be a JSON Schema boolean; got {sync_prop!r}"
+    )
+    assert "description" in sync_prop and sync_prop["description"], (
+        f"Injected 'synchronous' must carry a description so the "
+        f"LLM understands when to set it; got {sync_prop!r}"
+    )
+    # The author's real arg is preserved alongside the injected one.
+    assert "n" in properties, (
+        f"Original tool args must survive injection; got properties={properties!r}"
     )
 
 
 def test_build_tool_handler_mixes_sync_and_async() -> None:
     """
     A mixed handler must keep each tool's schema independent —
-    flipping one tool's ``synchronous`` must not pollute the
-    other. Catches a future regression where build_tool_handler
-    might (incorrectly) reuse a shared dict and propagate one
-    tool's flag onto every other entry.
+    injecting ``synchronous`` into one tool's properties must
+    not leak into the other's. Catches a regression where the
+    helper mutates shared metadata in place.
     """
     handler = build_tool_handler([_sync_echo, _async_long_compute])
     by_name = {
         s["function"]["name"]: s  # type: ignore[index]
         for s in handler.schemas
     }
-    assert "synchronous" not in by_name["_sync_echo"], (
-        "_sync_echo must remain free of the synchronous field."
+    sync_props = _properties_of(by_name["_sync_echo"])
+    async_props = _properties_of(by_name["_async_long_compute"])
+    assert "synchronous" not in sync_props, (
+        "_sync_echo must remain free of the synchronous property."
     )
-    assert by_name["_async_long_compute"].get("synchronous") is False, (
-        "_async_long_compute must keep its synchronous=False flag."
+    assert "synchronous" in async_props, "_async_long_compute must keep its synchronous property."
+
+
+def test_build_tool_handler_does_not_mutate_metadata_schema() -> None:
+    """
+    The injection helper must deep-copy the metadata's
+    ``json_schema`` — building the same handler twice (or
+    sharing a metadata object across handlers) must not produce
+    nested ``synchronous`` keys or otherwise corrupt the cached
+    schema. Catches a copy-by-reference regression.
+    """
+    from agent_plane_client.tools._decorator import (
+        TOOL_MARKER_ATTR,
+        ToolMetadata,
     )
+
+    meta_before: ToolMetadata = getattr(_async_long_compute, TOOL_MARKER_ATTR)
+    original_properties = dict(meta_before.json_schema.get("properties", {}))
+    assert "synchronous" not in original_properties, (
+        "Pre-test sanity: metadata's pristine schema must not carry the injected property."
+    )
+
+    build_tool_handler([_async_long_compute])
+    build_tool_handler([_async_long_compute])
+
+    meta_after: ToolMetadata = getattr(_async_long_compute, TOOL_MARKER_ATTR)
+    after_properties = meta_after.json_schema.get("properties", {})
+    assert "synchronous" not in after_properties, (
+        f"Building the handler must not mutate the metadata's "
+        f"json_schema. After two builds, properties={after_properties!r}"
+    )
+
+
+def test_build_tool_handler_rejects_synchronous_param_collision() -> None:
+    """
+    If a ``@tool(synchronous=False)`` function declares a real
+    ``synchronous`` parameter on its signature, injecting our
+    routing-hint property would silently shadow the author's
+    argument — and the server's per-call check would conflate
+    the LLM's intent with whatever value the author meant.
+    The SDK must refuse to build the handler.
+    """
+    with pytest.raises(ValueError, match="cannot be combined"):
+        build_tool_handler([_async_with_collision])
 
 
 # ── SSE parser: response.client_task.cancel ─────────────────
