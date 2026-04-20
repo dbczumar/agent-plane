@@ -24,6 +24,9 @@ class Conversation:
         sub-agents store ``"<type>:<name>"`` here so the partial
         unique index on ``(parent_conversation_id, title)`` can
         enforce uniqueness within a parent.
+    :param metadata: Optional key-value map of up to 16 pairs
+        (keys ≤64 chars, values ≤512 chars). Set by the client
+        at create or update time.
     :param kind: Conversation type. ``"default"`` for
         user-initiated, ``"sub_agent"`` for sub-agent
         execution conversations.
@@ -36,6 +39,7 @@ class Conversation:
     created_at: int
     updated_at: int
     title: str | None = None
+    metadata: dict[str, str] | None = None
     kind: str = "default"
     parent_conversation_id: str | None = None
 

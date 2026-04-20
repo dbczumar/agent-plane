@@ -47,6 +47,7 @@ class ConversationStore(ABC):
         self,
         kind: str = "default",
         title: str | None = None,
+        metadata: dict[str, str] | None = None,
         parent_conversation_id: str | None = None,
     ) -> Conversation:
         """
@@ -60,6 +61,8 @@ class ConversationStore(ABC):
             store ``"<type>:<name>"`` so the partial unique index
             can enforce ``(parent_conversation_id, title)``
             uniqueness within a parent.
+        :param metadata: Optional key-value map of up to 16
+            pairs (keys ≤64 chars, values ≤512 chars).
         :param parent_conversation_id: Phase 4 — for child
             sub-agent conversations, the owning parent's id.
             ``None`` for top-level conversations.
@@ -239,8 +242,41 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def get_item(
+        self, conversation_id: str, item_id: str
+    ) -> ConversationItem | None:
+        """
+        Retrieve a single item from a conversation by ID.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param item_id: Unique item identifier,
+            e.g. ``"msg_abc123"``.
+        :returns: The :class:`ConversationItem` if found and
+            belongs to the given conversation, otherwise ``None``.
+        """
+        ...
+
+    @abstractmethod
+    def delete_item(self, conversation_id: str, item_id: str) -> bool:
+        """
+        Delete a single item from a conversation.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param item_id: Unique item identifier to delete,
+            e.g. ``"msg_abc123"``.
+        :returns: ``True`` if the item existed and was deleted,
+            ``False`` if no matching item was found.
+        """
+        ...
+
+    @abstractmethod
     def update_conversation(
-        self, conversation_id: str, title: str | None = None
+        self,
+        conversation_id: str,
+        title: str | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -249,6 +285,8 @@ class ConversationStore(ABC):
             e.g. ``"conv_abc123"``.
         :param title: New title for the conversation, or ``None``
             to leave unchanged.
+        :param metadata: New metadata map to replace the existing
+            one, or ``None`` to leave unchanged.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
         """

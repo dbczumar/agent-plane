@@ -8,7 +8,7 @@ and files (`/v1/files`).
 | Namespace | Compatible with | Reference implementation |
 |---|---|---|
 | Agent Management (`/api/agents`) | Agent Plane (ours) | No external reference — this is our own API. |
-| Conversations (`/v1/conversations`) | Agent Plane (ours) | No external reference. OpenResponses defines a minimal `conversation` object on responses but no conversation management endpoints. |
+| Conversations (`/v1/conversations`) | [OpenAI Conversations API](https://platform.openai.com/docs/api-reference/conversations) | OpenAI's Conversations API is the reference. Agent-plane extends it with `title` and cursor-based pagination. Update uses `PATCH` (REST-style) as primary; `POST /{id}` accepted as alias for OpenAI SDK compat. |
 | Inference (`/v1/responses`) | [OpenResponses spec](https://openresponses.org) | OpenAI Responses API is the reference implementation. Test with: `curl https://api.openai.com/v1/responses -H "Authorization: Bearer $KEY" ...` |
 | Cancel Response (`POST /v1/responses/{id}/cancel`) | OpenAI (undocumented) | Not in OpenResponses spec. Discovered empirically on OpenAI. Test with: `curl -X POST https://api.openai.com/v1/responses/{id}/cancel -H "Authorization: Bearer $KEY"` |
 | Files (`/v1/files`) | OpenAI Files API | Test with: `curl https://api.openai.com/v1/files -H "Authorization: Bearer $KEY"` |
@@ -207,9 +207,10 @@ Content-Type: <original media type>
 
 ## Conversations
 
-Conversations are created automatically. When a response has no `previous_response_id`,
-the server creates a new conversation and assigns the response to it. When a response
-has a `previous_response_id` pointing to the **latest** response in a conversation,
+Conversations can be created explicitly via `POST /v1/conversations` or implicitly
+by the server. When a response has no `previous_response_id`, the server creates
+a new conversation and assigns the response to it. When a response has a
+`previous_response_id` pointing to the **latest** response in a conversation,
 it joins that conversation.
 
 When `previous_response_id` points to a **non-latest** response (a fork), the server
@@ -223,6 +224,52 @@ Clients may optionally pass a conversation ID when creating responses (must be
 paired with `previous_response_id`). Conversation APIs are primarily for
 **retrieval** — listing past conversations, loading message history, and finding
 the latest response ID to continue from.
+
+### Conversation object
+
+```json
+{
+  "id": "conv_abc123",
+  "object": "conversation",
+  "title": null,
+  "metadata": {"app": "my-app", "session": "s_001"},
+  "created_at": 1774118382,
+  "updated_at": 1774118400
+}
+```
+
+Fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | string | Server-assigned. Format: `conv_*`. |
+| `object` | string | Always `"conversation"`. |
+| `title` | string \| null | Optional human-readable title. Agent-plane extension (not in OpenAI spec). |
+| `metadata` | object \| null | Up to 16 key-value pairs. Keys ≤64 chars, values ≤512 chars. |
+| `created_at` | integer | Unix epoch seconds. |
+| `updated_at` | integer | Unix epoch seconds of last modification. |
+
+### Create Conversation
+
+```
+POST /v1/conversations
+Content-Type: application/json
+
+{"metadata": {"app": "my-app"}}
+
+201 Created
+{
+  "id": "conv_abc123",
+  "object": "conversation",
+  "title": null,
+  "metadata": {"app": "my-app"},
+  "created_at": 1774118382,
+  "updated_at": 1774118382
+}
+```
+
+Creates an empty conversation. Items are added by subsequent `POST /v1/responses`
+calls targeting this conversation. `metadata` is optional.
 
 ### List Conversations
 
@@ -249,8 +296,8 @@ Query parameters:
 {
   "object": "list",
   "data": [
-    {"id": "conv_abc123", "object": "conversation", "title": null, "created_at": ..., "updated_at": ...},
-    {"id": "conv_def456", "object": "conversation", "title": "Weather chat", "created_at": ..., "updated_at": ...}
+    {"id": "conv_abc123", "object": "conversation", "title": null, "metadata": null, "created_at": ..., "updated_at": ...},
+    {"id": "conv_def456", "object": "conversation", "title": "Weather chat", "metadata": {"app": "x"}, "created_at": ..., "updated_at": ...}
   ],
   "first_id": "conv_abc123",
   "last_id": "conv_def456",
@@ -270,6 +317,7 @@ GET /v1/conversations/{id}
   "id": "conv_abc123",
   "object": "conversation",
   "title": null,
+  "metadata": null,
   "created_at": 1774118382,
   "updated_at": 1774118400
 }
@@ -328,19 +376,46 @@ the agent. User messages and function call outputs do not have `model` — the a
 is always recoverable from `response_id` if needed. To continue a conversation,
 pass the `response_id` from the last item as `previous_response_id`.
 
-### Update Conversation
+### Get Conversation Item
 
 ```
-PATCH /v1/conversations/{id}
+GET /v1/conversations/{id}/items/{item_id}
+
+200 OK
+{"id": "msg_aaa", "response_id": "resp_001", "type": "message", "role": "user",
+ "status": "completed", "content": [...]}
+
+404 Not Found — conversation or item not found
+```
+
+### Delete Conversation Item
+
+```
+DELETE /v1/conversations/{id}/items/{item_id}
+
+200 OK
+{"id": "msg_aaa", "object": "conversation.item.deleted", "deleted": true, "conversation_id": "conv_abc123"}
+
+404 Not Found — conversation or item not found
+```
+
+### Update Conversation
+
+Two methods are accepted; both are equivalent:
+
+```
+PATCH /v1/conversations/{id}      ← REST-style (preferred)
+POST  /v1/conversations/{id}      ← OpenAI API-style alias
 Content-Type: application/json
 
-{"title": "Weather chat"}
+{"title": "Weather chat", "metadata": {"key": "value"}}
 
 200 OK
 {
   "id": "conv_abc123",
   "object": "conversation",
   "title": "Weather chat",
+  "metadata": {"key": "value"},
   "created_at": 1774118382,
   "updated_at": 1774118400
 }
@@ -349,7 +424,8 @@ Content-Type: application/json
 400 Bad Request — invalid field
 ```
 
-Currently only `title` (string | null) is updatable.
+Updatable fields: `title` (string | null) and `metadata` (object | null).
+Any field set to `null` or omitted is left unchanged. To clear metadata, set it to `{}`.
 
 ### Delete Conversation
 
@@ -379,21 +455,32 @@ responses in the conversation before deleting.
    → POST /v1/responses {model: "my-agent", input: "...", previous_response_id: "resp_xyz"}
    → response is automatically added to the same conversation
 
-4. User starts a brand new chat
+4. User starts a brand new chat (implicit — no conversation management needed)
    → POST /v1/responses {model: "my-agent", input: "..."}
    → no previous_response_id, so server creates a new conversation
 
-5. User clicks "regenerate" on the last response
+5. User starts a new chat with app-level metadata (explicit)
+   → POST /v1/conversations {"metadata": {"app_id": "my-app", "user": "u_123"}}
+   → POST /v1/responses {model: "my-agent", input: "...", conversation: {"id": "conv_abc123"}}
+
+6. User clicks "regenerate" on the last response
    → POST /v1/responses/{id}/cancel           → stop and preserve the response
    → POST /v1/responses {model: "my-agent", input: "...", previous_response_id: "resp_prev"}
    → same previous_response_id as the cancelled response used, creating a fork
    → new conversation is created with copied history + the new response
 
-6. User steers a running agent
+7. User steers a running agent
    → POST /v1/responses {model: "my-agent", input: "Focus on X instead",
        previous_response_id: "resp_in_progress"}
    → input delivered to running agent's inbox; no new response created
 ```
+
+### Compatibility note
+
+The [OpenAI Conversations API](https://platform.openai.com/docs/api-reference/conversations)
+uses `POST /conversations/{id}` (not PATCH) for updates, and exposes `metadata` but
+not `title`. Agent-plane supports both update methods and both fields so that clients
+targeting either API surface work without modification.
 
 ---
 
