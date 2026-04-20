@@ -500,23 +500,35 @@ def test_sub_agent_async_client_tool_signal_routes_to_worker_drain(
     # the same system message. Catches the inverse failure: if
     # the signal goes to BOTH (a future fan-out fix gone wrong),
     # the parent shouldn't see the worker's tool result.
+    # Specifically: the parent's conv must NOT contain a
+    # ``(client_tool)`` [System: ...] message with the marker.
+    # It's perfectly fine — and expected — for the parent to
+    # receive a ``(sub_agent)`` [System: ...] message with the
+    # marker (that's the worker's eventual reply being relayed
+    # to the parent's drain). The audit-fix-#1 routing bug is
+    # specifically about the client_tool drain payload landing
+    # on the wrong agent; check only the client_tool kind.
     parent_items = _items(http_client, parent_conv_id)
-    parent_system_with_marker = [
-        i
+    parent_client_tool_misroute = [
+        (i["content"][0].get("text") or "")
         for i in parent_items
         if i.get("role") == "user"
         and isinstance(i.get("content"), list)
         and i["content"]
         and i["content"][0].get("type") == "input_text"
-        and _MARKER in i["content"][0].get("text", "")
-        and i["content"][0].get("text", "").startswith("[System: task ")
+        and "(client_tool)" in (i["content"][0].get("text") or "")
+        and _MARKER in (i["content"][0].get("text") or "")
     ]
-    assert parent_system_with_marker == [], (
-        f"Parent's conversation must NOT contain the worker's "
-        f"client-tool [System: ...] message — it belongs on the "
-        f"worker's drain. If non-empty, the routing has been "
-        f"flipped from 'always root' to 'fan out to both' "
-        f"(also a bug). Got {parent_system_with_marker!r}"
+    assert parent_client_tool_misroute == [], (
+        f"Parent's conversation must NOT contain a "
+        f"``(client_tool)`` [System: ...] message with the marker "
+        f"— that drain payload belongs on the worker's drain. "
+        f"If non-empty, audit fix #1 has regressed: signal is "
+        f"routing to the root again instead of to the immediate "
+        f"caller. (A ``(sub_agent)`` system message with the "
+        f"marker IS expected — that's the worker's reply being "
+        f"relayed back to the parent.) Got: "
+        f"{parent_client_tool_misroute!r}"
     )
 
     # Steps 8 and 9 (assistant-text echoes of the marker) are

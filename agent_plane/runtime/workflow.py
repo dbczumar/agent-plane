@@ -4738,23 +4738,34 @@ async def _run_agent_loop(
                         # SSE but never committed), and the next
                         # LLM call wouldn't see what the model
                         # said in this turn.
+                        #
+                        # Skip when text is empty/None: persisting
+                        # an assistant item with ``text: null``
+                        # makes the next iteration's LLM call fail
+                        # (OpenAI rejects ``input[i].content[0].text``
+                        # being null). The LLM legitimately produces
+                        # no text in many turn-types (e.g., when it
+                        # only emits a function_call and waits for
+                        # an async drain); we have nothing to
+                        # preserve in those cases.
                         text = _get_text_content(llm_resp)
                         file_annotations = _collect_file_annotations(output_items)
-                        _emit_file_annotations(task_id, file_annotations)
-                        item = _build_assistant_item(
-                            task_id,
-                            agent_name,
-                            text,
-                            annotations=file_annotations or None,
-                        )
-                        persisted = _persist_and_stream(
-                            task_id,
-                            conv_store,
-                            conversation_id,
-                            [item],
-                            output_items,
-                        )
-                        history.extend(persisted)
+                        if text or file_annotations:
+                            _emit_file_annotations(task_id, file_annotations)
+                            item = _build_assistant_item(
+                                task_id,
+                                agent_name,
+                                text,
+                                annotations=file_annotations or None,
+                            )
+                            persisted = _persist_and_stream(
+                                task_id,
+                                conv_store,
+                                conversation_id,
+                                [item],
+                                output_items,
+                            )
+                            history.extend(persisted)
                         if late_drained:
                             # Already-drained payloads need
                             # persisting; pending case will block
