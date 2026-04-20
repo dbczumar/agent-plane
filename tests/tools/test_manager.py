@@ -22,6 +22,40 @@ from agent_plane.tools.mcp import clear_discovery_cache
 
 _TEST_CTX = ToolContext(task_id="task_test", agent_id="agent_test")
 
+# Tools that ToolManager registers unconditionally (task
+# lifecycle — ``check_task`` / ``cancel_task``). Filtered out
+# in tests that assert on *specific* tool sets so the
+# lifecycle tools' presence doesn't alter the other checks.
+# Adding a tool here requires a deliberate decision — this is
+# a hard-coded allowlist, not a filter on `_register_*`.
+_ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset({"check_task", "cancel_task"})
+
+
+def _non_lifecycle_schemas(
+    mgr: ToolManager,
+) -> list[dict[str, object]]:
+    """
+    Return tool schemas minus the always-registered lifecycle
+    tools (``check_task`` / ``cancel_task``).
+
+    Tests that assert "no tools registered" or "only tool X"
+    should filter out the lifecycle tools — they're part of
+    every ToolManager but orthogonal to whatever the test is
+    actually checking.
+
+    :param mgr: The :class:`ToolManager` under test.
+    :returns: Schema list with lifecycle entries filtered out.
+    """
+    return [
+        s
+        for s in mgr.get_tool_schemas()
+        if not (
+            isinstance(s, dict)
+            and isinstance(fn := s.get("function"), dict)
+            and fn.get("name") in _ALWAYS_PRESENT_TOOLS
+        )
+    ]
+
 
 @pytest.fixture()
 def skill_with_resources(tmp_path: Path) -> SkillSpec:
@@ -200,10 +234,12 @@ def test_schemas_exclude_read_skill_file_without_resources(
 
 def test_schemas_empty_when_no_skills() -> None:
     """
-    get_tool_schemas returns empty when agent has no skills.
+    get_tool_schemas returns empty when agent has no skills,
+    excluding the always-registered lifecycle tools
+    (``check_task`` / ``cancel_task``).
     """
     mgr = ToolManager(_make_spec([]))
-    assert mgr.get_tool_schemas() == []
+    assert _non_lifecycle_schemas(mgr) == []
 
 
 # ── MCP integration ──────────────────────────────────────
@@ -386,7 +422,10 @@ def test_client_tools_registered_in_schemas() -> None:
         ],
     )
 
-    schemas = mgr.get_tool_schemas()
+    # Filter out the always-present lifecycle tools
+    # (check_task / cancel_task) — they're orthogonal to the
+    # client-tool registration being tested.
+    schemas = _non_lifecycle_schemas(mgr)
     names = [s["function"]["name"] for s in schemas]
 
     # Both client tools appear in schemas — 2 registered, 2 returned
@@ -476,8 +515,8 @@ def test_client_tools_none_equivalent_to_empty() -> None:
     mgr_none = ToolManager(spec, client_tool_specs=None)
     mgr_empty = ToolManager(spec, client_tool_specs=[])
 
-    assert mgr_none.get_tool_schemas() == []
-    assert mgr_empty.get_tool_schemas() == []
+    assert _non_lifecycle_schemas(mgr_none) == []
+    assert _non_lifecycle_schemas(mgr_empty) == []
 
 
 def test_mcp_duplicate_tool_name_last_wins() -> None:
@@ -572,7 +611,7 @@ def test_mcp_tool_invalid_name_skipped(
     with _patch_mcp_connect([tool_def]):
         mgr.start()
 
-    assert mgr.get_tool_schemas() == []
+    assert _non_lifecycle_schemas(mgr) == []
 
     mgr.shutdown()
 
@@ -599,7 +638,7 @@ def test_mcp_tool_valid_names_registered() -> None:
     with _patch_mcp_connect(tools):
         mgr.start()
 
-    schemas = mgr.get_tool_schemas()
+    schemas = _non_lifecycle_schemas(mgr)
     names = {s["function"]["name"] for s in schemas}
     assert names == {"simple", "with_underscore", "with-hyphen", "MixedCase123"}
 
@@ -627,7 +666,7 @@ def test_mcp_tool_mixed_valid_and_invalid() -> None:
     with _patch_mcp_connect(tools):
         mgr.start()
 
-    schemas = mgr.get_tool_schemas()
+    schemas = _non_lifecycle_schemas(mgr)
     names = {s["function"]["name"] for s in schemas}
     assert names == {"valid_tool", "also_valid"}
 
@@ -739,4 +778,10 @@ def test_local_tools_skipped_without_workdir() -> None:
     spec = _make_spec(local_tools=[info])
     # workdir=None (default) — should not raise.
     mgr = ToolManager(spec)
-    assert mgr.get_tool_schemas() == [], "No tools should be registered when workdir is None."
+    # Excluding the always-present lifecycle tools
+    # (check_task / cancel_task), no tools should register
+    # when workdir is None and no skills / builtins are set.
+    assert _non_lifecycle_schemas(mgr) == [], (
+        "No tools (apart from the always-present check_task / "
+        "cancel_task) should be registered when workdir is None."
+    )

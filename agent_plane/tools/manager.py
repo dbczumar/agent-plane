@@ -101,9 +101,38 @@ class ToolManager:
         self._uv_available = shutil.which("uv") is not None
         self._register_skill_tools()
         self._register_builtin_tools()
+        self._register_task_lifecycle_tools()
         self._register_sub_agent_tools()
         self._register_local_tools(workdir)
         self._register_client_tools(client_tool_specs or [])
+
+    def _register_task_lifecycle_tools(self) -> None:
+        """
+        Register the always-available task-lifecycle tools.
+
+        ``check_task`` and ``cancel_task`` are needed any time
+        the LLM dispatches background work it might want to
+        poll or abort — async ``@tool(synchronous=False)``
+        invocations, sub-agent spawns, async client tools.
+        Every dispatched handle's message even tells the LLM
+        to "call check_task / cancel_task" — that promise
+        only holds if these are registered unconditionally.
+
+        Both are gated server-side: ``CheckTaskTool`` and
+        ``CancelTaskTool`` themselves filter out
+        ``kind="agent_task"`` and out-of-scope task_ids (G23),
+        so registering them universally doesn't expose any
+        cross-agent state.
+        """
+        from agent_plane.tools.builtins.task_lifecycle import (
+            CancelTaskTool,
+            CheckTaskTool,
+        )
+
+        check_tool = CheckTaskTool()
+        cancel_tool = CancelTaskTool()
+        self._tools[check_tool.name()] = check_tool
+        self._tools[cancel_tool.name()] = cancel_tool
 
     def _register_skill_tools(self) -> None:
         """
