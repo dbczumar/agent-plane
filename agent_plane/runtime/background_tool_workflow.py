@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent_plane.runtime.durability import (
+    dbos_recv_async,
     dbos_send_async,
     get_workflow_id,
     step,
@@ -59,6 +60,22 @@ _TRACEBACK_LINE_BUDGET = 30
 # (sub-agents, async tools, async client tools) signals on this
 # single topic so the parent has one wake point regardless of kind.
 ASYNC_WORK_COMPLETE_TOPIC = "async_work_complete"
+
+# Topic the PATCH ``async_tool_results`` route uses to deliver a
+# client-reported result into the corresponding
+# :func:`client_tool_workflow`. One topic per workflow instance
+# (keyed by task_id), single recv per workflow, so no fan-out
+# concerns. The payload is the raw PATCH body's per-task entry
+# (``{status, output, error}``).
+CLIENT_TOOL_RESULT_TOPIC = "client_tool_result"
+
+# B7: hard upper bound on how long a ``client_tool_workflow``
+# will wait for the client's PATCH before giving up and
+# surfacing the stall as a ``failed`` drain payload. Keeps
+# orphaned rows from pinning DBOS workflow slots indefinitely
+# when a client walks away mid-flight. One hour matches the
+# design doc's 1h-max-lifetime cap for async client tools.
+_CLIENT_TOOL_MAX_LIFETIME_S = 3600
 
 
 @dataclass(frozen=True)
@@ -302,3 +319,140 @@ def _payload_to_dict(payload: AsyncWorkCompletePayload) -> dict[str, Any]:
         "output": payload.output,
         "error": payload.error,
     }
+
+
+@workflow()
+async def client_tool_workflow(parent_task_id: str) -> dict[str, Any]:
+    """
+    Durable holder for an async client-side tool's result.
+
+    The LLM dispatches a ``synchronous: false`` client tool; the
+    server doesn't execute anything — the client owns the tool
+    body. This workflow's sole job is to **wait durably** for
+    the client's ``PATCH /v1/responses/{id}`` with
+    ``async_tool_results`` to arrive, then signal the parent's
+    drain so the result auto-delivers on the next iteration.
+
+    Using a DBOS workflow for this (instead of four ``manual_*``
+    columns on ``tasks``) gives three wins:
+
+    - **Atomic PATCH → signal**: ``DBOS.send`` + workflow return
+      are persisted by DBOS, so a crash between "PATCH accepted"
+      and "parent's drain woken" replays the send on recovery.
+      No stranded tasks.
+    - **Uniform task-status sourcing**: ``_enrich_from_dbos``
+      already overlays the workflow's terminal output onto the
+      :class:`Task`; client_tool rows follow the same path as
+      ``@tool`` and ``sub_agent``. No "what's the source of
+      truth for this kind" branching.
+    - **Cancel propagation for free**: ``cancel_workflow_async``
+      kills this workflow exactly like it does an ``@tool`` or
+      ``sub_agent`` child. The ``except BaseException`` block
+      sends ``status="cancelled"`` to the parent's drain.
+
+    Lifecycle:
+
+    1. ``DBOS.recv`` on :data:`CLIENT_TOOL_RESULT_TOPIC` with a
+       1-hour timeout.
+    2. On payload arrival, build an
+       :class:`AsyncWorkCompletePayload` with the PATCH's
+       status/output/error, truncated for the LLM.
+    3. On timeout (``recv`` returns ``None``), emit a ``failed``
+       payload explaining the 1h lifetime was exceeded — keeps
+       orphan rows from sitting in ``in_progress`` forever.
+    4. On cancellation (DBOS cancel via
+       ``cancel_workflow_async``), emit a ``cancelled`` payload
+       and re-raise so DBOS records the workflow as CANCELLED.
+    5. Send the payload to the parent's drain on
+       :data:`ASYNC_WORK_COMPLETE_TOPIC` and return it as the
+       workflow's terminal output so ``check_task`` / the
+       ``_to_entity`` overlay surface it.
+
+    :param parent_task_id: The IMMEDIATE calling agent's
+        task_id (audit fix #1) — receives the
+        ``async_work_complete`` signal when this workflow
+        terminates. Distinct from the top-level root when the
+        caller is a sub-agent.
+    :returns: The :class:`AsyncWorkCompletePayload` as a dict.
+    """
+    task_id = get_workflow_id()
+
+    try:
+        raw_payload = await dbos_recv_async(
+            topic=CLIENT_TOOL_RESULT_TOPIC,
+            timeout_seconds=_CLIENT_TOOL_MAX_LIFETIME_S,
+        )
+    except BaseException as exc:  # noqa: BLE001 — workflow boundary
+        # Cancellation (DBOS cancel_workflow) or any other
+        # unexpected fault while waiting. G86 — still signal so
+        # the parent drain wakes and removes this task from
+        # pending. Re-raise after sending so DBOS records the
+        # failure on the workflow.
+        err = format_failure_payload(exc)
+        cancel_payload = AsyncWorkCompletePayload(
+            task_id=task_id,
+            kind="client_tool",
+            status="cancelled",
+            output=err["message"],
+            error=err,
+        )
+        await _send_payload(parent_task_id, cancel_payload)
+        raise
+
+    if raw_payload is None:
+        # Timed out — the 1h lifetime cap fired. The client
+        # either crashed or walked away; surface as failed so
+        # the LLM sees a clean terminal state rather than
+        # hanging forever.
+        payload = AsyncWorkCompletePayload(
+            task_id=task_id,
+            kind="client_tool",
+            status="failed",
+            output="client-tool 1-hour lifetime cap exceeded",
+            error={
+                "message": (
+                    f"Client never PATCHed async_tool_results within the "
+                    f"{_CLIENT_TOOL_MAX_LIFETIME_S}s lifetime cap."
+                ),
+            },
+        )
+    else:
+        status = _coerce_terminal_status(raw_payload.get("status"))
+        output_raw = raw_payload.get("output") or ""
+        error_raw = raw_payload.get("error")
+        # Only truncate completed output for the LLM; failure /
+        # cancellation already carry bounded strings.
+        output_for_drain = truncate_for_llm(output_raw) if status == "completed" else output_raw
+        payload = AsyncWorkCompletePayload(
+            task_id=task_id,
+            kind="client_tool",
+            status=status,
+            output=output_for_drain,
+            error=error_raw if isinstance(error_raw, dict) else None,
+        )
+
+    await _send_payload(parent_task_id, payload)
+    return _payload_to_dict(payload)
+
+
+def _coerce_terminal_status(raw: Any) -> str:
+    """
+    Normalize a client-supplied terminal status string.
+
+    The server's Pydantic ``AsyncToolResult`` model (audit fix
+    #5) already restricts the PATCH-level field to
+    ``{completed, failed, cancelled}`` before the workflow sees
+    it, so in practice this helper is belt-and-suspenders:
+    garbage can only arrive if the payload was constructed by
+    an internal caller that bypassed the Pydantic layer. Fall
+    back to ``"failed"`` in that case rather than leaking the
+    unknown status into the drain's system-message formatter.
+
+    :param raw: The ``status`` value from the PATCH payload,
+        e.g. ``"completed"``.
+    :returns: One of ``"completed"``, ``"failed"``, or
+        ``"cancelled"``.
+    """
+    if raw in ("completed", "failed", "cancelled"):
+        return str(raw)
+    return "failed"

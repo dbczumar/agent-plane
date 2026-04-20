@@ -257,50 +257,47 @@ async def _finalize_and_signal(
     task_store: TaskStore,
 ) -> None:
     """
-    Persist a finalized async client-tool result and signal the parent.
+    Deliver an async client-tool result to its holder workflow.
 
-    Writes the manual_* columns on the task row, then sends the
-    ``async_work_complete`` payload to the parent so its drain
-    auto-delivers a system message on the next iteration.
+    Each ``kind="client_tool"`` task has a
+    :func:`~agent_plane.runtime.background_tool_workflow.client_tool_workflow`
+    parked on :data:`CLIENT_TOOL_RESULT_TOPIC`. This handler
+    sends the PATCH payload to that workflow; the workflow
+    then builds the ``AsyncWorkCompletePayload``, sends it on
+    the parent's drain, and returns — DBOS persists the return
+    value so ``_enrich_from_dbos`` surfaces the terminal state
+    the next time ``check_task`` runs.
+
+    Audit fix #8: the PATCH→parent-drain handoff is atomic.
+    DBOS persists both the recv and the subsequent send as
+    part of the workflow's checkpoint, so a crash between the
+    two replays exactly once on recovery — no stranded rows,
+    no duplicate drain payloads.
 
     :param async_result: The PATCH entry being applied.
     :param task: The looked-up :class:`Task` row (already
         validated as a non-terminal client_tool by
-        :func:`_lookup_client_tool_task`).
-    :param task_store: Task store for the finalization write.
+        :func:`_lookup_client_tool_task`). Only its ``id`` is
+        used — the holder workflow's id == task_id.
+    :param task_store: Unused; kept in the signature for
+        symmetry with :func:`_lookup_client_tool_task` and in
+        case future auth / ownership checks want a store
+        handle.
     """
     from agent_plane.runtime.background_tool_workflow import (
-        ASYNC_WORK_COMPLETE_TOPIC,
+        CLIENT_TOOL_RESULT_TOPIC,
     )
     from agent_plane.runtime.durability import dbos_send_async
 
-    await task_store.finalize_async_task(
-        task_id=async_result.task_id,
-        status=async_result.status,
-        output=async_result.output,
-        error=async_result.error,
-    )
-    # Audit fix #1: signal the IMMEDIATE caller's drain, not the
-    # root. For a top-level caller, parent_task_id is None and
-    # root_task_id is also None (falling back to task.id
-    # routes the signal back to a non-existent recipient, but
-    # the top-level agent doesn't wait for its own
-    # client-tool completions on the drain — it finishes and
-    # the signal is harmless). For sub-agent callers, the
-    # immediate parent is the sub-agent; signaling root would
-    # land the completion on the wrong conversation.
-    parent_task_id = task.parent_task_id or task.root_task_id or task.id
-    payload: dict[str, Any] = {
-        "task_id": async_result.task_id,
-        "kind": "client_tool",
-        "status": async_result.status,
-        "output": async_result.output,
-        "error": async_result.error,
-    }
+    _ = task_store  # reserved for future auth / observability use
     await dbos_send_async(
-        parent_task_id,
-        payload,
-        topic=ASYNC_WORK_COMPLETE_TOPIC,
+        task.id,
+        {
+            "status": async_result.status,
+            "output": async_result.output,
+            "error": async_result.error,
+        },
+        topic=CLIENT_TOOL_RESULT_TOPIC,
     )
 
 

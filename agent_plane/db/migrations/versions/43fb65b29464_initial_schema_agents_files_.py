@@ -139,15 +139,6 @@ def upgrade() -> None:
             "kind IN ('agent_task', 'tool', 'sub_agent', 'client_tool')",
             name="ck_tasks_kind",
         ),
-        # Phase 5: terminal status / output / error for tasks
-        # without a DBOS workflow (e.g. async client tools
-        # finalized via PATCH async_tool_results). NULL for
-        # tasks WITH a workflow — the store's _enrich_from_dbos
-        # overlay supplies live values from DBOS instead.
-        sa.Column("manual_status", sa.String(length=32), nullable=True),
-        sa.Column("manual_output", sa.Text(), nullable=True),
-        sa.Column("manual_error_message", sa.Text(), nullable=True),
-        sa.Column("manual_error_traceback", sa.Text(), nullable=True),
         sa.ForeignKeyConstraint(
             ["agent_id"],
             ["agents.id"],

@@ -2980,24 +2980,43 @@ async def _dispatch_async_client_tools(
             f"parent task {parent_task_id!r} not found — "
             f"async client tool dispatch invariant broken"
         )
-    # Resolve root_task_id for cancel-cascade scoping
-    # (cancel_pending_child_tools walks list_tasks(root_task_id=...)).
-    root_task_id = parent_row.root_task_id or parent_task_id
     # ``parent_task_id`` is the IMMEDIATE calling agent — what
     # the PATCH handler signals so its drain wakes. Audit fix
-    # #1: this differs from ``root_task_id`` when the caller is
-    # a sub-agent. Signaling the root would land the completion
-    # on the wrong conversation.
+    # #1: distinct from the top-level root when the caller is a
+    # sub-agent. Both ``root_task_id`` and ``parent_task_id`` on
+    # the new row are set to this same immediate-parent id —
+    # matches the @tool path's behavior so the parent's
+    # auto-collect query (``list_tasks(root_task_id=parent)``)
+    # actually finds its own client_tool children. Walking up
+    # to the top-level root would hide the children from the
+    # immediate parent's auto-collect entirely.
     immediate_parent_task_id = parent_task_id
+    root_task_id = parent_task_id
+    # parent_row is unused now that we don't walk up the chain;
+    # kept the lookup above so a missing parent fails loud
+    # before we create an orphan child row.
+    _ = parent_row
+
+    from agent_plane.runtime.background_tool_workflow import (
+        client_tool_workflow,
+    )
+    from agent_plane.runtime.durability import (
+        SetWorkflowID,
+        start_workflow,
+    )
 
     fco_items: list[NewConversationItem] = []
     for tc in tool_calls:
-        # Create the client_tool task row. ``start`` is NOT
-        # called — the client owns execution. The PATCH handler
-        # will later cancel the (non-existent) workflow but
-        # still mark the row terminal in task_store.
-        def _create_row() -> Any:
-            return task_store.create(
+        # Create the client_tool task row AND start its
+        # holder workflow. The workflow just parks on
+        # DBOS.recv(CLIENT_TOOL_RESULT_TOPIC) until the PATCH
+        # arrives, then fans out async_work_complete to
+        # `immediate_parent_task_id`. Attaching a DBOS workflow
+        # (vs. the old "manual_* columns" approach) gives
+        # atomic PATCH→signal durability and lets the cancel
+        # path use the same cancel_workflow_async as @tool.
+        def _create_and_start() -> Any:
+            created = task_store.create(
                 conversation_id=conversation_id,
                 agent_id=agent_id,
                 agent_name=agent_name,
@@ -3005,8 +3024,15 @@ async def _dispatch_async_client_tools(
                 parent_task_id=immediate_parent_task_id,
                 kind=_CLIENT_TOOL_KIND,
             )
+            # Pin DBOS workflow_uuid to the new task_id (G56) so
+            # the PATCH handler, cancel_workflow_async, and
+            # _enrich_from_dbos can address the workflow by
+            # task_id.
+            with SetWorkflowID(created.id):
+                start_workflow(client_tool_workflow, immediate_parent_task_id)
+            return created
 
-        new_task = await _to_thread(_create_row)
+        new_task = await _to_thread(_create_and_start)
         handle = {
             "task_id": new_task.id,
             "kind": _CLIENT_TOOL_KIND,
@@ -3084,18 +3110,20 @@ async def cancel_pending_child_tools(parent_task_id: str) -> None:
                     child.id,
                 )
         elif child.kind == _CLIENT_TOOL_KIND:
-            # Client-side async tool — there's no server-side
-            # workflow. Mark the task row cancelled in-store
-            # and emit a response.client_task.cancel SSE event
-            # so the client cancels its local asyncio task and
-            # PATCHes back. The drain doesn't get a signal here
-            # — the client's PATCH will trigger one via the
-            # normal async_tool_results path.
+            # Client-side async tool — has a holder DBOS
+            # workflow (client_tool_workflow) parked on
+            # DBOS.recv. Cancelling that workflow makes its
+            # except-block fire, which sends an
+            # async_work_complete payload with status=cancelled
+            # to the parent's drain (G86) and re-raises so DBOS
+            # records CANCELLED. We also emit the
+            # response.client_task.cancel SSE so the client can
+            # stop its local asyncio task and (optionally)
+            # PATCH back — the late PATCH is a no-op once the
+            # workflow has terminated (DBOS.send to a
+            # finished workflow is dropped).
             try:
-                await task_store.finalize_async_task(
-                    task_id=child.id,
-                    status="cancelled",
-                )
+                await cancel_workflow_async(child.id)
                 _write_output(
                     parent_task_id,
                     {
@@ -3125,28 +3153,6 @@ async def cancel_pending_child_tools(parent_task_id: str) -> None:
 # the contract.
 
 
-def _truncate_for_drain(body: str) -> str:
-    """
-    Cap a drain-payload body at the LLM-context budget.
-
-    The ``async_work_complete`` drain stuffs payload bodies
-    directly into the next LLM iteration's input — an unbounded
-    body would blow the context window or starve the LLM of
-    room for actual reasoning. Matches the @tool / sub-agent
-    truncation budget so every drain producer (sub-agents,
-    @tool, client tools) shares one ceiling.
-
-    :param body: The producer-supplied body string. May be empty.
-    :returns: Either the original body (when within budget) or
-        the head plus a ``[... N more chars truncated]`` marker.
-    """
-    if len(body) <= _SUB_AGENT_OUTPUT_BUDGET:
-        return body
-    return body[:_SUB_AGENT_OUTPUT_BUDGET] + (
-        f"\n[... {len(body) - _SUB_AGENT_OUTPUT_BUDGET} more chars truncated]"
-    )
-
-
 def _format_async_completion_text(payload: dict[str, Any]) -> str:
     """
     Render an ``async_work_complete`` payload as a system message body.
@@ -3155,9 +3161,11 @@ def _format_async_completion_text(payload: dict[str, Any]) -> str:
     elsewhere in the workflow (steering markers, sub-agent
     auto-collect). Includes the task_id verbatim so the LLM can
     cross-reference the original handle it received from the
-    asynchronous tool call. Bodies (success ``output``, failure
-    ``traceback``) are truncated at :data:`_SUB_AGENT_OUTPUT_BUDGET`
-    so a single drained payload can't blow the LLM's context.
+    asynchronous tool call. Producers (background_tool_workflow
+    for ``@tool``, client_tool_workflow for ``client_tool``,
+    the sub-agent path for ``sub_agent``) all truncate their
+    output bodies before sending the drain payload, so this
+    formatter doesn't re-truncate.
 
     :param payload: Drained dict with ``task_id``, ``kind``,
         ``status``, ``output``, and ``error`` keys (the shape
@@ -3169,12 +3177,12 @@ def _format_async_completion_text(payload: dict[str, Any]) -> str:
     kind = payload["kind"]
     status = payload["status"]
     if status == "completed":
-        body = _truncate_for_drain(payload.get("output") or "")
+        body = payload.get("output") or ""
         return f"[System: task {task_id} ({kind}) completed]\n{body}"
     if status == "failed":
         err = payload.get("error") or {}
         message = err.get("message", "(no message)")
-        traceback_text = _truncate_for_drain(err.get("traceback", ""))
+        traceback_text = err.get("traceback", "")
         return f"[System: task {task_id} ({kind}) failed]\n{message}\n{traceback_text}".rstrip()
     # Cancelled (G86) or any other terminal status — surface the
     # status verbatim so the LLM can adjust its plan rather than
