@@ -790,6 +790,138 @@ async def test_list_tasks_includes_client_tool_kind(
     await _wait_for_completion(client, response_id)
 
 
+async def test_blocking_drain_does_not_spin_when_llm_emits_text_with_pending(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Regression for the steering-cursor-stale bug.
+
+    When the parent loop entered the end-of-turn auto-collect
+    branch with (a) pending async children AND (b) the LLM
+    having emitted text on this turn, the assistant text item
+    was persisted *between* the iteration's cursor capture and
+    the blocking drain's steering-cursor read. The drain's
+    steering check then immediately saw the just-persisted
+    text as "new steering" and returned early. The outer loop
+    continued straight into another iteration — calling the
+    LLM again, persisting another assistant text, draining
+    early again. Spin.
+
+    Visible symptom in ``ap chat``: the agent emits the same
+    "Done — all 6 tasks finished" message ~7-15 times in a
+    single response while the loop spun before the actual
+    completions arrived.
+
+    Fix: track a local ``drain_cursor`` advanced past every
+    item persisted in the auto-collect branch (the assistant
+    text + any late-drained completion items) and pass *that*
+    as the drain's ``steering_cursor``.
+
+    Failure mode this test catches:
+    - With the cursor-stale bug, the mock LLM's
+      ``add_call(text="ack")`` would be invoked many extra
+      times before the test's PATCH lands. ``call_count`` would
+      then be much higher than the expected 3 (initial dispatch
+      turn + the "waiting" turn the drain blocks on + the
+      final-response turn after the PATCH).
+    """
+    await create_test_agent(client)
+
+    # Turn 1: dispatch one async client tool.
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_no_spin",
+                "name": "client_long_compute",
+                "arguments": _async_args(n=1),
+            },
+        ],
+    )
+    # Turn 2: LLM emits text only (no further tool calls).
+    # Without the fix, this is the turn that triggers the spin
+    # — the drain immediately breaks on the just-persisted
+    # "ack" text and the loop continues, calling the LLM
+    # again and again until either max_iterations or the
+    # PATCH lands.
+    mock_llm.add_call(text="ack — waiting for the async tool")
+    # Generous reservoir for the spin scenario. With the fix
+    # in place exactly ONE of these gets consumed (the
+    # post-completion turn). Without the fix, the loop
+    # would chew through as many as it can before the PATCH.
+    for _ in range(20):
+        mock_llm.add_call(text="final — done")
+
+    resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": "Test no-spin invariant",
+            "background": True,
+            "stream": False,
+            "tools": [_ASYNC_CAPABLE_CLIENT_TOOL],
+        },
+    )
+    response_id = resp.json()["id"]
+    conv_id = resp.json()["conversation"]["id"]
+
+    # Wait for the dispatch and capture the client_tool task_id.
+    fco = await _wait_for_item_type(client, conv_id, "function_call_output")
+    handle = json.loads(fco["output"])
+    client_tool_task_id: str = handle["task_id"]
+    assert handle["kind"] == "client_tool"
+
+    # Give the loop a beat to enter the blocking drain. With
+    # the fix, the loop is genuinely waiting on
+    # ``DBOS.recv(async_work_complete)`` — so the LLM call
+    # count does NOT grow during this sleep. With the
+    # cursor-stale bug, the count would creep up by one per
+    # ~1s of spin.
+    pre_patch_count_t0 = mock_llm.call_count
+    await asyncio.sleep(2.0)
+    pre_patch_count_t2 = mock_llm.call_count
+    assert pre_patch_count_t2 == pre_patch_count_t0, (
+        f"LLM was called {pre_patch_count_t2 - pre_patch_count_t0} extra "
+        f"times during the 2s drain wait — the loop is spinning. "
+        f"This is the steering-cursor-stale regression: the drain "
+        f"breaks immediately on the just-persisted assistant text "
+        f"item because the steering_cursor doesn't include items "
+        f"the iteration itself just appended. Fix: advance the "
+        f"local ``drain_cursor`` after each persist before "
+        f"passing it to ``_drain_async_completions``."
+    )
+
+    # PATCH the result so the parent's drain wakes naturally
+    # and the response can complete.
+    await client.patch(
+        f"/v1/responses/{response_id}",
+        json={
+            "async_tool_results": [
+                {
+                    "task_id": client_tool_task_id,
+                    "status": "completed",
+                    "output": "OK",
+                },
+            ],
+        },
+    )
+
+    body = await _wait_for_completion(client, response_id)
+    assert body["status"] == "completed"
+
+    # End-state: exactly the iterations the design implies.
+    # 1: dispatch turn (LLM emits the tool_call)
+    # 2: "waiting" turn while drain blocks
+    # 3: post-completion turn (LLM sees [System: ... completed]
+    #    and emits final response)
+    # If 4+, the loop spun. If 2, something's terribly off.
+    assert mock_llm.call_count == 3, (
+        f"Expected exactly 3 LLM calls (dispatch + wait + final); "
+        f"got {mock_llm.call_count}. If 4+, the steering-cursor-stale "
+        f"spin regressed — each extra call is one spin iteration."
+    )
+
+
 async def test_parent_natural_completion_reaps_pending_client_tool_children(
     client: httpx.AsyncClient,
     mock_llm: ControllableMockClient,

@@ -4864,6 +4864,17 @@ async def _run_agent_loop(
                         # preserve in those cases.
                         text = _get_text_content(llm_resp)
                         file_annotations = _collect_file_annotations(output_items)
+                        # Track the cursor as we persist new
+                        # items in this branch. The blocking
+                        # drain below uses this as
+                        # ``steering_cursor`` — its check is
+                        # "any item past the cursor", so a
+                        # cursor that doesn't include items
+                        # *we just persisted ourselves* would
+                        # break out immediately every iteration
+                        # and spin the loop. Each persist site
+                        # below advances ``drain_cursor``.
+                        drain_cursor = last_seen
                         if text or file_annotations:
                             _emit_file_annotations(task_id, file_annotations)
                             item = _build_assistant_item(
@@ -4880,17 +4891,21 @@ async def _run_agent_loop(
                                 output_items,
                             )
                             history.extend(persisted)
+                            if persisted:
+                                drain_cursor = persisted[-1].id
                         if late_drained:
                             # Already-drained payloads need
                             # persisting; pending case will block
                             # for at least one more.
-                            _persist_async_completions(
+                            late_persisted = _persist_async_completions(
                                 task_id,
                                 conversation_id,
                                 late_drained,
                                 output_items,
                                 conv_store,
                             )
+                            if late_persisted:
+                                drain_cursor = late_persisted[-1].id
                         if pending_tool_tasks:
                             # Block on the topic until at least
                             # one signal arrives OR a steering
@@ -4908,7 +4923,7 @@ async def _run_agent_loop(
                                 block_for_one=True,
                                 conv_store=conv_store,
                                 conversation_id=conversation_id,
-                                steering_cursor=last_seen,
+                                steering_cursor=drain_cursor,
                             )
                             _persist_async_completions(
                                 task_id,
