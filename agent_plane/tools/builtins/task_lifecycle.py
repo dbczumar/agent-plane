@@ -353,6 +353,40 @@ class CancelTaskTool(Tool):
                 }
             )
 
+        # For client_tool kind, emit the response.client_task.cancel
+        # SSE event on the parent's stream BEFORE cancelling the
+        # holder workflow. The SDK's D6 lifecycle uses this event
+        # to cancel the local asyncio.Task running the tool body —
+        # without it, the SDK keeps running the body even though
+        # the agent has moved on. The body's eventual PATCH will
+        # be a no-op (G3) but compute / I/O / etc. is wasted.
+        # Mirrors what cancel_pending_child_tools does for the
+        # parent-cancel propagation path; uses _write_output so the
+        # cancel lands on both the live stream (for connected SDKs)
+        # and the durable stream (for crash-recovery / inspection).
+        if task.kind == "client_tool":
+            # Use _live_publish (real-time only) instead of
+            # _write_output (which also writes to the durable
+            # stream via DBOS write_stream). The durable
+            # write requires a DBOS step context, but
+            # CancelTaskTool.invoke runs inside the parent
+            # workflow's thread executor (via asyncio.to_thread)
+            # — calling sync DBOS APIs from there can deadlock
+            # against the workflow's own recv loop. Live-only
+            # publish goes through an in-process channel and
+            # is what the SDK actually reads via SSE.
+            from agent_plane.runtime.live_stream import publish as _live_publish
+
+            cancel_target_task_id = task.parent_task_id or task.root_task_id
+            if cancel_target_task_id is not None:
+                _live_publish(
+                    cancel_target_task_id,
+                    {
+                        "type": "response.client_task.cancel",
+                        "task_id": task_id,
+                    },
+                )
+
         task_store.cancel(task_id)
         return json.dumps(
             {

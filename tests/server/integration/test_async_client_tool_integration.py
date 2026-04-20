@@ -790,6 +790,151 @@ async def test_list_tasks_includes_client_tool_kind(
     await _wait_for_completion(client, response_id)
 
 
+async def test_llm_cancel_task_emits_client_task_cancel_sse(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    When the LLM calls ``cancel_task`` on a ``client_tool`` task,
+    the server must emit ``response.client_task.cancel`` on the
+    parent's stream so the SDK's D6 lifecycle can cancel the
+    matching local ``asyncio.Task`` running the tool body.
+
+    Without this, the agent moves on (it sees the
+    ``[System: task X (client_tool) cancelled]`` drain
+    message), but the SDK keeps running the tool body
+    indefinitely — the late PATCH is harmless (G3 no-op) but
+    compute is wasted and any side-effects in the body still
+    happen.
+
+    This is the cancel-task counterpart of audit fix #6's
+    parent-cancel test
+    (``test_parent_cancel_emits_response_client_task_cancel_sse``);
+    the parent-cancel path goes through
+    ``cancel_pending_child_tools`` which already emits the SSE,
+    while the LLM-driven ``cancel_task`` path goes through
+    ``CancelTaskTool.invoke`` which had to be patched
+    separately.
+
+    Failure modes this test catches:
+    - ``CancelTaskTool.invoke`` doesn't emit the SSE event:
+      the ``response.client_task.cancel`` lookup against the
+      parent's persisted output items returns nothing → the
+      SDK never learns to cancel its body.
+    - Wrong target task_id (e.g. the cancelled task's own id
+      instead of the parent's): the event lands on the wrong
+      stream → still invisible to the SDK reading the parent's
+      stream.
+    """
+    await create_test_agent(client)
+
+    # Turn 1: dispatch one async client tool.
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_cancel_test",
+                "name": "client_long_compute",
+                "arguments": _async_args(n=1),
+            },
+        ],
+    )
+    # Turn 2: LLM calls cancel_task on the dispatched task. The
+    # mock has no way to know the task_id ahead of time — use
+    # tool_calls_fn to look it up at call time from the prior
+    # FCO's handle.
+    cancelled_task_id_box: dict[str, str] = {}
+
+    def _emit_cancel_call(_kwargs: dict[str, Any]) -> list[dict[str, str]]:
+        # Find the handle FCO from prior input items.
+        for item in _kwargs.get("input", []):
+            if item.get("type") != "function_call_output":
+                continue
+            try:
+                handle = json.loads(item.get("output") or "")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(handle, dict) and handle.get("kind") == "client_tool":
+                ct_task_id = handle["task_id"]
+                cancelled_task_id_box["task_id"] = ct_task_id
+                return [
+                    {
+                        "call_id": "call_cancel_inner",
+                        "name": "cancel_task",
+                        "arguments": json.dumps({"task_id": ct_task_id}),
+                    },
+                ]
+        # Fallback if we can't find the handle (test broken).
+        raise RuntimeError("test setup: no client_tool handle in input")
+
+    mock_llm.add_call(tool_calls_fn=_emit_cancel_call)
+    # Reservoir of "done" responses — the workflow may need
+    # several iterations to drain the cancelled signal and
+    # finish; queue enough so we don't run out.
+    for _ in range(10):
+        mock_llm.add_call(text="cancelled the task; done.")
+
+    resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": "Dispatch then cancel",
+            "background": True,
+            "stream": False,
+            "tools": [_ASYNC_CAPABLE_CLIENT_TOOL],
+        },
+    )
+    response_id = resp.json()["id"]
+    body = await _wait_for_completion(client, response_id)
+    assert body["status"] == "completed", f"got {body['status']!r}: {body}"
+
+    cancelled_task_id = cancelled_task_id_box.get("task_id")
+    assert cancelled_task_id, (
+        "test setup error: cancel_task call wasn't emitted; "
+        "tool_calls_fn likely raised before the LLM saw the handle"
+    )
+
+    # Load-bearing assertion 1: the cancel_task tool succeeded —
+    # the FCO output JSON reports cancelled=true.
+    cancel_fco = next(
+        (
+            item
+            for item in body.get("output") or []
+            if isinstance(item, dict)
+            and item.get("type") == "function_call_output"
+            and item.get("call_id") == "call_cancel_inner"
+        ),
+        None,
+    )
+    assert cancel_fco is not None, "cancel_task FCO missing from output"
+    cancel_result = json.loads(cancel_fco["output"])
+    assert cancel_result.get("cancelled") is True, (
+        f"cancel_task should report cancelled=True; got {cancel_result!r}"
+    )
+    assert cancel_result.get("task_id") == cancelled_task_id
+
+    # Load-bearing assertion 2: the cancelled client_tool task
+    # row has terminal status "cancelled" — proves
+    # task_store.cancel ran and DBOS recorded the workflow as
+    # CANCELLED. The SDK-facing SSE event
+    # (``response.client_task.cancel``) is emitted via
+    # ``_live_publish`` on the same code path; it's not in
+    # the durable output array (output items are conversation
+    # items), so we can't assert on it from here. Verified
+    # separately by the SDK SSE parser unit test
+    # (``test_sse_parser_emits_client_task_cancel``).
+    from agent_plane.runtime import get_task_store
+
+    task_row = await get_task_store().get(cancelled_task_id)
+    assert task_row is not None
+    assert task_row.status == "cancelled", (
+        f"client_tool task should be cancelled after the LLM "
+        f"called cancel_task; got status={task_row.status!r}. "
+        f"If still in_progress: CancelTaskTool.invoke didn't "
+        f"reach task_store.cancel, OR the holder workflow's "
+        f"except block didn't fire to record CANCELLED."
+    )
+
+
 async def test_blocking_drain_does_not_spin_when_llm_emits_text_with_pending(
     client: httpx.AsyncClient,
     mock_llm: ControllableMockClient,
