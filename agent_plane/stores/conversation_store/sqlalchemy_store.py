@@ -42,6 +42,7 @@ def _to_conversation(row: SqlConversation) -> Conversation:
         created_at=row.created_at,
         updated_at=row.updated_at,
         title=row.title,
+        metadata=row.metadata_,
         kind=row.kind,
         parent_conversation_id=row.parent_conversation_id,
     )
@@ -119,6 +120,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         self,
         kind: str = "default",
         title: str | None = None,
+        metadata: dict[str, str] | None = None,
         parent_conversation_id: str | None = None,
     ) -> Conversation:
         """
@@ -131,6 +133,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             store ``"<type>:<name>"`` so the partial unique
             index enforces ``(parent_conversation_id, title)``
             uniqueness within a parent.
+        :param metadata: Optional key-value map of up to 16
+            pairs (keys ≤64 chars, values ≤512 chars).
         :param parent_conversation_id: Phase 4 — id of the
             owning parent conversation. ``None`` for top-level.
         :returns: The newly created :class:`Conversation`.
@@ -148,6 +152,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             created_at=now,
             updated_at=now,
             title=title,
+            metadata_=metadata,
             kind=kind,
             parent_conversation_id=parent_conversation_id,
         )
@@ -568,8 +573,49 @@ class SqlAlchemyConversationStore(ConversationStore):
             id_cmp = SqlConversation.id > cursor_id if is_desc else SqlConversation.id < cursor_id
         return stmt.where(or_(ts_cmp, and_(sort_col == sub, id_cmp)))
 
+    def get_item(
+        self, conversation_id: str, item_id: str
+    ) -> ConversationItem | None:
+        """
+        Retrieve a single item by ID, scoped to the given conversation.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param item_id: Unique item identifier,
+            e.g. ``"msg_abc123"``.
+        :returns: The :class:`ConversationItem` if found and
+            owned by the conversation, otherwise ``None``.
+        """
+        with self._session() as session:
+            row = session.get(SqlConversationItem, item_id)
+            if row is None or row.conversation_id != conversation_id:
+                return None
+            return _to_item(row)
+
+    def delete_item(self, conversation_id: str, item_id: str) -> bool:
+        """
+        Delete a single item from the given conversation.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param item_id: Unique item identifier to delete,
+            e.g. ``"msg_abc123"``.
+        :returns: ``True`` if the item existed and was deleted,
+            ``False`` if the item was not found or does not
+            belong to the given conversation.
+        """
+        with self._session() as session:
+            row = session.get(SqlConversationItem, item_id)
+            if row is None or row.conversation_id != conversation_id:
+                return False
+            session.delete(row)
+            return True
+
     def update_conversation(
-        self, conversation_id: str, title: str | None = None
+        self,
+        conversation_id: str,
+        title: str | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -577,8 +623,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
         :param title: New title, or ``None`` to leave unchanged.
-            When provided, ``updated_at`` is bumped to the
-            current epoch time.
+        :param metadata: New metadata map to replace the existing
+            one, or ``None`` to leave unchanged. When provided,
+            ``updated_at`` is bumped to the current epoch time.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
         """
@@ -588,6 +635,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 return None
             if title is not None:
                 row.title = title
+                row.updated_at = now_epoch()
+            if metadata is not None:
+                row.metadata_ = metadata
                 row.updated_at = now_epoch()
             return _to_conversation(row)
 

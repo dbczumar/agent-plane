@@ -126,6 +126,9 @@ class ConversationObject(BaseModel):
     :param object: Fixed resource type, always
         ``"conversation"``.
     :param title: Optional user-assigned conversation title.
+        Agent-plane extension; not present in the OpenAI spec.
+    :param metadata: Optional key-value map of up to 16 pairs
+        (keys ≤64 chars, values ≤512 chars).
     :param created_at: Unix epoch timestamp of creation.
     :param updated_at: Unix epoch timestamp of the last
         update, e.g. ``1774118400``.
@@ -134,6 +137,7 @@ class ConversationObject(BaseModel):
     id: str
     object: str = "conversation"
     title: str | None = None
+    metadata: dict[str, str] | None = None
     created_at: int
     updated_at: int
 
@@ -152,6 +156,24 @@ class ConversationDeleted(BaseModel):
     id: str
     object: str = "conversation.deleted"
     deleted: bool = True
+
+
+class ItemDeleted(BaseModel):
+    """
+    Confirmation payload returned after deleting a conversation item.
+
+    :param id: ID of the deleted item, e.g. ``"msg_abc123"``.
+    :param object: Fixed resource type, always
+        ``"conversation.item.deleted"``.
+    :param deleted: Always ``True``.
+    :param conversation_id: ID of the owning conversation,
+        e.g. ``"conv_abc123"``.
+    """
+
+    id: str
+    object: str = "conversation.item.deleted"
+    deleted: bool = True
+    conversation_id: str
 
 
 class ConversationRef(BaseModel):

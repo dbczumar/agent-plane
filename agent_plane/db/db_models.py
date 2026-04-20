@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     ForeignKey,
@@ -95,6 +96,10 @@ class SqlConversation(Base):
         last updated (item append, title change, etc.).
     :param title: Optional human-readable title for the conversation.
         ``None`` when not provided.
+    :param metadata_: Optional key-value metadata map (up to 16 pairs,
+        keys ≤64 chars, values ≤512 chars). Stored in the ``metadata``
+        column. Attribute uses trailing underscore to avoid shadowing
+        :attr:`DeclarativeBase.metadata`. ``None`` when not provided.
     :param kind: Conversation type. ``"default"`` for user-initiated,
         ``"sub_agent"`` for sub-agent execution conversations.
     :param parent_conversation_id: For Phase 4 named sub-agents,
@@ -109,6 +114,9 @@ class SqlConversation(Base):
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int] = mapped_column(Integer)
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Stored as "metadata" column; attribute uses trailing underscore to
+    # avoid shadowing DeclarativeBase.metadata (a SQLAlchemy reserved name).
+    metadata_: Mapped[dict[str, str] | None] = mapped_column("metadata", JSON, nullable=True)
     kind: Mapped[str] = mapped_column(String(32), default="default")
     parent_conversation_id: Mapped[str | None] = mapped_column(
         String(64),
