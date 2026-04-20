@@ -229,6 +229,10 @@ def _get_rendered_terminal_screen(task: Task) -> str | None:
         return None
     from pathlib import Path as _Path
 
+    # The workspace arg is only consulted on cache MISS; the
+    # ``active_conversation_ids`` check above guarantees the manager
+    # already exists, so this sentinel path is never used as a
+    # workspace. Same pattern as ``_get_recent_terminal_activity``.
     manager = registry.for_conversation(task.conversation_id, _Path("."))
     return manager.rendered_screen_for_task(task.id)
 

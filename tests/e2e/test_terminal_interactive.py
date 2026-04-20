@@ -640,8 +640,6 @@ def test_three_persistent_repls_and_followup_turn_is_processed(
     - Any of the REPLs fails to launch / receive input (no
       random number appears in the screen fields).
     """
-    import time as _time
-
     unique = "REPL-STATE-TRIPLE-M9K"
     # Turn 1: launch + send to each REPL, then report.
     resp1 = http_client.post(
@@ -737,9 +735,8 @@ def test_three_persistent_repls_and_followup_turn_is_processed(
     # --- Turn 2: follow-up message threads off turn 1. ---
     # Without the drain-for-terminals fix, turn 1 would be stuck
     # and this POST would hang or be routed as steering. With the
-    # fix, turn 1 is done and turn 2 is a clean new turn.
-    _time.sleep(0.5)  # brief gap — not required for correctness, makes the
-    # server-side "new turn" distinction cleaner to observe.
+    # fix, turn 1 is already at status="completed" (we asserted
+    # this above) so the server cleanly starts a new turn.
     resp2 = http_client.post(
         "/v1/responses",
         json={

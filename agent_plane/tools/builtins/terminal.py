@@ -28,7 +28,11 @@ import json
 from typing import Any
 
 from agent_plane.runtime import get_terminal_registry
-from agent_plane.terminals.manager import ShellCapExceeded, ShellNameInvalid
+from agent_plane.terminals.manager import (
+    ShellCapExceeded,
+    ShellNameInvalid,
+    TerminalManager,
+)
 from agent_plane.tools.base import Tool, ToolContext
 
 # Shared "description" text for the shell parameter, referenced in
@@ -631,9 +635,14 @@ class TerminalSendInputTool(Tool):
             (required), and optional ``wait_ms``.
         :param ctx: Must have ``conversation_id`` populated.
         :returns: JSON string of shape
-            ``{delivered, task_id, recent_activity?, screen?,
+            ``{delivered, task_id, recent_activity?, screen,
             reason?}``. ``reason`` is set only when
-            ``delivered=False``.
+            ``delivered=False``. ``recent_activity`` is present
+            when any new bytes arrived since the last poll;
+            ``screen`` is always populated for delivered calls
+            (captured from the shell object at send time, so it's
+            present even if the task unregistered during the
+            quiescence wait).
         """
         try:
             parsed: dict[str, Any] = json.loads(arguments) if arguments else {}
@@ -710,7 +719,7 @@ class TerminalSendInputTool(Tool):
 
     def _wait_for_quiescence(
         self,
-        manager: Any,
+        manager: TerminalManager,
         task_id: str,
         budget_ms: int,
     ) -> None:

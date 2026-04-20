@@ -211,7 +211,7 @@ def test_async_terminal_cancel_stops_sleep(
         f"No check_task saw the task in 'cancelled' status. "
         f"Statuses observed: "
         f"{[co.get('status') for co in check_payloads]}. If all "
-        f"'in_progress', wait_ms=5000 expired before the cancel "
+        f"'in_progress', wait_ms=15000 expired before the cancel "
         f"finalized (SIGINT path too slow). If 'completed', SIGINT "
         f"didn't flip the status (sleep ran to completion)."
     )
