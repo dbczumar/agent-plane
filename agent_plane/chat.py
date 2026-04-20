@@ -318,7 +318,15 @@ def _load_tool_handler(name: str) -> ToolHandler:
     """
     Load a client-side tool set by name and wrap it as a ToolHandler.
 
-    :param name: Tool set name, e.g. ``"coder"``.
+    Prefers the modern ``@tool``-decorated functions (exposed
+    by the tool set as ``_TOOL_FNS``) so the SDK's D6 lifecycle
+    can detect ``synchronous: false`` properties on the wire
+    schema. Falls back to the legacy ``TOOLS`` + ``execute_tool``
+    surface for tool sets that haven't migrated yet — same
+    behavior as before, just constructed manually rather than
+    via ``build_tool_handler``.
+
+    :param name: Tool set name, e.g. ``"coding"``.
     :returns: A ToolHandler with schemas and execute function.
     :raises click.ClickException: If the tool set is not found.
     """
@@ -327,11 +335,24 @@ def _load_tool_handler(name: str) -> ToolHandler:
 
         tool_set = get_tool_set(name)
     except (ImportError, SystemExit):
-        raise click.ClickException(f"Tool set {name!r} not found. Available: coding")
+        raise click.ClickException(f"Tool set {name!r} not found. Available: coding, async_demo")
 
+    fns = getattr(tool_set, "_TOOL_FNS", None)
+    if fns is not None:
+        # Modern path: @tool-decorated functions. The SDK's
+        # build_tool_handler derives schemas from type hints +
+        # docstrings, strips ``synchronous`` routing hints
+        # before invoking the user fn, and bridges sync vs
+        # async ``execute`` correctly.
+        from agent_plane_client.tools import build_tool_handler
+
+        return build_tool_handler(fns)
+
+    # Legacy path: hand-written TOOLS dict + sync
+    # execute_tool dispatcher.
     def execute(call: ToolCallInfo) -> str:
         """
-        Execute a client-side tool call.
+        Execute a client-side tool call (legacy sync path).
 
         :param call: The tool call info with name and arguments.
         :returns: The tool result string.
