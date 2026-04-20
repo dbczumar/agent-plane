@@ -3307,9 +3307,55 @@ def _build_async_completion_item(
     )
 
 
+def _steering_arrived(
+    conv_store: ConversationStore,
+    conversation_id: str,
+    last_seen: str,
+) -> bool:
+    """
+    Return ``True`` iff the conversation has any item appended
+    after ``last_seen``.
+
+    Used by :func:`_drain_async_completions` on each heartbeat
+    slice to break out of the async-signal wait when steering
+    (or any other out-of-band append) has arrived. The caller
+    passes its pre-drain cursor; a single new item is enough to
+    force an iteration.
+
+    Failures are swallowed to ``False`` — a transient store
+    error on the steering check should not prevent the drain
+    from eventually picking up its async_work_complete signal.
+
+    :param conv_store: The active conversation store.
+    :param conversation_id: The conversation being agent'd.
+    :param last_seen: Pre-drain cursor (item id).
+    :returns: ``True`` when at least one item exists after
+        ``last_seen``; ``False`` otherwise, or on any store
+        error.
+    """
+    try:
+        page = conv_store.list_items(
+            conversation_id=conversation_id,
+            after=last_seen,
+            limit=1,
+            order="asc",
+        )
+    except Exception:
+        _logger.exception(
+            "steering check failed for conv %s after cursor %s",
+            conversation_id,
+            last_seen,
+        )
+        return False
+    return bool(page.data)
+
+
 async def _drain_async_completions(
     *,
     block_for_one: bool,
+    conv_store: ConversationStore | None = None,
+    conversation_id: str | None = None,
+    steering_cursor: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Drain queued ``async_work_complete`` signals for the current workflow.
@@ -3322,29 +3368,60 @@ async def _drain_async_completions(
       list if the queue is empty — the caller proceeds straight to
       the LLM call.
     * ``block_for_one=True`` (end-of-turn auto-collect, D5): the
-      first ``recv_async`` call blocks until at least one payload
-      arrives (no timeout). Subsequent reads use ``timeout=0`` to
-      drain anything that piled up while the first one was
-      waiting. Caller must check ``pending_tasks`` independently
-      before deciding to call this — calling with no pending work
-      will deadlock.
+      first ``recv_async`` call blocks with the heartbeat cadence
+      (G20: 15 s) until at least one payload arrives. Subsequent
+      reads use ``timeout=0`` to drain anything that piled up
+      while the first one was waiting. Caller must check
+      ``pending_tasks`` independently before deciding to call
+      this — calling with no pending work will deadlock.
 
-    Both modes filter against nothing: the topic itself is the
-    filter and the sender side (background workflows + future
-    sub-agent terminal hook) is the contract for what arrives.
+    **Steering responsiveness** (B-side to the heartbeat):
+    when ``conv_store``, ``conversation_id``, and
+    ``steering_cursor`` are all supplied, the blocking-loop's
+    heartbeat-timeout path also peeks the conversation store
+    for any items appended after ``steering_cursor``. A hit
+    breaks the drain loop early and returns whatever's been
+    collected so far (possibly empty) — the outer agent loop
+    then ``continue``s so its next iteration's ``_sync_history``
+    picks up the steered message. Without this check the
+    workflow would keep blocking on ``recv_async`` and the user
+    would wait up to the longest-running child's remaining
+    duration before their steering landed.
 
     :param block_for_one: When ``True``, block on the first read
-        until a payload arrives. When ``False``, return
-        immediately if the queue is empty.
+        until a payload arrives or ``steering_cursor`` is
+        passed and a new steering item appears. When ``False``,
+        return immediately if the queue is empty.
+    :param conv_store: Optional conversation store for steering
+        check. Pass together with ``conversation_id`` and
+        ``steering_cursor`` or all-None.
+    :param conversation_id: Optional conversation id to poll
+        for steering messages.
+    :param steering_cursor: Optional cursor — the last-seen
+        conversation item id. ``list_items(after=cursor,
+        limit=1)`` with a non-empty result means steering (or
+        any other out-of-band append) has arrived.
     :returns: List of payload dicts in arrival order. Each dict has
         the
         :class:`~agent_plane.runtime.background_tool_workflow.AsyncWorkCompletePayload`
         shape: ``task_id``, ``kind``, ``status``, ``output``,
-        ``error``.
+        ``error``. May be empty when the blocking loop broke
+        on steering arrival.
     """
     from agent_plane.runtime.background_tool_workflow import (
         ASYNC_WORK_COMPLETE_TOPIC,
     )
+
+    # Capture locally so mypy can narrow the types inside the
+    # heartbeat loop without repeating the None checks.
+    if conv_store is not None and conversation_id is not None and steering_cursor is not None:
+        _steering_conv_store: ConversationStore | None = conv_store
+        _steering_conv_id: str | None = conversation_id
+        _steering_cursor_resolved: str | None = steering_cursor
+    else:
+        _steering_conv_store = None
+        _steering_conv_id = None
+        _steering_cursor_resolved = None
 
     drained: list[dict[str, Any]] = []
     if block_for_one:
@@ -3365,6 +3442,23 @@ async def _drain_async_completions(
                     parent_id,
                     {"type": "response.heartbeat"},
                 )
+                if (
+                    _steering_conv_store is not None
+                    and _steering_conv_id is not None
+                    and _steering_cursor_resolved is not None
+                    and _steering_arrived(
+                        _steering_conv_store,
+                        _steering_conv_id,
+                        _steering_cursor_resolved,
+                    )
+                ):
+                    # Break out so the outer agent loop can
+                    # iterate and _sync_history pulls in the
+                    # new message. pending_tool_tasks stays
+                    # pending — the drain will pick them up on
+                    # the next iteration via the non-blocking
+                    # path.
+                    return drained
         drained.append(first)
     while True:
         # timeout_seconds=0 is the documented "non-blocking poll"
@@ -4779,11 +4873,22 @@ async def _run_agent_loop(
                             )
                         if pending_tool_tasks:
                             # Block on the topic until at least
-                            # one signal arrives. The next
-                            # iteration's drain picks up
-                            # remaining completions.
+                            # one signal arrives OR a steering
+                            # message lands on the conversation
+                            # — both wake the loop so the LLM
+                            # can react. Steering-break returns
+                            # an empty list; the outer continue
+                            # feeds into the next iteration's
+                            # _sync_history which picks up the
+                            # steering. pending_tool_tasks stay
+                            # pending; the non-blocking drain
+                            # at the top of the next iteration
+                            # picks them up when they arrive.
                             blocking = await _drain_async_completions(
                                 block_for_one=True,
+                                conv_store=conv_store,
+                                conversation_id=conversation_id,
+                                steering_cursor=last_seen,
                             )
                             _persist_async_completions(
                                 task_id,
