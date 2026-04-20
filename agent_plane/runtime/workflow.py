@@ -2417,27 +2417,76 @@ def _split_tool_calls(
     return _ToolCallSplit(server=server, client=client, has_client=bool(client))
 
 
-def _wants_async_dispatch(tc: _ToolCall) -> bool:
+def _tool_schema_declares_synchronous(tool: Any) -> bool:
+    """
+    Return ``True`` iff the tool's schema exposes ``synchronous``
+    as a parameter.
+
+    Used to gate :func:`_wants_async_dispatch` so an
+    LLM-hallucinated ``synchronous: false`` on a tool whose
+    schema doesn't actually offer the choice is ignored (treated
+    as sync). Without this check, a hallucination would route
+    the call through the async path even though the tool author
+    never opted in — and the SDK wouldn't know to inject /
+    strip / track the call as async.
+
+    :param tool: Any tool object exposing
+        ``get_schema()`` -> OpenAI-format dict. ``None`` is
+        accepted and returns ``False`` (defensive — the caller
+        already filtered missing tools elsewhere).
+    :returns: ``True`` iff
+        ``schema["function"]["parameters"]["properties"]["synchronous"]``
+        exists. Any structural deviation falls through as
+        ``False`` — better to drop a malformed schema's async
+        opt-in than to crash the routing decision.
+    """
+    if tool is None:
+        return False
+    try:
+        schema = tool.get_schema()
+    except Exception:  # noqa: BLE001 — bad schema → treat as no opt-in
+        return False
+    if not isinstance(schema, dict):
+        return False
+    function = schema.get("function")
+    if not isinstance(function, dict):
+        return False
+    parameters = function.get("parameters")
+    if not isinstance(parameters, dict):
+        return False
+    properties = parameters.get("properties")
+    if not isinstance(properties, dict):
+        return False
+    return "synchronous" in properties
+
+
+def _wants_async_dispatch(tc: _ToolCall, tool: Any) -> bool:
     """
     Decide whether the LLM asked for async dispatch on this call.
 
     Phase 5 v2: the LLM expresses async dispatch by setting
-    ``synchronous: false`` in its tool-call arguments. The
-    tool's schema (typically ``parameters.properties.synchronous``)
-    is what surfaces the choice to the LLM in the first place;
-    if the schema doesn't expose it, the LLM has nowhere to set
-    the field and this function returns ``False`` (sync default).
+    ``synchronous: false`` in its tool-call arguments. Two
+    conditions must both hold for async routing:
+
+    1. The tool's schema declares ``synchronous`` inside
+       ``parameters.properties`` — otherwise the LLM had no
+       legitimate way to know it could request async, and a
+       hallucinated ``synchronous: false`` is dropped to sync.
+    2. ``arguments`` JSON-decodes to a dict whose
+       ``synchronous`` is literally ``False``.
 
     Malformed JSON arguments are treated as sync — the call's
     real execution path will surface a parse error in its own
     error path; routing decisions don't fail loud here.
 
     :param tc: The tool call from the LLM.
-    :returns: ``True`` iff ``arguments`` JSON-decodes to a dict
-        with ``synchronous`` literally equal to ``False``. Any
-        other value (missing key, ``True``, malformed JSON,
-        non-bool value) yields ``False``.
+    :param tool: The matching tool object from the
+        :class:`ToolManager`. Used to verify the schema
+        actually exposes ``synchronous``.
+    :returns: ``True`` iff both gates pass; ``False`` otherwise.
     """
+    if not _tool_schema_declares_synchronous(tool):
+        return False
     try:
         parsed = json.loads(tc.arguments) if tc.arguments else {}
     except json.JSONDecodeError:
@@ -2543,7 +2592,8 @@ async def _handle_tool_calls(
     client_async: list[_ToolCall] = []
     client_sync: list[_ToolCall] = []
     for tc in split.client:
-        if _wants_async_dispatch(tc):
+        client_tool = tool_mgr.get_tool(tc.name)
+        if _wants_async_dispatch(tc, client_tool):
             client_async.append(tc)
         else:
             client_sync.append(tc)
@@ -3068,6 +3118,28 @@ async def cancel_pending_child_tools(parent_task_id: str) -> None:
 # the contract.
 
 
+def _truncate_for_drain(body: str) -> str:
+    """
+    Cap a drain-payload body at the LLM-context budget.
+
+    The ``async_work_complete`` drain stuffs payload bodies
+    directly into the next LLM iteration's input — an unbounded
+    body would blow the context window or starve the LLM of
+    room for actual reasoning. Matches the @tool / sub-agent
+    truncation budget so every drain producer (sub-agents,
+    @tool, client tools) shares one ceiling.
+
+    :param body: The producer-supplied body string. May be empty.
+    :returns: Either the original body (when within budget) or
+        the head plus a ``[... N more chars truncated]`` marker.
+    """
+    if len(body) <= _SUB_AGENT_OUTPUT_BUDGET:
+        return body
+    return body[:_SUB_AGENT_OUTPUT_BUDGET] + (
+        f"\n[... {len(body) - _SUB_AGENT_OUTPUT_BUDGET} more chars truncated]"
+    )
+
+
 def _format_async_completion_text(payload: dict[str, Any]) -> str:
     """
     Render an ``async_work_complete`` payload as a system message body.
@@ -3076,7 +3148,9 @@ def _format_async_completion_text(payload: dict[str, Any]) -> str:
     elsewhere in the workflow (steering markers, sub-agent
     auto-collect). Includes the task_id verbatim so the LLM can
     cross-reference the original handle it received from the
-    asynchronous tool call.
+    asynchronous tool call. Bodies (success ``output``, failure
+    ``traceback``) are truncated at :data:`_SUB_AGENT_OUTPUT_BUDGET`
+    so a single drained payload can't blow the LLM's context.
 
     :param payload: Drained dict with ``task_id``, ``kind``,
         ``status``, ``output``, and ``error`` keys (the shape
@@ -3088,12 +3162,12 @@ def _format_async_completion_text(payload: dict[str, Any]) -> str:
     kind = payload["kind"]
     status = payload["status"]
     if status == "completed":
-        body = payload.get("output") or ""
+        body = _truncate_for_drain(payload.get("output") or "")
         return f"[System: task {task_id} ({kind}) completed]\n{body}"
     if status == "failed":
         err = payload.get("error") or {}
         message = err.get("message", "(no message)")
-        traceback_text = err.get("traceback", "")
+        traceback_text = _truncate_for_drain(err.get("traceback", ""))
         return f"[System: task {task_id} ({kind}) failed]\n{message}\n{traceback_text}".rstrip()
     # Cancelled (G86) or any other terminal status — surface the
     # status verbatim so the LLM can adjust its plan rather than
