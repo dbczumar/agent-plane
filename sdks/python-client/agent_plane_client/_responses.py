@@ -486,9 +486,12 @@ class ResponsesNamespace:
                     iteration=iteration,
                 )
                 try:
-                    output = tool_handler.execute(call_info)
-                    if inspect.isawaitable(output):
-                        output = await output
+                    # Sync ``execute`` routes through
+                    # ``asyncio.to_thread`` so a blocking body
+                    # doesn't serialize the sync-tool loop
+                    # (each call would otherwise freeze the
+                    # event loop for its duration).
+                    output = await _call_execute_off_loop(tool_handler, call_info)
                 except ToolCallDenied as exc:
                     output = str(exc)
 
@@ -738,9 +741,10 @@ async def _execute_and_patch(
         iteration=iteration,
     )
     try:
-        output = tool_handler.execute(call_info)
-        if inspect.isawaitable(output):
-            output = await output
+        # Sync ``execute`` goes through asyncio.to_thread so a
+        # blocking body doesn't stall the SSE stream or the
+        # TUI's render loop. See ``_call_execute_off_loop``.
+        output = await _call_execute_off_loop(tool_handler, call_info)
     except ToolCallDenied as exc:
         output = str(exc)
     except Exception:
@@ -771,6 +775,38 @@ async def _execute_and_patch(
             )
     except Exception:
         _log.exception("Error PATCHing tool result for call_id %s", tool_call.call_id)
+
+
+async def _call_execute_off_loop(
+    tool_handler: ToolHandler,
+    call_info: ToolCallInfo,
+) -> Any:
+    """
+    Invoke ``tool_handler.execute(call_info)`` without blocking
+    the event loop.
+
+    ``execute`` may be ``async def`` (returns a coroutine) or
+    sync ``def`` (returns a plain value). If async, we await
+    the coroutine on the loop; async bodies are already
+    loop-cooperative. If sync, we run it via
+    :func:`asyncio.to_thread` so blocking calls inside —
+    ``time.sleep``, file I/O, subprocess, ``requests`` — don't
+    stall the loop.
+
+    Sync-vs-async is detected via
+    :func:`inspect.iscoroutinefunction` so we only invoke
+    ``execute`` once. Without the thread bounce, a single
+    sync body with ``time.sleep(5)`` would serialize every
+    concurrent tool call AND freeze any render loop (like the
+    ``ap chat`` TUI) sharing the event loop.
+
+    :param tool_handler: Handler whose ``execute`` will run.
+    :param call_info: Call context passed through to the handler.
+    :returns: Whatever ``execute`` returns (typically a string).
+    """
+    if inspect.iscoroutinefunction(tool_handler.execute):
+        return await tool_handler.execute(call_info)
+    return await asyncio.to_thread(tool_handler.execute, call_info)
 
 
 # ── D6: async client-tool dispatch ────────────────────────────
@@ -998,13 +1034,20 @@ async def _run_async_tool_body(
         # Now run the tool body. Cap at 1h so a hung body
         # surfaces as a clean ``failed`` PATCH rather than
         # leaking the asyncio task.
-        body_coro = tool_handler.execute(call_info)
-        if inspect.isawaitable(body_coro):
-            raw_output = await asyncio.wait_for(
-                body_coro, timeout=_ASYNC_CLIENT_TOOL_MAX_LIFETIME_S
-            )
-        else:
-            raw_output = body_coro
+        #
+        # ``execute`` may be sync (returns a string) or async
+        # (returns a coroutine). If sync, we invoke it via
+        # ``asyncio.to_thread`` so a blocking body (``time.sleep``,
+        # file I/O, subprocess, etc.) doesn't freeze the event
+        # loop — in the D6 happy path several async tools run
+        # concurrently, and a sync ``time.sleep(5)`` inline on
+        # the loop would serialize them AND stall the TUI's
+        # render. The async path is already loop-safe, so just
+        # await it.
+        raw_output = await asyncio.wait_for(
+            _call_execute_off_loop(tool_handler, call_info),
+            timeout=_ASYNC_CLIENT_TOOL_MAX_LIFETIME_S,
+        )
         output = raw_output if isinstance(raw_output, str) else json.dumps(raw_output, default=str)
         status = "completed"
     except asyncio.CancelledError:
