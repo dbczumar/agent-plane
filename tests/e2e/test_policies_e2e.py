@@ -43,6 +43,9 @@ _E2E_LABEL_GATE_DIR = (
     Path(__file__).resolve().parents[1] / "_fixtures" / "agents" / "e2e-label-gate"
 )
 _ASK_DEMO_DIR = Path(__file__).resolve().parents[2] / "examples" / "agents" / "ask-demo"
+_E2E_PROMPT_POLICY_DIR = (
+    Path(__file__).resolve().parents[1] / "_fixtures" / "agents" / "e2e-prompt-policy"
+)
 
 
 @pytest.fixture(scope="session")
@@ -61,6 +64,12 @@ def label_gate_agent(http_client: httpx.Client) -> str:
 def ask_demo_agent(http_client: httpx.Client) -> str:
     """Upload the ``ask-demo`` example agent — always-ASK on INPUT."""
     return _upload_agent(http_client, _ASK_DEMO_DIR)
+
+
+@pytest.fixture(scope="session")
+def prompt_policy_agent(http_client: httpx.Client) -> str:
+    """Upload the e2e-prompt-policy fixture and return its name."""
+    return _upload_agent(http_client, _E2E_PROMPT_POLICY_DIR)
 
 
 def _find_pending_approval(body: dict) -> dict | None:
@@ -627,4 +636,91 @@ def test_polling_api_malformed_verdict_treated_as_refuse(
         "Malformed verdict did not fail-closed refuse — major safety "
         "regression. The server must treat anything other than exact "
         f'{{"approved": true}} as a refusal.\nGot: {text!r}'
+    )
+
+
+# ── PromptPolicy (Phase 9): real LLM classifier end-to-end ─
+#
+# These tests exercise the production path of
+# :func:`make_default_classifier` — the real LLM gets called
+# with the framework-generated envelope + author prompt, and
+# the parsed JSON verdict drives the ALLOW / DENY branch.
+
+
+def test_prompt_policy_allow_path_reaches_llm(
+    http_client: httpx.Client,
+    prompt_policy_agent: str,
+) -> None:
+    """
+    Non-Canadian input → classifier ALLOWs → agent LLM runs →
+    assistant text comes back. Proves the real classifier
+    works end-to-end through the real LLM, the policy engine
+    composes ALLOW, and the full turn completes normally.
+    """
+    resp = http_client.post(
+        "/v1/responses",
+        json={
+            "model": prompt_policy_agent,
+            "input": "What's 2+2? Answer with the number only.",
+            "background": True,
+        },
+    )
+    resp.raise_for_status()
+    rid = resp.json()["id"]
+    body = poll_until_terminal(http_client, rid, timeout=120)
+    assert body["status"] == "completed", f"Unexpected status: {body.get('error')}"
+    text = _extract_all_assistant_text(body)
+    # Real LLM answered the question — "4" must appear.
+    # Stronger than a non-empty check: proves the request
+    # actually reached the LLM and the LLM's output
+    # propagated through the ALLOW path.
+    assert "4" in text, f"Expected the LLM's answer to 2+2 ('4') in the reply.\nGot: {text!r}"
+    # Policy did NOT deny — the DENY sentinel must not appear.
+    assert "[Denied by policy" not in text, (
+        f"ALLOW path accidentally emitted a DENY sentinel: {text!r}"
+    )
+
+
+def test_prompt_policy_deny_path_short_circuits(
+    http_client: httpx.Client,
+    prompt_policy_agent: str,
+) -> None:
+    """
+    Canadian-topic input → classifier DENYs → sentinel replaces
+    the assistant reply → LLM never produces its normal
+    output.
+
+    This is the canonical reason PromptPolicy exists: a
+    topic-level content filter an author describes in prose
+    rather than a Python predicate. If the real classifier
+    isn't wired, the policy falls back to
+    :class:`NotImplementedError` and the turn would fail —
+    so this test is simultaneously a Phase 9 wiring proof
+    AND a regression guard against someone accidentally
+    reverting to the raising stub.
+    """
+    resp = http_client.post(
+        "/v1/responses",
+        json={
+            "model": prompt_policy_agent,
+            "input": "What's the capital of Canada?",
+            "background": True,
+        },
+    )
+    resp.raise_for_status()
+    rid = resp.json()["id"]
+    body = poll_until_terminal(http_client, rid, timeout=120)
+    assert body["status"] == "completed", f"Unexpected status: {body.get('error')}"
+    text = _extract_all_assistant_text(body)
+    assert "[Denied by policy" in text, (
+        f"PromptPolicy DENY did not short-circuit the turn.\nGot: {text!r}"
+    )
+    # The reason carried in the sentinel should mention
+    # Canada — the author's prompt instructs the classifier
+    # to emit exactly ``"mentions Canada"`` as the reason,
+    # and the server interpolates it into ``[Denied by
+    # policy: <reason>]``. Casefold-compare so model
+    # capitalization variance doesn't break the test.
+    assert "canada" in text.lower(), (
+        f"DENY sentinel didn't carry the expected reason ('Canada').\nGot: {text!r}"
     )

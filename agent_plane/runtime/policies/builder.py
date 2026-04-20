@@ -22,12 +22,14 @@ from agent_plane.policies.function import resolve_function_policy
 from agent_plane.policies.label import LabelPolicy
 from agent_plane.policies.prompt import resolve_prompt_policy
 from agent_plane.runtime.policies.engine import PolicyEngine
+from agent_plane.runtime.policies.prompt_classifier import make_default_classifier
 from agent_plane.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     AgentSpec,
     FunctionPolicySpec,
     LabelDef,
     LabelPolicySpec,
+    LLMConfig,
     PolicySpec,
     PromptPolicySpec,
 )
@@ -76,7 +78,7 @@ def build_policy_engine(
         conversation_store=conversation_store,
     )
     return PolicyEngine(
-        policies=[_instantiate_policy(s) for s in (guardrails.policies or [])],
+        policies=[_instantiate_policy(s, agent_llm=spec.llm) for s in (guardrails.policies or [])],
         label_defs=label_defs,
         ask_timeout=guardrails.ask_timeout,
         conversation_id=conversation_id,
@@ -85,33 +87,38 @@ def build_policy_engine(
     )
 
 
-def _instantiate_policy(spec: PolicySpec) -> Policy:
+def _instantiate_policy(
+    spec: PolicySpec,
+    *,
+    agent_llm: LLMConfig | None,
+) -> Policy:
     """
     Dispatch a :class:`PolicySpec` to the matching runtime
     :class:`Policy` subclass.
 
-    Phase 3: only :class:`LabelPolicySpec` is supported;
-    :class:`FunctionPolicySpec` and :class:`PromptPolicySpec`
-    raise a clear NotImplementedError until Phases 4 and 7
-    land. The error message names the missing phase so the
-    agent author can see why their spec's declaration was
-    rejected.
-
     :param spec: The declarative spec.
+    :param agent_llm: The agent-level ``llm:`` config. Used
+        as the default backend for :class:`PromptPolicy`
+        when the policy didn't declare its own ``llm:``
+        override. Unused for Label / Function policies.
     :returns: A :class:`Policy` subclass instance bound to
         the spec.
-    :raises NotImplementedError: For policy types whose
-        runtime class has not yet shipped.
+    :raises NotImplementedError: When ``spec`` is not a
+        known :class:`PolicySpec` subclass — parser bug
+        protection.
     """
     if isinstance(spec, LabelPolicySpec):
         return LabelPolicy(spec)
     if isinstance(spec, FunctionPolicySpec):
         return resolve_function_policy(spec)
     if isinstance(spec, PromptPolicySpec):
-        # Production path — classifier wires to real LLM in a
-        # later executor-integration phase. Tests inject a
-        # stub directly via PromptPolicy(spec, classifier=fn).
-        return resolve_prompt_policy(spec)
+        # Phase 9 production path: build the real
+        # LLM-backed classifier from the policy's (or
+        # agent's) llm config. Tests can still override via
+        # PromptPolicy(spec, classifier=fn) — that constructor
+        # path is independent of this builder.
+        classifier = make_default_classifier(spec, agent_llm)
+        return resolve_prompt_policy(spec, classifier=classifier)
     raise NotImplementedError(
         f"Policy type {type(spec).__name__} for {spec.name!r} is not "
         f"a known subclass of PolicySpec (LabelPolicySpec, "
