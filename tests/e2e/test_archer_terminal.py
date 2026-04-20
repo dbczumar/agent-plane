@@ -1,13 +1,13 @@
-"""End-to-end test for code_sandbox package installation and isolation.
+"""End-to-end test for terminal_run package installation and isolation.
 
 Requires ``--llm-api-key`` and a real server. Run with::
 
-    pytest tests/e2e/test_archer_code_sandbox.py \
+    pytest tests/e2e/test_archer_terminal.py \\
         --llm-api-key $LLM_API_KEY -v
 
 Exercises:
-- code_sandbox tool executing pip and npm install commands
-- Installed packages usable in subsequent code_sandbox calls
+- terminal_run tool executing pip and npm install commands
+- Installed packages usable in subsequent terminal_run calls
 - Package directories isolated to the conversation's workspace
 - Sandbox blocks reads of files outside the workspace
 """
@@ -49,20 +49,20 @@ def test_pip_install_and_use(
     """
     Ask the archer agent to pip install a package and use it.
     The package should install into the workspace and be importable
-    in a subsequent code_sandbox call within the same conversation.
+    in a subsequent terminal_run call within the same conversation.
 
     **What breaks if wrong**:
     - srt blocks pypi.org: pip install fails
     - PIP_TARGET not set: installs to system (or fails in sandbox)
     - PYTHONPATH not set: import fails despite install
     - Workspace not persistent: package gone on next turn
+    - terminal_run shell not persistent across turns
     """
-    # Turn 1: install cowsay via pip
     resp = http_client.post(
         "/v1/responses",
         json={
             "model": archer_agent,
-            "input": ("Use the code_sandbox tool to run this exact command: pip install cowsay"),
+            "input": "Use the terminal_run tool to run this exact command: pip install cowsay",
             "background": True,
         },
     )
@@ -71,14 +71,12 @@ def test_pip_install_and_use(
     final = poll_until_terminal(http_client, response_id, timeout=120)
     assert final["status"] == "completed", f"Turn 1 failed: {final.get('error')}"
 
-    # Verify code_sandbox was called
-    fc_items = _get_output_items(final, "function_call", "code_sandbox")
+    fc_items = _get_output_items(final, "function_call", "terminal_run")
     assert len(fc_items) >= 1, (
-        f"Expected code_sandbox call, got: "
+        f"Expected terminal_run call, got: "
         f"{[i.get('name') for i in _get_output_items(final, 'function_call')]}"
     )
 
-    # Verify the install succeeded (no error in tool output)
     fco_items = _get_output_items(final, "function_call_output")
     install_outputs = [i for i in fco_items if i.get("call_id") == fc_items[0].get("call_id")]
     assert len(install_outputs) == 1
@@ -87,13 +85,12 @@ def test_pip_install_and_use(
         f"pip install may have failed: {install_output[:200]}"
     )
 
-    # Turn 2: use the installed package (same conversation)
     resp2 = http_client.post(
         "/v1/responses",
         json={
             "model": archer_agent,
             "input": (
-                "Use code_sandbox to run this exact command: "
+                "Use terminal_run to run this exact command: "
                 "python -c \"import cowsay; print(cowsay.get_output_string('cow', 'e2e test'))\""
             ),
             "previous_response_id": response_id,
@@ -105,7 +102,6 @@ def test_pip_install_and_use(
     final2 = poll_until_terminal(http_client, response_id_2, timeout=120)
     assert final2["status"] == "completed", f"Turn 2 failed: {final2.get('error')}"
 
-    # Verify the package was importable and produced output
     fco_items_2 = _get_output_items(final2, "function_call_output")
     has_cow_output = any("e2e test" in (i.get("output") or "") for i in fco_items_2)
     assert has_cow_output, (
@@ -131,7 +127,7 @@ def test_npm_install_and_use(
         json={
             "model": archer_agent,
             "input": (
-                "Use the code_sandbox tool to run these two commands "
+                "Use the terminal_run tool to run these two commands "
                 "in a single invocation:\n"
                 "npm install cowsay && "
                 "npx cowsay 'npm works'"
@@ -144,7 +140,6 @@ def test_npm_install_and_use(
     final = poll_until_terminal(http_client, response_id, timeout=120)
     assert final["status"] == "completed", f"npm test failed: {final.get('error')}"
 
-    # Verify code_sandbox was called and npm produced output
     fco_items = _get_output_items(final, "function_call_output")
     has_npm_output = any("npm works" in (i.get("output") or "") for i in fco_items)
     assert has_npm_output, (
@@ -165,12 +160,11 @@ def test_packages_isolated_across_conversations(
     - PIP_TARGET points to a shared directory
     - Workspace not scoped to conversation
     """
-    # Conversation 1: install cowsay
     resp1 = http_client.post(
         "/v1/responses",
         json={
             "model": archer_agent,
-            "input": ("Use code_sandbox to run: pip install cowsay"),
+            "input": "Use terminal_run to run: pip install cowsay",
             "background": True,
         },
     )
@@ -182,14 +176,12 @@ def test_packages_isolated_across_conversations(
     )
     assert final1["status"] == "completed"
 
-    # Conversation 2 (new conversation — no previous_response_id):
-    # try to import cowsay — should fail
     resp2 = http_client.post(
         "/v1/responses",
         json={
             "model": archer_agent,
             "input": (
-                "Use code_sandbox to run this exact command: "
+                "Use terminal_run to run this exact command: "
                 'python -c "import cowsay" '
                 "and tell me if it succeeded or failed"
             ),
@@ -204,8 +196,6 @@ def test_packages_isolated_across_conversations(
     )
     assert final2["status"] == "completed"
 
-    # The agent's response should mention the import failure.
-    # Check tool outputs for ModuleNotFoundError.
     fco_items = _get_output_items(final2, "function_call_output")
     has_import_error = any(
         "ModuleNotFoundError" in (i.get("output") or "")
@@ -234,7 +224,6 @@ def test_sandbox_blocks_reads_outside_workspace(
     - denyRead is empty: srt allows all reads, sentinel leaks
     - allowRead too broad: reads outside workspace succeed
     """
-    # Create a sentinel file outside any workspace.
     sentinel = f"SANDBOX_LEAK_{os.getpid()}"
     fd, sentinel_path = tempfile.mkstemp(
         prefix="ap_sandbox_read_test_",
@@ -249,7 +238,7 @@ def test_sandbox_blocks_reads_outside_workspace(
             json={
                 "model": archer_agent,
                 "input": (
-                    f"Use the code_sandbox tool to run this exact command: cat {sentinel_path}"
+                    f"Use the terminal_run tool to run this exact command: cat {sentinel_path}"
                 ),
                 "background": True,
             },
@@ -263,15 +252,9 @@ def test_sandbox_blocks_reads_outside_workspace(
         )
         assert final["status"] == "completed", f"Task failed: {final.get('error')}"
 
-        # Collect all tool outputs — the sentinel content must
-        # NOT appear. If it does, the sandbox failed to block the
-        # read.
         fco_items = _get_output_items(final, "function_call_output")
         all_tool_output = " ".join(i.get("output", "") for i in fco_items)
 
-        # The sentinel value must not appear in any tool output.
-        # If it does, the sandbox allowed reading /tmp — the bug
-        # we're testing for.
         assert sentinel not in all_tool_output, (
             f"SECURITY: sandbox allowed reading {sentinel_path} "
             f"outside workspace. Tool output contained the "
@@ -279,7 +262,6 @@ def test_sandbox_blocks_reads_outside_workspace(
             f"not blocking reads outside the workspace."
         )
     finally:
-        # Clean up sentinel file.
         try:
             os.unlink(sentinel_path)
         except OSError:
@@ -306,7 +288,7 @@ def test_sandbox_allows_network_access(
         json={
             "model": archer_agent,
             "input": (
-                "Use the code_sandbox tool to run this exact "
+                "Use the terminal_run tool to run this exact "
                 "command: curl -sk https://example.com -o /dev/null "
                 "-w '%{http_code}' --connect-timeout 10"
             ),
@@ -322,8 +304,6 @@ def test_sandbox_allows_network_access(
     )
     assert final["status"] == "completed", f"Task failed: {final.get('error')}"
 
-    # Check tool outputs for HTTP 200 — proves the request
-    # reached example.com through the sandbox.
     fco_items = _get_output_items(final, "function_call_output")
     all_tool_output = " ".join(i.get("output", "") for i in fco_items)
     assert "200" in all_tool_output, (

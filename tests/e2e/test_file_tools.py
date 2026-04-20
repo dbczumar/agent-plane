@@ -1,7 +1,7 @@
 """E2E test: list_files and download_file tools.
 
 Verifies the full round-trip: agent creates a file with
-code_sandbox, uploads it with upload_file, then uses list_files
+terminal_run, uploads it with upload_file, then uses list_files
 to find it and download_file to retrieve it.
 
 Usage::
@@ -65,7 +65,7 @@ def test_list_files_finds_uploaded_file(
         json={
             "model": archer_agent,
             "input": (
-                "Use code_sandbox to create a file called "
+                "Use terminal_run to create a file called "
                 "test_data.txt containing 'Hello from agent-plane'. "
                 "Then upload it with upload_file."
             ),
@@ -116,7 +116,7 @@ def test_download_file_retrieves_content(
         json={
             "model": archer_agent,
             "input": (
-                "Use code_sandbox to create a file called "
+                "Use terminal_run to create a file called "
                 "greeting.txt containing exactly 'HELLO_WORLD'. "
                 "Then upload it with upload_file."
             ),

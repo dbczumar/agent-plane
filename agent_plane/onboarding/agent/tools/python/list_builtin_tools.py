@@ -17,7 +17,6 @@ from agent_plane_client import tool
 # add it here. Each module is imported individually to avoid the
 # transitive import chain from agent_plane.tools.builtins.__init__.
 _TOOL_CLASSES: dict[str, tuple[str, str]] = {
-    "code_sandbox": ("agent_plane.tools.builtins.code_sandbox", "CodeSandboxTool"),
     "download_file": ("agent_plane.tools.builtins.download_file", "DownloadFileTool"),
     "export_agent": ("agent_plane.tools.builtins.export_agent", "ExportAgentTool"),
     "introspect": ("agent_plane.tools.builtins.introspect", "IntrospectTool"),
@@ -26,6 +25,9 @@ _TOOL_CLASSES: dict[str, tuple[str, str]] = {
         "agent_plane.tools.builtins.search_conversations",
         "SearchConversationsTool",
     ),
+    "terminal_close": ("agent_plane.tools.builtins.terminal", "TerminalCloseTool"),
+    "terminal_list": ("agent_plane.tools.builtins.terminal", "TerminalListTool"),
+    "terminal_run": ("agent_plane.tools.builtins.terminal", "TerminalRunTool"),
     "upload_file": ("agent_plane.tools.builtins.upload_file", "UploadFileTool"),
     "web_fetch": ("agent_plane.tools.builtins.web_fetch", "WebFetchTool"),
     "web_search": ("agent_plane.tools.builtins.web_search", "WebSearchTool"),

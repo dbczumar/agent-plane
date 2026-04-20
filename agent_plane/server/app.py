@@ -1,11 +1,15 @@
 """FastAPI application — main entry point for the agent-plane server."""
 
+import asyncio
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from agent_plane.errors import AgentPlaneError, ErrorCode
+from agent_plane.runtime import get_terminal_registry
 from agent_plane.runtime.agent_cache import AgentCache
 from agent_plane.server.routes.agents import create_agents_router
 from agent_plane.server.routes.conversations import create_conversations_router
@@ -49,7 +53,30 @@ def create_app(
         directories.
     :returns: A fully configured :class:`FastAPI` application.
     """
-    app = FastAPI(title="Agent Plane Server")
+
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        """FastAPI lifespan: start/stop the terminal registry's reaper.
+
+        On startup, attach the idle-manager reaper to the running
+        event loop so abandoned shells get GC'd (see §6.4 of
+        PERSISTENT_TERMINAL_RESEARCH.md). On shutdown, stop the
+        reaper and call ``shutdown()`` to kill every remaining
+        shell. Without this, clean server stops would leak bash
+        subprocesses and the reaper task would never terminate.
+
+        :param _app: The FastAPI app (unused — required by the
+            lifespan context-manager protocol).
+        """
+        registry = get_terminal_registry()
+        registry.start_reaper(asyncio.get_running_loop())
+        try:
+            yield
+        finally:
+            await registry.stop_reaper()
+            registry.shutdown()
+
+    app = FastAPI(title="Agent Plane Server", lifespan=_lifespan)
 
     @app.exception_handler(AgentPlaneError)
     async def _handle_agent_plane_error(request: Request, exc: AgentPlaneError) -> JSONResponse:

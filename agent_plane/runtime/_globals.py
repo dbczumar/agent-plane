@@ -20,6 +20,7 @@ if TYPE_CHECKING:
         FileStore,
         TaskStore,
     )
+    from agent_plane.terminals import TerminalManagerRegistry
     from agent_plane.tools import ToolManager
 
 _conversation_store: ConversationStore | None = None
@@ -29,6 +30,14 @@ _agent_cache: AgentCache | None = None
 _file_store: FileStore | None = None
 _artifact_store: ArtifactStore | None = None
 _caps: RuntimeCaps = RuntimeCaps()
+
+# Server-resident terminal-shell registry. Initialized in
+# :func:`init` and accessed via ``get_terminal_registry()`` in
+# ``agent_plane.runtime``. Conversation-scoped: one
+# ``TerminalManager`` per ``conversation_id``, shells persist
+# across task workflows within a conversation. See
+# ``designs/PERSISTENT_TERMINAL_RESEARCH.md`` §6.4, §6.9.
+_terminal_registry: TerminalManagerRegistry | None = None
 
 # Per-workflow tool manager. ContextVar ensures thread-safe isolation —
 # DBOS runs each workflow in its own thread, and contextvars are
@@ -71,8 +80,11 @@ def init(
     :param caps: Operator-configured execution ceiling.
         ``None`` uses :class:`RuntimeCaps` defaults.
     """
+    from agent_plane.terminals import TerminalManagerRegistry
+
     global _conversation_store, _task_store, _agent_store  # noqa: PLW0603
     global _agent_cache, _file_store, _artifact_store, _caps  # noqa: PLW0603
+    global _terminal_registry  # noqa: PLW0603
     _conversation_store = conversation_store
     _task_store = task_store
     _agent_store = agent_store
@@ -80,3 +92,11 @@ def init(
     _file_store = file_store
     _artifact_store = artifact_store
     _caps = caps if caps is not None else RuntimeCaps()
+    # Terminal registry: server-resident, conversation-scoped shell
+    # management (see §6.4/§6.9 of PERSISTENT_TERMINAL_RESEARCH.md).
+    # Sandbox policy mirrors ``RuntimeCaps.sandbox_enabled`` — when
+    # True (default), every shell spawned by this registry is wrapped
+    # via srt (§6.5). Timeouts use the §7.1 hardcoded defaults.
+    _terminal_registry = TerminalManagerRegistry(
+        sandbox_enabled=_caps.sandbox_enabled,
+    )

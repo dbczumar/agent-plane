@@ -33,8 +33,10 @@ from agent_plane.tools.builtins.web_search import WebSearchTool
 
 __all__ = [
     "BUILTIN_NAMES",
+    "INSTANTIABLE_BUILTINS",
     "ListSubAgentsTool",
     "LoadSkillTool",
+    "REQUEST_APPROVAL_TOOL_NAME",
     "ReadSkillFileTool",
     "SendToSubAgentTool",
     "SpawnSubAgentTool",
@@ -44,29 +46,22 @@ __all__ = [
     "list_skill_resources",
 ]
 
-# Lazy imports for code_sandbox and upload_file to avoid
-# circular imports — they are registered in the factory below.
+# Name of the framework-emitted ASK-flow function_call
+# (POLICIES.md §7.1). Reserved: user-authored tool declarations
+# with this name are rejected at spec load; MCP servers
+# advertising this name have the tool filtered out. Lives in
+# the registry with a ``None`` factory so the unique name-space
+# check always includes it.
+REQUEST_APPROVAL_TOOL_NAME = "request_approval"
+
+# Lazy imports avoid circular import cycles — each tool's actual
+# class is imported only when the factory fires.
 
 # Factory type: each constructor accepts a config dict and returns
 # a Tool. Callable is used instead of type[Tool] because the base
 # Tool.__init__ does not declare a config parameter — only the
 # web search subclasses do.
 _BuiltinFactory = Callable[[dict[str, str]], Tool]
-
-
-# Registry of built-in tools that agents can enable via
-# ``tools.builtins`` in config.yaml. Keyed by the name string
-# users write in the spec.
-def _create_code_sandbox(config: dict[str, str]) -> Tool:
-    """
-    Lazy factory for CodeSandboxTool.
-
-    :param config: Tool config (unused).
-    :returns: A CodeSandboxTool instance.
-    """
-    from agent_plane.tools.builtins.code_sandbox import CodeSandboxTool
-
-    return CodeSandboxTool()
 
 
 def _create_upload_file(config: dict[str, str]) -> Tool:
@@ -131,35 +126,94 @@ def _create_export_agent(config: dict[str, str]) -> Tool:
     return ExportAgentTool()
 
 
-# Canonical set of all builtin tool names that agents can enable
-# via ``tools.builtins`` in config.yaml. Used for discovery (e.g.
-# by the onboarding assistant's list_builtin_tools).
-BUILTIN_NAMES: frozenset[str] = frozenset(
-    {
-        "web_search",
-        "web_fetch",
-        "introspect",
-        "code_sandbox",
-        "upload_file",
-        "list_files",
-        "download_file",
-        "search_conversations",
-        "export_agent",
-    }
-)
+def _create_terminal_run(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for :class:`TerminalRunTool`.
 
-_BUILTIN_REGISTRY: dict[str, _BuiltinFactory] = {
-    # web_fetch and introspect need runtime context (parent spec)
-    # to instantiate — ToolManager handles them before reaching
-    # this registry. They are listed in BUILTIN_NAMES above.
+    :param config: Tool config (unused).
+    :returns: A TerminalRunTool instance.
+    """
+    from agent_plane.tools.builtins.terminal import TerminalRunTool
+
+    return TerminalRunTool()
+
+
+def _create_terminal_list(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for :class:`TerminalListTool`.
+
+    :param config: Tool config (unused).
+    :returns: A TerminalListTool instance.
+    """
+    from agent_plane.tools.builtins.terminal import TerminalListTool
+
+    return TerminalListTool()
+
+
+def _create_terminal_close(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for :class:`TerminalCloseTool`.
+
+    :param config: Tool config (unused).
+    :returns: A TerminalCloseTool instance.
+    """
+    from agent_plane.tools.builtins.terminal import TerminalCloseTool
+
+    return TerminalCloseTool()
+
+
+def _create_terminal_send_input(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for :class:`TerminalSendInputTool`.
+
+    :param config: Tool config (unused).
+    :returns: A TerminalSendInputTool instance.
+    """
+    from agent_plane.tools.builtins.terminal import TerminalSendInputTool
+
+    return TerminalSendInputTool()
+
+
+# Unified registry for every reserved builtin name. The value
+# is either a factory callable (for user-enablable tools) or
+# ``None`` for framework-owned names that occupy the name-space
+# but are never instantiated by user spec directives.
+# See POLICIES.md §15.8 for the unification rationale.
+_BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
+    # User-enablable tools (factory present).
     "web_search": lambda config: WebSearchTool(config=config),
-    "code_sandbox": _create_code_sandbox,
+    "terminal_run": _create_terminal_run,
+    "terminal_list": _create_terminal_list,
+    "terminal_close": _create_terminal_close,
+    "terminal_send_input": _create_terminal_send_input,
     "upload_file": _create_upload_file,
     "list_files": _create_list_files,
     "download_file": _create_download_file,
     "search_conversations": _create_search_conversations,
     "export_agent": _create_export_agent,
+    # Framework-owned: need runtime context or are
+    # framework-emitted. ToolManager handles ``web_fetch`` and
+    # ``introspect`` via parent-spec plumbing before reaching
+    # this registry; ``request_approval`` is emitted by the
+    # policy engine when a policy returns ASK (POLICIES.md §7).
+    "web_fetch": None,
+    "introspect": None,
+    REQUEST_APPROVAL_TOOL_NAME: None,
 }
+
+# Canonical set of every reserved builtin name. Derived from
+# the registry so there is a single source of truth — no drift
+# between the reserved-name check and the factory dispatch.
+BUILTIN_NAMES: frozenset[str] = frozenset(_BUILTIN_REGISTRY.keys())
+
+# Subset of names that have a user-facing factory. Used by the
+# onboarding ``list_builtin_tools`` helper, which only lists
+# tools an agent spec can actually enable via
+# ``tools.builtins`` — framework-owned names would just confuse
+# the agent author.
+INSTANTIABLE_BUILTINS: frozenset[str] = frozenset(
+    name for name, factory in _BUILTIN_REGISTRY.items() if factory is not None
+)
 
 
 def get_builtin_tool(
@@ -178,6 +232,10 @@ def get_builtin_tool(
     :returns: A :class:`Tool` instance, or ``None`` if the
         name is not recognized.
     """
+    # Returns None for both "not in registry" AND
+    # "framework-owned without factory" — callers treat both
+    # as "not instantiable via this entry point". Check against
+    # BUILTIN_NAMES first if you need to distinguish.
     factory = _BUILTIN_REGISTRY.get(name)
     if factory is None:
         return None

@@ -6,13 +6,18 @@ import asyncio
 import inspect
 import json
 import logging
+import traceback
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 
 from ._errors import ToolCallDenied, raise_for_status
 from ._events import (
+    RESERVED_APPROVAL_TOOL_NAME,
+    ApprovalRequest,
+    ClientTaskCancel,
     CompactionInProgress,
     ErrorEvent,
     MessageDone,
@@ -34,6 +39,7 @@ from ._events import (
 )
 from ._sse import parse_sse_stream
 from ._tool_handler import (
+    ApprovalRequestCtx,
     CompactionStartCtx,
     FileOutputCtx,
     MessageEndCtx,
@@ -61,6 +67,67 @@ _log = logging.getLogger("agent_plane_client.responses")
 
 # Terminal statuses — the response won't change further.
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "incomplete", "cancelled"})
+
+# D6 — async client-tool dispatch.
+#
+# Server-side hard cap on a single client_tool task's lifetime
+# (matches background_tool_workflow._CLIENT_TOOL_MAX_LIFETIME_S).
+# After this elapses the holder workflow times out, sends a
+# ``failed`` drain payload, and any later PATCH from the client
+# is dropped. We mirror the cap on the SDK side so a tool body
+# that's stuck (deadlock, lost upstream, etc.) doesn't pin the
+# asyncio task forever — TimeoutError surfaces as a
+# ``status="failed"`` PATCH that races the server's own timeout
+# (whichever lands first wins under G3 first-write-wins).
+_ASYNC_CLIENT_TOOL_MAX_LIFETIME_S = 3600.0
+
+# Maximum traceback-line budget for a failure PATCH's
+# ``error.traceback`` field. Mirrors the server's
+# ``truncate_traceback`` budget so a single failure can't blow
+# the parent's LLM context. Lines beyond this are summarized
+# with a ``[... N more lines truncated]`` marker.
+_FAILURE_TRACEBACK_LINE_BUDGET = 30
+
+
+@dataclass
+class _AsyncToolState:
+    """
+    Per-call dispatch state for a ``synchronous: false`` client
+    tool the SDK is running locally.
+
+    The SDK creates one of these the moment it sees a
+    :class:`ToolCall` for an async tool, spawns the tool body
+    on an :class:`asyncio.Task`, and parks the task on the
+    ``task_id_event`` until the matching handle FCO arrives in
+    the same SSE stream (or a later one). Once the body
+    completes, it PATCHes ``async_tool_results`` for ``task_id``;
+    if a :class:`ClientTaskCancel` SSE event arrives first, the
+    asyncio task is cancelled and a ``status="cancelled"`` PATCH
+    is attempted before the task unwinds.
+
+    :param call_id: The LLM-assigned ``call_id`` from the
+        ``function_call`` event. Used to match this state to
+        the later ``function_call_output`` (handle FCO) event
+        that carries the server-issued ``task_id``.
+    :param task_id: Populated from the handle FCO's ``output``
+        JSON (``{"task_id": "...", "kind": "client_tool", ...}``).
+        ``None`` until the handle arrives — the body waits on
+        ``task_id_event`` before PATCHing.
+    :param task_id_event: Set when ``task_id`` becomes available.
+        The body's ``await`` on this event is the synchronization
+        point that prevents PATCHing before the server has even
+        created the task row.
+    :param asyncio_task: The :class:`asyncio.Task` running the
+        tool body. ``None`` only during the brief window between
+        state construction and ``asyncio.create_task`` (kept
+        ``None``-able so a future refactor can construct state
+        before scheduling).
+    """
+
+    call_id: str
+    task_id: str | None = None
+    task_id_event: asyncio.Event = field(default_factory=asyncio.Event)
+    asyncio_task: asyncio.Task[None] | None = None
 
 
 async def _call_hook(hook: Any, ctx: Any) -> Any:
@@ -150,6 +217,12 @@ class ResponsesNamespace:
         current_input: str | list[dict[str, object]] = input
         current_prev_id = previous_response_id
         iteration = 0
+        # D6: per-call_id state for ``synchronous: false`` client
+        # tools the SDK is dispatching locally. Persists across
+        # the outer ``while True`` so a tool dispatched in one
+        # iteration's stream can deliver via PATCH before — or
+        # well after — the next iteration's stream opens.
+        async_tool_state: dict[str, _AsyncToolState] = {}
 
         while True:
             tools = tool_handler.schemas if tool_handler is not None else None
@@ -250,10 +323,65 @@ class ResponsesNamespace:
                                 )
                             )
                         elif is_client_side:
-                            pending_client_calls.append(event)
+                            # D6: detect ``synchronous: false`` tools
+                            # and dispatch them locally as
+                            # asyncio.Tasks. The matching FCO with
+                            # the handle's task_id will arrive in
+                            # this same stream and unblock the
+                            # task's PATCH.
+                            if tool_handler is not None and _is_async_tool_call(
+                                event, tool_handler
+                            ):
+                                completed_call_ids.add(event.call_id)
+                                state = _AsyncToolState(call_id=event.call_id)
+                                async_tool_state[event.call_id] = state
+                                state.asyncio_task = asyncio.create_task(
+                                    _run_async_tool_body(
+                                        self._http,
+                                        self._base,
+                                        tool_handler,
+                                        hooks,
+                                        state,
+                                        event,
+                                        current_response_id or "",
+                                        iteration,
+                                    )
+                                )
+                            else:
+                                pending_client_calls.append(event)
+
+                    elif isinstance(event, ApprovalRequest):
+                        # Policy ASK — the server is waiting on
+                        # a verdict. Route to the approval hook
+                        # (not the tool_handler — this is not a
+                        # real tool). If no hook is registered,
+                        # fail-closed refuse so the parked
+                        # workflow doesn't stall forever.
+                        completed_call_ids.add(event.call_id)
+                        asyncio.ensure_future(
+                            _handle_approval_request(
+                                self._http,
+                                self._base,
+                                hooks,
+                                event,
+                                current_response_id or "",
+                            )
+                        )
 
                     elif isinstance(event, ToolResult):
                         completed_call_ids.add(event.call_id)
+                        # D6: if this FCO is the handle for an
+                        # async dispatch we just spawned, capture
+                        # the task_id so the body's PATCH can
+                        # address it. The body is parked on
+                        # state.task_id_event; setting the event
+                        # unblocks it.
+                        state = async_tool_state.get(event.call_id)
+                        if state is not None and state.task_id is None:
+                            task_id = _parse_handle_task_id(event.output)
+                            if task_id is not None:
+                                state.task_id = task_id
+                                state.task_id_event.set()
                         await _call_hook(
                             hooks.on_tool_call_end,
                             ToolCallEndCtx(
@@ -263,6 +391,17 @@ class ResponsesNamespace:
                                 output=event.output,
                             ),
                         )
+
+                    elif isinstance(event, ClientTaskCancel):
+                        # D6: server is telling us to stop the
+                        # local body. Look up by task_id and cancel
+                        # the asyncio.Task — the body's
+                        # ``except CancelledError`` will PATCH
+                        # ``status="cancelled"`` and re-raise.
+                        for s in async_tool_state.values():
+                            if s.task_id == event.task_id and s.asyncio_task is not None:
+                                s.asyncio_task.cancel()
+                                break
 
                     elif isinstance(event, NativeToolCall):
                         await _call_hook(
@@ -368,9 +507,12 @@ class ResponsesNamespace:
                     iteration=iteration,
                 )
                 try:
-                    output = tool_handler.execute(call_info)
-                    if inspect.isawaitable(output):
-                        output = await output
+                    # Sync ``execute`` routes through
+                    # ``asyncio.to_thread`` so a blocking body
+                    # doesn't serialize the sync-tool loop
+                    # (each call would otherwise freeze the
+                    # event loop for its duration).
+                    output = await _call_execute_off_loop(tool_handler, call_info)
                 except ToolCallDenied as exc:
                     output = str(exc)
 
@@ -472,6 +614,19 @@ class ResponsesNamespace:
                 arguments = json.loads(args_str)
             except json.JSONDecodeError:
                 arguments = {}
+
+            # Reserved-name carve-out: policy ASKs surfacing
+            # via the polling path (no streaming hook
+            # registered) fail-closed refuse. Callers that
+            # want interactive approval must use streaming.
+            if name == RESERVED_APPROVAL_TOOL_NAME:
+                tool_results.append(
+                    {
+                        "call_id": call_id,
+                        "output": json.dumps({"approved": False}),
+                    }
+                )
+                continue
 
             call_info = ToolCallInfo(
                 name=name,
@@ -620,9 +775,10 @@ async def _execute_and_patch(
         iteration=iteration,
     )
     try:
-        output = tool_handler.execute(call_info)
-        if inspect.isawaitable(output):
-            output = await output
+        # Sync ``execute`` goes through asyncio.to_thread so a
+        # blocking body doesn't stall the SSE stream or the
+        # TUI's render loop. See ``_call_execute_off_loop``.
+        output = await _call_execute_off_loop(tool_handler, call_info)
     except ToolCallDenied as exc:
         output = str(exc)
     except Exception:
@@ -653,3 +809,422 @@ async def _execute_and_patch(
             )
     except Exception:
         _log.exception("Error PATCHing tool result for call_id %s", tool_call.call_id)
+
+
+async def _call_execute_off_loop(
+    tool_handler: ToolHandler,
+    call_info: ToolCallInfo,
+) -> Any:
+    """
+    Invoke ``tool_handler.execute(call_info)`` without blocking
+    the event loop.
+
+    ``execute`` may be ``async def`` (returns a coroutine) or
+    sync ``def`` (returns a plain value). If async, we await
+    the coroutine on the loop; async bodies are already
+    loop-cooperative. If sync, we run it via
+    :func:`asyncio.to_thread` so blocking calls inside —
+    ``time.sleep``, file I/O, subprocess, ``requests`` — don't
+    stall the loop.
+
+    Sync-vs-async is detected via
+    :func:`inspect.iscoroutinefunction` so we only invoke
+    ``execute`` once. Without the thread bounce, a single
+    sync body with ``time.sleep(5)`` would serialize every
+    concurrent tool call AND freeze any render loop (like the
+    ``ap chat`` TUI) sharing the event loop.
+
+    :param tool_handler: Handler whose ``execute`` will run.
+    :param call_info: Call context passed through to the handler.
+    :returns: Whatever ``execute`` returns (typically a string).
+    """
+    if inspect.iscoroutinefunction(tool_handler.execute):
+        return await tool_handler.execute(call_info)
+    return await asyncio.to_thread(tool_handler.execute, call_info)
+
+
+# ── D6: async client-tool dispatch ────────────────────────────
+
+
+def _is_async_tool_call(
+    tool_call: ToolCall,
+    tool_handler: ToolHandler,
+) -> bool:
+    """
+    Return ``True`` iff this ``function_call`` is for a tool the
+    handler exposed with ``synchronous: false`` (i.e. with a
+    ``synchronous`` boolean inside ``parameters.properties``).
+
+    The check is structural — same gate the server uses
+    (``_wants_async_dispatch`` requires the schema to declare
+    the property). If the SDK builds a handler without the
+    property and the LLM hallucinates ``synchronous: false``
+    in args, the server still routes sync; we mirror that
+    decision here so the SDK doesn't double-track the call.
+
+    :param tool_call: The :class:`ToolCall` event from the SSE
+        stream.
+    :param tool_handler: The :class:`ToolHandler` whose schemas
+        were sent on the request. ``None`` is impossible at the
+        call sites (gated above).
+    :returns: ``True`` iff the matching schema's
+        ``parameters.properties`` declares ``synchronous``.
+        Any structural deviation falls through as ``False``.
+    """
+    for schema in tool_handler.schemas:
+        fn = schema.get("function") if isinstance(schema, dict) else None
+        if not isinstance(fn, dict) or fn.get("name") != tool_call.name:
+            continue
+        params = fn.get("parameters")
+        if not isinstance(params, dict):
+            return False
+        properties = params.get("properties")
+        if not isinstance(properties, dict):
+            return False
+        return "synchronous" in properties
+    return False
+
+
+def _parse_handle_task_id(output: str) -> str | None:
+    """
+    Parse a handle FCO's ``output`` field and extract its task_id.
+
+    The server emits async-tool dispatch handles as a
+    ``function_call_output`` whose ``output`` is JSON of the
+    form ``{"task_id": "...", "kind": "client_tool", ...}``.
+    Returns the task_id only when both the JSON parses and the
+    ``kind`` is ``"client_tool"`` — otherwise the FCO is for a
+    different kind (sub_agent handle, sync result, etc.) and
+    the SDK should not pair it with an async dispatch state.
+
+    :param output: The ``output`` field of a
+        :class:`ToolResult` event. Usually JSON but may be free
+        text for non-async results.
+    :returns: The handle's ``task_id`` when it's a valid
+        ``client_tool`` handle; ``None`` otherwise.
+    """
+    try:
+        parsed = json.loads(output)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if parsed.get("kind") != "client_tool":
+        return None
+    task_id = parsed.get("task_id")
+    return task_id if isinstance(task_id, str) and task_id else None
+
+
+def _truncate_traceback_lines(tb_text: str) -> str:
+    """
+    Cap a traceback at :data:`_FAILURE_TRACEBACK_LINE_BUDGET` lines.
+
+    Mirrors the server's truncation budget so failure PATCHes
+    don't push the LLM's context budget around. Keeps the head
+    (exception type + deepest frames — the most diagnostic part)
+    and appends a ``[... N more lines truncated]`` marker.
+
+    :param tb_text: Raw multi-line traceback text from
+        :func:`traceback.format_exc`.
+    :returns: Either the original text (when within budget) or
+        the head plus a truncation marker.
+    """
+    lines = tb_text.splitlines()
+    if len(lines) <= _FAILURE_TRACEBACK_LINE_BUDGET:
+        return tb_text
+    head = "\n".join(lines[:_FAILURE_TRACEBACK_LINE_BUDGET])
+    return f"{head}\n[... {len(lines) - _FAILURE_TRACEBACK_LINE_BUDGET} more lines truncated]"
+
+
+async def _patch_async_tool_result(
+    http: httpx.AsyncClient,
+    base_url: str,
+    root_response_id: str,
+    task_id: str,
+    status: str,
+    output: str | None,
+    error: dict[str, str] | None,
+) -> None:
+    """
+    PATCH ``async_tool_results`` to the server.
+
+    Idempotent on the server side — a second PATCH after the
+    task is terminal hits the G3 first-write-wins no-op path.
+    HTTP errors are logged but swallowed; losing the PATCH
+    leaves the server's holder workflow waiting on its 1h
+    ``DBOS.recv`` timeout, which still terminates the task.
+
+    :param http: SDK HTTP client.
+    :param base_url: Server base URL,
+        e.g. ``"http://localhost:18501"``.
+    :param root_response_id: The response id the SSE stream is
+        open on. Server's PATCH route accepts the task_id in
+        the body and looks up the right ``client_tool`` row;
+        the URL's response_id only needs to be a valid response
+        the caller has access to.
+    :param task_id: The server-issued ``client_tool`` task id
+        from the handle FCO.
+    :param status: Terminal status — one of ``"completed"``,
+        ``"failed"``, ``"cancelled"``.
+    :param output: Tool output for ``"completed"``. ``None``
+        otherwise.
+    :param error: For ``"failed"`` only — a dict with
+        ``message`` and (optionally) ``traceback`` keys.
+    """
+    body: dict[str, object] = {
+        "task_id": task_id,
+        "status": status,
+    }
+    if output is not None:
+        body["output"] = output
+    if error is not None:
+        body["error"] = error
+    try:
+        resp = await http.patch(
+            f"{base_url}/v1/responses/{root_response_id}",
+            json={"async_tool_results": [body]},
+            timeout=60.0,
+        )
+        if resp.status_code not in (200, 404, 409):
+            _log.warning(
+                "PATCH async_tool_results failed for task_id %s: %s",
+                task_id,
+                resp.text[:200],
+            )
+    except Exception:
+        _log.exception(
+            "Error PATCHing async_tool_results for task_id %s",
+            task_id,
+        )
+
+
+async def _run_async_tool_body(
+    http: httpx.AsyncClient,
+    base_url: str,
+    tool_handler: ToolHandler,
+    hooks: StreamHooks,
+    state: _AsyncToolState,
+    tool_call: ToolCall,
+    root_response_id: str,
+    iteration: int,
+) -> None:
+    """
+    Execute one async client tool's body and PATCH the result back.
+
+    Lifecycle:
+
+    1. Wait (up to 1 h) for the matching handle FCO to set
+       ``state.task_id_event`` so we know what task to PATCH.
+    2. Run the tool body via ``tool_handler.execute``, wrapped in
+       :func:`asyncio.wait_for` with the lifetime cap so a
+       deadlocked body can't pin the asyncio task forever.
+    3. PATCH ``async_tool_results`` with the appropriate
+       ``status`` (``completed`` / ``failed`` / ``cancelled``).
+    4. Fire the ``on_tool_call_end`` hook so consumers see the
+       outcome alongside the in-stream events.
+
+    Cancellation is honored at every ``await`` point — when the
+    SSE stream surfaces a :class:`ClientTaskCancel` for our
+    ``task_id``, the outer code calls ``state.asyncio_task.cancel()``
+    and the ``except asyncio.CancelledError`` block here PATCHes
+    a ``cancelled`` status (best-effort) before re-raising.
+
+    :param http: SDK HTTP client (shared with the stream).
+    :param base_url: Server base URL.
+    :param tool_handler: Handler that built the schemas
+        (provides ``execute`` for the body).
+    :param hooks: Stream hooks for ``on_tool_call_end``.
+    :param state: Per-call state with the
+        ``task_id_event`` synchronization gate.
+    :param tool_call: The originating ``function_call`` event.
+    :param root_response_id: The response id to PATCH against.
+    :param iteration: The stream-loop iteration that emitted
+        the call (passed through to hooks).
+    """
+    call_info = ToolCallInfo(
+        name=tool_call.name,
+        arguments=tool_call.arguments,
+        call_id=tool_call.call_id,
+        agent_name=tool_call.agent_name,
+        response_id=root_response_id,
+        iteration=iteration,
+    )
+
+    status: str
+    output: str | None = None
+    error: dict[str, str] | None = None
+
+    try:
+        # Wait for the handle FCO to populate state.task_id.
+        # The server emits the handle synchronously after the
+        # function_call, so this typically returns within
+        # milliseconds — the timeout is only a backstop for a
+        # broken stream that never delivers it.
+        await asyncio.wait_for(
+            state.task_id_event.wait(),
+            timeout=_ASYNC_CLIENT_TOOL_MAX_LIFETIME_S,
+        )
+
+        # Now run the tool body. Cap at 1h so a hung body
+        # surfaces as a clean ``failed`` PATCH rather than
+        # leaking the asyncio task.
+        #
+        # ``execute`` may be sync (returns a string) or async
+        # (returns a coroutine). If sync, we invoke it via
+        # ``asyncio.to_thread`` so a blocking body (``time.sleep``,
+        # file I/O, subprocess, etc.) doesn't freeze the event
+        # loop — in the D6 happy path several async tools run
+        # concurrently, and a sync ``time.sleep(5)`` inline on
+        # the loop would serialize them AND stall the TUI's
+        # render. The async path is already loop-safe, so just
+        # await it.
+        raw_output = await asyncio.wait_for(
+            _call_execute_off_loop(tool_handler, call_info),
+            timeout=_ASYNC_CLIENT_TOOL_MAX_LIFETIME_S,
+        )
+        output = raw_output if isinstance(raw_output, str) else json.dumps(raw_output, default=str)
+        status = "completed"
+    except asyncio.CancelledError:
+        # Outer code (ClientTaskCancel handler) cancelled us.
+        # Best-effort PATCH the cancelled status, then re-raise
+        # so DBOS / asyncio see the cancellation.
+        status = "cancelled"
+        if state.task_id is not None:
+            await _patch_async_tool_result(
+                http,
+                base_url,
+                root_response_id,
+                state.task_id,
+                status=status,
+                output=None,
+                error=None,
+            )
+        raise
+    except TimeoutError:
+        status = "failed"
+        error = {
+            "message": (
+                f"async client tool {tool_call.name!r} exceeded the "
+                f"{_ASYNC_CLIENT_TOOL_MAX_LIFETIME_S}s SDK lifetime cap"
+            ),
+        }
+    except ToolCallDenied as exc:
+        status = "failed"
+        error = {"message": str(exc)}
+    except Exception as exc:
+        _log.exception("async client tool %s raised", tool_call.name)
+        status = "failed"
+        error = {
+            "message": f"{type(exc).__name__}: {exc}",
+            "traceback": _truncate_traceback_lines(traceback.format_exc()),
+        }
+
+    await _call_hook(
+        hooks.on_tool_call_end,
+        ToolCallEndCtx(
+            name=tool_call.name,
+            call_id=tool_call.call_id,
+            agent_name=tool_call.agent_name,
+            output=output if output is not None else (error or {}).get("message", ""),
+        ),
+    )
+
+    # Final PATCH for non-cancellation paths (cancellation path
+    # already PATCHed before re-raising). If state.task_id is
+    # still ``None`` here the handle FCO never arrived and the
+    # 1h wait timed out — surface as a failed PATCH would be
+    # nice but we have nothing to address it to. Log and drop.
+    if state.task_id is None:
+        _log.warning(
+            "async client tool %s never received a task_id from the "
+            "handle FCO (timed out at %ss); dropping PATCH",
+            tool_call.name,
+            _ASYNC_CLIENT_TOOL_MAX_LIFETIME_S,
+        )
+        return
+    await _patch_async_tool_result(
+        http,
+        base_url,
+        root_response_id,
+        state.task_id,
+        status=status,
+        output=output,
+        error=error,
+    )
+
+
+async def _handle_approval_request(
+    http: httpx.AsyncClient,
+    base_url: str,
+    hooks: StreamHooks,
+    event: ApprovalRequest,
+    response_id: str,
+) -> None:
+    """
+    Route a policy ASK through the approval hook and PATCH the verdict.
+
+    When no ``on_approval_request`` hook is registered the
+    client refuses fail-closed — an ASK the caller cannot
+    answer must not stall the parked workflow forever. The
+    server treats ``{"approved": false}`` the same as refused /
+    timed-out per POLICIES.md §13.
+
+    Runs on a background task so the SSE stream continues to
+    drain while the user is deciding. The verdict PATCH goes
+    through the existing ``tool_results`` contract — no new
+    endpoint, no server-side change.
+
+    :param http: Shared HTTPX client.
+    :param base_url: Server base URL.
+    :param hooks: Stream hooks — the ``on_approval_request``
+        hook gets the decision.
+    :param event: The parsed approval request.
+    :param response_id: Root response id (the parked
+        workflow).
+    """
+    ctx = ApprovalRequestCtx(
+        call_id=event.call_id,
+        reason=event.reason,
+        policy_name=event.policy_name,
+        phase=event.phase,
+        content_preview=event.content_preview,
+        response_id=response_id,
+    )
+    approved = False
+    if hooks.on_approval_request is not None:
+        try:
+            raw = hooks.on_approval_request(ctx)
+            if inspect.isawaitable(raw):
+                raw = await raw
+            approved = bool(raw)
+        except Exception:
+            _log.exception(
+                "on_approval_request hook raised for call_id %s; refusing fail-closed",
+                event.call_id,
+            )
+            approved = False
+    else:
+        _log.info(
+            "No on_approval_request hook registered; refusing ASK call_id=%s policy=%s",
+            event.call_id,
+            event.policy_name,
+        )
+
+    verdict_output = json.dumps({"approved": approved})
+    try:
+        resp = await http.patch(
+            f"{base_url}/v1/responses/{response_id}",
+            json={"tool_results": [{"call_id": event.call_id, "output": verdict_output}]},
+            timeout=60.0,
+        )
+        if resp.status_code not in (200, 404, 409):
+            _log.warning(
+                "PATCH verdict failed for call_id %s: %s",
+                event.call_id,
+                resp.text[:200],
+            )
+    except Exception:
+        _log.exception(
+            "Error PATCHing approval verdict for call_id %s",
+            event.call_id,
+        )

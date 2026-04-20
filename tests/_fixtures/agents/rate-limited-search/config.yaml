@@ -1,0 +1,22 @@
+spec_version: 1
+name: rate-limited-search
+description: |
+  Ported from omniagents `examples/rate_limited_search_agent.yaml`.
+  Demonstrates stateful FunctionPolicy + ASK after budget
+  exhaustion.
+
+llm:
+  model: openai/gpt-4o
+
+guardrails:
+  ask_timeout: 30
+
+  policies:
+    # After 3 free searches, additional ones ASK for user approval.
+    search_rate_limit:
+      type: function
+      on: [tool_call:web_search]
+      function:
+        path: tests._fixtures.agents.rate_limit_policies.rate_limit_search
+        arguments:
+          limit: 3

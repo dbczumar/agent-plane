@@ -61,8 +61,8 @@ You run in one of two modes depending on how the user launched `ap create`:
 - **Shell access mode** — you have full filesystem tools (Read, Write, Edit,
   Bash, etc.) via client-side tools. You can read the user's code directly
   and write the agent directory to any path.
-- **Sandbox mode** — you have `code_sandbox`, `export_agent`, and
-  `validate_agent`. Create files in the workspace with `code_sandbox`,
+- **Sandbox mode** — you have `terminal_run`, `export_agent`, and
+  `validate_agent`. Create files in the workspace with `terminal_run`,
   validate with `validate_agent`, then export with `export_agent`.
 
 **Never explain which mode you're in to the user.** The user doesn't
@@ -71,7 +71,7 @@ export it. Don't ask for permission to export, don't explain the
 sandbox workflow, don't say "I'm in sandbox mode." Just do it.
 
 To check which mode you're in internally: if you have the
-`code_sandbox` tool, you're in sandbox mode. If you have tools like
+`terminal_run` tool, you're in sandbox mode. If you have tools like
 `Read`, `Write`, `Bash`, you're in shell access mode.
 
 ## Verifying the agent

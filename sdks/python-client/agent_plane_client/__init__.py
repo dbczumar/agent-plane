@@ -48,11 +48,17 @@ from ._blocks import (
 )
 from ._client import AgentPlaneClient
 from ._errors import AgentPlaneError, ToolCallDenied
+from ._events import RESERVED_APPROVAL_TOOL_NAME, ApprovalRequest
 from ._query import QueryResult, QueryStream
 from ._server import LocalServer
 from ._session import Session
 from ._stream import BlockStream
-from ._tool_handler import StreamHooks, ToolCallInfo, ToolHandler
+from ._tool_handler import (
+    ApprovalRequestCtx,
+    StreamHooks,
+    ToolCallInfo,
+    ToolHandler,
+)
 from ._transforms import (
     merge_text_across_iterations,
     only_agent,
@@ -64,9 +70,12 @@ from ._types import File
 from .tools import ToolMetadata, ToolState, tool
 
 __all__ = [
+    "RESERVED_APPROVAL_TOOL_NAME",
     "AgentPlaneClient",
     "AgentPlaneError",
     "AnyBlock",
+    "ApprovalRequest",
+    "ApprovalRequestCtx",
     "BlockContext",
     "BlockStream",
     "CompactionBlock",

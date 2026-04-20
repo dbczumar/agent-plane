@@ -143,21 +143,75 @@ class LocalPythonTool(Tool):
         """
         return self._metadata.name
 
-    def is_async(self) -> bool:
+    def is_async(self, arguments: str | None = None) -> bool:
         """
         Return ``True`` for ``@tool(synchronous=False)`` functions.
 
-        Reads the flag captured at decoration time. Async tools
-        bypass the inline ``invoke()`` path entirely — the runtime
-        starts a background workflow and returns a handle to the
-        LLM (D2/D3); the actual tool body still runs in a
-        subprocess, just inside the background workflow's
-        ``@step`` rather than the parent workflow.
+        ``LocalPythonTool`` ignores ``arguments`` because async-ness
+        is a property of the decoration, not the invocation. Reads
+        the flag captured at decoration time. Async tools bypass
+        the inline ``invoke()`` path entirely — the runtime starts
+        a background workflow and returns a handle to the LLM
+        (D2/D3); the actual tool body still runs in a subprocess,
+        just inside the background workflow's ``@step`` rather than
+        the parent workflow.
 
+        :param arguments: Ignored — kept for interface parity with
+            ``Tool.is_async`` and tools whose async-ness depends on
+            per-call arguments (e.g. ``TerminalRunTool``).
         :returns: ``True`` if the tool was decorated with
             ``synchronous=False``.
         """
         return not self._metadata.synchronous
+
+    async def dispatch_async(
+        self,
+        *,
+        parent_task_id: str,
+        parent_conversation_id: str,
+        agent_id: str,
+        agent_name: str,
+        arguments: str,
+        workspace_path: str | None,
+    ) -> Any:
+        """
+        Start the background @tool workflow and return an ``_AsyncToolHandle``.
+
+        Delegates to the runtime's shared
+        ``_dispatch_local_python_tool_async`` helper so the
+        workflow-body logic (task_store row creation,
+        ``SetWorkflowID`` pinning, ``start_workflow``) stays in one
+        place. The tool's responsibility here is just to hand off
+        its identifying metadata (``module_path``, ``name``) plus
+        the arguments.
+
+        :param parent_task_id: The parent workflow's task_id.
+        :param parent_conversation_id: The parent's conversation id
+            (stamped onto the child task row via the helper, which
+            falls back to the parent's conversation if nothing
+            overrides it).
+        :param agent_id: The owning agent id.
+        :param agent_name: The tool's name — used as ``agent_name``
+            on the child task row so ``list_tasks`` shows which
+            tool produced the work.
+        :param arguments: JSON-encoded argument string from the LLM.
+        :param workspace_path: Ignored — local Python tools get
+            their workspace via the runner subprocess env.
+        :returns: An ``_AsyncToolHandle`` ready for JSON
+            serialization.
+        """
+        from agent_plane.runtime.workflow import (
+            _dispatch_local_python_tool_async,
+        )
+
+        return await _dispatch_local_python_tool_async(
+            tool=self,
+            parent_task_id=parent_task_id,
+            parent_conversation_id=parent_conversation_id,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            arguments=arguments,
+        )
 
     def module_path(self) -> str:
         """

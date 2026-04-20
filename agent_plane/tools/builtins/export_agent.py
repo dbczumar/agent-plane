@@ -24,7 +24,7 @@ _SCHEMA: dict[str, Any] = {
         "description": (
             "Copy a generated agent directory from the sandbox workspace "
             "to a target path on the user's filesystem. Use this after "
-            "creating an agent with code_sandbox to place it where the "
+            "creating an agent with terminal_run to place it where the "
             "user wants it."
         ),
         "parameters": {
@@ -58,9 +58,10 @@ class ExportAgentTool(Tool):
     Copy a generated agent directory from the sandbox to a target path.
 
     The onboarding assistant generates agent files inside the
-    code_sandbox workspace. This tool copies the result to the
-    user's chosen location. The target directory must not already
-    exist (to prevent accidental overwrites).
+    conversation's workspace (via ``terminal_run``). This tool
+    copies the result to the user's chosen location. The target
+    directory must not already exist (to prevent accidental
+    overwrites).
     """
 
     @classmethod
@@ -78,7 +79,7 @@ class ExportAgentTool(Tool):
         return (
             "Copy a generated agent directory from the sandbox workspace "
             "to a target path on the user's filesystem. Use this after "
-            "creating an agent with code_sandbox to place it where the "
+            "creating an agent with terminal_run to place it where the "
             "user wants it."
         )
 

@@ -1,0 +1,30 @@
+spec_version: 1
+
+name: e2e-tool-result-gate
+description: |
+  E2E fixture: TOOL_RESULT-phase policy enforcement.
+  Distinct from the ``e2e-tool-gate`` fixture which ASKs
+  on TOOL_CALL; this one ASKs on TOOL_RESULT. The tool
+  dispatches freely — the policy fires only AFTER it
+  returns, BEFORE the result reaches function_call_output
+  (POLICIES.md §11.4 pre-persistence invariant).
+
+llm:
+  model: openai/gpt-4o
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+guardrails:
+  policies:
+    ask_on_echo_result:
+      type: label
+      on: [tool_result:echo]
+      action: ask
+      reason: Review the echo tool's output before surfacing.
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

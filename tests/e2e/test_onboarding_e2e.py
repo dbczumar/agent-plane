@@ -153,8 +153,9 @@ def test_sandbox_mode_creates_and_exports_agent(
 ) -> None:
     """
     ``ap create`` without ``--allow-shell-access`` uses sandbox mode:
-    the onboarding assistant creates the agent in its code_sandbox
-    workspace and exports it to the user's path via ``export_agent``.
+    the onboarding assistant creates the agent in its sandboxed
+    terminal_run workspace and exports it to the user's path via
+    ``export_agent``.
 
     Flow:
     1. Run ``ap create`` WITHOUT ``--allow-shell-access``.
@@ -164,7 +165,7 @@ def test_sandbox_mode_creates_and_exports_agent(
     4. Boot the exported agent and verify it responds.
 
     **What breaks if this fails:**
-    - code_sandbox not added to onboarding agent in sandbox mode →
+    - terminal_run not added to onboarding agent in sandbox mode →
       agent can't create files at all.
     - export_agent not added → agent creates files in workspace but
       can't copy them to the target path.
@@ -213,7 +214,7 @@ def test_sandbox_mode_creates_and_exports_agent(
     assert config_path.exists(), (
         f"Expected config.yaml at {config_path}. "
         f"The onboarding assistant did not export the agent. "
-        f"It should have used code_sandbox to create files in the "
+        f"It should have used terminal_run to create files in the "
         f"workspace, then export_agent to copy them to {agent_dir}. "
         f"stdout: {result.stdout[-2000:]}"
     )

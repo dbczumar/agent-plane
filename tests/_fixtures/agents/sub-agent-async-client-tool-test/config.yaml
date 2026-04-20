@@ -1,0 +1,32 @@
+spec_version: 1
+
+name: sub-agent-async-client-tool-test
+
+description: |
+  Test-only parent agent for the audit-fix-#1 E2E.
+
+  Reproduces the bug where a sub-agent calls an async client
+  tool (synchronous: false): the server's PATCH handler signals
+  task.root_task_id (this parent), not the immediate caller
+  (the sub-agent). Result: the sub-agent's drain never wakes
+  and the client-tool result is never delivered to the
+  sub-agent's conversation.
+
+  See designs/ASYNC_CLIENT_TOOL_PROTOCOL.md "Audit fix #1"
+  and tests/e2e/test_sub_agent_async_client_tool_routing_e2e.py.
+
+llm:
+  model: gpt-5.4
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  agents: [worker]
+  timeout: 60
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

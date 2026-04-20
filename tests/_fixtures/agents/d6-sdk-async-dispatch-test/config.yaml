@@ -1,0 +1,27 @@
+spec_version: 1
+
+name: d6-sdk-async-dispatch-test
+
+description: |
+  Test-only agent for the Phase 5 D6 SDK-lifecycle E2E.
+
+  Calls a single async client tool (``compute``) supplied by
+  the SDK at request time with ``synchronous: false``. Waits
+  for the system message ``[System: task X (client_tool)
+  completed]\n<body>`` and replies to the user with the body
+  prefixed by ``ANSWER:`` so the test can pull it out.
+
+llm:
+  model: gpt-5.4
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  timeout: 60
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

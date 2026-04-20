@@ -261,11 +261,17 @@ def test_parse_invalid_data() -> None:
 
 
 def test_conversation_title_defaults_to_none() -> None:
+    """Conversation created without a title has title=None and
+    empty labels; timestamps reflect what was passed in."""
     conv = Conversation(id="conv_1", created_at=1700000000, updated_at=1700000000)
     assert conv.title is None
+    # Labels default to empty dict, not None — iteration via
+    # ``.items()`` must always be safe.
+    assert conv.labels == {}
 
 
 def test_conversation_title_set() -> None:
+    """Title is persisted when passed at construction."""
     conv = Conversation(
         id="conv_1",
         created_at=1700000000,
@@ -273,3 +279,14 @@ def test_conversation_title_set() -> None:
         title="Weather chat",
     )
     assert conv.title == "Weather chat"
+
+
+def test_conversation_labels_default_independent() -> None:
+    """Each Conversation gets its own labels dict via
+    ``default_factory``. If this test fails, two Conversations
+    would share state (the classic mutable-default footgun)."""
+    a = Conversation(id="conv_a", created_at=1, updated_at=1)
+    b = Conversation(id="conv_b", created_at=1, updated_at=1)
+    a.labels["integrity"] = "0"
+    # Writing on a must NOT show up on b.
+    assert b.labels == {}

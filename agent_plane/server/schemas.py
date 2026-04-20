@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -408,7 +408,8 @@ class AsyncToolResult(BaseModel):
         ``function_call_output`` handle the LLM saw, e.g.
         ``"resp_async_xyz"``.
     :param status: Terminal status — one of ``"completed"``,
-        ``"failed"``, or ``"cancelled"``.
+        ``"failed"``, or ``"cancelled"``. Pydantic's ``Literal``
+        validator rejects any other string with a 422.
     :param output: For ``status="completed"`` only: the tool's
         string output. ``None`` on failure / cancellation.
     :param error: For ``status="failed"`` only: dict with
@@ -417,7 +418,7 @@ class AsyncToolResult(BaseModel):
     """
 
     task_id: str
-    status: str
+    status: Literal["completed", "failed", "cancelled"]
     output: str | None = None
     error: dict[str, str] | None = None
 

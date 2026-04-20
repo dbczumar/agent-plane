@@ -1,0 +1,23 @@
+spec_version: 1
+
+name: worker
+
+description: |
+  Worker sub-agent. Calls the async client tool ``async_compute``
+  with ``synchronous: false`` to dispatch a long-running
+  computation and waits for the system-message delivery.
+
+llm:
+  model: gpt-5.4
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  timeout: 60
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

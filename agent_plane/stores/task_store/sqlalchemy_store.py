@@ -118,30 +118,17 @@ def _to_entity(row: SqlTask) -> Task:
     as the default.
 
     Call :func:`_enrich_from_dbos` afterwards to merge DBOS
-    workflow state (status, output, error, instructions, reasoning).
+    workflow state (status, output, error, instructions,
+    reasoning). All four task kinds — ``agent_task``, ``tool``,
+    ``sub_agent``, and ``client_tool`` — have a DBOS workflow
+    today (``client_tool`` since the holder-workflow refactor),
+    so the enrichment step is the single source of truth for
+    terminal status / output / error.
 
     :param row: The :class:`SqlTask` ORM row to convert.
     :returns: A :class:`Task` dataclass instance with status
         defaulting to ``"queued"``.
     """
-    # Phase 5 — for tasks without a DBOS workflow (e.g. async
-    # client tools), the manual_* columns hold the terminal
-    # status set by the PATCH async_tool_results handler.
-    # Surface these on _to_entity so check_task / list_tasks
-    # see the right state. For tasks with a DBOS workflow,
-    # manual_status is NULL and ``_enrich_from_dbos`` overwrites
-    # the queued default with live workflow state.
-    initial_status = row.manual_status or TaskStatus.QUEUED.value
-    initial_output: list[dict[str, Any]] = []
-    initial_error: dict[str, str] | None = None
-    if row.manual_output:
-        initial_output = [{"text": row.manual_output}]
-    if row.manual_error_message:
-        initial_error = {"message": row.manual_error_message}
-        # Only include traceback when the client actually sent
-        # one — preserves "no traceback" vs "empty traceback".
-        if row.manual_error_traceback is not None:
-            initial_error["traceback"] = row.manual_error_traceback
     return Task(
         id=row.id,
         conversation_id=row.conversation_id,
@@ -152,12 +139,13 @@ def _to_entity(row: SqlTask) -> Task:
         previous_response_id=row.previous_response_id,
         background=row.background,
         root_task_id=row.root_task_id,
+        parent_task_id=row.parent_task_id,
         kind=row.kind,
         # task.status is typed str; store the enum's .value so f-string
         # formatting produces "queued" not "TaskStatus.QUEUED".
-        status=initial_status,
-        output=initial_output,
-        error=initial_error,
+        status=TaskStatus.QUEUED.value,
+        output=[],
+        error=None,
         # instructions and reasoning are populated by _apply_workflow_status
         # from DBOS workflow inputs, not from the DB row.
     )
@@ -191,6 +179,24 @@ def _apply_workflow_status(task: Task, wf_status: WorkflowStatus) -> Task:
         task.output = result["output"]
         task.usage = result.get("usage")
         task.completed_at = result.get("completed_at")
+        # Business-level status override: some workflows (notably the
+        # terminal async path with its in-process SIGINT cancel)
+        # return NORMALLY from DBOS's perspective but carry a
+        # ``status`` field in the payload that overrides the
+        # SUCCESS → COMPLETED mapping. For terminal kind, SIGINT
+        # produces ``status="cancelled"`` and a timeout produces
+        # ``status="failed"``; both should surface to check_task /
+        # list_tasks as the payload says, not as "completed".
+        payload_status = result.get("status")
+        if payload_status in {
+            TaskStatus.CANCELLED.value,
+            TaskStatus.FAILED.value,
+        }:
+            task.status = payload_status
+            if payload_status == TaskStatus.FAILED.value:
+                payload_error = result.get("error")
+                if isinstance(payload_error, dict):
+                    task.error = payload_error
 
     if task.status == TaskStatus.FAILED and wf_status.error is not None:
         task.error = {
@@ -296,6 +302,7 @@ class SqlAlchemyTaskStore(TaskStore):
         previous_response_id: str | None = None,
         background: bool = False,
         root_task_id: str | None = None,
+        parent_task_id: str | None = None,
         kind: str = "agent_task",
     ) -> Task:
         """
@@ -312,6 +319,12 @@ class SqlAlchemyTaskStore(TaskStore):
         :param background: Whether this is a background task.
         :param root_task_id: ID of the top-level task for
             sub-agent spawns. ``None`` for top-level tasks.
+        :param parent_task_id: ID of the IMMEDIATE parent task
+            (the caller that created this one) — distinct from
+            ``root_task_id`` when a sub-agent is the caller.
+            ``None`` for top-level tasks. Signal routing for
+            ``async_work_complete`` delivers to this id so the
+            immediate calling agent's drain wakes (audit fix #1).
         :param kind: Task kind discriminator, one of
             ``"agent_task"`` (default — user-initiated turn),
             ``"tool"`` (background ``@tool(synchronous=False)``),
@@ -332,6 +345,7 @@ class SqlAlchemyTaskStore(TaskStore):
             inbox_closed=False,
             background=background,
             root_task_id=root_task_id,
+            parent_task_id=parent_task_id,
             kind=kind,
         )
         with self._session() as session:
@@ -476,7 +490,6 @@ class SqlAlchemyTaskStore(TaskStore):
         :raises LookupError: If the task does not exist after
             completion.
         """
-        import asyncio
 
         handle: WorkflowHandleAsync[dict[str, Any]] = await retrieve_workflow_async(task_id)
         try:
@@ -678,50 +691,6 @@ class SqlAlchemyTaskStore(TaskStore):
             return []
 
     # ── Cancel / Delete ───────────────────────────────────
-
-    async def finalize_async_task(
-        self,
-        *,
-        task_id: str,
-        status: str,
-        output: str | None = None,
-        error: dict[str, str] | None = None,
-    ) -> None:
-        """
-        Phase 5: mark a non-DBOS task terminal with a result.
-
-        Used by the PATCH ``async_tool_results`` handler to
-        record the client's reported outcome on a
-        ``kind="client_tool"`` task. Writes the manual_*
-        columns on the row; the next ``_to_entity`` will surface
-        them as ``status`` / ``output`` / ``error``.
-
-        :param task_id: The task's id.
-        :param status: Terminal status — one of ``"completed"``,
-            ``"failed"``, ``"cancelled"``.
-        :param output: The string output for ``"completed"``.
-            ``None`` when the client did not produce a result
-            (failure / cancellation).
-        :param error: For ``"failed"`` only — dict with
-            ``message`` and optional ``traceback`` keys.
-            ``None`` when status is not ``"failed"``.
-        :raises LookupError: If the task does not exist.
-        """
-
-        def _do_update() -> None:
-            with self._session() as session:
-                # Read-then-write: SQLAlchemy's Result.rowcount is
-                # not statically typed across dialects, so detect a
-                # missing row via .get() rather than .rowcount.
-                row = session.get(SqlTask, task_id)
-                if row is None:
-                    raise LookupError(f"task {task_id!r} not found")
-                row.manual_status = status
-                row.manual_output = output
-                row.manual_error_message = (error or {}).get("message")
-                row.manual_error_traceback = (error or {}).get("traceback")
-
-        await asyncio.to_thread(_do_update)
 
     def cancel(self, task_id: str) -> Task:
         """

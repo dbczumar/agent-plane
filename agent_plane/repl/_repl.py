@@ -6,15 +6,18 @@ The public API is ``run_repl(client, agent_name, tool_handler)``.
 from __future__ import annotations
 
 import asyncio
+import enum
 import os
 import pathlib
 from typing import Any
 
 from agent_plane_client import (
     AgentPlaneClient,
+    ApprovalRequestCtx,
     BlockStream,
     ResponseEndBlock,
     ResponseStartBlock,
+    StreamHooks,
     ToolHandler,
     pipe,
     skip_intermediate_ends,
@@ -46,6 +49,314 @@ class TimedFormatter(RichBlockFormatter):  # type: ignore[misc]
         return items
 
 
+class _ApprovalVerdict(enum.Enum):
+    """
+    How the user answered a policy approval prompt.
+
+    Three-way rather than boolean so the REPL can distinguish
+    "approve just this one" from "approve and stop asking for
+    the rest of this session". Mirrors the Claude Code model
+    (y / A / n); same muscle memory transfers.
+
+    - ``APPROVE_ONCE`` — allow this one request only.
+    - ``APPROVE_ALWAYS`` — allow this request AND remember the
+      decision for the rest of the REPL session. Future asks
+      from the same policy at the same phase auto-approve
+      without prompting.
+    - ``REFUSE`` — refuse this request. Fail-closed default
+      per POLICIES.md §13; anything not explicitly approve is
+      a refusal.
+    """
+
+    APPROVE_ONCE = "approve_once"
+    APPROVE_ALWAYS = "approve_always"
+    REFUSE = "refuse"
+
+
+# Input-token vocabulary for each verdict, case-insensitive.
+# Both short and long forms accepted so muscle memory from
+# other tools (aider's "y", claude-code's "yes") carries over.
+# Anything outside these sets is a REFUSE — fail-closed per
+# POLICIES.md §13.
+_APPROVE_ONCE_TOKENS: frozenset[str] = frozenset({"y", "yes", "approve", "ok"})
+_APPROVE_ALWAYS_TOKENS: frozenset[str] = frozenset(
+    {"a", "always", "yes always", "approve always"},
+)
+
+
+def _parse_approval_input(text: str) -> _ApprovalVerdict:
+    """
+    Classify a line of user input as one of the three verdicts.
+
+    Case-insensitive, whitespace-stripped. ALWAYS tokens are
+    checked before ONCE tokens so the lone letter ``a`` is
+    treated as "always" rather than ambiguously falling
+    through to the refuse default.
+
+    :param text: Raw user input from the main REPL prompt.
+    :returns: The parsed verdict.
+    """
+    normalized = text.strip().lower()
+    if normalized in _APPROVE_ALWAYS_TOKENS:
+        return _ApprovalVerdict.APPROVE_ALWAYS
+    if normalized in _APPROVE_ONCE_TOKENS:
+        return _ApprovalVerdict.APPROVE_ONCE
+    return _ApprovalVerdict.REFUSE
+
+
+class _ApprovalState:
+    """
+    Per-REPL holder for pending approvals and the session
+    auto-approve cache.
+
+    Owning an object (rather than module globals) keeps
+    multiple REPL sessions in the same process isolated —
+    tests can spin up two :func:`run_repl` invocations and
+    their state doesn't collide.
+
+    Two pieces of state:
+
+    1. The currently-pending approval :class:`asyncio.Future`
+       (``None`` when no ASK is in flight). The hook creates
+       it via :meth:`begin`; the main input loop resolves it
+       via :meth:`resolve`. Using a future avoids the stdin /
+       ``patch_stdout`` fight that a direct ``input()`` call
+       produced.
+    2. The session auto-approve cache: a set of
+       ``(policy_name, phase)`` pairs the user said "always"
+       to. Future ASKs matching one of these entries skip the
+       prompt and auto-approve. Scoped to this REPL run —
+       restart wipes the cache.
+    """
+
+    def __init__(self) -> None:
+        """Start with no pending approval and an empty cache."""
+        self._future: asyncio.Future[bool] | None = None
+        # Current ASK's identity — captured on ``begin`` so
+        # ``resolve_verdict`` can stash the pair on an
+        # APPROVE_ALWAYS without the caller having to re-pass
+        # ctx fields.
+        self._current_policy: str | None = None
+        self._current_phase: str | None = None
+        # (policy_name, phase) → "approve always" cache.
+        # ``phase`` comes from the server as a string
+        # (``"input"``, ``"tool_call"``, ...) so storing the
+        # pair as-is avoids any re-parsing overhead.
+        self._always: set[tuple[str, str]] = set()
+
+    @property
+    def pending(self) -> bool:
+        """:returns: ``True`` iff an approval is awaiting a verdict."""
+        return self._future is not None and not self._future.done()
+
+    def is_pre_approved(self, policy_name: str, phase: str) -> bool:
+        """
+        Look up an earlier "always" decision.
+
+        Called by the approval hook BEFORE rendering anything —
+        a pre-approved ASK must produce no UI noise. The cache
+        key is specifically ``(policy_name, phase)``; different
+        policies or different phases still prompt even if the
+        user approved a related one.
+
+        :param policy_name: Deciding policy's name from the
+            :class:`ApprovalRequestCtx`.
+        :param phase: Phase string from the ctx (``"input"`` /
+            ``"tool_call"`` / etc.).
+        :returns: ``True`` iff the user previously answered
+            "always" for this policy+phase pair.
+        """
+        return (policy_name, phase) in self._always
+
+    def remember_always(self, policy_name: str, phase: str) -> None:
+        """
+        Cache an "approve always" decision for the rest of the
+        session.
+
+        Idempotent — adding a duplicate entry is a no-op. The
+        cache is NEVER persisted to disk; closing ``ap chat``
+        clears it, so the next session starts from a clean
+        slate. That matches what users expect from
+        session-scoped approvals in other tools.
+
+        :param policy_name: Deciding policy's name.
+        :param phase: Phase string.
+        """
+        self._always.add((policy_name, phase))
+
+    def begin(self, policy_name: str, phase: str) -> asyncio.Future[bool]:
+        """
+        Start a new approval — create the future the hook awaits.
+
+        Records the identity of the ASK so
+        :meth:`resolve_verdict` can cache an "always" decision
+        against the right ``(policy_name, phase)`` pair
+        without the caller having to re-pass them.
+
+        If a previous approval's future is still open (the user
+        never answered before a new ASK arrived), refuse the
+        old one fail-closed and replace it. In practice the
+        server only has one parked workflow per REPL at a
+        time, so this is defense-in-depth.
+
+        :param policy_name: Deciding policy's name from the
+            :class:`ApprovalRequestCtx`.
+        :param phase: Phase string from the ctx.
+        :returns: The future to await. Resolves to ``True`` on
+            approve (one or always) and ``False`` on refuse.
+        """
+        if self._future is not None and not self._future.done():
+            self._future.set_result(False)
+        self._current_policy = policy_name
+        self._current_phase = phase
+        self._future = asyncio.get_running_loop().create_future()
+        return self._future
+
+    def resolve_verdict(self, verdict: _ApprovalVerdict) -> bool:
+        """
+        Resolve a pending approval with a three-way verdict.
+
+        On :attr:`_ApprovalVerdict.APPROVE_ALWAYS`, caches
+        ``(current_policy, current_phase)`` so subsequent
+        ASKs for that pair auto-approve without prompting.
+        On any other verdict, the cache is untouched.
+
+        :param verdict: The user's answer.
+        :returns: ``True`` iff a pending approval existed and
+            was resolved. ``False`` when there was nothing to
+            resolve (the caller should route input normally).
+        """
+        if self._future is None or self._future.done():
+            return False
+        approved = verdict != _ApprovalVerdict.REFUSE
+        if (
+            verdict == _ApprovalVerdict.APPROVE_ALWAYS
+            and self._current_policy is not None
+            and self._current_phase is not None
+        ):
+            self.remember_always(self._current_policy, self._current_phase)
+        self._future.set_result(approved)
+        self._future = None
+        self._current_policy = None
+        self._current_phase = None
+        return True
+
+    def cancel(self) -> None:
+        """
+        Cancel any pending approval — refuse fail-closed.
+
+        Called on REPL teardown or when the user ``/cancel``s
+        an in-progress response to avoid leaking an unresolved
+        future. Does NOT clear the "always" cache — that
+        persists for the REPL session.
+        """
+        if self._future is not None and not self._future.done():
+            self._future.set_result(False)
+        self._future = None
+        self._current_policy = None
+        self._current_phase = None
+
+
+def _make_approval_prompt(
+    host: TerminalHost,
+    fmt: RichBlockFormatter,
+    state: _ApprovalState,
+) -> Any:
+    """
+    Build the ``on_approval_request`` hook for the REPL.
+
+    When the server emits a policy ASK (synthetic
+    ``request_approval`` function_call), the SDK routes it to
+    this hook. Two paths:
+
+    - Pre-approved: the user previously said "always" for this
+      ``(policy_name, phase)`` pair. Skip all UI, auto-approve.
+      Print a short muted line so the transcript records that
+      an auto-approve fired — silent auto-approval would be
+      security-hostile (user forgets they once said "always").
+    - Fresh ASK: render the preview, offer three options
+      (``y`` / ``a`` / ``n``), await a future resolved by the
+      main input loop.
+
+    This hook does NOT touch stdin or call :func:`input` —
+    under the REPL's active ``prompt_toolkit`` session, any
+    direct stdin read fights ``patch_stdout`` and produces
+    the "characters disappear / auto-delete" jank. Reusing
+    the main input loop means typing the verdict works
+    exactly like typing any other message. See POLICIES.md
+    §7 + §15.10.
+
+    :param host: The active :class:`TerminalHost` whose
+        output channel we render the request on.
+    :param fmt: Formatter whose accent / muted styles we
+        reuse for visual consistency with the rest of the
+        REPL.
+    :param state: Shared :class:`_ApprovalState` that couples
+        this hook to the main input loop and holds the
+        session auto-approve cache.
+    :returns: Async callable suitable for
+        :attr:`StreamHooks.on_approval_request`.
+    """
+
+    async def _on_approval_request(ctx: ApprovalRequestCtx) -> bool:
+        """
+        Render the approval request and await the main loop's verdict.
+
+        :param ctx: Parsed approval request carrying the
+            reason, deciding policy, phase, and a truncated
+            preview of the gated content.
+        :returns: ``True`` on user approval (one or always);
+            ``False`` otherwise.
+        """
+        if state.is_pre_approved(ctx.policy_name, ctx.phase):
+            # Audit line — don't be silent when auto-approving,
+            # the user might have forgotten they flipped it on.
+            host.output(
+                Text.from_markup(
+                    f"   [{fmt.muted}]auto-approved · "
+                    f"{ctx.policy_name} · {ctx.phase}[/{fmt.muted}]",
+                ),
+            )
+            return True
+
+        host.output(
+            Text.from_markup(
+                f"\n [{fmt.warning}]⚠ approval required · {ctx.phase}[/{fmt.warning}]",
+            ),
+        )
+        host.output(
+            Text.from_markup(
+                f"   [{fmt.muted}]policy: {ctx.policy_name}[/{fmt.muted}]",
+            ),
+        )
+        if ctx.reason:
+            host.output(
+                Text.from_markup(
+                    f"   [{fmt.muted}]reason: {ctx.reason}[/{fmt.muted}]",
+                ),
+            )
+        if ctx.content_preview:
+            preview = ctx.content_preview
+            if len(preview) > 200:
+                preview = preview[:200] + "…"
+            host.output(
+                Text.from_markup(
+                    f"   [{fmt.muted}]preview:[/{fmt.muted}] {preview}",
+                ),
+            )
+        host.output(
+            Text.from_markup(
+                f"   [{fmt.accent}]y = approve once, "
+                f"a = approve always (this session), "
+                f"n = refuse[/{fmt.accent}]",
+            ),
+        )
+        future = state.begin(ctx.policy_name, ctx.phase)
+        return await future
+
+    return _on_approval_request
+
+
 async def run_repl(
     client: AgentPlaneClient,
     agent_name: str,
@@ -62,10 +373,20 @@ async def run_repl(
         (e.g. a greeting prompt for onboarding).
     """
     ui_name = agent_name.replace("-", " ").replace("_", " ")
-    session = client.session(model=agent_name, tool_handler=tool_handler)
-    block_stream = BlockStream()
     fmt = TimedFormatter(show_agent_labels=True)
     host = TerminalHost(model_name=ui_name)
+    # Wire the policy-ASK seam into the session so any policy
+    # in the agent's spec that returns ASK surfaces an inline
+    # y/n prompt here. The hook lives on the session so every
+    # turn in this REPL benefits — no per-call re-registration.
+    # Shared state couples the hook (which awaits a future) to
+    # the main input loop (which resolves it); reusing the
+    # normal prompt_toolkit input path avoids the stdin /
+    # patch_stdout fight that a direct input() call produced.
+    approval_state = _ApprovalState()
+    hooks = StreamHooks(on_approval_request=_make_approval_prompt(host, fmt, approval_state))
+    session = client.session(model=agent_name, tool_handler=tool_handler, hooks=hooks)
+    block_stream = BlockStream()
     is_streaming = False
 
     def show_help() -> None:
@@ -84,6 +405,27 @@ async def run_repl(
 
     async def on_input(text: str, attachments: list[Any] | None = None) -> None:
         nonlocal is_streaming
+
+        # Pending policy approval: consume this input as the
+        # verdict BEFORE slash-command / normal-send routing.
+        # The hook is awaiting a future; resolving it wakes
+        # the SSE stream. Echo the user's choice in dim so the
+        # transcript makes sense on scrollback — otherwise a
+        # bare "y" would look like an unrelated message.
+        if approval_state.pending:
+            verdict = _parse_approval_input(text)
+            verdict_label = {
+                _ApprovalVerdict.APPROVE_ONCE: "approved",
+                _ApprovalVerdict.APPROVE_ALWAYS: "approved always (this session)",
+                _ApprovalVerdict.REFUSE: "refused",
+            }[verdict]
+            host.output(
+                Text.from_markup(
+                    f"   [{fmt.muted}]› {verdict_label}[/{fmt.muted}]",
+                ),
+            )
+            approval_state.resolve_verdict(verdict)
+            return
 
         # Slash commands are short tokens like "/help", "/clear".
         # File paths like "/Users/foo/bar.jpg" start with "/" but
@@ -130,6 +472,10 @@ async def run_repl(
             # next send() tries to steer a dead response.
             # shield() prevents the cancel() coroutine from being
             # re-cancelled by the propagating CancelledError.
+            # Also refuse any pending approval fail-closed so the
+            # hook's future doesn't leak waiting for a verdict
+            # that will never come.
+            approval_state.cancel()
             try:
                 await asyncio.shield(session.cancel())
             except Exception:

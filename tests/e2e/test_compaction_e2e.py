@@ -109,7 +109,7 @@ def compaction_client(
         yield client
 
 
-def _upload_agent(client: httpx.Client, agent_dir: Path) -> str:
+def upload_agent(client: httpx.Client, agent_dir: Path) -> str:
     """
     Upload an agent bundle with a unique name to avoid stale cache.
 
@@ -205,7 +205,7 @@ def test_compaction_fires_and_agent_continues(
     :param compaction_client: HTTP client pointed at the
         compaction e2e server.
     """
-    agent_name = _upload_agent(compaction_client, _COMPACTION_AGENT_DIR)
+    agent_name = upload_agent(compaction_client, _COMPACTION_AGENT_DIR)
 
     # --- Turn 1: seed the conversation ---
     turn_1 = _create_turn(

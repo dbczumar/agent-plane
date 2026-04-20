@@ -189,9 +189,9 @@ def _prepare_onboarding_agent(
     Copy the built-in onboarding assistant to a temp dir with resolved config.
 
     Replaces the placeholder model/key in config.yaml with the user's
-    selection. When shell access is disabled, adds ``code_sandbox``
+    selection. When shell access is disabled, adds ``terminal_run``
     and ``export_agent`` to the agent's builtin tools so it can work
-    in a sandbox and export the result.
+    in a sandboxed shell and export the result.
 
     :param selection: The provider/model/credentials chosen by the user.
     :param allow_shell_access: Whether full shell access is enabled.
@@ -217,7 +217,7 @@ def _rewrite_agent_config(
     :param dest: Path to the copied agent directory.
     :param selection: The provider/model/credentials chosen by the user.
     :param allow_shell_access: Whether full shell access is enabled.
-        When False, adds code_sandbox and export_agent to builtins.
+        When False, adds terminal_run and export_agent to builtins.
     """
     config_path = dest / "config.yaml"
     config = yaml.safe_load(config_path.read_text())
@@ -225,10 +225,11 @@ def _rewrite_agent_config(
     config["llm"]["connection"] = dict(selection.credentials)
 
     if not allow_shell_access:
-        # Add sandbox tools so the assistant can create files in the
-        # sandbox and export the finished agent to the user's path.
+        # Add persistent-terminal + export tools so the assistant
+        # can create files in the sandbox and export the finished
+        # agent to the user's path.
         builtins = config.get("tools", {}).get("builtins", [])
-        builtins.extend(["code_sandbox", "export_agent"])
+        builtins.extend(["terminal_run", "export_agent"])
         config.setdefault("tools", {})["builtins"] = builtins
 
     config_path.write_text(yaml.dump(config, default_flow_style=False))

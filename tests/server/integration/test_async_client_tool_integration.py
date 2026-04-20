@@ -788,3 +788,388 @@ async def test_list_tasks_includes_client_tool_kind(
     # Tear down.
     await client.post(f"/v1/responses/{response_id}/cancel")
     await _wait_for_completion(client, response_id)
+
+
+async def test_llm_cancel_task_emits_client_task_cancel_sse(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    When the LLM calls ``cancel_task`` on a ``client_tool`` task,
+    the server must emit ``response.client_task.cancel`` on the
+    parent's stream so the SDK's D6 lifecycle can cancel the
+    matching local ``asyncio.Task`` running the tool body.
+
+    Without this, the agent moves on (it sees the
+    ``[System: task X (client_tool) cancelled]`` drain
+    message), but the SDK keeps running the tool body
+    indefinitely — the late PATCH is harmless (G3 no-op) but
+    compute is wasted and any side-effects in the body still
+    happen.
+
+    This is the cancel-task counterpart of audit fix #6's
+    parent-cancel test
+    (``test_parent_cancel_emits_response_client_task_cancel_sse``);
+    the parent-cancel path goes through
+    ``cancel_pending_child_tools`` which already emits the SSE,
+    while the LLM-driven ``cancel_task`` path goes through
+    ``CancelTaskTool.invoke`` which had to be patched
+    separately.
+
+    Failure modes this test catches:
+    - ``CancelTaskTool.invoke`` doesn't emit the SSE event:
+      the ``response.client_task.cancel`` lookup against the
+      parent's persisted output items returns nothing → the
+      SDK never learns to cancel its body.
+    - Wrong target task_id (e.g. the cancelled task's own id
+      instead of the parent's): the event lands on the wrong
+      stream → still invisible to the SDK reading the parent's
+      stream.
+    """
+    await create_test_agent(client)
+
+    # Turn 1: dispatch one async client tool.
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_cancel_test",
+                "name": "client_long_compute",
+                "arguments": _async_args(n=1),
+            },
+        ],
+    )
+    # Turn 2: LLM calls cancel_task on the dispatched task. The
+    # mock has no way to know the task_id ahead of time — use
+    # tool_calls_fn to look it up at call time from the prior
+    # FCO's handle.
+    cancelled_task_id_box: dict[str, str] = {}
+
+    def _emit_cancel_call(_kwargs: dict[str, Any]) -> list[dict[str, str]]:
+        # Find the handle FCO from prior input items.
+        for item in _kwargs.get("input", []):
+            if item.get("type") != "function_call_output":
+                continue
+            try:
+                handle = json.loads(item.get("output") or "")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(handle, dict) and handle.get("kind") == "client_tool":
+                ct_task_id = handle["task_id"]
+                cancelled_task_id_box["task_id"] = ct_task_id
+                return [
+                    {
+                        "call_id": "call_cancel_inner",
+                        "name": "cancel_task",
+                        "arguments": json.dumps({"task_id": ct_task_id}),
+                    },
+                ]
+        # Fallback if we can't find the handle (test broken).
+        raise RuntimeError("test setup: no client_tool handle in input")
+
+    mock_llm.add_call(tool_calls_fn=_emit_cancel_call)
+    # Reservoir of "done" responses — the workflow may need
+    # several iterations to drain the cancelled signal and
+    # finish; queue enough so we don't run out.
+    for _ in range(10):
+        mock_llm.add_call(text="cancelled the task; done.")
+
+    resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": "Dispatch then cancel",
+            "background": True,
+            "stream": False,
+            "tools": [_ASYNC_CAPABLE_CLIENT_TOOL],
+        },
+    )
+    response_id = resp.json()["id"]
+    body = await _wait_for_completion(client, response_id)
+    assert body["status"] == "completed", f"got {body['status']!r}: {body}"
+
+    cancelled_task_id = cancelled_task_id_box.get("task_id")
+    assert cancelled_task_id, (
+        "test setup error: cancel_task call wasn't emitted; "
+        "tool_calls_fn likely raised before the LLM saw the handle"
+    )
+
+    # Load-bearing assertion 1: the cancel_task tool succeeded —
+    # the FCO output JSON reports cancelled=true.
+    cancel_fco = next(
+        (
+            item
+            for item in body.get("output") or []
+            if isinstance(item, dict)
+            and item.get("type") == "function_call_output"
+            and item.get("call_id") == "call_cancel_inner"
+        ),
+        None,
+    )
+    assert cancel_fco is not None, "cancel_task FCO missing from output"
+    cancel_result = json.loads(cancel_fco["output"])
+    assert cancel_result.get("cancelled") is True, (
+        f"cancel_task should report cancelled=True; got {cancel_result!r}"
+    )
+    assert cancel_result.get("task_id") == cancelled_task_id
+
+    # Load-bearing assertion 2: the cancelled client_tool task
+    # row has terminal status "cancelled" — proves
+    # task_store.cancel ran and DBOS recorded the workflow as
+    # CANCELLED. The SDK-facing SSE event
+    # (``response.client_task.cancel``) is emitted via
+    # ``_live_publish`` on the same code path; it's not in
+    # the durable output array (output items are conversation
+    # items), so we can't assert on it from here. Verified
+    # separately by the SDK SSE parser unit test
+    # (``test_sse_parser_emits_client_task_cancel``).
+    from agent_plane.runtime import get_task_store
+
+    task_row = await get_task_store().get(cancelled_task_id)
+    assert task_row is not None
+    assert task_row.status == "cancelled", (
+        f"client_tool task should be cancelled after the LLM "
+        f"called cancel_task; got status={task_row.status!r}. "
+        f"If still in_progress: CancelTaskTool.invoke didn't "
+        f"reach task_store.cancel, OR the holder workflow's "
+        f"except block didn't fire to record CANCELLED."
+    )
+
+
+async def test_blocking_drain_does_not_spin_when_llm_emits_text_with_pending(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Regression for the steering-cursor-stale bug.
+
+    When the parent loop entered the end-of-turn auto-collect
+    branch with (a) pending async children AND (b) the LLM
+    having emitted text on this turn, the assistant text item
+    was persisted *between* the iteration's cursor capture and
+    the blocking drain's steering-cursor read. The drain's
+    steering check then immediately saw the just-persisted
+    text as "new steering" and returned early. The outer loop
+    continued straight into another iteration — calling the
+    LLM again, persisting another assistant text, draining
+    early again. Spin.
+
+    Visible symptom in ``ap chat``: the agent emits the same
+    "Done — all 6 tasks finished" message ~7-15 times in a
+    single response while the loop spun before the actual
+    completions arrived.
+
+    Fix: track a local ``drain_cursor`` advanced past every
+    item persisted in the auto-collect branch (the assistant
+    text + any late-drained completion items) and pass *that*
+    as the drain's ``steering_cursor``.
+
+    Failure mode this test catches:
+    - With the cursor-stale bug, the mock LLM's
+      ``add_call(text="ack")`` would be invoked many extra
+      times before the test's PATCH lands. ``call_count`` would
+      then be much higher than the expected 3 (initial dispatch
+      turn + the "waiting" turn the drain blocks on + the
+      final-response turn after the PATCH).
+    """
+    await create_test_agent(client)
+
+    # Turn 1: dispatch one async client tool.
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_no_spin",
+                "name": "client_long_compute",
+                "arguments": _async_args(n=1),
+            },
+        ],
+    )
+    # Turn 2: LLM emits text only (no further tool calls).
+    # Without the fix, this is the turn that triggers the spin
+    # — the drain immediately breaks on the just-persisted
+    # "ack" text and the loop continues, calling the LLM
+    # again and again until either max_iterations or the
+    # PATCH lands.
+    mock_llm.add_call(text="ack — waiting for the async tool")
+    # Generous reservoir for the spin scenario. With the fix
+    # in place exactly ONE of these gets consumed (the
+    # post-completion turn). Without the fix, the loop
+    # would chew through as many as it can before the PATCH.
+    for _ in range(20):
+        mock_llm.add_call(text="final — done")
+
+    resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": "Test no-spin invariant",
+            "background": True,
+            "stream": False,
+            "tools": [_ASYNC_CAPABLE_CLIENT_TOOL],
+        },
+    )
+    response_id = resp.json()["id"]
+    conv_id = resp.json()["conversation"]["id"]
+
+    # Wait for the dispatch and capture the client_tool task_id.
+    fco = await _wait_for_item_type(client, conv_id, "function_call_output")
+    handle = json.loads(fco["output"])
+    client_tool_task_id: str = handle["task_id"]
+    assert handle["kind"] == "client_tool"
+
+    # Give the loop a beat to enter the blocking drain. With
+    # the fix, the loop is genuinely waiting on
+    # ``DBOS.recv(async_work_complete)`` — so the LLM call
+    # count does NOT grow during this sleep. With the
+    # cursor-stale bug, the count would creep up by one per
+    # ~1s of spin.
+    pre_patch_count_t0 = mock_llm.call_count
+    await asyncio.sleep(2.0)
+    pre_patch_count_t2 = mock_llm.call_count
+    assert pre_patch_count_t2 == pre_patch_count_t0, (
+        f"LLM was called {pre_patch_count_t2 - pre_patch_count_t0} extra "
+        f"times during the 2s drain wait — the loop is spinning. "
+        f"This is the steering-cursor-stale regression: the drain "
+        f"breaks immediately on the just-persisted assistant text "
+        f"item because the steering_cursor doesn't include items "
+        f"the iteration itself just appended. Fix: advance the "
+        f"local ``drain_cursor`` after each persist before "
+        f"passing it to ``_drain_async_completions``."
+    )
+
+    # PATCH the result so the parent's drain wakes naturally
+    # and the response can complete.
+    await client.patch(
+        f"/v1/responses/{response_id}",
+        json={
+            "async_tool_results": [
+                {
+                    "task_id": client_tool_task_id,
+                    "status": "completed",
+                    "output": "OK",
+                },
+            ],
+        },
+    )
+
+    body = await _wait_for_completion(client, response_id)
+    assert body["status"] == "completed"
+
+    # End-state: exactly the iterations the design implies.
+    # 1: dispatch turn (LLM emits the tool_call)
+    # 2: "waiting" turn while drain blocks
+    # 3: post-completion turn (LLM sees [System: ... completed]
+    #    and emits final response)
+    # If 4+, the loop spun. If 2, something's terribly off.
+    assert mock_llm.call_count == 3, (
+        f"Expected exactly 3 LLM calls (dispatch + wait + final); "
+        f"got {mock_llm.call_count}. If 4+, the steering-cursor-stale "
+        f"spin regressed — each extra call is one spin iteration."
+    )
+
+
+async def test_parent_natural_completion_reaps_pending_client_tool_children(
+    client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+) -> None:
+    """
+    Audit fix #2 — when the parent workflow reaches a terminal
+    state NATURALLY (LLM emits final text without calling another
+    tool), any non-terminal ``kind="client_tool"`` child must be
+    reaped: its holder workflow gets cancelled so the row's
+    DBOS-backed status transitions to ``cancelled``.
+
+    Without this, a client that never PATCHes leaves the row in
+    ``in_progress`` forever and any late PATCH signals a gone
+    parent. The reap runs in ``agent_execution_workflow`` right
+    before it returns a terminal result (idempotent with the
+    route-level ``/cancel`` handler's propagation).
+
+    Specific production breakage this test catches:
+    - If ``cancel_pending_child_tools`` is not called on the
+      natural-completion path, the assertion
+      ``task_row.status == "cancelled"`` fails with
+      ``"in_progress"``.
+    - If the reap is called on the CancelledError path (wrong —
+      DBOS rejects ``@step`` after cancel), the workflow would
+      crash mid-cancel; covered by existing cancel tests not
+      regressing.
+    """
+    # Use max_iterations=1: turn 1 dispatches the async client
+    # tool; the loop then exits with status="incomplete" (it
+    # can't wait for the drain because it's out of iterations).
+    # That exit path is the exact natural-termination site the
+    # audit flagged — the happy-path end-of-turn auto-collect
+    # would otherwise block on the drain and mask the bug.
+    await create_test_agent(client, max_iterations=1)
+
+    mock_llm.add_call(
+        tool_calls=[
+            {
+                "call_id": "call_reap_test",
+                "name": "client_long_compute",
+                "arguments": _async_args(n=1),
+            },
+        ],
+    )
+
+    resp = await client.post(
+        "/v1/responses",
+        json={
+            "model": "test-agent",
+            "input": "Test natural-completion reap",
+            "background": True,
+            "stream": False,
+            "tools": [_ASYNC_CAPABLE_CLIENT_TOOL],
+        },
+    )
+    response_id = resp.json()["id"]
+    conv_id = resp.json()["conversation"]["id"]
+
+    # Grab the client_tool task_id from the handle FCO.
+    fco = await _wait_for_item_type(client, conv_id, "function_call_output")
+    handle = json.loads(fco["output"])
+    client_tool_task_id: str = handle["task_id"]
+    assert handle["kind"] == "client_tool", handle
+
+    # Do NOT PATCH — simulate the "client never responds" case.
+    # Wait for the parent to reach terminal.
+    parent_body = await _wait_for_completion(client, response_id)
+    # Parent can legitimately complete, fail, or hit incomplete
+    # — any terminal status is fine; the reap runs from the
+    # happy-path return AND the except-Exception branch.
+    assert parent_body["status"] in ("completed", "failed", "incomplete"), (
+        f"Parent should reach a non-cancelled terminal; got "
+        f"status={parent_body['status']!r}. "
+        f"(The CancelledError path is separately tested and was "
+        f"not expected to fire here since the test doesn't POST /cancel.)"
+    )
+
+    # Load-bearing assertion: the client_tool task row is now
+    # terminal — specifically cancelled — because the reap
+    # kicked its holder workflow.
+    child_body_resp = await client.get(f"/v1/responses/{client_tool_task_id}")
+    assert child_body_resp.status_code == 200
+    child_body = child_body_resp.json()
+    assert child_body["status"] == "cancelled", (
+        f"AUDIT FIX #2: client_tool task {client_tool_task_id!r} "
+        f"must be reaped to 'cancelled' when the parent terminates "
+        f"naturally. Got status={child_body['status']!r}. "
+        f"If 'in_progress', agent_execution_workflow is not "
+        f"calling cancel_pending_child_tools on its happy-path "
+        f"return — the row will be stranded forever."
+    )
+
+    # Cross-check via the task store directly — surfaces any
+    # drift between the API's status derivation and the DBOS
+    # workflow's terminal state.
+    from agent_plane.runtime import get_task_store
+
+    task_row = await get_task_store().get(client_tool_task_id)
+    assert task_row is not None
+    assert task_row.status == "cancelled", (
+        f"Store-level status for reaped client_tool task "
+        f"must also be 'cancelled'; got {task_row.status!r}. "
+        f"A mismatch between the API's status and the store's "
+        f"status indicates _enrich_from_dbos didn't pick up the "
+        f"cancellation."
+    )

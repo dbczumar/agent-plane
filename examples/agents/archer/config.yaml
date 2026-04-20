@@ -14,7 +14,9 @@ tools:
   builtins:
     - web_search
     - web_fetch
-    - code_sandbox
+    - terminal_run
+    - terminal_list
+    - terminal_close
     - introspect
     - upload_file
     - search_conversations

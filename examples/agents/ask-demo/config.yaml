@@ -1,0 +1,27 @@
+spec_version: 1
+
+name: ask-demo
+description: |
+  Minimal demo agent for Phase 10 (REPL approval prompt).
+  A single LabelPolicy at INPUT always ASKs — so every user
+  turn pauses on a y/n approval prompt in ``ap chat``.
+
+llm:
+  model: openai/gpt-4o
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+guardrails:
+  policies:
+    always_ask_on_input:
+      type: label
+      on: [input]
+      action: ask
+      reason: Confirm this message before I process it.
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

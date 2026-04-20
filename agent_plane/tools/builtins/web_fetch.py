@@ -1,6 +1,6 @@
 """Built-in tool: web_fetch — LLM-powered web research via sub-agent.
 
-Spawns a built-in ``__web_researcher`` sub-agent with ``code_sandbox``
+Spawns a built-in ``__web_researcher`` sub-agent with ``terminal_run``
 to search the web and fetch page content. The sub-agent uses the
 parent agent's LLM model and credentials. From the calling agent's
 perspective, this is a synchronous function tool — the sub-agent
@@ -52,14 +52,14 @@ _RESEARCHER_INSTRUCTIONS: str = """\
 You are a fast web research assistant. Speed is critical — the caller
 is waiting for your result synchronously.
 
-You have a code_sandbox tool. Use it to run commands that fetch web
-content. Be direct: fetch, extract the answer, return it. Do not
-write elaborate scripts or over-analyze.
+You have a terminal_run tool backed by a persistent bash shell. Use it
+to run commands that fetch web content. Be direct: fetch, extract the
+answer, return it. Do not write elaborate scripts or over-analyze.
 
 ## Speed rules (most important)
 
 - **One tool call when possible.** If a URL is given, fetch it in a
-  single code_sandbox call. Don't plan first — just do it.
+  single terminal_run call. Don't plan first — just do it.
 - **Minimal script.** Use curl or a short Python one-liner. Don't
   write multi-function scripts with error handling classes.
 - **Answer immediately.** Once you have the data, return the answer.
@@ -110,7 +110,7 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
 
     The researcher gets:
     - The parent's ``llm`` config (model + connection + extras)
-    - ``code_sandbox`` as its only builtin tool
+    - ``terminal_run`` as its only builtin tool
     - Non-conversational mode (one-shot task)
     - Inline instructions for web research
 
@@ -124,7 +124,7 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
         llm=parent_spec.llm,
         interaction=InteractionConfig(conversational=False),
         tools=ToolsConfig(
-            builtins=[BuiltinToolConfig(name="code_sandbox")],
+            builtins=[BuiltinToolConfig(name="terminal_run")],
         ),
         instructions=_RESEARCHER_INSTRUCTIONS,
         # Low max_iterations to keep the sub-agent fast.
@@ -136,7 +136,7 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
 
 class WebFetchTool(Tool):
     """
-    Web research tool that spawns a sub-agent with code sandbox.
+    Web research tool that spawns a sub-agent with a persistent shell.
 
     The sub-agent searches the web and/or fetches specific URLs,
     extracts text, and returns findings. The parent agent sees
@@ -232,6 +232,27 @@ class WebFetchTool(Tool):
             },
         }
 
+    def is_async(self, arguments: str | None = None) -> bool:
+        """
+        Run web_fetch in a background workflow.
+
+        ``invoke()`` here spawns a sub-agent (the
+        ``__web_researcher``) that runs its own multi-iteration
+        agent loop — typically tens of seconds per fetch.
+        Returning ``True`` makes the runtime dispatch each call
+        as a ``kind="tool"`` background workflow and hand the
+        LLM a ``{task_id, kind: "tool"}`` handle inline, so
+        the LLM can fan out multiple fetches in one turn (and
+        can cancel any of them via the standard cancel path).
+        The eventual researcher output is auto-delivered to the
+        parent on the unified ``async_work_complete`` drain.
+
+        :param arguments: Ignored — async-ness is a property of
+            this tool, not the per-call arguments.
+        :returns: ``True`` — web_fetch is always long-running.
+        """
+        return True
+
     def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
         Spawn the web researcher sub-agent and wait for results.
@@ -314,6 +335,10 @@ def _spawn_and_wait(
         sa_name=sa_name,
         user_input=prompt,
         root_task_id=root_task_id,
+        # web_fetch is invoked as a server-side tool from the
+        # calling task; audit fix #1 → store the caller as
+        # parent_task_id so drain signals route correctly.
+        parent_task_id=task_id,
         parent_conversation_id=parent_conversation_id,
     )
 

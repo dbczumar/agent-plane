@@ -212,7 +212,7 @@ def record_llm_usage(span: LiveSpan, usage: dict[str, Any]) -> None:
     span.set_attribute(SpanAttributeKey.CHAT_USAGE, payload)
 
 
-def record_error(span: LiveSpan, exc: Exception) -> None:
+def record_error(span: LiveSpan, exc: BaseException) -> None:
     """
     Mark a span as failed with an ``error.type`` attribute.
 

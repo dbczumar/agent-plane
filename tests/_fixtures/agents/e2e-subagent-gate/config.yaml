@@ -1,0 +1,28 @@
+spec_version: 1
+
+name: e2e-subagent-gate
+description: |
+  E2E fixture: sub-agent approval tunneling.
+  Parent agent delegates to a ``worker`` sub-agent on every
+  user message. The worker has an INPUT-phase ASK policy, so
+  spawning it parks on a request_approval surfaced on the
+  ROOT task's SSE stream (not the sub-agent's). The REPL
+  receives the approval through the same stream it's been
+  consuming since turn 1 — proves ASK routing works through
+  the root_task_id tunnel.
+
+llm:
+  model: openai/gpt-4o
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  agents:
+    - worker
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md

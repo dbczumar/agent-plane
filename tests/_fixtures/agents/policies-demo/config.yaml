@@ -1,0 +1,41 @@
+spec_version: 1
+name: policies-demo
+description: |
+  Ported from omniagents `examples/agent_with_policies.yaml`.
+  Demonstrates FunctionPolicy (block long sleep) + LabelPolicy
+  (taint on web) composition.
+
+llm:
+  model: openai/gpt-4o
+
+guardrails:
+  labels:
+    integrity: "1"
+
+  policies:
+    # FunctionPolicy blocking a specific tool_call argument shape.
+    # Equivalent to omniagents examples/tool_functions.py::block_long_sleep.
+    block_long_sleep:
+      type: function
+      on: [tool_call:sleep]
+      function: tests._fixtures.agents.policies_demo_policies.block_long_sleep
+
+    # LabelPolicy taint: web_search lowers integrity label.
+    taint_web:
+      type: label
+      on: [tool_call:web_search]
+      action: allow
+      set_labels:
+        integrity: "0"
+
+    # LabelPolicy condition-gate: after integrity is tainted,
+    # subsequent shell calls require approval.
+    confirm_shell_after_taint:
+      type: label
+      on: [tool_call:run_shell]
+      condition:
+        integrity: "0"
+      action: ask
+      reason: |
+        Untrusted web content was consumed; shell commands require
+        explicit approval.

@@ -47,6 +47,7 @@ class TaskStore(ABC):
         previous_response_id: str | None = None,
         background: bool = False,
         root_task_id: str | None = None,
+        parent_task_id: str | None = None,
         kind: str = "agent_task",
     ) -> Task:
         """
@@ -78,6 +79,12 @@ class TaskStore(ABC):
         :param root_task_id: ID of the top-level task that
             initiated this sub-agent's spawn tree. ``None``
             for top-level tasks, e.g. ``"task_abc123"``.
+        :param parent_task_id: ID of the IMMEDIATE parent task
+            (the caller that created this one) — distinct from
+            ``root_task_id`` when a sub-agent is the caller.
+            ``None`` for top-level tasks. The
+            ``async_work_complete`` drain signals this id so the
+            immediate calling agent wakes (audit fix #1).
         :param kind: Task kind discriminator, one of
             ``"agent_task"`` (default — user-initiated turn),
             ``"tool"`` (background ``@tool(synchronous=False)``),
@@ -388,37 +395,6 @@ class TaskStore(ABC):
         :param root_task_id: Optional root task ID filter.
         :returns: A list of matching :class:`Task` objects,
             ordered by ``created_at`` descending.
-        """
-        ...
-
-    @abstractmethod
-    async def finalize_async_task(
-        self,
-        *,
-        task_id: str,
-        status: str,
-        output: str | None = None,
-        error: dict[str, str] | None = None,
-    ) -> None:
-        """
-        Phase 5: mark a non-DBOS task terminal with a result.
-
-        Used by the PATCH ``async_tool_results`` handler to
-        record the client's reported outcome on a
-        ``kind="client_tool"`` task. Tasks WITH a DBOS
-        workflow should NOT use this — DBOS itself is the
-        source of truth for their status.
-
-        :param task_id: The task's id.
-        :param status: Terminal status — one of ``"completed"``,
-            ``"failed"``, ``"cancelled"``.
-        :param output: The string output for ``"completed"``.
-            ``None`` when the client did not produce a result
-            (failure / cancellation).
-        :param error: For ``"failed"`` only — dict with
-            ``message`` and optional ``traceback`` keys.
-            ``None`` when status is not ``"failed"``.
-        :raises LookupError: If the task does not exist.
         """
         ...
 

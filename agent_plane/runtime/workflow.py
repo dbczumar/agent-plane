@@ -126,10 +126,24 @@ _logger = logging.getLogger(__name__)
 _TOOL_KIND = "tool"
 _SUB_AGENT_KIND = "sub_agent"
 _CLIENT_TOOL_KIND = "client_tool"
+_TERMINAL_KIND = "terminal"
 # Kinds whose completion arrives via the async_work_complete drain
-# (Phase 2: tools; Phase 3: sub-agents; Phase 5: client tools).
-# The legacy "agent_task" kind is the top-level user turn —
-# always tracked separately.
+# and that can block the parent turn from finalizing. Tools,
+# sub-agents, and client tools belong here: they represent jobs the
+# parent expects to finish, and blocking the turn so the LLM sees
+# the result in-line is a real UX win.
+#
+# Terminals are NOT in this set. An async ``terminal_run`` may be
+# either a short job (``sleep 5``) or a long-lived session
+# (``python3 -i``, ``vim``, ``bash``). We can't tell up front, and
+# making the turn block on a session that never ends produces a
+# deadlock (see designs/PERSISTENT_TERMINAL_RESEARCH.md §6.12).
+# Instead, agents poll via ``check_task(task_id, wait_ms=...)`` —
+# the tool holds a bounded DBOS wait under the hood — so the "I
+# want to wait for this to finish" use case is still cheap without
+# risking a runaway turn. When a terminal workflow does complete,
+# its final status is persisted into DBOS by the workflow itself
+# and surfaced through the next ``check_task`` call.
 _DRAIN_KINDS = frozenset({_TOOL_KIND, _SUB_AGENT_KIND, _CLIENT_TOOL_KIND})
 
 # Per-payload character cap for sub-agent output piggy-backed on
@@ -143,6 +157,17 @@ _SUB_AGENT_OUTPUT_BUDGET = 10_000
 # proxies that close idle connections at 30 s safely under their
 # threshold without flooding the channel with pings.
 _HEARTBEAT_INTERVAL_S = 15.0
+
+# How often the blocking drain wakes to poll the conversation
+# store for steering messages. Decoupled from
+# ``_HEARTBEAT_INTERVAL_S`` because they answer different
+# questions: heartbeat is for SSE-proxy keepalive (ceiling on
+# how long a connection can stay idle), steering poll is for
+# user-perceived latency (floor on how quickly the agent
+# reacts to a mid-flight "hello"). 1 s is fast enough that
+# steering feels instant while keeping conv_store load to
+# 1 QPS per blocked workflow.
+_STEERING_POLL_INTERVAL_S = 1.0
 
 # Generic type variable used by ``_to_thread`` (pure helper).
 _T = TypeVar("_T")
@@ -1470,6 +1495,7 @@ async def _call_tool(
     retry_config: RetryConfig,
     workspace_path: str | None = None,
     call_id: str | None = None,
+    conversation_id: str | None = None,
 ) -> str:
     """
     Route a tool call to the current workflow's ToolManager
@@ -1509,6 +1535,13 @@ async def _call_tool(
         invocation, recorded on the span as ``tool.call_id``.
         ``None`` when called from code paths that don't track
         call IDs (legacy callers).
+    :param conversation_id: The conversation that owns this
+        tool call. Populated on the :class:`ToolContext` so
+        conversation-scoped tools (e.g. the terminal tool,
+        which looks up its per-conversation
+        ``TerminalManager`` by id) can function. ``None`` for
+        legacy callers that don't track it; tools requiring it
+        must fail loud in that case.
     :returns: The tool's string result, or an error string
         if all retries are exhausted.
     """
@@ -1519,7 +1552,12 @@ async def _call_tool(
         """Execute the tool call in a thread."""
         mgr = get_tool_manager()
         ws = Path(workspace_path) if workspace_path else None
-        ctx = ToolContext(task_id=task_id, agent_id=agent_id, workspace=ws)
+        ctx = ToolContext(
+            task_id=task_id,
+            agent_id=agent_id,
+            workspace=ws,
+            conversation_id=conversation_id,
+        )
         tool = mgr.get_tool(tool_name)
         # Inject client-side tool schemas into spawn arguments so
         # sub-agents know which client tools are available.
@@ -2045,9 +2083,13 @@ def _build_assistant_item(
         "filename": "chart.png", "content_type": "image/png"}]``.
     :returns: A NewConversationItem ready for persistence.
     """
+    # Coerce None → "" here so we never persist null text on an
+    # assistant message. Null text breaks the next turn's input
+    # because OpenAI's Responses API rejects input messages whose
+    # content blocks have null text. Empty string is accepted.
     output_text_block: dict[str, Any] = {
         "type": "output_text",
-        "text": text,
+        "text": text if text is not None else "",
     }
     if annotations:
         output_text_block["annotations"] = annotations
@@ -2073,6 +2115,9 @@ async def _handle_final_response(
     task_store: TaskStore,
     conv_store: ConversationStore,
     iteration_item_ids: frozenset[str] | None = None,
+    *,
+    policy_engine: Any,
+    root_task_id: str | None,
 ) -> _AgentLoopResult | _SteeringRetry:
     """
     Handle the no-tool-calls path using persist-first-then-check.
@@ -2113,6 +2158,26 @@ async def _handle_final_response(
     # message must exist in the conversation regardless of
     # whether late steering messages arrived.
     text = _get_text_content(llm_resp)
+    # Phase 6: OUTPUT-phase policy enforcement.
+    # Fires on the final assistant text BEFORE persistence —
+    # POLICIES.md §11.4 makes pre-persistence ordering
+    # load-bearing so compaction cannot resurface blocked
+    # content. DENY replaces the text with a sentinel; the
+    # streamed tokens the client already saw will be
+    # overwritten by the next response the loop emits (the
+    # client renders from persisted conversation items on
+    # reconnect). A no-op engine returns ALLOW unchanged.
+    # _get_text_content returns str | None (empty-text
+    # responses land as None). Coerce to "" before OUTPUT
+    # enforcement — a policy evaluating None is meaningless
+    # and the assistant item path downstream expects str.
+    text = await _enforce_output_policy(
+        engine=policy_engine,
+        task_id=task_id,
+        root_task_id=root_task_id,
+        task_store=task_store,
+        text=text or "",
+    )
     file_annotations = _collect_file_annotations(output_items)
     _emit_file_annotations(task_id, file_annotations)
     item = _build_assistant_item(
@@ -2267,6 +2332,10 @@ async def _execute_tools(
     conv_store: ConversationStore,
     agent_id: str,
     workspace_path: str | None = None,
+    *,
+    policy_engine: Any,
+    task_store: TaskStore,
+    root_task_id: str | None,
 ) -> str:
     """
     Execute tool calls in parallel and persist output in call order.
@@ -2277,6 +2346,13 @@ async def _execute_tools(
     persisted in the original call order so the LLM sees
     ``function_call_output`` items matching their ``function_call``
     items.
+
+    Phase 6: wraps each dispatch with TOOL_CALL enforcement
+    (before) and TOOL_RESULT enforcement (after). Policies
+    that DENY a call replace its output with a ``[Denied by
+    policy: ...]`` sentinel; the tool is never dispatched. An
+    approved ASK proceeds to dispatch; a refused ASK yields
+    the same sentinel.
 
     :param task_id: The task identifier, e.g.
         ``"task_abc123"``.
@@ -2292,27 +2368,59 @@ async def _execute_tools(
     :param conv_store: The ConversationStore for persistence.
     :param agent_id: The registered agent ID, passed through
         to :class:`ToolContext`, e.g. ``"ag_abc123"``.
+    :param policy_engine: The per-workflow
+        :class:`PolicyEngine` — consulted before dispatch
+        (TOOL_CALL) and after (TOOL_RESULT).
+    :param task_store: Store used by the ASK seams.
+    :param root_task_id: Root task id for ASK SSE routing, or
+        ``None`` when this is itself a root task.
     :returns: The ID of the last persisted tool output item.
     """
+    mgr = get_tool_manager()
+    results: dict[str, str] = {}
+    # TOOL_CALL enforcement: evaluate each call BEFORE dispatch.
+    # Sentinels land directly in ``results`` and the tool is
+    # skipped entirely — no side effects on DENY.
+    calls_to_dispatch: list[_ToolCall] = []
+    for tc in tool_calls:
+        sentinel = await _enforce_tool_call_policy(
+            engine=policy_engine,
+            task_id=task_id,
+            root_task_id=root_task_id,
+            task_store=task_store,
+            tool_name=tc.name,
+            arguments=tc.arguments,
+        )
+        if sentinel is not None:
+            results[tc.call_id] = sentinel
+            continue
+        calls_to_dispatch.append(tc)
+
     # Separate async @tool(synchronous=False) calls from sync
     # ones. Async calls dispatch directly here (workflow body,
     # NOT a @step) because DBOS forbids start_workflow from
     # inside a step. Sync calls still go through the @step
     # `_call_tool` so DBOS checkpoints their results for replay.
-    mgr = get_tool_manager()
-    results: dict[str, str] = {}
     sync_calls: list[_ToolCall] = []
-    for tc in tool_calls:
+    for tc in calls_to_dispatch:
         tool = mgr.get_tool(tc.name) if mgr is not None else None
-        if tool is not None and tool.is_async():
-            handle = await _dispatch_async_tool(
+        # is_async is per-invocation — pass arguments so tools like
+        # ``TerminalRunTool`` can inspect the call-time ``synchronous``
+        # field. Tools whose async-ness is fixed at decoration
+        # (``LocalPythonTool``) ignore the argument.
+        if tool is not None and tool.is_async(tc.arguments):
+            handle = await tool.dispatch_async(
                 parent_task_id=task_id,
-                conversation_id_for_handle=None,
+                parent_conversation_id=conversation_id,
                 agent_id=agent_id,
                 agent_name=tc.name,
-                tool=tool,
                 arguments=tc.arguments,
+                workspace_path=workspace_path,
             )
+            # Async @tool dispatch yields a handle, not a
+            # result — TOOL_RESULT fires on the async
+            # completion payload later, not here. Surface
+            # the handle as-is for now.
             results[tc.call_id] = handle.to_handle_json()
             continue
         sync_calls.append(tc)
@@ -2328,6 +2436,7 @@ async def _execute_tools(
                 tools_config.timeout,
                 tools_config.retry,
                 workspace_path=workspace_path,
+                conversation_id=conversation_id,
             )
         )
         for tc in sync_calls
@@ -2343,6 +2452,22 @@ async def _execute_tools(
         )
         for i, tc in enumerate(sync_calls):
             results[tc.call_id] = sync_tasks[i].result()
+
+    # TOOL_RESULT enforcement: post-dispatch, before persist.
+    # Applies to sync results only; async-handle payloads
+    # (opaque handles, not real tool output) are skipped.
+    sync_call_ids = {tc.call_id for tc in sync_calls}
+    for tc in tool_calls:
+        if tc.call_id not in sync_call_ids:
+            continue
+        results[tc.call_id] = await _enforce_tool_result_policy(
+            engine=policy_engine,
+            task_id=task_id,
+            root_task_id=root_task_id,
+            task_store=task_store,
+            tool_name=tc.name,
+            result_text=results[tc.call_id],
+        )
 
     # Persist in original call order so the LLM sees outputs
     # matching the function_call item sequence.
@@ -2417,27 +2542,76 @@ def _split_tool_calls(
     return _ToolCallSplit(server=server, client=client, has_client=bool(client))
 
 
-def _wants_async_dispatch(tc: _ToolCall) -> bool:
+def _tool_schema_declares_synchronous(tool: Any) -> bool:
+    """
+    Return ``True`` iff the tool's schema exposes ``synchronous``
+    as a parameter.
+
+    Used to gate :func:`_wants_async_dispatch` so an
+    LLM-hallucinated ``synchronous: false`` on a tool whose
+    schema doesn't actually offer the choice is ignored (treated
+    as sync). Without this check, a hallucination would route
+    the call through the async path even though the tool author
+    never opted in — and the SDK wouldn't know to inject /
+    strip / track the call as async.
+
+    :param tool: Any tool object exposing
+        ``get_schema()`` -> OpenAI-format dict. ``None`` is
+        accepted and returns ``False`` (defensive — the caller
+        already filtered missing tools elsewhere).
+    :returns: ``True`` iff
+        ``schema["function"]["parameters"]["properties"]["synchronous"]``
+        exists. Any structural deviation falls through as
+        ``False`` — better to drop a malformed schema's async
+        opt-in than to crash the routing decision.
+    """
+    if tool is None:
+        return False
+    try:
+        schema = tool.get_schema()
+    except Exception:  # noqa: BLE001 — bad schema → treat as no opt-in
+        return False
+    if not isinstance(schema, dict):
+        return False
+    function = schema.get("function")
+    if not isinstance(function, dict):
+        return False
+    parameters = function.get("parameters")
+    if not isinstance(parameters, dict):
+        return False
+    properties = parameters.get("properties")
+    if not isinstance(properties, dict):
+        return False
+    return "synchronous" in properties
+
+
+def _wants_async_dispatch(tc: _ToolCall, tool: Any) -> bool:
     """
     Decide whether the LLM asked for async dispatch on this call.
 
     Phase 5 v2: the LLM expresses async dispatch by setting
-    ``synchronous: false`` in its tool-call arguments. The
-    tool's schema (typically ``parameters.properties.synchronous``)
-    is what surfaces the choice to the LLM in the first place;
-    if the schema doesn't expose it, the LLM has nowhere to set
-    the field and this function returns ``False`` (sync default).
+    ``synchronous: false`` in its tool-call arguments. Two
+    conditions must both hold for async routing:
+
+    1. The tool's schema declares ``synchronous`` inside
+       ``parameters.properties`` — otherwise the LLM had no
+       legitimate way to know it could request async, and a
+       hallucinated ``synchronous: false`` is dropped to sync.
+    2. ``arguments`` JSON-decodes to a dict whose
+       ``synchronous`` is literally ``False``.
 
     Malformed JSON arguments are treated as sync — the call's
     real execution path will surface a parse error in its own
     error path; routing decisions don't fail loud here.
 
     :param tc: The tool call from the LLM.
-    :returns: ``True`` iff ``arguments`` JSON-decodes to a dict
-        with ``synchronous`` literally equal to ``False``. Any
-        other value (missing key, ``True``, malformed JSON,
-        non-bool value) yields ``False``.
+    :param tool: The matching tool object from the
+        :class:`ToolManager`. Used to verify the schema
+        actually exposes ``synchronous``.
+    :returns: ``True`` iff both gates pass; ``False`` otherwise.
     """
+    if not _tool_schema_declares_synchronous(tool):
+        return False
     try:
         parsed = json.loads(tc.arguments) if tc.arguments else {}
     except json.JSONDecodeError:
@@ -2459,6 +2633,10 @@ async def _handle_tool_calls(
     conv_store: ConversationStore,
     tool_mgr: ToolManager,
     workspace_path: str | None = None,
+    *,
+    policy_engine: Any,
+    task_store: TaskStore,
+    root_task_id: str | None,
 ) -> str | _ClientToolCallsPending:
     """
     Handle the tool execution path: build ``function_call`` items,
@@ -2543,7 +2721,8 @@ async def _handle_tool_calls(
     client_async: list[_ToolCall] = []
     client_sync: list[_ToolCall] = []
     for tc in split.client:
-        if _wants_async_dispatch(tc):
+        client_tool = tool_mgr.get_tool(tc.name)
+        if _wants_async_dispatch(tc, client_tool):
             client_async.append(tc)
         else:
             client_sync.append(tc)
@@ -2561,6 +2740,9 @@ async def _handle_tool_calls(
             conv_store,
             agent_id=agent_id,
             workspace_path=workspace_path,
+            policy_engine=policy_engine,
+            task_store=task_store,
+            root_task_id=root_task_id,
         )
 
     if client_async:
@@ -2691,43 +2873,44 @@ def _async_handle_message(task_id: str, tool_name: str) -> str:
     )
 
 
-async def _dispatch_async_tool(
+async def _dispatch_local_python_tool_async(
     *,
+    tool: Any,
     parent_task_id: str,
-    conversation_id_for_handle: str | None,
+    parent_conversation_id: str,
     agent_id: str,
     agent_name: str,
-    tool: Any,
     arguments: str,
 ) -> _AsyncToolHandle:
     """
-    Create a child task row and start its background workflow.
+    Create a child task row and start ``background_tool_workflow``.
 
-    Implements D2/D3 dispatch: pins the new DBOS workflow_uuid to
-    the freshly minted task_id (G56) so callers can later look up
-    workflow state by task_id, then returns the handle to the
-    parent ``_call_tool`` for serialization back to the LLM.
+    Shared helper called by :meth:`LocalPythonTool.dispatch_async`.
+    Pins the new DBOS workflow_uuid to the freshly minted task_id
+    (G56) so callers can later look up workflow state by task_id,
+    then returns the handle to the parent ``_call_tool`` for
+    serialization back to the LLM.
 
     The created task row carries ``kind="tool"`` so the parent's
     end-of-turn auto-collect (D5) groups it correctly with other
     async work. ``root_task_id`` is set to the parent so
     ``task_store.list_tasks(root_task_id=...)`` finds it.
 
+    :param tool: The :class:`LocalPythonTool` instance to dispatch.
+        The function pulls ``module_path`` and ``name()`` off the
+        instance.
     :param parent_task_id: The currently-executing parent
         workflow's task_id. The new task points at it via
         ``root_task_id``; the background workflow signals it via
         the ``async_work_complete`` topic.
-    :param conversation_id_for_handle: Optional conversation_id
-        override for the new task row. Defaults to the parent
-        task's conversation_id (looked up from task_store).
+    :param parent_conversation_id: The parent's conversation id.
+        When non-empty, used as the child task's conversation id;
+        otherwise falls back to looking up the parent row to read
+        its conversation_id.
     :param agent_id: The owning agent's ID.
     :param agent_name: The tool's name (recorded as ``agent_name``
         on the task so ``list_tasks`` results show what produced
         the work).
-    :param tool: The :class:`Tool` instance to dispatch — must be
-        a :class:`~agent_plane.tools.local.LocalPythonTool`. The
-        function pulls ``module_path`` and ``name()`` off the
-        instance.
     :param arguments: JSON-encoded arguments string from the LLM.
     :returns: An :class:`_AsyncToolHandle` ready to be serialized
         back to the LLM as a tool-call result.
@@ -2746,16 +2929,22 @@ async def _dispatch_async_tool(
 
     if not isinstance(tool, LocalPythonTool):
         raise RuntimeError(
-            f"async dispatch only supported for LocalPythonTool, got {type(tool).__name__}"
+            f"local-python async dispatch requires LocalPythonTool, got {type(tool).__name__}"
         )
 
     task_store = get_task_store()
-    parent_row = await _to_thread(lambda: task_store.get_sync(parent_task_id))
-    if parent_row is None:
-        raise RuntimeError(
-            f"parent task {parent_task_id!r} not found — async dispatch invariant broken"
-        )
-    conv_id = conversation_id_for_handle or parent_row.conversation_id
+    if parent_conversation_id:
+        conv_id = parent_conversation_id
+    else:
+        # Fall back to the parent row's conversation_id for legacy
+        # callers that don't pass it. Kept as a defensive path —
+        # the workflow body always has conversation_id available now.
+        parent_row = await _to_thread(lambda: task_store.get_sync(parent_task_id))
+        if parent_row is None:
+            raise RuntimeError(
+                f"parent task {parent_task_id!r} not found — async dispatch invariant broken"
+            )
+        conv_id = parent_row.conversation_id
 
     def _create_row() -> Any:
         return task_store.create(
@@ -2763,6 +2952,7 @@ async def _dispatch_async_tool(
             agent_id=agent_id,
             agent_name=agent_name,
             root_task_id=parent_task_id,
+            parent_task_id=parent_task_id,
             kind=_TOOL_KIND,
         )
 
@@ -2929,27 +3119,59 @@ async def _dispatch_async_client_tools(
             f"parent task {parent_task_id!r} not found — "
             f"async client tool dispatch invariant broken"
         )
-    # Resolve root_task_id so signals route to the original
-    # top-level task even for nested sub-agents calling client
-    # tools.
-    root_task_id = parent_row.root_task_id or parent_task_id
+    # ``parent_task_id`` is the IMMEDIATE calling agent — what
+    # the PATCH handler signals so its drain wakes. Audit fix
+    # #1: distinct from the top-level root when the caller is a
+    # sub-agent. Both ``root_task_id`` and ``parent_task_id`` on
+    # the new row are set to this same immediate-parent id —
+    # matches the @tool path's behavior so the parent's
+    # auto-collect query (``list_tasks(root_task_id=parent)``)
+    # actually finds its own client_tool children. Walking up
+    # to the top-level root would hide the children from the
+    # immediate parent's auto-collect entirely.
+    immediate_parent_task_id = parent_task_id
+    root_task_id = parent_task_id
+    # parent_row is unused now that we don't walk up the chain;
+    # kept the lookup above so a missing parent fails loud
+    # before we create an orphan child row.
+    _ = parent_row
+
+    from agent_plane.runtime.background_tool_workflow import (
+        client_tool_workflow,
+    )
+    from agent_plane.runtime.durability import (
+        SetWorkflowID,
+        start_workflow,
+    )
 
     fco_items: list[NewConversationItem] = []
     for tc in tool_calls:
-        # Create the client_tool task row. ``start`` is NOT
-        # called — the client owns execution. The PATCH handler
-        # will later cancel the (non-existent) workflow but
-        # still mark the row terminal in task_store.
-        def _create_row() -> Any:
-            return task_store.create(
+        # Create the client_tool task row AND start its
+        # holder workflow. The workflow just parks on
+        # DBOS.recv(CLIENT_TOOL_RESULT_TOPIC) until the PATCH
+        # arrives, then fans out async_work_complete to
+        # `immediate_parent_task_id`. Attaching a DBOS workflow
+        # (vs. the old "manual_* columns" approach) gives
+        # atomic PATCH→signal durability and lets the cancel
+        # path use the same cancel_workflow_async as @tool.
+        def _create_and_start() -> Any:
+            created = task_store.create(
                 conversation_id=conversation_id,
                 agent_id=agent_id,
                 agent_name=agent_name,
                 root_task_id=root_task_id,
+                parent_task_id=immediate_parent_task_id,
                 kind=_CLIENT_TOOL_KIND,
             )
+            # Pin DBOS workflow_uuid to the new task_id (G56) so
+            # the PATCH handler, cancel_workflow_async, and
+            # _enrich_from_dbos can address the workflow by
+            # task_id.
+            with SetWorkflowID(created.id):
+                start_workflow(client_tool_workflow, immediate_parent_task_id)
+            return created
 
-        new_task = await _to_thread(_create_row)
+        new_task = await _to_thread(_create_and_start)
         handle = {
             "task_id": new_task.id,
             "kind": _CLIENT_TOOL_KIND,
@@ -2995,13 +3217,25 @@ async def cancel_pending_child_tools(parent_task_id: str) -> None:
     inside it, so the propagation must be issued from outside the
     parent's workflow context.
 
-    The cancelled child's ``background_tool_workflow`` enters its
-    ``except BaseException`` block, sends an
-    ``async_work_complete`` payload with ``status="cancelled"``
-    (G86), and re-raises so DBOS records the workflow as
-    CANCELLED. The parent's drain on the next iteration picks up
-    the cancellation message; if the parent is itself being
-    cancelled the message is harmless (it's just a database row).
+    The cancelled child's ``background_tool_workflow`` /
+    ``client_tool_workflow`` enters its ``except BaseException``
+    block, sends an ``async_work_complete`` payload with
+    ``status="cancelled"`` (G86), and re-raises so DBOS records
+    the workflow as CANCELLED. The parent's drain on the next
+    iteration would normally pick up the cancellation message —
+    but in every place we call this function the parent is
+    *already* terminating (route /cancel, audit fix #2 reap),
+    so no future iteration will run and the drain payload is
+    stranded in DBOS.
+
+    **Audit fix #6 (d)**: to keep the cancellation visible to
+    the LLM on conversation replay, this helper also writes a
+    ``[System: task X (kind) cancelled]`` user-role item
+    directly into the parent's conversation. That message is
+    what the LLM reads on the next ``previous_response_id``
+    resumption — without it the FCO handle's ``"in_progress"``
+    status would be the only signal and the LLM would have no
+    way to know the task ended.
 
     Per-child failures are swallowed so one cancel error does
     not block the others.
@@ -3013,7 +3247,11 @@ async def cancel_pending_child_tools(parent_task_id: str) -> None:
     from agent_plane.runtime.durability import cancel_workflow_async
 
     task_store = get_task_store()
+    conv_store = get_conversation_store()
     children = await task_store.list_tasks(root_task_id=parent_task_id)
+    parent_task = await task_store.get(parent_task_id)
+    parent_conv_id = parent_task.conversation_id if parent_task is not None else None
+
     for child in children:
         if child.status in TERMINAL_STATUSES:
             continue
@@ -3026,19 +3264,22 @@ async def cancel_pending_child_tools(parent_task_id: str) -> None:
                     "failed to cancel child tool task %s during parent cancel",
                     child.id,
                 )
+            _persist_cancellation_message(conv_store, parent_conv_id, parent_task_id, child)
         elif child.kind == _CLIENT_TOOL_KIND:
-            # Client-side async tool — there's no server-side
-            # workflow. Mark the task row cancelled in-store
-            # and emit a response.client_task.cancel SSE event
-            # so the client cancels its local asyncio task and
-            # PATCHes back. The drain doesn't get a signal here
-            # — the client's PATCH will trigger one via the
-            # normal async_tool_results path.
+            # Client-side async tool — has a holder DBOS
+            # workflow (client_tool_workflow) parked on
+            # DBOS.recv. Cancelling that workflow makes its
+            # except-block fire, which sends an
+            # async_work_complete payload with status=cancelled
+            # to the parent's drain (G86) and re-raises so DBOS
+            # records CANCELLED. We also emit the
+            # response.client_task.cancel SSE so the client can
+            # stop its local asyncio task and (optionally)
+            # PATCH back — the late PATCH is a no-op once the
+            # workflow has terminated (DBOS.send to a
+            # finished workflow is dropped).
             try:
-                await task_store.finalize_async_task(
-                    task_id=child.id,
-                    status="cancelled",
-                )
+                await cancel_workflow_async(child.id)
                 _write_output(
                     parent_task_id,
                     {
@@ -3051,7 +3292,73 @@ async def cancel_pending_child_tools(parent_task_id: str) -> None:
                     "failed to cancel client_tool task %s during parent cancel",
                     child.id,
                 )
+            _persist_cancellation_message(conv_store, parent_conv_id, parent_task_id, child)
         # Other kinds (sub_agent) handled by their own signaling.
+
+
+def _persist_cancellation_message(
+    conv_store: ConversationStore,
+    parent_conv_id: str | None,
+    parent_task_id: str,
+    child: Task,
+) -> None:
+    """
+    Write a ``[System: task X (kind) cancelled]`` item into the
+    parent's conversation.
+
+    Mirrors the drain delivery format
+    (:func:`_format_async_completion_text`) so the LLM can't
+    tell apart "drain delivered the cancellation" from "reap
+    persisted it directly" — the same text flows into context
+    on the next turn / replay either way.
+
+    Audit fix #6 (d): the parent has terminated (or is about
+    to) by the time this runs, so the drain won't deliver the
+    cancellation. Without this direct persist, the LLM would
+    see only the original ``"status": "in_progress"`` handle on
+    replay and have no way to know the task is dead.
+
+    Failures are swallowed and logged — losing the system
+    message doesn't break correctness; it only hurts the LLM's
+    visibility on the next replay.
+
+    :param conv_store: The conversation store.
+    :param parent_conv_id: The parent's conversation id.
+        ``None`` short-circuits (the parent task row was missing
+        — already a logged error elsewhere).
+    :param parent_task_id: The parent task id (used as the
+        item's ``response_id``).
+    :param child: The child task being cancelled. Its ``id`` and
+        ``kind`` go into the system message body.
+    """
+    if parent_conv_id is None:
+        return
+    payload = {
+        "task_id": child.id,
+        "kind": child.kind,
+        "status": "cancelled",
+    }
+    item = NewConversationItem(
+        type="message",
+        response_id=parent_task_id,
+        data=MessageData(
+            role="user",
+            content=[
+                {
+                    "type": "input_text",
+                    "text": _format_async_completion_text(payload),
+                },
+            ],
+        ),
+    )
+    try:
+        conv_store.append(parent_conv_id, [item])
+    except Exception:
+        _logger.exception(
+            "failed to persist cancellation message for child %s in conv %s",
+            child.id,
+            parent_conv_id,
+        )
 
 
 # ─── Async work drain ──────────────────────────────────────
@@ -3076,7 +3383,11 @@ def _format_async_completion_text(payload: dict[str, Any]) -> str:
     elsewhere in the workflow (steering markers, sub-agent
     auto-collect). Includes the task_id verbatim so the LLM can
     cross-reference the original handle it received from the
-    asynchronous tool call.
+    asynchronous tool call. Producers (background_tool_workflow
+    for ``@tool``, client_tool_workflow for ``client_tool``,
+    the sub-agent path for ``sub_agent``) all truncate their
+    output bodies before sending the drain payload, so this
+    formatter doesn't re-truncate.
 
     :param payload: Drained dict with ``task_id``, ``kind``,
         ``status``, ``output``, and ``error`` keys (the shape
@@ -3135,9 +3446,55 @@ def _build_async_completion_item(
     )
 
 
+def _steering_arrived(
+    conv_store: ConversationStore,
+    conversation_id: str,
+    last_seen: str,
+) -> bool:
+    """
+    Return ``True`` iff the conversation has any item appended
+    after ``last_seen``.
+
+    Used by :func:`_drain_async_completions` on each heartbeat
+    slice to break out of the async-signal wait when steering
+    (or any other out-of-band append) has arrived. The caller
+    passes its pre-drain cursor; a single new item is enough to
+    force an iteration.
+
+    Failures are swallowed to ``False`` — a transient store
+    error on the steering check should not prevent the drain
+    from eventually picking up its async_work_complete signal.
+
+    :param conv_store: The active conversation store.
+    :param conversation_id: The conversation being agent'd.
+    :param last_seen: Pre-drain cursor (item id).
+    :returns: ``True`` when at least one item exists after
+        ``last_seen``; ``False`` otherwise, or on any store
+        error.
+    """
+    try:
+        page = conv_store.list_items(
+            conversation_id=conversation_id,
+            after=last_seen,
+            limit=1,
+            order="asc",
+        )
+    except Exception:
+        _logger.exception(
+            "steering check failed for conv %s after cursor %s",
+            conversation_id,
+            last_seen,
+        )
+        return False
+    return bool(page.data)
+
+
 async def _drain_async_completions(
     *,
     block_for_one: bool,
+    conv_store: ConversationStore | None = None,
+    conversation_id: str | None = None,
+    steering_cursor: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Drain queued ``async_work_complete`` signals for the current workflow.
@@ -3150,49 +3507,106 @@ async def _drain_async_completions(
       list if the queue is empty — the caller proceeds straight to
       the LLM call.
     * ``block_for_one=True`` (end-of-turn auto-collect, D5): the
-      first ``recv_async`` call blocks until at least one payload
-      arrives (no timeout). Subsequent reads use ``timeout=0`` to
-      drain anything that piled up while the first one was
-      waiting. Caller must check ``pending_tasks`` independently
-      before deciding to call this — calling with no pending work
-      will deadlock.
+      first ``recv_async`` call blocks with the heartbeat cadence
+      (G20: 15 s) until at least one payload arrives. Subsequent
+      reads use ``timeout=0`` to drain anything that piled up
+      while the first one was waiting. Caller must check
+      ``pending_tasks`` independently before deciding to call
+      this — calling with no pending work will deadlock.
 
-    Both modes filter against nothing: the topic itself is the
-    filter and the sender side (background workflows + future
-    sub-agent terminal hook) is the contract for what arrives.
+    **Steering responsiveness** (B-side to the heartbeat):
+    when ``conv_store``, ``conversation_id``, and
+    ``steering_cursor`` are all supplied, the blocking-loop's
+    heartbeat-timeout path also peeks the conversation store
+    for any items appended after ``steering_cursor``. A hit
+    breaks the drain loop early and returns whatever's been
+    collected so far (possibly empty) — the outer agent loop
+    then ``continue``s so its next iteration's ``_sync_history``
+    picks up the steered message. Without this check the
+    workflow would keep blocking on ``recv_async`` and the user
+    would wait up to the longest-running child's remaining
+    duration before their steering landed.
 
     :param block_for_one: When ``True``, block on the first read
-        until a payload arrives. When ``False``, return
-        immediately if the queue is empty.
+        until a payload arrives or ``steering_cursor`` is
+        passed and a new steering item appears. When ``False``,
+        return immediately if the queue is empty.
+    :param conv_store: Optional conversation store for steering
+        check. Pass together with ``conversation_id`` and
+        ``steering_cursor`` or all-None.
+    :param conversation_id: Optional conversation id to poll
+        for steering messages.
+    :param steering_cursor: Optional cursor — the last-seen
+        conversation item id. ``list_items(after=cursor,
+        limit=1)`` with a non-empty result means steering (or
+        any other out-of-band append) has arrived.
     :returns: List of payload dicts in arrival order. Each dict has
         the
         :class:`~agent_plane.runtime.background_tool_workflow.AsyncWorkCompletePayload`
         shape: ``task_id``, ``kind``, ``status``, ``output``,
-        ``error``.
+        ``error``. May be empty when the blocking loop broke
+        on steering arrival.
     """
     from agent_plane.runtime.background_tool_workflow import (
         ASYNC_WORK_COMPLETE_TOPIC,
     )
 
+    # Capture locally so mypy can narrow the types inside the
+    # heartbeat loop without repeating the None checks.
+    if conv_store is not None and conversation_id is not None and steering_cursor is not None:
+        _steering_conv_store: ConversationStore | None = conv_store
+        _steering_conv_id: str | None = conversation_id
+        _steering_cursor_resolved: str | None = steering_cursor
+    else:
+        _steering_conv_store = None
+        _steering_conv_id = None
+        _steering_cursor_resolved = None
+
     drained: list[dict[str, Any]] = []
     if block_for_one:
-        # Loop with the documented heartbeat cadence (G20: 15s).
-        # Each timeout slice emits a `response.heartbeat` so SSE
-        # proxies that close idle connections see traffic. The
-        # parent workflow_id is the heartbeat target — it's
-        # always available in this DBOS workflow context.
+        # Two cadences run off the same recv loop:
+        #
+        # * Steering poll every _STEERING_POLL_INTERVAL_S (1s)
+        #   — fast enough to feel instant when the user types
+        #   mid-drain; sets the recv timeout.
+        # * Heartbeat emission every _HEARTBEAT_INTERVAL_S
+        #   (15s) — SSE-proxy keepalive ceiling; driven by a
+        #   wall-clock deadline independent of the recv
+        #   timeout so the heartbeat rate stays constant even
+        #   if ``recv`` returns early due to steering polling.
         parent_id = get_workflow_id()
+        next_heartbeat_at = time.monotonic() + _HEARTBEAT_INTERVAL_S
         first: dict[str, Any] | None = None
         while first is None:
             first = await dbos_recv_async(
                 topic=ASYNC_WORK_COMPLETE_TOPIC,
-                timeout_seconds=_HEARTBEAT_INTERVAL_S,
+                timeout_seconds=_STEERING_POLL_INTERVAL_S,
             )
             if first is None:
-                _write_output(
-                    parent_id,
-                    {"type": "response.heartbeat"},
-                )
+                now = time.monotonic()
+                if now >= next_heartbeat_at:
+                    _write_output(
+                        parent_id,
+                        {"type": "response.heartbeat"},
+                    )
+                    next_heartbeat_at = now + _HEARTBEAT_INTERVAL_S
+                if (
+                    _steering_conv_store is not None
+                    and _steering_conv_id is not None
+                    and _steering_cursor_resolved is not None
+                    and _steering_arrived(
+                        _steering_conv_store,
+                        _steering_conv_id,
+                        _steering_cursor_resolved,
+                    )
+                ):
+                    # Break out so the outer agent loop can
+                    # iterate and _sync_history pulls in the
+                    # new message. pending_tool_tasks stays
+                    # pending — the drain will pick them up on
+                    # the next iteration via the non-blocking
+                    # path.
+                    return drained
         drained.append(first)
     while True:
         # timeout_seconds=0 is the documented "non-blocking poll"
@@ -3469,6 +3883,623 @@ def _sync_steered_after_tools(
     if steered:
         history.extend(steered)
     return post_tool_last_seen
+
+
+async def _enforce_input_policies(
+    *,
+    engine: Any,
+    history: list[ConversationItem],
+    last_enforced_input_id: str | None,
+    agent_name: str,
+    task_id: str,
+    root_task_id: str | None,
+    task_store: TaskStore,
+) -> tuple[str | None, str | None]:
+    """
+    Check newly-surfaced user messages against INPUT policies.
+
+    Walks the user-message items in history after
+    ``last_enforced_input_id`` and evaluates each against the
+    engine. Returns ``(deny_sentinel, new_cursor)`` — the
+    caller advances its cursor to ``new_cursor`` so the next
+    iteration only re-checks steering messages, not the
+    already-enforced turn-1 input.
+
+    :param engine: The per-workflow :class:`PolicyEngine`. For
+        agents without guardrails, this is a no-op engine that
+        always returns ALLOW.
+    :param history: The conversation history (already extended
+        by ``_sync_history`` for this iteration).
+    :param last_enforced_input_id: The id of the last
+        user-message item enforced in a prior iteration, or
+        ``None`` on the very first iteration (everything
+        counts as new).
+    :param agent_name: Used for error logging / sentinel shaping.
+    :param task_id: Current task id — passed to the ASK seam
+        so parked workflows are woken by the right PATCH
+        verdict.
+    :param root_task_id: Root task id (for ASK SSE routing),
+        or ``None`` when this is itself a root task.
+    :param task_store: Store used by the ASK seam.
+    :returns: ``(deny_sentinel_text_or_None, advanced_cursor)``.
+        ``deny_sentinel_text`` is ``None`` when no policy
+        DENYed; otherwise it's the text to persist as the
+        assistant reply. ``advanced_cursor`` is the id of the
+        last user message seen (or the prior value when no new
+        messages were found).
+    """
+    from agent_plane.policies.types import EvaluationContext
+    from agent_plane.runtime.policies import _enforce_policy
+    from agent_plane.spec.types import (
+        Phase,
+        PolicyAction,
+    )
+
+    # Determine where the "new" user messages begin.
+    #
+    # Three cases:
+    # 1. We already enforced up to ``last_enforced_input_id``
+    #    earlier in this workflow — resume from the item after
+    #    it. Picks up steering messages delivered mid-turn.
+    # 2. Fresh invocation (cursor is None): a prior turn may
+    #    have left user/assistant history in the store. Only
+    #    enforce user messages that arrived *after* the last
+    #    assistant response — anything before that is already
+    #    part of a completed turn and has already been shown
+    #    to the LLM + policy engine as applicable.
+    # 3. Brand-new conversation (no assistant yet, cursor
+    #    None): start from index 0 so the first user message
+    #    gets enforced. Case 2 degenerates to this.
+    if last_enforced_input_id is not None:
+        start_index = 0
+        for i, item in enumerate(history):
+            if item.id == last_enforced_input_id:
+                start_index = i + 1
+                break
+    else:
+        start_index = _last_assistant_index(history) + 1
+    cursor = last_enforced_input_id
+    for item in history[start_index:]:
+        if item.type != "message":
+            continue
+        data = item.data
+        if getattr(data, "role", None) != "user":
+            continue
+        text = _extract_user_text(data)
+        if not text:
+            continue
+        result = await _enforce_policy(
+            engine,
+            EvaluationContext(
+                phase=Phase.INPUT,
+                content=text,
+                tool_name=None,
+            ),
+        )
+        cursor = item.id
+        if result.action == PolicyAction.DENY:
+            _logger.info(
+                "policy DENY at INPUT for agent %s: %s",
+                agent_name,
+                result.reason,
+            )
+            return _build_deny_sentinel(result.reason), cursor
+        if result.action == PolicyAction.ASK:
+            approved = await _handle_policy_ask(
+                engine=engine,
+                task_id=task_id,
+                root_task_id=root_task_id,
+                task_store=task_store,
+                result=result,
+                phase=Phase.INPUT,
+                content_preview=text,
+            )
+            if not approved:
+                return _build_deny_sentinel(result.reason), cursor
+    return None, cursor
+
+
+def _last_assistant_index(history: list[ConversationItem]) -> int:
+    """
+    Find the index of the last assistant message in *history*.
+
+    Used by :func:`_enforce_input_policies` to skip user
+    messages that belong to prior, already-responded turns.
+    Anything before the last assistant message has already
+    been handled (the agent replied to it) — re-enforcing
+    would fire ASK / DENY on every historical input every
+    new turn, which is both wrong behavior and a major UX
+    bug (three approvals for one new message).
+
+    :param history: The conversation history in store order.
+    :returns: The index of the last assistant message, or
+        ``-1`` when no assistant message is present yet (the
+        caller adds 1 to get the start index, so ``-1 + 1 =
+        0`` enforces everything for brand-new
+        conversations).
+    """
+    for i in range(len(history) - 1, -1, -1):
+        item = history[i]
+        if item.type != "message":
+            continue
+        if getattr(item.data, "role", None) == "assistant":
+            return i
+    return -1
+
+
+def _extract_user_text(data: Any) -> str:
+    """
+    Concatenate text content blocks from a user MessageData.
+
+    :param data: The item's data payload (MessageData shape).
+    :returns: Joined text, or an empty string when no text blocks.
+    """
+    content = getattr(data, "content", None) or []
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict):
+            text = block.get("text") or block.get("input_text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts)
+
+
+# ── Phase 6: TOOL_CALL / TOOL_RESULT / OUTPUT enforcement ───
+
+
+def _build_deny_sentinel(reason: str | None) -> str:
+    """
+    Assemble the standard DENY sentinel text.
+
+    All four enforcement sites (INPUT, TOOL_CALL, TOOL_RESULT,
+    OUTPUT) use the same ``[Denied by policy: <reason>]`` shape
+    so e2e tests can match a single substring. ``reason`` is
+    ``None`` only when a policy DENYs without supplying a
+    reason — in that case we emit a bare ``[Denied by policy]``
+    so the output is still grepable.
+
+    :param reason: Reason string from the composed
+        :class:`PolicyResult`, or ``None``.
+    :returns: The sentinel string to surface in place of the
+        blocked content.
+    """
+    if reason:
+        return f"[Denied by policy: {reason}]"
+    return "[Denied by policy]"
+
+
+def _content_preview(content: Any) -> str:
+    """
+    Render content for an approval UI preview.
+
+    Strings pass through; dicts / lists JSON-dump; anything
+    else falls back to ``repr``. Final truncation to the
+    approval-UI cap happens inside ``_await_policy_approval``
+    — this helper just produces a readable string regardless
+    of shape.
+
+    :param content: The ``EvaluationContext.content`` — any
+        shape a policy might gate.
+    :returns: A readable string suitable for the preview
+        field.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (dict, list)):
+        try:
+            return json.dumps(content, default=str, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return repr(content)
+    return repr(content)
+
+
+async def _handle_policy_ask(
+    *,
+    engine: Any,
+    task_id: str,
+    root_task_id: str | None,
+    task_store: TaskStore,
+    result: Any,
+    phase: Any,
+    content_preview: str,
+) -> bool:
+    """
+    Drive one ASK round-trip at a real enforcement site.
+
+    Wires the three seams (``register``, ``emit``, ``park``)
+    on :func:`_await_policy_approval` to the production DBOS +
+    task_store + SSE stack. See
+    :file:`designs/POLICIES_INTEGRATION_GUIDE.md` §6 for the
+    intended shape.
+
+    * ``register`` — insert a ``pending_tool_calls`` row using
+      the same ``create_pending_tool_call`` path that
+      client-side tool tunneling uses. The reserved tool name
+      is ``request_approval``. The PATCH endpoint routes the
+      verdict back without needing any special-casing.
+    * ``emit`` — publish the synthetic ``function_call`` item
+      on the root task's SSE stream via :func:`_write_output`.
+      Clients that understand the ``request_approval``
+      reserved name render an approval UI.
+    * ``park`` — block on the existing ``tool_result`` DBOS
+      topic. The PATCH endpoint calls
+      ``DBOS.send(task_id, None, topic="tool_result")`` when
+      the verdict arrives. On wake, we fetch the completed
+      row's ``result`` string and return it.
+
+    :param engine: The per-workflow :class:`PolicyEngine`.
+    :param task_id: The parked workflow's task id.
+    :param root_task_id: The root task whose SSE stream
+        carries the synthetic approval request. ``None`` when
+        this is itself a root task.
+    :param task_store: Store for the pending row.
+    :param result: The composed ASK :class:`PolicyResult` the
+        engine returned.
+    :param phase: The :class:`Phase` that produced the ASK.
+    :param content_preview: A readable snapshot of the gated
+        content (truncated again inside the helper to 1024
+        chars).
+    :returns: ``True`` on approve; ``False`` on refuse /
+        timeout / cancel / malformed verdict.
+    """
+    from agent_plane.runtime.policies import _await_policy_approval
+
+    publish_target = root_task_id if root_task_id is not None else task_id
+
+    def _register(call_id: str, inner_task_id: str, args_json: str) -> None:
+        """
+        Register the synthetic call_id row so PATCH can deliver
+        the verdict to this parked workflow.
+        """
+        task_store.create_pending_tool_call(
+            call_id=call_id,
+            root_task_id=publish_target,
+            task_id=inner_task_id,
+            tool_name="request_approval",
+            arguments=args_json,
+        )
+
+    def _emit(event: dict[str, Any]) -> None:
+        """Publish the synthetic function_call on the root SSE stream."""
+        _write_output(publish_target, event)
+
+    async def _park(call_id: str, timeout_s: int) -> str | None:
+        """
+        Block on the ``tool_result`` topic until PATCH delivers
+        a verdict. Return the verdict string or ``None`` when
+        the matching row isn't in "completed" state on wake
+        (cancel races, malformed PATCH, etc.).
+        """
+        await dbos_recv_async(topic="tool_result", timeout_seconds=timeout_s)
+        rows = task_store.list_pending_tool_calls(
+            call_id=call_id,
+            status="completed",
+        )
+        if not rows:
+            return None
+        return rows[0].result
+
+    return await _await_policy_approval(
+        task_id=task_id,
+        root_task_id=publish_target,
+        result=result,
+        phase=phase,
+        content_preview=content_preview,
+        policy_engine=engine,
+        register=_register,
+        emit=_emit,
+        park=_park,
+    )
+
+
+async def _enforce_tool_call_policy(
+    *,
+    engine: Any,
+    task_id: str,
+    root_task_id: str | None,
+    task_store: TaskStore,
+    tool_name: str,
+    arguments: str,
+) -> str | None:
+    """
+    Evaluate TOOL_CALL policies; return a sentinel iff blocked.
+
+    Called from :func:`_execute_tools` before the actual
+    tool dispatch. ``None`` means "proceed to dispatch";
+    a non-``None`` string is the pre-built blocked sentinel
+    that should replace the tool's output in
+    ``function_call_output``.
+
+    :param engine: Per-workflow :class:`PolicyEngine`.
+    :param task_id: The workflow's task id (for ASK parking).
+    :param root_task_id: Root task id (for ASK SSE routing),
+        or ``None`` when this is itself a root task.
+    :param task_store: Store used by the ASK seam.
+    :param tool_name: Resolved tool name the LLM called.
+    :param arguments: JSON-encoded tool arguments string as
+        sent by the LLM.
+    :returns: ``None`` on ALLOW (or approved ASK); a
+        ``[Denied by policy: ...]`` sentinel string on DENY
+        or refused ASK.
+    """
+    from agent_plane.policies.types import EvaluationContext
+    from agent_plane.runtime.policies import _enforce_policy
+    from agent_plane.spec.types import Phase, PolicyAction
+
+    try:
+        args_payload: Any = json.loads(arguments)
+    except (TypeError, json.JSONDecodeError):
+        # Malformed arguments from the LLM shouldn't crash the
+        # enforcement site — the policy can still gate on the
+        # tool name, and the tool itself (if we ALLOW through)
+        # will reject the malformed payload. Keep as a string
+        # so policies that inspect content see *something*.
+        args_payload = arguments
+    ctx = EvaluationContext(
+        phase=Phase.TOOL_CALL,
+        content={"tool": tool_name, "args": args_payload},
+        tool_name=tool_name,
+    )
+    result = await _enforce_policy(engine, ctx)
+    if result.action == PolicyAction.DENY:
+        _logger.info(
+            "policy DENY at TOOL_CALL for %s: %s",
+            tool_name,
+            result.reason,
+        )
+        return _build_deny_sentinel(result.reason)
+    if result.action == PolicyAction.ASK:
+        approved = await _handle_policy_ask(
+            engine=engine,
+            task_id=task_id,
+            root_task_id=root_task_id,
+            task_store=task_store,
+            result=result,
+            phase=Phase.TOOL_CALL,
+            content_preview=_content_preview(ctx.content),
+        )
+        if not approved:
+            return _build_deny_sentinel(result.reason)
+    return None
+
+
+async def _enforce_tool_result_policy(
+    *,
+    engine: Any,
+    task_id: str,
+    root_task_id: str | None,
+    task_store: TaskStore,
+    tool_name: str,
+    result_text: str,
+) -> str:
+    """
+    Evaluate TOOL_RESULT policies; return the result to persist.
+
+    Called from :func:`_execute_tools` after each tool returns.
+    On ALLOW (or approved ASK), returns the original
+    ``result_text`` unchanged. On DENY or refused ASK,
+    substitutes a blocked sentinel — the LLM sees that in
+    ``function_call_output`` instead of the raw tool output.
+
+    :param engine: Per-workflow :class:`PolicyEngine`.
+    :param task_id: Workflow task id (for ASK parking).
+    :param root_task_id: Root task id (for ASK SSE), or
+        ``None``.
+    :param task_store: Store used by the ASK seam.
+    :param tool_name: MUST match the same name passed at the
+        TOOL_CALL site — LabelPolicy selectors that target
+        a specific tool rely on this (POLICIES.md §4).
+    :param result_text: The raw tool output the dispatcher
+        produced.
+    :returns: The text to persist as the
+        ``function_call_output`` — either ``result_text``
+        itself or a sentinel.
+    """
+    from agent_plane.policies.types import EvaluationContext
+    from agent_plane.runtime.policies import _enforce_policy
+    from agent_plane.spec.types import Phase, PolicyAction
+
+    ctx = EvaluationContext(
+        phase=Phase.TOOL_RESULT,
+        content={"output": result_text},
+        tool_name=tool_name,
+    )
+    policy_result = await _enforce_policy(engine, ctx)
+    if policy_result.action == PolicyAction.DENY:
+        _logger.info(
+            "policy DENY at TOOL_RESULT for %s: %s",
+            tool_name,
+            policy_result.reason,
+        )
+        return _build_deny_sentinel(policy_result.reason)
+    if policy_result.action == PolicyAction.ASK:
+        approved = await _handle_policy_ask(
+            engine=engine,
+            task_id=task_id,
+            root_task_id=root_task_id,
+            task_store=task_store,
+            result=policy_result,
+            phase=Phase.TOOL_RESULT,
+            content_preview=_content_preview(ctx.content),
+        )
+        if not approved:
+            return _build_deny_sentinel(policy_result.reason)
+    return result_text
+
+
+async def _enforce_output_policy(
+    *,
+    engine: Any,
+    task_id: str,
+    root_task_id: str | None,
+    task_store: TaskStore,
+    text: str,
+) -> str:
+    """
+    Evaluate OUTPUT policies; return the text to persist.
+
+    Called from :func:`_handle_final_response` BEFORE the
+    assistant message is persisted — POLICIES.md §11.4 makes
+    pre-persistence ordering load-bearing (otherwise
+    compaction could resurface blocked text).
+
+    When a DENY or refused-ASK substitutes the sentinel, the
+    original LLM text has ALREADY streamed to clients as
+    ``response.output_text.delta`` events (text deltas fire
+    during the LLM's generation, before ``_handle_final_response``
+    runs). Streaming clients that fold deltas into displayed
+    text (REPL BlockStream, UI SDK) would render the original
+    text and never see the sentinel, because the subsequent
+    ``response.output_item.done`` event is treated as a
+    section-end boundary, not a text source. To keep those
+    clients aligned with what actually lands in
+    ``conversation_items``, we emit an additional text delta
+    carrying the sentinel — the user sees both what the
+    agent tried to say AND the policy denial. The persisted
+    conversation item still contains ONLY the sentinel, so
+    compaction / follow-up turns see only the denial.
+
+    :param engine: Per-workflow :class:`PolicyEngine`.
+    :param task_id: Workflow task id (for ASK parking).
+    :param root_task_id: Root task id (for ASK SSE), or
+        ``None``.
+    :param task_store: Store used by the ASK seam.
+    :param text: The LLM's final assistant text.
+    :returns: The text to persist — either the original or a
+        sentinel.
+    """
+    from agent_plane.policies.types import EvaluationContext
+    from agent_plane.runtime.policies import _enforce_policy
+    from agent_plane.spec.types import Phase, PolicyAction
+
+    ctx = EvaluationContext(
+        phase=Phase.OUTPUT,
+        content=text,
+        tool_name=None,
+    )
+    policy_result = await _enforce_policy(engine, ctx)
+    if policy_result.action == PolicyAction.DENY:
+        _logger.info(
+            "policy DENY at OUTPUT: %s",
+            policy_result.reason,
+        )
+        sentinel = _build_deny_sentinel(policy_result.reason)
+        _stream_output_substitution(task_id, sentinel)
+        return sentinel
+    if policy_result.action == PolicyAction.ASK:
+        approved = await _handle_policy_ask(
+            engine=engine,
+            task_id=task_id,
+            root_task_id=root_task_id,
+            task_store=task_store,
+            result=policy_result,
+            phase=Phase.OUTPUT,
+            content_preview=_content_preview(ctx.content),
+        )
+        if not approved:
+            sentinel = _build_deny_sentinel(policy_result.reason)
+            _stream_output_substitution(task_id, sentinel)
+            return sentinel
+    return text
+
+
+def _stream_output_substitution(task_id: str, sentinel: str) -> str:
+    """
+    Emit the sentinel as an extra text delta so streaming
+    clients see it after the original LLM text.
+
+    Streaming clients (REPL, UI SDK) assemble assistant text
+    from ``response.output_text.delta`` events. When OUTPUT
+    enforcement substitutes the text, the original deltas
+    already fired — emitting the sentinel as a delta means
+    the client's accumulated text becomes
+    ``<original>\\n<sentinel>``. That's what the user sees on
+    screen, while the persisted conversation item (written
+    next by ``_handle_final_response``) contains ONLY the
+    sentinel. Follow-up turns and compaction never see the
+    original.
+
+    :param task_id: The task whose SSE stream gets the
+        delta.
+    :param sentinel: The DENY sentinel string.
+    :returns: The sentinel (for call-site convenience).
+    """
+    _write_output(
+        task_id,
+        {
+            "type": "response.output_text.delta",
+            # Leading newline separates the sentinel from the
+            # LLM's original text so users can read both.
+            "delta": f"\n{sentinel}",
+        },
+    )
+    return sentinel
+
+
+async def _persist_input_deny_sentinel(
+    *,
+    task_id: str,
+    conversation_id: str,
+    assistant_message: str,
+    output_items: list[dict[str, Any]],
+    conv_store: ConversationStore,
+) -> _AgentLoopResult:
+    """
+    Short-circuit the loop with a synthetic DENY assistant message.
+
+    Persists the sentinel as a real assistant message in the
+    conversation (so follow-up turns see it in history) AND
+    streams it to the SSE output so streaming clients (REPL,
+    UI SDK) render it immediately. Without the SSE emit,
+    only polling clients saw the sentinel — a DENY through
+    ``ap chat`` looked like silence.
+
+    :param task_id: The current task id.
+    :param conversation_id: The current conversation id.
+    :param assistant_message: The sentinel text to persist.
+    :param output_items: Mutable output-items list — the sentinel
+        is appended for both the SSE stream and the final
+        response body.
+    :param conv_store: Conversation store for persistence.
+    :returns: A completed :class:`_AgentLoopResult`.
+    """
+    # Emit the sentinel as a text delta first so streaming
+    # consumers (REPL BlockStream, UI SDK formatters) render
+    # it. Without this, the assistant message's text would
+    # arrive only via ``response.output_item.done`` — which
+    # BlockStream treats as an end-of-text boundary, not a
+    # source of text. Typical LLM flow is delta-then-done;
+    # matching that shape keeps client code simple.
+    _write_output(
+        task_id,
+        {
+            "type": "response.output_text.delta",
+            "delta": assistant_message,
+        },
+    )
+    new_item = NewConversationItem(
+        type="message",
+        response_id=task_id,
+        data=MessageData(
+            role="assistant",
+            agent="policy",
+            content=[{"type": "output_text", "text": assistant_message}],
+        ),
+    )
+    # _persist_and_stream persists to conv_store, appends to
+    # output_items, and emits an SSE response.output_item.done
+    # event — single call covers all three consumers. Wrapped
+    # in _to_thread because the store call is sync.
+    await _to_thread(
+        lambda: _persist_and_stream(
+            task_id,
+            conv_store,
+            conversation_id,
+            [new_item],
+            output_items,
+        ),
+    )
+    return _AgentLoopResult(status="completed", output=output_items)
 
 
 def _sync_history(
@@ -4061,6 +5092,7 @@ def _build_executor_context(
         task_id=task_id,
         agent_id=agent_id,
         workspace=workspace,
+        conversation_id=conversation_id,
     )
     server_names = frozenset(tool_mgr.get_tool_names())
 
@@ -4343,6 +5375,19 @@ async def _run_agent_loop(
     tool_schemas = tool_mgr.get_tool_schemas()
     conv_store = get_conversation_store()
     task_store = get_task_store()
+    # Phase 6: build the per-workflow PolicyEngine. The engine is a
+    # plain local (not a ContextVar) passed explicitly to the
+    # enforcement sites. For agents without a guardrails block in
+    # their spec, this returns a no-op engine — all four
+    # enforcement sites still call through, they just always ALLOW.
+    # See POLICIES.md §4 + designs/POLICIES_INTEGRATION_GUIDE.md.
+    from agent_plane.runtime.policies import build_policy_engine
+
+    policy_engine = build_policy_engine(
+        spec=spec,
+        conversation_id=conversation_id,
+        conversation_store=conv_store,
+    )
     # Determine if this is a sub-agent (has root_task_id).
     # Sub-agents park when hitting client tools instead of
     # completing — the park mechanism tunnels tool calls to
@@ -4353,6 +5398,11 @@ async def _run_agent_loop(
     # to avoid loading the full conversation on long-running agents.
     history = _load_initial_history(conv_store, conversation_id)
     last_seen = history[-1].id if history else None
+    # Tracks the most recent user-message item we've already
+    # evaluated against INPUT policies. ``None`` means "no
+    # messages enforced yet" — every user message in history
+    # gets checked on the first loop iteration (Phase 6).
+    last_enforced_input_id: str | None = None
     output_items: list[dict[str, Any]] = []
     # For remote executors, spec.llm may be None — they ignore it.
     # Provide a stub LLMConfig so downstream code doesn't break.
@@ -4422,6 +5472,33 @@ async def _run_agent_loop(
                 last_seen,
                 history,
             )
+            # Phase 6: INPUT-phase policy enforcement.
+            # Check user messages newly added since the last input
+            # enforcement run. On the first iteration, every user
+            # message in history is "new" from the engine's view.
+            # On DENY, replace the content with a sentinel BEFORE
+            # the LLM sees it (POLICIES.md §5.1 / §11.4). A no-op
+            # engine (agent without guardrails) returns ALLOW on
+            # every check — zero overhead beyond the enum compare.
+            deny_assistant_message, last_enforced_input_id = await _enforce_input_policies(
+                engine=policy_engine,
+                history=history,
+                last_enforced_input_id=last_enforced_input_id,
+                agent_name=agent_name,
+                task_id=task_id,
+                root_task_id=root_task_id,
+                task_store=task_store,
+            )
+            if deny_assistant_message is not None:
+                # Persist the sentinel as an assistant message and
+                # return — the DENY short-circuits this turn.
+                return await _persist_input_deny_sentinel(
+                    task_id=task_id,
+                    conversation_id=conversation_id,
+                    assistant_message=deny_assistant_message,
+                    output_items=output_items,
+                    conv_store=conv_store,
+                )
             # Drain any async-work signals that piled up since the
             # last iteration (D4). Each completion is persisted as a
             # `[System: task ... <status>]` user message; the next
@@ -4566,41 +5643,78 @@ async def _run_agent_loop(
                         # SSE but never committed), and the next
                         # LLM call wouldn't see what the model
                         # said in this turn.
+                        #
+                        # Skip when text is empty/None: persisting
+                        # an assistant item with ``text: null``
+                        # makes the next iteration's LLM call fail
+                        # (OpenAI rejects ``input[i].content[0].text``
+                        # being null). The LLM legitimately produces
+                        # no text in many turn-types (e.g., when it
+                        # only emits a function_call and waits for
+                        # an async drain); we have nothing to
+                        # preserve in those cases.
                         text = _get_text_content(llm_resp)
                         file_annotations = _collect_file_annotations(output_items)
-                        _emit_file_annotations(task_id, file_annotations)
-                        item = _build_assistant_item(
-                            task_id,
-                            agent_name,
-                            text,
-                            annotations=file_annotations or None,
-                        )
-                        persisted = _persist_and_stream(
-                            task_id,
-                            conv_store,
-                            conversation_id,
-                            [item],
-                            output_items,
-                        )
-                        history.extend(persisted)
+                        # Track the cursor as we persist new
+                        # items in this branch. The blocking
+                        # drain below uses this as
+                        # ``steering_cursor`` — its check is
+                        # "any item past the cursor", so a
+                        # cursor that doesn't include items
+                        # *we just persisted ourselves* would
+                        # break out immediately every iteration
+                        # and spin the loop. Each persist site
+                        # below advances ``drain_cursor``.
+                        drain_cursor = last_seen
+                        if text or file_annotations:
+                            _emit_file_annotations(task_id, file_annotations)
+                            item = _build_assistant_item(
+                                task_id,
+                                agent_name,
+                                text,
+                                annotations=file_annotations or None,
+                            )
+                            persisted = _persist_and_stream(
+                                task_id,
+                                conv_store,
+                                conversation_id,
+                                [item],
+                                output_items,
+                            )
+                            history.extend(persisted)
+                            if persisted:
+                                drain_cursor = persisted[-1].id
                         if late_drained:
                             # Already-drained payloads need
                             # persisting; pending case will block
                             # for at least one more.
-                            _persist_async_completions(
+                            late_persisted = _persist_async_completions(
                                 task_id,
                                 conversation_id,
                                 late_drained,
                                 output_items,
                                 conv_store,
                             )
+                            if late_persisted:
+                                drain_cursor = late_persisted[-1].id
                         if pending_tool_tasks:
                             # Block on the topic until at least
-                            # one signal arrives. The next
-                            # iteration's drain picks up
-                            # remaining completions.
+                            # one signal arrives OR a steering
+                            # message lands on the conversation
+                            # — both wake the loop so the LLM
+                            # can react. Steering-break returns
+                            # an empty list; the outer continue
+                            # feeds into the next iteration's
+                            # _sync_history which picks up the
+                            # steering. pending_tool_tasks stay
+                            # pending; the non-blocking drain
+                            # at the top of the next iteration
+                            # picks them up when they arrive.
                             blocking = await _drain_async_completions(
                                 block_for_one=True,
+                                conv_store=conv_store,
+                                conversation_id=conversation_id,
+                                steering_cursor=drain_cursor,
                             )
                             _persist_async_completions(
                                 task_id,
@@ -4621,6 +5735,8 @@ async def _run_agent_loop(
                         task_store,
                         conv_store,
                         iteration_item_ids=iteration_item_ids,
+                        policy_engine=policy_engine,
+                        root_task_id=root_task_id,
                     )
                     if isinstance(result, _SteeringRetry):
                         # Late steered messages arrived during streaming.
@@ -4654,6 +5770,9 @@ async def _run_agent_loop(
                     conv_store,
                     tool_mgr,
                     workspace_path=workspace_path,
+                    policy_engine=policy_engine,
+                    task_store=task_store,
+                    root_task_id=root_task_id,
                 )
                 if isinstance(handle_result, _ClientToolCallsPending):
                     if root_task_id is not None:
@@ -4745,6 +5864,59 @@ def _find_spec_by_name(
         if found is not None:
             return found
     return None
+
+
+def _resolve_workdir_for_spec(
+    root_spec: AgentSpec,
+    root_workdir: Path,
+    target_name: str | None,
+) -> Path:
+    """
+    Walk the spec tree and return the on-disk directory that
+    *owns* the spec with the given name.
+
+    The bundle layout places sub-agents at
+    ``<root>/agents/<sub_name>/``. Nested sub-agents live at
+    ``<root>/agents/<parent>/agents/<sub>/``. Local tools are
+    always declared with paths relative to the agent that
+    owns them — so the ``ToolManager`` for a sub-agent must
+    use that sub-agent's directory as the workdir, not the
+    root's. Before this helper, the runtime passed
+    ``loaded.workdir`` unconditionally, which meant
+    sub-agents with local Python tools tried to load them
+    from ``<root>/tools/python/...`` and failed.
+
+    :param root_spec: The root agent's parsed spec — holds
+        the full sub-agent tree.
+    :param root_workdir: On-disk path of the root agent's
+        bundle (``<root>``).
+    :param target_name: Name of the spec whose workdir we
+        want. ``None`` or the root spec's own name returns
+        ``root_workdir`` unchanged.
+    :returns: The directory that contains
+        ``config.yaml`` / ``tools/`` / ``agents/`` for the
+        target spec.
+    """
+    if target_name is None or target_name == root_spec.name:
+        return root_workdir
+    # DFS through the tree tracking the physical path in
+    # parallel with the spec pointer.
+    stack: list[tuple[AgentSpec, Path]] = [(root_spec, root_workdir)]
+    while stack:
+        current_spec, current_workdir = stack.pop()
+        for sub in current_spec.sub_agents:
+            sub_workdir = current_workdir / "agents" / (sub.name or "")
+            if sub.name == target_name:
+                return sub_workdir
+            stack.append((sub, sub_workdir))
+    # Fallback — no matching sub-agent found. This mirrors the
+    # pre-existing ``_resolve_agent_spec_for_task`` raising
+    # LookupError earlier in the pipeline; if we're called
+    # with a bad name we bail loud rather than silently
+    # returning root.
+    raise LookupError(
+        f"sub-agent {target_name!r} not found when resolving workdir under {root_workdir!s}",
+    )
 
 
 async def _resolve_agent_spec_for_task(
@@ -4923,10 +6095,21 @@ async def agent_execution_workflow(
                 span.set_attribute(SpanAttributeKey.MODEL_PROVIDER, provider)
 
             client_tool_specs: list[ClientSideToolSpec] = parse_client_side_tool_specs(tools or [])
+            # When this workflow is a sub-agent, its local
+            # tools live at ``<root>/agents/<sub>/tools/...``,
+            # not ``<root>/tools/...``. Resolve the correct
+            # per-spec workdir so local tool paths (stored
+            # relative to the owning agent's dir by the
+            # parser) join correctly.
+            effective_workdir = _resolve_workdir_for_spec(
+                root_spec,
+                loaded.workdir,
+                spec.name,
+            )
             tool_mgr = ToolManager(
                 spec,
                 client_tool_specs=client_tool_specs,
-                workdir=loaded.workdir,
+                workdir=effective_workdir,
                 sandbox_enabled=caps.sandbox_enabled,
             )
             set_tool_manager(tool_mgr)
@@ -4944,6 +6127,19 @@ async def agent_execution_workflow(
                     executor,
                     reasoning=reasoning,
                 )
+                # Audit fix #2: reap any non-terminal children
+                # (``kind in _DRAIN_KINDS``) before returning.
+                # _run_agent_loop's end-of-turn auto-collect
+                # usually waits for pending children on the happy
+                # path, but an LLM that hits max_iterations or
+                # returns final text without another tool call
+                # can exit while a client_tool is still
+                # in_progress. Without this reap, the child row
+                # stays in_progress forever and a late PATCH
+                # signals a gone parent. Idempotent — re-running
+                # skips children already cancelled by the route's
+                # cancel endpoint.
+                await cancel_pending_child_tools(task_id)
                 span.set_outputs({"status": result.status})
                 # Phase 3: if this workflow is a sub-agent, signal
                 # the parent on the unified async_work_complete topic
@@ -4991,6 +6187,19 @@ async def agent_execution_workflow(
                 raise
             except Exception as exc:
                 _logger.exception("agent loop failed for task %s", task_id)
+                # Audit fix #2: reap stranded children on the
+                # failure path too. Safe here because we haven't
+                # been cancelled by DBOS yet — @step calls like
+                # ``task_store.list_tasks`` still succeed.
+                # Swallow errors from reap (the primary failure
+                # below is what we care about surfacing).
+                try:
+                    await cancel_pending_child_tools(task_id)
+                except Exception:
+                    _logger.exception(
+                        "failed to reap child tools during agent loop failure for task %s",
+                        task_id,
+                    )
                 _write_output(
                     task_id,
                     {

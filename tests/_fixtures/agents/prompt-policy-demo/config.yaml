@@ -1,0 +1,39 @@
+spec_version: 1
+name: prompt-policy-demo
+description: |
+  Fixture for the PromptPolicy integration tests. Declares a
+  PromptPolicy at the input phase (block_canada style) plus a
+  label-writing PromptPolicy at tool_result. Exercised with
+  stubbed classifiers — production LLM wiring lands in a
+  later phase.
+
+llm:
+  model: openai/gpt-4o
+
+guardrails:
+  labels:
+    sensitivity:
+      initial: public
+      values: [public, internal, confidential]
+      monotonic: increasing
+
+  policies:
+    # Classifier on user input — ALLOW / DENY.
+    block_canada_input:
+      type: prompt
+      on: [input]
+      action: [allow, deny]
+      prompt: |
+        Deny if the user's request mentions Canada or a
+        Canadian place / person. Otherwise allow.
+
+    # Classifier on tool output — ALLOW only, writes a label.
+    classify_doc_sensitivity:
+      type: prompt
+      on: [tool_result:read_doc]
+      action: [allow]
+      set_labels: [sensitivity]
+      prompt: |
+        Classify the document's sensitivity level
+        (public / internal / confidential) based on the
+        content. Emit the level in set_labels.sensitivity.

@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from sqlalchemy import Select, and_, asc, delete, desc, func, or_, select, text
 from sqlalchemy.orm import QueryableAttribute, Session
 
-from agent_plane.db.db_models import SqlConversation, SqlConversationItem, SqlTask
+from agent_plane.db.db_models import (
+    SqlConversation,
+    SqlConversationItem,
+    SqlConversationLabel,
+    SqlTask,
+)
 from agent_plane.db.utils import (
     delete_fts_by_conversation,
     ensure_fts_table,
@@ -29,12 +35,21 @@ from agent_plane.entities import (
 from agent_plane.stores.conversation_store import ConversationStore
 
 
-def _to_conversation(row: SqlConversation) -> Conversation:
+def _to_conversation(
+    row: SqlConversation,
+    labels: dict[str, str] | None = None,
+) -> Conversation:
     """
     Convert a :class:`SqlConversation` ORM row to a
     :class:`Conversation` entity.
 
     :param row: The SQLAlchemy ORM row to convert.
+    :param labels: Pre-fetched guardrails labels for this
+        conversation. ``None`` means "no label fetch was
+        performed" (callers that don't need labels pass
+        ``None`` rather than forcing a second query); this
+        maps to an empty dict on the entity. Populated
+        callers pass the JOINed ``{key: value}`` map.
     :returns: A :class:`Conversation` dataclass instance.
     """
     return Conversation(
@@ -44,7 +59,167 @@ def _to_conversation(row: SqlConversation) -> Conversation:
         title=row.title,
         kind=row.kind,
         parent_conversation_id=row.parent_conversation_id,
+        labels=labels if labels is not None else {},
     )
+
+
+def _upsert_labels(
+    session: Session,
+    conversation_id: str,
+    updates: dict[str, str],
+    updated_at: int,
+) -> None:
+    """
+    Atomically UPSERT multiple labels on one conversation.
+
+    Dialect-aware: SQLite and PostgreSQL both support
+    ``INSERT ... ON CONFLICT ... DO UPDATE``, so we use
+    their dedicated INSERT builders. Other dialects fall
+    back to a SELECT-then-INSERT/UPDATE path, which is
+    race-safe inside one transaction under SERIALIZABLE or
+    (for SQLite) its default single-writer semantics.
+
+    :param session: Active SQLAlchemy session (the atomic
+        unit of work).
+    :param conversation_id: Owning conversation ID.
+    :param updates: Non-empty dict of label key → value.
+    :param updated_at: Timestamp to write on every row
+        touched by this call.
+    """
+    dialect = session.bind.dialect.name if session.bind is not None else ""
+    rows = [
+        {
+            "conversation_id": conversation_id,
+            "key": key,
+            "value": value,
+            "updated_at": updated_at,
+        }
+        for key, value in updates.items()
+    ]
+    if dialect in ("sqlite", "postgresql"):
+        _dialect_upsert_labels(session, dialect, rows)
+        return
+    # Generic dialect fallback — SELECT-then-INSERT/UPDATE in
+    # one transaction. Safe for the v1 "one active workflow
+    # per conversation" invariant (POLICIES.md §10); the
+    # SQLite / Postgres dialect-specific paths above give
+    # true atomic UPSERT for the supported production dbs.
+    for row in rows:
+        existing = session.get(
+            SqlConversationLabel,
+            (row["conversation_id"], row["key"]),
+        )
+        if existing is None:
+            session.add(SqlConversationLabel(**row))
+        else:
+            # mypy sees existing.{value,updated_at} as the
+            # Mapped[...] descriptor types; at runtime these
+            # are plain attributes that accept the target
+            # Python type directly. SQLAlchemy's ORM handles
+            # the coercion.
+            existing.value = row["value"]  # type: ignore[assignment]
+            existing.updated_at = row["updated_at"]  # type: ignore[assignment]
+
+
+def _dialect_upsert_labels(
+    session: Session,
+    dialect: str,
+    rows: list[dict[str, Any]],
+) -> None:
+    """
+    Dialect-specific UPSERT path for SQLite / PostgreSQL.
+
+    Extracted from ``_upsert_labels`` so the two branches
+    (which use different ``insert`` builders producing
+    incompatible type variances at the mypy level) each live
+    in their own narrow scope. The outer function selects the
+    branch; this one executes it.
+
+    :param session: Active SQLAlchemy session.
+    :param dialect: ``"sqlite"`` or ``"postgresql"`` (the
+        outer function gates all other dialects onto the
+        generic fallback path).
+    :param rows: Pre-built row dicts to upsert.
+    """
+    # Typed as Any to sidestep the mypy variance issue between
+    # the two dialect-specific ``Insert`` classes; the runtime
+    # shape of both classes is identical for our use.
+    stmt: Any
+    if dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        stmt = sqlite_insert(SqlConversationLabel).values(rows)
+    else:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        stmt = pg_insert(SqlConversationLabel).values(rows)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["conversation_id", "key"],
+        set_={
+            "value": stmt.excluded.value,
+            "updated_at": stmt.excluded.updated_at,
+        },
+    )
+    session.execute(stmt)
+
+
+def _fetch_labels(
+    session: Session,
+    conversation_id: str,
+) -> dict[str, str]:
+    """
+    Load all guardrails labels for a conversation.
+
+    Returns an empty dict when no labels have been written
+    yet — a conversation that was created before its spec
+    declared guardrails, or before any policy wrote a label.
+
+    :param session: The active SQLAlchemy session.
+    :param conversation_id: Unique conversation identifier,
+        e.g. ``"conv_abc123"``.
+    :returns: Mapping from label key to value (string-typed).
+        Empty dict when no rows match.
+    """
+    rows = session.execute(
+        select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+            SqlConversationLabel.conversation_id == conversation_id,
+        )
+    ).all()
+    return {key: value for key, value in rows}
+
+
+def _fetch_labels_bulk(
+    session: Session,
+    conversation_ids: list[str],
+) -> dict[str, dict[str, str]]:
+    """
+    Load labels for many conversations in a single query.
+
+    Used by ``list_conversations`` to avoid an N+1 fan-out.
+    Empty input returns an empty map without touching the
+    database.
+
+    :param session: The active SQLAlchemy session.
+    :param conversation_ids: Conversation IDs to fetch labels
+        for, e.g. ``["conv_a", "conv_b"]``. Duplicates are
+        tolerated but yield the same map entries.
+    :returns: Mapping ``{conversation_id: {key: value}}``.
+        Conversations with no label rows are absent from the
+        outer map (callers should default to ``{}``).
+    """
+    if not conversation_ids:
+        return {}
+    rows = session.execute(
+        select(
+            SqlConversationLabel.conversation_id,
+            SqlConversationLabel.key,
+            SqlConversationLabel.value,
+        ).where(SqlConversationLabel.conversation_id.in_(conversation_ids))
+    ).all()
+    out: dict[str, dict[str, str]] = {}
+    for conv_id, key, value in rows:
+        out.setdefault(conv_id, {})[key] = value
+    return out
 
 
 def _to_item(row: SqlConversationItem) -> ConversationItem:
@@ -186,6 +361,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Fetch a conversation by its unique ID.
 
+        Populates ``Conversation.labels`` via a second query
+        against ``conversation_labels`` — separate from the
+        conversation row fetch because the label JOIN would
+        otherwise multiply the row count by the label count
+        and require post-processing. The two queries run in
+        the same session so they see a consistent snapshot
+        under serializable isolation.
+
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
         :returns: The :class:`Conversation` if found, otherwise
@@ -193,7 +376,41 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         with self._session() as session:
             row = session.get(SqlConversation, conversation_id)
-            return _to_conversation(row) if row else None
+            if row is None:
+                return None
+            return _to_conversation(row, _fetch_labels(session, conversation_id))
+
+    def set_labels(
+        self,
+        conversation_id: str,
+        updates: dict[str, str],
+        updated_at: int | None = None,
+    ) -> None:
+        """
+        Upsert guardrails labels on a conversation.
+
+        Single-transaction batched UPSERT — either every key
+        lands or none do (POLICIES.md §6.3). The dialect-aware
+        path dispatches to ``INSERT ... ON CONFLICT`` on
+        SQLite / PostgreSQL; other dialects fall back to
+        SELECT-then-INSERT/UPDATE inside the same transaction.
+        Empty updates is a no-op.
+
+        :param conversation_id: The conversation to update,
+            e.g. ``"conv_abc123"``.
+        :param updates: Mapping from label key to new value.
+            Example: ``{"integrity": "0"}``. Empty dict
+            returns immediately without opening a transaction.
+        :param updated_at: Caller-supplied timestamp
+            (``None`` → current wall-clock). See the abstract
+            method docstring for why callers may want to
+            pass their own.
+        """
+        if not updates:
+            return
+        stamp = updated_at if updated_at is not None else now_epoch()
+        with self._session() as session:
+            _upsert_labels(session, conversation_id, updates, stamp)
 
     def get_conversation_id(self, response_id: str) -> str:
         """
@@ -506,7 +723,17 @@ class SqlAlchemyConversationStore(ConversationStore):
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
-            convs = [_to_conversation(r) for r in rows]
+            # Fetch labels for all returned conversations in a
+            # single IN-clause query so the list-path is O(1)
+            # queries regardless of page size. Dropping this
+            # would either silently return empty-labels
+            # conversations (silent data loss) or fan out to
+            # N+1 per-row queries.
+            labels_by_conv = _fetch_labels_bulk(
+                session,
+                [r.id for r in rows],
+            )
+            convs = [_to_conversation(r, labels_by_conv.get(r.id, {})) for r in rows]
             return PagedList(
                 data=convs,
                 first_id=convs[0].id if convs else None,
@@ -589,7 +816,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             if title is not None:
                 row.title = title
                 row.updated_at = now_epoch()
-            return _to_conversation(row)
+            # Populate labels for parity with get_conversation —
+            # callers must not see an empty dict masquerading as
+            # "no labels exist" when labels do exist.
+            return _to_conversation(row, _fetch_labels(session, conversation_id))
 
     async def delete_conversation(self, conversation_id: str) -> bool:
         """

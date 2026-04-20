@@ -1569,6 +1569,226 @@ Principle #33 honored: no `# removed` comments, no aliases, no
 `warnings.warn` shim, no dual-register period surviving past Slice 5.
 The old tool ceases to exist.
 
+### 6.11 Phase 2 implementation plan — `synchronous=False`
+
+§6.1 Option D specified `terminal_run(synchronous=False)` returning
+a task handle routed through the unified task lifecycle. This section
+nails down the execution path now that the surrounding Phase 2
+infrastructure (`check_task`/`cancel_task`/`list_tasks`,
+`async_work_complete` drain, `@tool(synchronous=False)` dispatch) is
+in place on `main`.
+
+#### Dispatch surface
+
+`Tool.is_async()` is extended to accept an optional `arguments` string
+and return the async decision per-invocation. `Tool.dispatch_async()`
+becomes polymorphic — each tool that opts into async dispatch owns
+its own workflow kickoff:
+
+```python
+class Tool:
+    def is_async(self, arguments: str | None = None) -> bool: ...
+    def dispatch_async(self, ctx: AsyncDispatchContext) -> _AsyncToolHandle:
+        raise NotImplementedError
+```
+
+`AsyncDispatchContext` is a lightweight dataclass carrying
+`parent_task_id`, `parent_conversation_id`, `agent_id`, `agent_name`,
+`arguments`, `workspace_path`. The workflow's existing
+`_dispatch_async_tool` call becomes `tool.dispatch_async(ctx)` —
+polymorphic, no more `isinstance(tool, LocalPythonTool)` check.
+
+`LocalPythonTool.dispatch_async` retains today's behavior (starts
+`background_tool_workflow`, returns `_AsyncToolHandle`).
+`TerminalRunTool.dispatch_async` starts the new
+`background_terminal_workflow` below.
+
+#### `TerminalRunTool` changes
+
+- `is_async(arguments)`: parse `arguments` JSON; return True iff
+  `synchronous` is present and false-y. Default is synchronous.
+- `dispatch_async(ctx)`: create a task row with `kind="terminal"`,
+  start `background_terminal_workflow` pinned to that task_id, return
+  an `_AsyncToolHandle`. Implemented on the tool to keep all terminal
+  logic in the terminal module — the workflow body just calls the
+  polymorphic method.
+- Schema gets a new optional boolean `synchronous` parameter with a
+  clear description of the handle-return flow.
+
+#### `background_terminal_workflow`
+
+Analogous to `background_tool_workflow` but with terminal-specific
+argument semantics:
+
+```python
+@workflow()
+async def background_terminal_workflow(
+    parent_task_id: str,
+    conversation_id: str,
+    shell_name: str,
+    command: str,
+    timeout_ms: int | None,
+    workspace_path: str,
+) -> dict[str, Any]:
+    task_id = get_workflow_id()
+    try:
+        result = await _run_terminal_step(
+            task_id=task_id,
+            conversation_id=conversation_id,
+            shell_name=shell_name,
+            command=command,
+            timeout_ms=timeout_ms,
+            workspace_path=workspace_path,
+        )
+        payload = _result_to_payload(task_id, result)
+    except BaseException as exc:
+        payload = _exception_to_payload(task_id, exc)
+        await _send_payload(parent_task_id, payload)
+        raise
+    await _send_payload(parent_task_id, payload)
+    return _payload_to_dict(payload)
+```
+
+Mapping `Shell.RunResult.status` → `AsyncWorkCompletePayload.status`:
+
+| RunResult.status | Payload.status | Notes |
+|---|---|---|
+| `"completed"` | `"completed"` | Normal exit; `result.{stdout, exit_code}` populated. |
+| `"killed"` | `"cancelled"` | Either `timeout_ms` fired or `cancel_task` sent SIGINT — either way the command was interrupted, not failed. |
+| `"shell_crashed"` | `"failed"` | Bash died; partial stdout in `result.stdout`, `exit_code=null`. |
+| `"shell_busy"` | `"failed"` | Should not happen (async dispatch creates a new shell or uses a named shell not already running another async command). Defensive map. |
+
+#### `_run_terminal_step` (the @step)
+
+```python
+@step()
+async def _run_terminal_step(
+    task_id: str,
+    conversation_id: str,
+    shell_name: str,
+    command: str,
+    timeout_ms: int | None,
+    workspace_path: str,
+) -> dict[str, Any]:
+    registry = get_terminal_registry()
+    manager = registry.for_conversation(conversation_id, Path(workspace_path))
+    # Register so cancel_task can find the shell.
+    manager.register_running_task(task_id, shell_name)
+    try:
+        # run_sync blocks the step's thread-pool thread for the
+        # duration of the command; timeout_ms and SIGINT (via
+        # cancel_task → shell.interrupt) both unblock it.
+        result = await asyncio.to_thread(
+            manager.run_sync, shell_name, command, timeout_ms
+        )
+    finally:
+        manager.unregister_running_task(task_id)
+    return dataclasses.asdict(result)
+```
+
+DBOS checkpoints the step's result. On replay after a server crash,
+the step re-executes (the command runs again). This matches the
+existing sync path's behavior. Agents using async mode accept this
+re-run property; non-idempotent commands should be run synchronously.
+
+#### `Shell` additions
+
+Two small primitives added to the `Shell` class:
+
+- **`interrupt()`** → sends SIGINT to the bash subprocess via
+  `proc.sendintr()`. Thread-safe: callable from any thread, because
+  `sendintr` writes a single byte to the PTY which is atomic at the
+  kernel level. The currently-running `run_sync` sees the D marker
+  fire with exit=130 and returns `status="killed"`.
+
+- **`peek_partial_stdout(cursor: int) -> (str, int)`** — returns ring
+  buffer bytes (ANSI-stripped) from `cursor` onwards, plus the new
+  cursor value. Implemented as a lockless snapshot: ring buffer
+  appends are sequential (single writer thread per Shell), so readers
+  can snapshot `buf.total_bytes_written` atomically and read back N
+  bytes without coordinating with the writer. Used by `check_task` to
+  produce `recent_activity`.
+
+#### `TerminalManager` additions
+
+- **`register_running_task(task_id, shell_name)`** / **`unregister_running_task(task_id)`**
+  — maintain a `task_id → shell_name` map so `cancel_task` (which
+  only has a `task_id`) can find the right shell. Map is in-memory;
+  lost on server crash (same durability as the shell itself).
+- **`shell_for_task(task_id) -> Shell | None`** — lookup for
+  `cancel_task`. Returns None if the task completed or was never
+  registered.
+
+#### `check_task(kind="terminal")` integration
+
+Extend `task_lifecycle.py` with a terminal branch:
+
+```python
+if task.kind == "terminal":
+    shell = _find_terminal_shell(task.id)
+    recent_activity = None
+    if shell is not None:
+        # task_cursor lives on the Shell, keyed by task_id.
+        recent_activity, new_cursor = shell.peek_partial_stdout(
+            cursor=shell.last_cursor_for_task(task.id)
+        )
+        shell.advance_task_cursor(task.id, new_cursor)
+    return _to_check_payload(task, recent_activity=recent_activity)
+```
+
+The cursor state is per-shell, keyed by task_id, in-memory. For a
+task that already terminated, `shell_for_task` returns None and
+`recent_activity` is None (the final stdout is on the task's stored
+result).
+
+#### `cancel_task(kind="terminal")` integration
+
+Extend `task_lifecycle.py`:
+
+```python
+if task.kind == "terminal":
+    shell = _find_terminal_shell(task.id)
+    if shell is None:
+        # Task already terminal or shell gone — nothing to interrupt.
+        return {"status": "already_terminal"}
+    shell.interrupt()
+    # The running run_sync will see the D marker with exit=130,
+    # return status="killed", and the background workflow will
+    # signal status="cancelled".
+    return {"status": "cancelling"}
+```
+
+The return shape matches existing `cancel_task` semantics
+(`{"status": "cancelling"}`). The actual transition to `cancelled`
+happens when the background workflow's step returns.
+
+#### What's NOT changing
+
+- **Sync path**: `terminal_run(synchronous=True)` still goes through
+  `_call_tool` unchanged. Existing tests / behavior preserved.
+- **No new task store methods**: `kind="terminal"` reuses all existing
+  `TaskStore` facilities (`create`, `get`, `list_tasks`, etc.).
+  Migration already supports arbitrary kind strings.
+- **No new inbox**: the `async_work_complete` drain on the parent
+  workflow already auto-delivers results as system messages between
+  LLM iterations (Phase 2 part 5). No read_inbox / list_background
+  equivalent needed — the unified `check_task` / `list_tasks` surface
+  covers it.
+
+#### Test coverage plan
+
+- **Unit (tests/terminals/)**: `Shell.interrupt` actually kills a
+  running command and the shell survives; `peek_partial_stdout`
+  returns correct deltas and handles empty state; the task registration
+  map round-trips.
+- **Integration (tests/server/integration/)**: full workflow with mock
+  LLM dispatching `terminal_run(synchronous=False)`, polling
+  `check_task`, cancelling via `cancel_task`, observing the
+  `async_work_complete` drain.
+- **E2E (tests/e2e/)**: at least one LLM-driven scenario confirming
+  agents can start a long-running command, check on it, and cancel it
+  cleanly.
+
 **Harness-based agents are unaffected.** Agents whose executor is
 `ClaudeAgentsExecutor` or `AgentsSdkExecutor` don't use `code_sandbox`
 today — they use the harness's own shell tool (Claude's built-in

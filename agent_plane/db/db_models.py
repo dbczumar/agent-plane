@@ -162,6 +162,16 @@ class SqlTask(Base):
     :param root_task_id: ID of the top-level task that initiated
         this sub-agent's spawn tree, or ``None`` for top-level
         tasks.
+    :param parent_task_id: ID of the IMMEDIATE parent task that
+        caused this task to be created (distinct from
+        :attr:`root_task_id`, which walks to the top-level root).
+        For top-level user turns this is ``None``. For async
+        child tasks (``kind="tool"``, ``"sub_agent"``,
+        ``"client_tool"``) created by a sub-agent, this is the
+        sub-agent's own task id — *not* the root. Used by the
+        ``async_work_complete`` drain to signal the immediate
+        calling agent (so a sub-agent's drain wakes on its own
+        children's completions, not the root's).
     :param kind: Task kind discriminator. ``"agent_task"`` for
         user-initiated turns; ``"tool"`` for background custom-tool
         invocations spawned via ``@tool(synchronous=False)``;
@@ -188,30 +198,28 @@ class SqlTask(Base):
     root_task_id: Mapped[str | None] = mapped_column(
         String(64), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=True
     )
+    # Immediate parent — distinct from root_task_id when a
+    # sub-agent creates children. The ``async_work_complete``
+    # drain signals this task_id (not the root) so the calling
+    # agent's own drain wakes. Nullable so pre-existing rows and
+    # top-level tasks both round-trip cleanly.
+    parent_task_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=True
+    )
     # Server-side default backfills pre-existing rows to "agent_task";
     # all new task creation paths set kind explicitly per G74.
     kind: Mapped[str] = mapped_column(
         String(32), default="agent_task", server_default="agent_task"
     )
-    # Phase 5 — terminal status / output / error for tasks that
-    # have NO DBOS workflow (e.g. ``kind="client_tool"`` async
-    # client-tool tasks finalized via PATCH async_tool_results).
-    # For tasks WITH a DBOS workflow, these stay NULL and the
-    # store's ``_enrich_from_dbos`` overlay supplies the live
-    # values from DBOS instead.
-    manual_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    manual_output: Mapped[str | None] = mapped_column(Text, nullable=True)
-    manual_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    manual_error_traceback: Mapped[str | None] = mapped_column(Text, nullable=True)
-
     __table_args__ = (
         Index("ix_tasks_conversation_id", "conversation_id"),
         Index("ix_tasks_agent_id", "agent_id"),
         Index("ix_tasks_created_at", "created_at"),
         Index("ix_tasks_root_task_id", "root_task_id"),
+        Index("ix_tasks_parent_task_id", "parent_task_id"),
         Index("ix_tasks_kind", "kind"),
         CheckConstraint(
-            "kind IN ('agent_task', 'tool', 'sub_agent', 'client_tool')",
+            "kind IN ('agent_task', 'tool', 'sub_agent', 'client_tool', 'terminal')",
             name="ck_tasks_kind",
         ),
     )
@@ -313,3 +321,45 @@ class SqlPendingToolCall(Base):
         Index("ix_pending_tool_calls_root_task_id", "root_task_id"),
         Index("ix_pending_tool_calls_task_id", "task_id"),
     )
+
+
+class SqlConversationLabel(Base):
+    """
+    SQLAlchemy model for the ``conversation_labels`` table.
+
+    One row per (conversation, label-key) pair. Labels live in
+    a dedicated table rather than a JSON column on
+    ``conversations`` so per-key UPDATEs are atomic without
+    read-modify-write (see POLICIES.md §6). The table is keyed
+    only by ``conversation_id`` + ``key``, so it is untouched
+    by compaction (which rewrites ``conversation_items``) —
+    labels set turn 3 still exist turn 20 even after the
+    earlier turns have been folded into a summary.
+
+    :param conversation_id: The conversation this label belongs
+        to. Composite PK member. Deleted with the conversation
+        via ``ON DELETE CASCADE``.
+    :param key: The label key, e.g. ``"integrity"``,
+        ``"sensitivity"``. Composite PK member.
+    :param value: The label value as a string, e.g. ``"0"``,
+        ``"confidential"``. All label values are string-typed
+        regardless of what the YAML author wrote — the parser
+        coerces scalar / list values during spec load
+        (POLICIES.md §14).
+    :param updated_at: Unix epoch seconds of the last write.
+        Single timestamp for each row; on UPSERT the row's
+        timestamp is refreshed even when the value is
+        unchanged (matches omniagents parity and keeps
+        debugging timelines accurate).
+    """
+
+    __tablename__ = "conversation_labels"
+
+    conversation_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[str] = mapped_column(String(256))
+    updated_at: Mapped[int] = mapped_column(Integer)
