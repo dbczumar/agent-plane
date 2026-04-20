@@ -3078,13 +3078,25 @@ async def cancel_pending_child_tools(parent_task_id: str) -> None:
     inside it, so the propagation must be issued from outside the
     parent's workflow context.
 
-    The cancelled child's ``background_tool_workflow`` enters its
-    ``except BaseException`` block, sends an
-    ``async_work_complete`` payload with ``status="cancelled"``
-    (G86), and re-raises so DBOS records the workflow as
-    CANCELLED. The parent's drain on the next iteration picks up
-    the cancellation message; if the parent is itself being
-    cancelled the message is harmless (it's just a database row).
+    The cancelled child's ``background_tool_workflow`` /
+    ``client_tool_workflow`` enters its ``except BaseException``
+    block, sends an ``async_work_complete`` payload with
+    ``status="cancelled"`` (G86), and re-raises so DBOS records
+    the workflow as CANCELLED. The parent's drain on the next
+    iteration would normally pick up the cancellation message —
+    but in every place we call this function the parent is
+    *already* terminating (route /cancel, audit fix #2 reap),
+    so no future iteration will run and the drain payload is
+    stranded in DBOS.
+
+    **Audit fix #6 (d)**: to keep the cancellation visible to
+    the LLM on conversation replay, this helper also writes a
+    ``[System: task X (kind) cancelled]`` user-role item
+    directly into the parent's conversation. That message is
+    what the LLM reads on the next ``previous_response_id``
+    resumption — without it the FCO handle's ``"in_progress"``
+    status would be the only signal and the LLM would have no
+    way to know the task ended.
 
     Per-child failures are swallowed so one cancel error does
     not block the others.
@@ -3096,7 +3108,11 @@ async def cancel_pending_child_tools(parent_task_id: str) -> None:
     from agent_plane.runtime.durability import cancel_workflow_async
 
     task_store = get_task_store()
+    conv_store = get_conversation_store()
     children = await task_store.list_tasks(root_task_id=parent_task_id)
+    parent_task = await task_store.get(parent_task_id)
+    parent_conv_id = parent_task.conversation_id if parent_task is not None else None
+
     for child in children:
         if child.status in TERMINAL_STATUSES:
             continue
@@ -3109,6 +3125,7 @@ async def cancel_pending_child_tools(parent_task_id: str) -> None:
                     "failed to cancel child tool task %s during parent cancel",
                     child.id,
                 )
+            _persist_cancellation_message(conv_store, parent_conv_id, parent_task_id, child)
         elif child.kind == _CLIENT_TOOL_KIND:
             # Client-side async tool — has a holder DBOS
             # workflow (client_tool_workflow) parked on
@@ -3136,7 +3153,73 @@ async def cancel_pending_child_tools(parent_task_id: str) -> None:
                     "failed to cancel client_tool task %s during parent cancel",
                     child.id,
                 )
+            _persist_cancellation_message(conv_store, parent_conv_id, parent_task_id, child)
         # Other kinds (sub_agent) handled by their own signaling.
+
+
+def _persist_cancellation_message(
+    conv_store: ConversationStore,
+    parent_conv_id: str | None,
+    parent_task_id: str,
+    child: Task,
+) -> None:
+    """
+    Write a ``[System: task X (kind) cancelled]`` item into the
+    parent's conversation.
+
+    Mirrors the drain delivery format
+    (:func:`_format_async_completion_text`) so the LLM can't
+    tell apart "drain delivered the cancellation" from "reap
+    persisted it directly" — the same text flows into context
+    on the next turn / replay either way.
+
+    Audit fix #6 (d): the parent has terminated (or is about
+    to) by the time this runs, so the drain won't deliver the
+    cancellation. Without this direct persist, the LLM would
+    see only the original ``"status": "in_progress"`` handle on
+    replay and have no way to know the task is dead.
+
+    Failures are swallowed and logged — losing the system
+    message doesn't break correctness; it only hurts the LLM's
+    visibility on the next replay.
+
+    :param conv_store: The conversation store.
+    :param parent_conv_id: The parent's conversation id.
+        ``None`` short-circuits (the parent task row was missing
+        — already a logged error elsewhere).
+    :param parent_task_id: The parent task id (used as the
+        item's ``response_id``).
+    :param child: The child task being cancelled. Its ``id`` and
+        ``kind`` go into the system message body.
+    """
+    if parent_conv_id is None:
+        return
+    payload = {
+        "task_id": child.id,
+        "kind": child.kind,
+        "status": "cancelled",
+    }
+    item = NewConversationItem(
+        type="message",
+        response_id=parent_task_id,
+        data=MessageData(
+            role="user",
+            content=[
+                {
+                    "type": "input_text",
+                    "text": _format_async_completion_text(payload),
+                },
+            ],
+        ),
+    )
+    try:
+        conv_store.append(parent_conv_id, [item])
+    except Exception:
+        _logger.exception(
+            "failed to persist cancellation message for child %s in conv %s",
+            child.id,
+            parent_conv_id,
+        )
 
 
 # ─── Async work drain ──────────────────────────────────────

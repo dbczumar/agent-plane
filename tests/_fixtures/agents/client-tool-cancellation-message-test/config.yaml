@@ -1,0 +1,28 @@
+spec_version: 1
+
+name: client-tool-cancellation-message-test
+
+description: |
+  Test-only agent for the audit-fix-#6 (d) E2E.
+
+  Calls the request-supplied async client tool once, with
+  ``synchronous: false``. The test cancels the parent before
+  any PATCH arrives — the fix must persist a
+  ``[System: task X (client_tool) cancelled]`` message into
+  the parent's conversation so the LLM sees the cancellation
+  on replay.
+
+llm:
+  model: gpt-5.4
+  connection:
+    api_key: ${OPENAI_API_KEY}
+
+tools:
+  timeout: 60
+
+interaction:
+  modalities:
+    input: [text]
+    output: [text]
+
+instructions: AGENTS.md
